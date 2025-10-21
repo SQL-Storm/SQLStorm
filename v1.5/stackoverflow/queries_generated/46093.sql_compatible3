@@ -1,0 +1,125 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT v.Id) as VoteCastCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (DATE '2024-10-01' - INTERVAL '3' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopQuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate as QuestionCreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        CAST('{' || REPLACE(REPLACE(p.Tags, '><', ','), '>', '' ) || '}' AS VARCHAR) as TagArrayRaw,
+        COUNT(DISTINCT pl.RelatedPostId) as LinkedQuestionCount,
+        COUNT(DISTINCT a.Id) as ActualAnswers,
+        MAX(a.Score) as BestAnswerScore,
+        AVG(a.Score) as AvgAnswerScore,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownVotes,
+        COUNT(DISTINCT ph.Id) as EditCount,
+        p.AcceptedAnswerId
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '2' YEAR)
+        AND p.Score > 5
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, 
+             p.FavoriteCount, p.OwnerUserId, p.Tags, p.AcceptedAnswerId
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagUsageCount,
+        AVG(tqa.QuestionScore) as AvgQuestionScore,
+        AVG(tqa.ViewCount) as AvgViews,
+        AVG(tqa.AnswerCount) as AvgAnswers,
+        COUNT(DISTINCT tqa.QuestionId) as QuestionsInPeriod,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tqa.QuestionScore) as MedianScore
+    FROM Tags t
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substr(t.TagName, 1, length(t.TagName)), '><')) AS tag_elem
+    ) AS tag_elems
+    JOIN TopQuestionAnalysis tqa ON tag_elems.tag_elem = ANY(string_to_array(tqa.TagArrayRaw, ','))
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT tqa.QuestionId) >= 10
+),
+AnswerQualityMetrics AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswererId,
+        q.CreationDate as QuestionCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer,
+        LENGTH(a.Body) as AnswerLength,
+        a.CommentCount,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        COUNT(DISTINCT ph.Id) as AnswerEditCount
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId = 5
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= (DATE '2024-10-01' - INTERVAL '2' YEAR)
+        AND a.Score >= 0
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate, a.OwnerUserId, 
+             q.CreationDate, a.Body, a.CommentCount, q.AcceptedAnswerId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(uem.AvgPostScore, 2) as AvgPostScore,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    uem.BronzeBadges,
+    tqa.Title as BestQuestionTitle,
+    tqa.QuestionScore,
+    tqa.ViewCount,
+    tp.TagName as TopTag,
+    ROUND(tp.AvgQuestionScore, 2) as TagAvgScore,
+    tp.QuestionsInPeriod as TagQuestionCount,
+    aqm.AnswerScore as TopAnswerScore,
+    ROUND(aqm.HoursToAnswer, 2) as HoursToAnswer,
+    aqm.IsAccepted,
+    RANK() OVER (PARTITION BY tp.TagName ORDER BY uem.Reputation DESC) as UserRankInTag,
+    DENSE_RANK() OVER (ORDER BY tqa.QuestionScore DESC, tqa.ViewCount DESC) as QuestionOverallRank,
+    ROW_NUMBER() OVER (PARTITION BY uem.UserId ORDER BY aqm.AnswerScore DESC) as AnswerRankForUser
+FROM UserEngagementMetrics uem
+JOIN TopQuestionAnalysis tqa ON uem.UserId = tqa.OwnerUserId
+JOIN AnswerQualityMetrics aqm ON uem.UserId = aqm.AnswererId
+CROSS JOIN LATERAL unnest(string_to_array(tqa.TagArrayRaw, ',')) AS question_tag
+JOIN TagPerformance tp ON tp.TagName = question_tag.question_tag_elem
+WHERE tqa.QuestionScore > 10
+    AND aqm.AnswerScore > 3
+    AND tp.AvgQuestionScore > 5
+ORDER BY uem.Reputation DESC, tqa.QuestionScore DESC, aqm.AnswerScore DESC
+LIMIT 1000;

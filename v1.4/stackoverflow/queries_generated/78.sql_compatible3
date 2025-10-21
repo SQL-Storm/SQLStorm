@@ -1,0 +1,121 @@
+WITH
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'UNKNOWN') ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS LocRank
+  FROM Users u
+),
+PostAnalytics AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    COALESCE(p.ViewCount, 0) * 1.0
+    + COALESCE(p.Score, 0) * 2.5
+    + COALESCE(p.FavoriteCount, 0) * 3.0
+    + COALESCE(p.CommentCount, 0) * 0.5 AS PopularityScore,
+    CASE WHEN p.Title ILIKE '%' || 'duplicate' || '%' THEN 1 ELSE 0 END AS IsPossibleDuplicate
+  FROM Posts p
+),
+OwnerTagContext AS (
+  SELECT
+    pa.PostId,
+    pa.OwnerUserId,
+    t.TagName AS TagFacet,
+    EXISTS (
+      SELECT 1
+      FROM Tags t2
+      WHERE t2.Id = COALESCE(NULLIF(pa.Tags, ''), 0)
+      LIMIT 1
+    ) AS HasTags
+  FROM PostAnalytics pa
+),
+VoteWindow AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN vt.Name LIKE 'Up%' THEN 1 ELSE 0 END) AS UpVotesForPost,
+    SUM(CASE WHEN vt.Name LIKE 'Down%' THEN 1 ELSE 0 END) AS DownVotesForPost,
+    COUNT(*) AS VoteCount,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+LatestEdits AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.Text,
+    ph.Comment,
+    ph.CreationDate,
+    ph.UserDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6, 16)
+),
+TagRichness AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  GROUP BY t.TagName
+),
+Final AS (
+  SELECT
+    u.UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    u.Location,
+    ps.PostId,
+    ps.PostTypeId,
+    ps.Title,
+    ps.Tags,
+    ps.CreationDate,
+    ps.LastActivityDate,
+    ps.Score,
+    ps.ViewCount,
+    ps.PopularityScore,
+    rw.UpVotesForPost,
+    rw.DownVotesForPost,
+    rw.VoteCount,
+    le.CreationDate AS LastEditDate,
+    le.PostHistoryTypeId AS LastEditType,
+    le.Text AS LastEditText,
+    le.UserDisplayName AS LastEditor,
+    ac.IsPossibleDuplicate,
+    tr.TagCount AS TagDiversity
+  FROM PostAnalytics ps
+  LEFT JOIN Users u ON ps.OwnerUserId = u.Id
+  LEFT JOIN VoteWindow rw ON ps.PostId = rw.PostId
+  LEFT JOIN LatestEdits le ON ps.PostId = le.PostId AND le.rn = 1
+  LEFT JOIN OwnerTagContext ac ON ps.PostId = ac.PostId
+  LEFT JOIN TagRichness tr ON ac.TagFacet = tr.TagName
+  WHERE ps.PostTypeId IN (1, 2)
+    AND ps.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+  AND ROW_NUMBER() OVER (PARTITION BY ps.PostId ORDER BY ps.PopularityScore DESC) = 1
+)
+SELECT
+  *
+FROM Final
+ORDER BY PopularityScore DESC, LastVoteDate NULLS LAST;

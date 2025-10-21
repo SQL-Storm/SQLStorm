@@ -1,0 +1,85 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        SUM(v.BountyAmount) AS TotalBounty,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        u.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TopPosts AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.OwnerUserId,
+        ua.UserId AS ActivityUserId,
+        ua.DisplayName,
+        ua.TotalUpvotes,
+        rc.CommentCount
+    FROM 
+        RankedPosts rp
+    JOIN 
+        UserActivity ua ON rp.OwnerUserId = ua.UserId
+    LEFT JOIN 
+        (SELECT 
+             PostId, COUNT(*) AS CommentCount 
+         FROM 
+             Comments 
+         WHERE 
+             CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months' 
+         GROUP BY 
+             PostId) rc ON rp.PostId = rc.PostId
+    WHERE 
+        rp.ScoreRank <= 5
+)
+SELECT 
+    tp.PostId,
+    tp.Title,
+    tp.Score,
+    tp.OwnerUserId,
+    tp.ActivityUserId,
+    tp.DisplayName,
+    tp.TotalUpvotes,
+    tp.CommentCount,
+    (SELECT COUNT(*) 
+     FROM Votes v
+     WHERE v.PostId = tp.PostId AND v.VoteTypeId = 3) AS TotalDownvotes,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+     FROM Tags t
+     JOIN Posts p ON t.ExcerptPostId = p.Id
+     WHERE p.Id = tp.PostId) AS AssociatedTags,
+    CASE 
+        WHEN tp.Score IS NULL THEN 'No Score'
+        ELSE 'Available Score'
+    END AS ScoreStatus
+FROM 
+    TopPosts tp
+ORDER BY 
+    tp.Score DESC, tp.TotalUpvotes DESC;

@@ -1,0 +1,155 @@
+-- {"query": "12008.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 1262} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) OVER (PARTITION BY P.Id) AS UpVoteCount,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) OVER (PARTITION BY P.Id) AS DownVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY P.OwnerUserId) AS TotalUserUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY P.OwnerUserId) AS TotalUserDownVotes
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+),
+TopPosts AS (
+    SELECT 
+        Id, 
+        PostTypeId, 
+        CreationDate, 
+        Score, 
+        ViewCount, 
+        OwnerUserId, 
+        OwnerDisplayName, 
+        UserPostRank, 
+        UpVoteCount, 
+        DownVoteCount, 
+        TotalUserUpVotes, 
+        TotalUserDownVotes
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersPosted,
+        MAX(P.CreationDate) AS LastActivityDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastBodyEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 6 THEN PH.CreationDate END) AS LastTagEditDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+),
+TagUsage AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.TagName = ANY(string_to_array(P.Tags, '<', '>'))
+    GROUP BY 
+        T.TagName
+)
+SELECT 
+    U.DisplayName,
+    U.Reputation,
+    U.UserCreationDate,
+    U.QuestionsPosted,
+    U.AnswersPosted,
+    U.LastActivityDate,
+    U.TotalUpVotes,
+    U.TotalDownVotes,
+    TP.Id AS TopPostId,
+    TP.PostTypeId,
+    TP.CreationDate AS TopPostCreationDate,
+    TP.Score AS TopPostScore,
+    TP.ViewCount AS TopPostViewCount,
+    TP.OwnerDisplayName,
+    TP.UserPostRank,
+    TP.UpVoteCount,
+    TP.DownVoteCount,
+    TP.TotalUserUpVotes,
+    TP.TotalUserDownVotes,
+    PHS.TotalEdits,
+    PHS.LastBodyEditDate,
+    PHS.LastTagEditDate,
+    string_agg(TU.TagName, ', ') AS TagsUsed,
+    SUM(TU.PostCount) AS TotalTagPosts,
+    SUM(TU.TotalScore) AS TotalTagScore
+FROM 
+    UserActivity U
+LEFT JOIN 
+    TopPosts TP ON U.Id = TP.OwnerUserId
+LEFT JOIN 
+    PostHistorySummary PHS ON TP.Id = PHS.PostId
+LEFT JOIN 
+    LATERAL (
+        SELECT 
+            TU.TagName,
+            TU.PostCount,
+            TU.TotalScore
+        FROM 
+            TagUsage TU
+        WHERE 
+            TU.TagName = ANY(string_to_array(TP.Tags, '<', '>'))
+    ) TU ON true
+GROUP BY 
+    U.DisplayName,
+    U.Reputation,
+    U.UserCreationDate,
+    U.QuestionsPosted,
+    U.AnswersPosted,
+    U.LastActivityDate,
+    U.TotalUpVotes,
+    U.TotalDownVotes,
+    TP.Id,
+    TP.PostTypeId,
+    TP.CreationDate,
+    TP.Score,
+    TP.ViewCount,
+    TP.OwnerDisplayName,
+    TP.UserPostRank,
+    TP.UpVoteCount,
+    TP.DownVoteCount,
+    TP.TotalUserUpVotes,
+    TP.TotalUserDownVotes,
+    PHS.TotalEdits,
+    PHS.LastBodyEditDate,
+    PHS.LastTagEditDate
+ORDER BY 
+    U.Reputation DESC, 
+    U.TotalUpVotes DESC, 
+    TP.Score DESC;

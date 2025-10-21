@@ -1,0 +1,69 @@
+WITH
+UserPosts AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserDisplayName,
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT STRING_AGG(t.TagName, ',')
+       FROM Tags t
+       WHERE t.ExcerptPostId = p.Id) AS TagList
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE p.CreationDate >= DATEADD(day, -90, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+Ranked AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Score DESC, LastActivityDate DESC) AS rn
+  FROM UserPosts
+),
+UserSummary AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName AS UserDisplayName
+  FROM Users u
+  GROUP BY u.Id, u.DisplayName
+)
+SELECT
+  UserId,
+  UserDisplayName,
+  PostId,
+  PostTypeName,
+  Title,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  UpVotes,
+  DownVotes,
+  CommentCount,
+  TagList,
+  rn AS RankInUser
+FROM Ranked
+WHERE rn <= 3
+UNION ALL
+SELECT
+  UserId,
+  UserDisplayName,
+  NULL AS PostId,
+  NULL AS PostTypeName,
+  NULL AS Title,
+  NULL AS CreationDate,
+  NULL AS LastActivityDate,
+  NULL AS Score,
+  NULL AS ViewCount,
+  NULL AS UpVotes,
+  NULL AS DownVotes,
+  NULL AS CommentCount,
+  NULL AS TagList,
+  NULL AS RankInUser
+FROM UserSummary
+ORDER BY UserId, RankInUser;

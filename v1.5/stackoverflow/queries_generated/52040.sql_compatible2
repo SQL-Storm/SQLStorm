@@ -1,0 +1,68 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVoteReceived,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalPostScore DESC, BadgeCount DESC, Reputation DESC) AS Rank
+    FROM UserStats
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.PostCount,
+    ru.TotalPostScore,
+    ru.AvgPostScore,
+    ru.CommentCount,
+    ru.BadgeCount,
+    ru.UpVoteReceived,
+    ru.DownVoteReceived,
+    ru.FirstPostDate,
+    ru.LastPostDate,
+    ru.Rank,
+    CASE 
+        WHEN ru.TotalPostScore > 1000 AND ru.BadgeCount > 10 THEN 'Elite Contributor'
+        WHEN ru.TotalPostScore > 500 THEN 'Active User'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM (
+            SELECT DISTINCT t.TagName
+            FROM Posts p
+            JOIN LATERAL (
+                SELECT TRIM(value) AS tag_name
+                FROM STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')
+            ) AS t1 ON TRUE
+            JOIN Tags t ON t.TagName = t1.tag_name
+            WHERE p.OwnerUserId = ru.UserId
+            GROUP BY t.TagName
+            ORDER BY COUNT(*) DESC
+            LIMIT 5
+        ) AS t
+    ) AS TopTags
+FROM RankedUsers ru
+ORDER BY ru.Rank
+LIMIT 100;

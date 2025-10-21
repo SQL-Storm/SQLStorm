@@ -1,0 +1,60 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS PostRank,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PostChronology,
+        COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS NetVotes
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1
+      AND u.Reputation > 1000
+),
+PostInteractions AS (
+    SELECT 
+        PostId,
+        COUNT(DISTINCT CASE WHEN VoteTypeId = 2 THEN UserId END) AS UpVoteCount,
+        COUNT(DISTINCT CASE WHEN VoteTypeId = 3 THEN UserId END) AS DownVoteCount,
+        COUNT(DISTINCT CommentId) AS CommentInteractions
+    FROM (
+        SELECT 
+            p.Id AS PostId, 
+            v.VoteTypeId, 
+            v.UserId,
+            c.Id AS CommentId
+        FROM Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        LEFT JOIN Comments c ON p.Id = c.PostId
+    ) SubQuery
+    GROUP BY PostId
+)
+SELECT 
+    rp.UserId,
+    rp.DisplayName,
+    rp.PostId,
+    rp.Title,
+    rp.Score,
+    rp.PostRank,
+    rp.PostChronology,
+    rp.NetVotes,
+    pi.UpVoteCount,
+    pi.DownVoteCount,
+    pi.CommentInteractions,
+    CASE 
+        WHEN rp.Score > 10 AND pi.UpVoteCount > pi.DownVoteCount THEN 'High Quality'
+        WHEN rp.Score <= 0 AND pi.DownVoteCount >= pi.UpVoteCount THEN 'Low Quality'
+        ELSE 'Neutral'
+    END AS PostQuality,
+    ROUND(
+        (CASE WHEN (pi.UpVoteCount + pi.DownVoteCount) = 0 THEN 0 ELSE (pi.UpVoteCount * 1.0) / (pi.UpVoteCount + pi.DownVoteCount) END) * 100, 
+        2
+    ) AS UpvotePercentage
+FROM RankedUserPosts rp
+JOIN PostInteractions pi ON rp.PostId = pi.PostId
+WHERE rp.PostRank <= 5
+ORDER BY rp.NetVotes DESC, pi.UpVoteCount DESC
+LIMIT 100;

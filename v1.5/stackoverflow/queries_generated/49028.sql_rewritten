@@ -1,0 +1,165 @@
+-- {"query": "49028.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2047} 
+WITH UserActivitySummary AS (
+    -- Summarizes key activities for each user, including total posts, comments, badges, and post scores.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersGiven,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(P.Score) AS AvgPostScoreOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    -- Calculates various historical activity metrics for posts created within the last 5 years.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN PH.Id END) AS EditCount, -- Title, Body, Tags, Suggested Edit Applied
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN PH.Id END) AS StatusChangeCount, -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked, Protected, Unprotected
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostCount
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    WHERE P.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year')
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount
+),
+TagPerformanceMetrics AS (
+    -- Aggregates performance metrics by individual tag for questions, focusing on tags with at least 10 posts.
+    SELECT
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        COUNT(P.Id) AS TaggedPostCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(P.ViewCount) AS TotalTagViews,
+        SUM(P.AnswerCount) AS TotalTagAnswers
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TagName
+    HAVING COUNT(P.Id) >= 10
+),
+TopUsersByInfluence AS (
+    -- Ranks users based on a composite influence score derived from reputation, upvotes, badges, posts, and average post score.
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalPostsOwned,
+        UAS.TotalQuestionsAsked,
+        UAS.TotalAnswersGiven,
+        UAS.TotalCommentsMade,
+        UAS.TotalBadges,
+        UAS.TotalPostScoreOwned,
+        (
+            UAS.Reputation * 0.4 +
+            UAS.UpVotes * 0.1 +
+            UAS.TotalBadges * 5 +
+            UAS.TotalPostsOwned * 2 +
+            COALESCE(UAS.AvgPostScoreOwned, 0) * 0.5 +
+            UAS.TotalCommentsMade * 0.5
+        ) AS InfluenceScore,
+        DENSE_RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.UpVotes DESC, UAS.TotalBadges DESC, UAS.TotalPostsOwned DESC) AS RankByCoreStats
+    FROM UserActivitySummary AS UAS
+    WHERE UAS.Reputation > 1000 AND UAS.TotalPostsOwned > 5
+),
+PostEngagementSummary AS (
+    -- Combines post metrics and identifies the top posts for influential users based on an engagement score.
+    SELECT
+        TPU.UserId,
+        TPU.DisplayName,
+        PHM.PostId,
+        PHM.PostTypeId,
+        PHM.CreationDate,
+        PHM.Score,
+        PHM.ViewCount,
+        PHM.AnswerCount,
+        PHM.CommentCount,
+        PHM.EditCount,
+        PHM.StatusChangeCount,
+        PHM.UpvoteCount,
+        PHM.DownvoteCount,
+        PHM.LinkedPostCount,
+        PHM.DuplicatePostCount,
+        -- Calculate an engagement score for each post
+        (
+            PHM.Score * 0.6 +
+            PHM.ViewCount * 0.01 +
+            PHM.CommentCount * 0.5 +
+            PHM.AnswerCount * 1 +
+            PHM.EditCount * 2 +
+            PHM.StatusChangeCount * 3
+        ) AS PostEngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY TPU.UserId ORDER BY PHM.Score DESC, PHM.ViewCount DESC) AS Rn
+    FROM TopUsersByInfluence AS TPU
+    JOIN PostHistoricalMetrics AS PHM ON TPU.UserId = PHM.OwnerUserId
+    WHERE TPU.RankByCoreStats <= 100
+),
+PostTagSummary AS (
+    -- Summarizes tag performance for each relevant post by listing its tags and averaging their performance metrics.
+    SELECT
+        PES.PostId,
+        STRING_AGG(DISTINCT PostTags.TagName, ', ') AS PostTagsList,
+        AVG(TPM.AvgTagScore) AS AverageOfAssociatedTagScores,
+        SUM(TPM.TotalTagViews) AS SumOfAssociatedTagViews
+    FROM PostEngagementSummary AS PES
+    JOIN Posts AS P ON PES.PostId = P.Id
+    LEFT JOIN LATERAL (
+        SELECT
+            TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName
+        FROM Posts
+        WHERE Posts.Id = P.Id AND Posts.Tags IS NOT NULL AND LENGTH(Posts.Tags) > 2
+    ) AS PostTags ON TRUE
+    LEFT JOIN TagPerformanceMetrics AS TPM ON PostTags.TagName = TPM.TagName
+    GROUP BY PES.PostId
+)
+-- Final result: Top influential users, their top 5 most engaging posts, and summarized performance of associated popular tags.
+SELECT
+    TU.DisplayName AS UserDisplayName,
+    TU.Reputation,
+    TU.InfluenceScore,
+    PE.PostId,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    PE.CreationDate AS PostCreationDate,
+    PE.Score AS PostScore,
+    PE.ViewCount AS PostViewCount,
+    PE.AnswerCount,
+    PE.CommentCount,
+    PE.EditCount,
+    PE.StatusChangeCount,
+    PE.UpvoteCount,
+    PE.DownvoteCount,
+    PE.LinkedPostCount,
+    PE.DuplicatePostCount,
+    PE.PostEngagementScore,
+    PTS.PostTagsList,
+    PTS.AverageOfAssociatedTagScores,
+    PTS.SumOfAssociatedTagViews
+FROM TopUsersByInfluence AS TU
+JOIN PostEngagementSummary AS PE ON TU.UserId = PE.UserId
+JOIN Posts AS P ON PE.PostId = P.Id
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostTagSummary AS PTS ON PE.PostId = PTS.PostId
+WHERE PE.Rn <= 5
+ORDER BY
+    TU.InfluenceScore DESC, PE.PostEngagementScore DESC, PE.PostId;

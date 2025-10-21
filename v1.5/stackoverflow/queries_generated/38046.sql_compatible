@@ -1,0 +1,240 @@
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid as owneruserid,
+    p.title,
+    p.tags,
+    date_trunc('month', p.creationdate) as month_bucket
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and p.posttypeid in (1,2)
+),
+post_engagement as (
+  select
+    rp.id,
+    count(distinct c.id) as comments_cnt,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as net_votes,
+    count(distinct case when v.votetypeid = 5 then v.userid end) as favorites_cnt
+  from recent_posts rp
+  left join comments c on c.postid = rp.id and c.creationdate >= rp.creationdate and c.creationdate < rp.creationdate + interval '30 days'
+  left join votes v on v.postid = rp.id and v.creationdate >= rp.creationdate and v.creationdate < rp.creationdate + interval '30 days'
+  group by rp.id
+),
+answer_counts as (
+  select
+    q.id as question_id,
+    count(a.id) filter (where a.creationdate <= q.creationdate + interval '30 days') as answers_30d,
+    count(a.id) as answers_all
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by q.id
+),
+owner_stats as (
+  select
+    u.id as user_id,
+    percentile_cont(0.5) within group (order by u.reputation) as user_rep_p50,
+    avg(u.upvotes - u.downvotes) as avg_user_netvotes,
+    count(*) as users_in_sample
+  from users u
+  join posts p on p.owneruserid = u.id
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by u.id
+),
+tag_expansion as (
+  select
+    rp.id,
+    unnest(string_to_array(substring(rp.tags from 2 for length(rp.tags)-2), '><')) as tagname,
+    rp.month_bucket,
+    rp.score,
+    rp.viewcount
+  from recent_posts rp
+  where rp.posttypeid = 1
+    and rp.tags is not null
+),
+tag_activity as (
+  select
+    te.tagname,
+    te.month_bucket,
+    count(*) as q_count,
+    avg(te.score) as avg_q_score,
+    avg(te.viewcount) as avg_q_views
+  from tag_expansion te
+  group by te.tagname, te.month_bucket
+),
+hot_question_candidates as (
+  select
+    rp.id as question_id,
+    rp.month_bucket,
+    rp.score,
+    rp.viewcount,
+    pe.net_votes,
+    pe.comments_cnt,
+    pe.favorites_cnt,
+    ac.answers_30d,
+    ac.answers_all,
+    u.reputation,
+    os.user_rep_p50,
+    os.avg_user_netvotes
+  from recent_posts rp
+  left join post_engagement pe on pe.id = rp.id
+  left join answer_counts ac on ac.question_id = rp.id
+  left join users u on u.id = rp.owneruserid
+  left join owner_stats os on os.user_id = u.id
+  where rp.posttypeid = 1
+),
+dup_links as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) as dup_inlinks
+  from postlinks pl
+  where pl.linktypeid = 3
+    and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by pl.relatedpostid
+),
+edit_volatility as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_cnt,
+    count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as mod_actions_cnt,
+    min(ph.creationdate) as first_edit,
+    max(ph.creationdate) as last_edit
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by ph.postid
+),
+monthly_user_activity as (
+  select
+    date_trunc('month', u.creationdate) as cohort_month,
+    count(*) as new_users,
+    percentile_cont(0.9) within group (order by u.reputation) as rep_p90
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by date_trunc('month', u.creationdate)
+),
+scored_questions as (
+  select
+    hqc.question_id,
+    hqc.month_bucket,
+    hqc.score,
+    hqc.viewcount,
+    hqc.net_votes,
+    hqc.comments_cnt,
+    hqc.favorites_cnt,
+    hqc.answers_30d,
+    hqc.answers_all,
+    hqc.reputation,
+    coalesce(hqc.user_rep_p50, 0) as user_rep_p50,
+    coalesce(hqc.avg_user_netvotes, 0.0) as avg_user_netvotes,
+    coalesce(dl.dup_inlinks, 0) as dup_inlinks,
+    coalesce(ev.edits_cnt, 0) as edits_cnt,
+    coalesce(ev.mod_actions_cnt, 0) as mod_actions_cnt,
+    -- composite score mixes engagement, velocity, quality, and controversy
+    (
+      0.30 * coalesce(hqc.net_votes, 0)
+      + 0.20 * least(coalesce(hqc.viewcount,0)/100.0, 1000)
+      + 0.15 * coalesce(hqc.comments_cnt, 0)
+      + 0.10 * coalesce(hqc.favorites_cnt, 0)
+      + 0.10 * least(coalesce(hqc.answers_30d,0), 20)
+      + 0.05 * greatest(least(coalesce(hqc.reputation,0) - coalesce(hqc.user_rep_p50,0), 10000), -10000)/100.0
+      + 0.05 * greatest(least(coalesce(hqc.avg_user_netvotes,0), 1000), -1000)/10.0
+      - 0.05 * coalesce(ev.mod_actions_cnt, 0)
+      - 0.05 * greatest(coalesce(hqc.answers_all,0) - coalesce(hqc.answers_30d,0), 0)
+    ) as composite_score
+  from hot_question_candidates hqc
+  left join dup_links dl on dl.canonical_id = hqc.question_id
+  left join edit_volatility ev on ev.postid = hqc.question_id
+),
+ranked_per_month as (
+  select
+    sq.*,
+    row_number() over (partition by sq.month_bucket order by sq.composite_score desc, sq.viewcount desc, sq.net_votes desc, sq.question_id) as rn,
+    dense_rank() over (partition by sq.month_bucket order by sq.composite_score desc) as dense_rnk,
+    percentile_disc(0.95) within group (order by sq.composite_score) over (partition by sq.month_bucket) as p95,
+    percentile_disc(0.50) within group (order by sq.composite_score) over (partition by sq.month_bucket) as p50
+  from scored_questions sq
+),
+tag_rollup as (
+  select
+    te.month_bucket,
+    te.tagname,
+    sum(case when rp.posttypeid = 1 then 1 else 0 end) as questions_in_month,
+    sum(case when rp.posttypeid = 2 then 1 else 0 end) as answers_in_month
+  from recent_posts rp
+  join tag_expansion te on te.id = rp.id
+  group by te.month_bucket, te.tagname
+),
+top_tags_per_month as (
+  select
+    ta.month_bucket,
+    ta.tagname,
+    ta.q_count,
+    ta.avg_q_score,
+    ta.avg_q_views,
+    row_number() over (partition by ta.month_bucket order by ta.q_count desc, ta.avg_q_views desc) as tag_rank
+  from tag_activity ta
+),
+final as (
+  select
+    rpm.month_bucket,
+    rpm.question_id,
+    rpm.composite_score,
+    rpm.p95,
+    rpm.p50,
+    rpm.viewcount,
+    rpm.net_votes,
+    rpm.comments_cnt,
+    rpm.favorites_cnt,
+    rpm.answers_30d,
+    rpm.answers_all,
+    rpm.dup_inlinks,
+    rpm.edits_cnt,
+    rpm.mod_actions_cnt,
+    ttm.tagname as top_tag_name,
+    ttm.q_count as top_tag_q_count,
+    ttm.avg_q_score as top_tag_avg_score,
+    ttm.avg_q_views as top_tag_avg_views,
+    mua.cohort_month,
+    mua.new_users,
+    mua.rep_p90
+  from ranked_per_month rpm
+  left join top_tags_per_month ttm on ttm.month_bucket = rpm.month_bucket and ttm.tag_rank = 1
+  left join monthly_user_activity mua on mua.cohort_month = rpm.month_bucket
+  where rpm.rn <= 50
+)
+select
+  f.month_bucket,
+  f.question_id,
+  p.title,
+  p.score as post_score,
+  p.viewcount as post_views,
+  u.displayname as owner_name,
+  u.reputation as owner_rep,
+  f.composite_score,
+  f.p95 as month_score_p95,
+  f.p50 as month_score_p50,
+  f.net_votes,
+  f.comments_cnt,
+  f.favorites_cnt,
+  f.answers_30d,
+  f.answers_all,
+  f.dup_inlinks,
+  f.edits_cnt,
+  f.mod_actions_cnt,
+  f.top_tag_name,
+  f.top_tag_q_count,
+  f.top_tag_avg_score,
+  f.top_tag_avg_views,
+  f.cohort_month as user_cohort_month,
+  f.new_users as new_users_in_cohort,
+  f.rep_p90 as cohort_rep_p90
+from final f
+join posts p on p.id = f.question_id
+left join users u on u.id = p.owneruserid
+order by f.month_bucket desc, f.composite_score desc, f.question_id
+limit 500;

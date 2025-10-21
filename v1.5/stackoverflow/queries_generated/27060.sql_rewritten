@@ -1,0 +1,150 @@
+-- {"query": "27060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1480} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalComments,
+        TotalVotes,
+        TotalBadges,
+        TotalQuestions,
+        TotalAnswers,
+        TotalUpVotesReceived,
+        TotalDownVotesReceived,
+        LastPostDate,
+        LastCommentDate,
+        LastVoteDate,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM
+        UserActivity
+    WHERE
+        Reputation > 10000
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(a.Id, -1) AS AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.OwnerUserId, u.DisplayName, a.Id, a.Score
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViewCount,
+        AVG(p.Score) AS AverageScore,
+        AVG(p.ViewCount) AS AverageViewCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = ANY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), ''><''))
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        PostCount DESC
+    LIMIT 10
+)
+SELECT
+    hr.UserId,
+    hr.DisplayName,
+    hr.Reputation,
+    hr.ReputationRank,
+    hr.TotalPosts,
+    hr.TotalQuestions,
+    hr.TotalAnswers,
+    hr.TotalComments,
+    hr.TotalVotes,
+    hr.TotalBadges,
+    hr.TotalUpVotesReceived,
+    hr.TotalDownVotesReceived,
+    hr.LastPostDate,
+    hr.LastCommentDate,
+    hr.LastVoteDate,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerDisplayName,
+    rp.AcceptedAnswerId,
+    rp.AcceptedAnswerScore,
+    rp.CommentCount,
+    rp.UpVoteCount,
+    rp.DownVoteCount,
+    tt.TagName,
+    tt.Count,
+    tt.PostCount,
+    tt.TotalScore,
+    tt.TotalViewCount,
+    tt.AverageScore,
+    tt.AverageViewCount
+FROM
+    HighReputationUsers hr
+LEFT JOIN
+    RecentPosts rp ON hr.UserId = rp.OwnerUserId
+LEFT JOIN
+    TopTags tt ON rp.Tags LIKE '%<' || tt.TagName || '>%'
+WHERE
+    hr.ReputationRank <= 50
+ORDER BY
+    hr.Reputation DESC,
+    rp.CreationDate DESC,
+    tt.PostCount DESC;

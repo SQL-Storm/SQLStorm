@@ -1,0 +1,145 @@
+WITH QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.Tags,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        -- Total number of comments on the question
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS QuestionCommentCount,
+        -- Total number of votes on the question
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id) AS QuestionVoteCount,
+        -- Sum of vote types (for example, positive votes minus negative votes)
+        (SELECT COALESCE(SUM(v2.VoteTypeId),0) FROM Votes v2 WHERE v2.PostId = p.Id) AS VoteTypeSum,
+        -- Check if question is closed
+        CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+        -- Whether question has accepted answer
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM 
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1
+),
+TagAnalysis AS (
+    SELECT
+        unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS QuestionCount,
+        AVG(q.QuestionScore) AS AvgQuestionScore,
+        SUM(q.AnswerCount) AS TotalAnswers,
+        AVG(q.ViewCount) AS AvgViewCount
+    FROM 
+        QuestionStats q
+    GROUP BY Tag
+),
+ActivityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerDisplayName,
+        p.Reputation
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+),
+RecentActivity AS (
+    SELECT 
+        am.PostId,
+        am.Title,
+        am.CreationDate,
+        am.LastActivityDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - am.LastActivityDate))/3600 AS HoursSinceLastActivity,
+        CASE 
+            WHEN am.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN TRUE
+            ELSE FALSE
+        END AS ActiveRecently
+    FROM 
+        ActivityMetrics am
+),
+VoteAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(v.*) AS TotalVotes,
+        AVG(v.CreationDate - p.CreationDate) OVER (PARTITION BY p.Id) AS AvgVoteAgeDays
+    FROM
+        Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.Title
+),
+LifecycleAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.ContentLicense,
+        (EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate))/86400)::numeric(10,2) AS DaysToFirstEdit,
+        (EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate))/86400)::numeric(10,2) AS DaysUntilClosure,
+        CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS ClosureStatus,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 12, 13)) AS StructuralChangesCount
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+)
+SELECT
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.QuestionCreationDate AS QuestionCreated,
+    q.Reputation,
+    q.OwnerDisplayName,
+    q.AnswerCount,
+    q.ViewCount,
+    q.QuestionScore,
+    q.QuestionCommentCount,
+    q.QuestionVoteCount,
+    q.VoteTypeSum,
+    q.IsClosed,
+    q.HasAcceptedAnswer,
+    array_agg(DISTINCT t.Tag) AS Tags,
+    t.QuestionCount,
+    t.AvgQuestionScore,
+    t.TotalAnswers,
+    t.AvgViewCount,
+    re.LastActivityDate,
+    re.HoursSinceLastActivity,
+    re.ActiveRecently,
+    va.Upvotes,
+    va.Downvotes,
+    va.TotalVotes,
+    va.AvgVoteAgeDays,
+    la.DaysToFirstEdit,
+    la.DaysUntilClosure,
+    la.ClosureStatus,
+    la.StructuralChangesCount
+FROM 
+    QuestionStats q
+    LEFT JOIN TagAnalysis t ON t.Tag = ANY(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><'))
+    LEFT JOIN RecentActivity re ON re.PostId = q.QuestionId
+    LEFT JOIN VoteAnalysis va ON va.PostId = q.QuestionId
+    LEFT JOIN LifecycleAnalysis la ON la.PostId = q.QuestionId
+GROUP BY 
+    q.QuestionId, q.Title, q.QuestionCreationDate, q.Reputation, q.OwnerDisplayName, q.AnswerCount, q.ViewCount, q.QuestionScore,
+    q.QuestionCommentCount, q.QuestionVoteCount, q.VoteTypeSum, q.IsClosed, q.HasAcceptedAnswer,
+    re.LastActivityDate, re.HoursSinceLastActivity, re.ActiveRecently,
+    va.Upvotes, va.Downvotes, va.TotalVotes, va.AvgVoteAgeDays,
+    la.DaysToFirstEdit, la.DaysUntilClosure, la.ClosureStatus, la.StructuralChangesCount;

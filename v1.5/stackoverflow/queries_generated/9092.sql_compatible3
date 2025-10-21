@@ -1,0 +1,129 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TopUserQ AS (
+    SELECT
+        rq.Id                AS QuestionId,
+        u.DisplayName,
+        rq.Tags,
+        COALESCE(v.VoteCount, 0)   AS TotalVotes,
+        COUNT(DISTINCT c.Id)       AS CommentsCount,
+        COUNT(DISTINCT b.Id)       AS BadgesCount,
+        (SELECT AVG(p2.Score)
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+        )                          AS AvgUserScore
+    FROM RecentQuestions rq
+    LEFT JOIN Users u
+        ON u.Id = rq.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2,3)
+        GROUP BY PostId
+    ) v
+        ON v.PostId = rq.Id
+    LEFT JOIN Comments c
+        ON c.PostId = rq.Id
+       AND c.UserId IS NOT NULL
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+       AND b.Date BETWEEN rq.CreationDate - INTERVAL '30 days' AND rq.CreationDate
+    WHERE rq.rn <= 3
+    GROUP BY
+        rq.Id,
+        u.DisplayName,
+        rq.Tags,
+        v.VoteCount,
+        u.Id
+),
+TagCrunch AS (
+    SELECT
+        UNNEST(
+            STRING_TO_ARRAY(
+                SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2),
+                '><'
+            )
+        ) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+PopularTags AS (
+    SELECT
+        Tag,
+        COUNT(*) AS QCount,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS RankByCount
+    FROM TagCrunch
+    GROUP BY Tag
+    HAVING COUNT(*) > 200
+),
+FilteredTags AS (
+    SELECT Tag
+    FROM PopularTags
+    EXCEPT
+    SELECT TagName
+    FROM Tags
+    WHERE IsModeratorOnly = 1
+)
+SELECT
+    t.Tag,
+    t.QCount,
+    tu.DisplayName,
+    tu.TotalVotes,
+    tu.CommentsCount,
+    tu.BadgesCount,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.RelatedPostId = tu.QuestionId
+          AND pl.LinkTypeId    = 3
+    ) AS DuplicateLinks,
+    CASE
+      WHEN tu.TotalVotes > 50 THEN 'Hot'
+      ELSE 'Cold'
+    END AS TagHeat
+FROM FilteredTags ft
+LEFT JOIN PopularTags t
+    ON t.Tag = ft.Tag
+LEFT JOIN TopUserQ tu
+    ON POSITION('<' || ft.Tag || '>' IN tu.Tags) > 0
+WHERE t.RankByCount <= 10
+
+UNION ALL
+
+SELECT
+    '<Summary>'        AS Tag,
+    SUM(t.QCount)      AS QCount,
+    'ALL_USERS'        AS DisplayName,
+    SUM(tu.TotalVotes) AS TotalVotes,
+    SUM(tu.CommentsCount) AS CommentsCount,
+    SUM(tu.BadgesCount)   AS BadgesCount,
+    SUM(
+      (SELECT COUNT(*)
+       FROM PostLinks pl
+       WHERE pl.RelatedPostId = tu.QuestionId
+         AND pl.LinkTypeId    = 3
+      )
+    ) AS DuplicateLinks,
+    NULL AS TagHeat
+FROM FilteredTags ft
+JOIN PopularTags t
+    ON t.Tag = ft.Tag
+JOIN TopUserQ tu
+    ON POSITION('<' || ft.Tag || '>' IN tu.Tags) > 0
+
+ORDER BY Tag DESC
+LIMIT 20 OFFSET 0;

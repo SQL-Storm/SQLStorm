@@ -1,0 +1,99 @@
+WITH q_base AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    CASE
+      WHEN p.Tags IS NULL OR length(p.Tags) <= 2 THEN NULL
+      ELSE string_to_array(substring(p.Tags FROM 2 FOR character_length(p.Tags) - 2), '><')
+    END AS TagList,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+q_questions_raw AS (
+  SELECT
+    qb.PostId,
+    'Question' AS Source,
+    qb.Title,
+    qb.TagList,
+    COALESCE(array_to_string(qb.TagList, ','), '') AS TagText,
+    qb.ViewCount,
+    qb.Score,
+    qb.CreationDate,
+    qb.OwnerUserId,
+    qb.OwnerDisplayName,
+    qb.LastActivityDate,
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = qb.PostId AND a.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qb.PostId) AS CommentCount,
+    (SELECT SUM(
+              CASE
+                WHEN v.VoteTypeId = 2 THEN 1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+              END
+            ) FROM Votes v WHERE v.PostId = qb.PostId) AS NetVotes,
+    MAX(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasDuplicate
+  FROM q_base qb
+  LEFT JOIN PostLinks pl ON pl.PostId = qb.PostId
+  GROUP BY
+    qb.PostId, qb.Title, qb.TagList, qb.ViewCount, qb.Score, qb.CreationDate, qb.OwnerUserId, qb.OwnerDisplayName, qb.LastActivityDate
+),
+q_questions_ranked AS (
+  SELECT qqr.*,
+         ROW_NUMBER() OVER (PARTITION BY qqr.OwnerUserId ORDER BY qqr.Score DESC, qqr.CreationDate DESC) AS PerOwnerRank
+  FROM q_questions_raw qqr
+),
+answers_snapshot AS (
+  SELECT p.Id AS PostId,
+         'Answer' AS Source,
+         NULL AS Title,
+         NULL AS TagList,
+         NULL AS TagText,
+         p.ViewCount,
+         p.Score,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.OwnerDisplayName,
+         p.LastActivityDate,
+         NULL AS AnswerCount,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+         NULL AS NetVotes,
+         NULL AS HasDuplicate,
+         NULL AS PerOwnerRank
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+)
+SELECT
+  PostId,
+  Source,
+  Title,
+  TagList,
+  TagText,
+  ViewCount,
+  Score,
+  CreationDate,
+  OwnerUserId,
+  OwnerDisplayName,
+  LastActivityDate,
+  COALESCE(AnswerCount, 0) AS AnswerCount,
+  COALESCE(CommentCount, 0) AS CommentCount,
+  HasDuplicate AS DuplicateFlag,
+  NetVotes,
+  PerOwnerRank
+FROM (
+  SELECT
+    PostId, Source, Title, TagList, TagText, ViewCount, Score, CreationDate, OwnerUserId, OwnerDisplayName, LastActivityDate,
+    AnswerCount, CommentCount, HasDuplicate, NetVotes, PerOwnerRank
+  FROM q_questions_ranked
+  UNION ALL
+  SELECT PostId, Source, Title, TagList, TagText, ViewCount, Score, CreationDate, OwnerUserId, OwnerDisplayName, LastActivityDate,
+         NULL AS AnswerCount, COALESCE(CommentCount, 0) AS CommentCount, NULL AS HasDuplicate, NULL AS NetVotes, NULL AS PerOwnerRank
+  FROM answers_snapshot
+) AS combined
+ORDER BY CreationDate DESC
+LIMIT 200;

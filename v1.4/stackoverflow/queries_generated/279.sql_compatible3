@@ -1,0 +1,87 @@
+WITH
+UserPosts AS (
+  SELECT p.OwnerUserId AS user_id,
+         COUNT(*) AS PostCount,
+         SUM(p.Score) AS ScoreSum,
+         AVG(p.Score) AS AvgScore,
+         MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+UserComments AS (
+  SELECT c.UserId AS user_id,
+         COUNT(*) AS CommentCount
+  FROM Comments c
+  GROUP BY c.UserId
+),
+UserBadges AS (
+  SELECT b.UserId AS user_id,
+         SUM(CASE b.Class WHEN 1 THEN 3 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END) AS BadgeScore
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserDistinctTags AS (
+  SELECT p.OwnerUserId AS user_id,
+         COUNT(DISTINCT t.TagName) AS DistinctTagCount
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT TagName
+    FROM UNNEST(COALESCE(string_to_array(substring(p.Tags from 2 for character_length(p.Tags) - 2), '><'), ARRAY[])) AS t(TagName)
+  ) AS t ON TRUE
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId
+),
+Ranked AS (
+  SELECT
+         u.Id AS user_id,
+         u.DisplayName AS display_name,
+         u.Reputation AS reputation,
+         COALESCE(up.PostCount,0) AS post_count,
+         COALESCE(uc.CommentCount,0) AS comment_count,
+         COALESCE(ub.BadgeScore,0) AS badge_score,
+         COALESCE(ud.DistinctTagCount,0) AS distinct_tag_count,
+         COALESCE(up.LastActivity, u.LastAccessDate) AS last_activity,
+         ROW_NUMBER() OVER (
+           ORDER BY COALESCE(ub.BadgeScore,0) DESC,
+                    COALESCE(up.PostCount,0) DESC,
+                    u.Reputation DESC,
+                    COALESCE(up.LastActivity, u.LastAccessDate) DESC
+         ) AS rn
+  FROM Users u
+  LEFT JOIN UserPosts up ON up.user_id = u.Id
+  LEFT JOIN UserComments uc ON uc.user_id = u.Id
+  LEFT JOIN UserBadges ub ON ub.user_id = u.Id
+  LEFT JOIN UserDistinctTags ud ON ud.user_id = u.Id
+),
+Active AS (
+  SELECT * FROM Ranked WHERE last_activity >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+),
+Inactive AS (
+  SELECT * FROM Ranked WHERE last_activity < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+)
+SELECT
+  user_id,
+  display_name,
+  reputation,
+  post_count,
+  comment_count,
+  badge_score,
+  distinct_tag_count,
+  last_activity,
+  rn
+FROM Active
+UNION ALL
+SELECT
+  user_id,
+  display_name,
+  reputation,
+  post_count,
+  comment_count,
+  badge_score,
+  distinct_tag_count,
+  last_activity,
+  rn
+FROM Inactive
+ORDER BY badge_score DESC, post_count DESC, reputation DESC
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,156 @@
+-- {"query": "46021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 48174, "output_tokens": 39218} 
+
+WITH RECURSIVE UserEngagementHierarchy AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    CASE 
+      WHEN u.Reputation >= 100000 THEN 5
+      WHEN u.Reputation >= 50000 THEN 4
+      WHEN u.Reputation >= 10000 THEN 3
+      WHEN u.Reputation >= 1000 THEN 2
+      ELSE 1
+    END as TierLevel,
+    1 as Depth
+  FROM Users u
+  WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+),
+QuestionAnswerGraph AS (
+  SELECT 
+    q.Id as QuestionId,
+    q.OwnerUserId as QuestionOwnerId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.CreationDate as QuestionDate,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+    string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><') as TagArray
+  FROM Posts q
+  LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1 
+    AND q.CreationDate >= CURRENT_DATE - INTERVAL '18 months'
+    AND q.Score > 0
+),
+TagPerformanceMetrics AS (
+  SELECT 
+    UNNEST(TagArray) as TagName,
+    COUNT(DISTINCT QuestionId) as QuestionCount,
+    AVG(QuestionScore) as AvgQuestionScore,
+    SUM(ViewCount) as TotalViews,
+    COUNT(DISTINCT AnswerId) as AnswerCount,
+    AVG(AnswerScore) as AvgAnswerScore,
+    SUM(IsAccepted) as AcceptedAnswerCount,
+    AVG(EXTRACT(EPOCH FROM (AnswerDate - QuestionDate))/3600.0) as AvgTimeToAnswerHours
+  FROM QuestionAnswerGraph
+  WHERE TagArray IS NOT NULL
+  GROUP BY UNNEST(TagArray)
+  HAVING COUNT(DISTINCT QuestionId) >= 100
+),
+UserInteractionNetwork AS (
+  SELECT 
+    qag.QuestionOwnerId as UserId1,
+    qag.AnswerOwnerId as UserId2,
+    COUNT(*) as InteractionCount,
+    SUM(qag.IsAccepted) as AcceptedAnswers,
+    AVG(qag.AnswerScore) as AvgAnswerScore,
+    STRING_AGG(DISTINCT UNNEST(qag.TagArray), ',') as SharedTags
+  FROM QuestionAnswerGraph qag
+  WHERE qag.AnswerOwnerId IS NOT NULL 
+    AND qag.QuestionOwnerId IS NOT NULL
+    AND qag.QuestionOwnerId != qag.AnswerOwnerId
+  GROUP BY qag.QuestionOwnerId, qag.AnswerOwnerId
+  HAVING COUNT(*) >= 3
+),
+VotePatternAnalysis AS (
+  SELECT 
+    p.OwnerUserId,
+    v.VoteTypeId,
+    DATE_TRUNC('month', v.CreationDate) as VoteMonth,
+    COUNT(*) as VoteCount,
+    SUM(v.BountyAmount) as TotalBounty
+  FROM Votes v
+  JOIN Posts p ON v.PostId = p.Id
+  WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '18 months'
+    AND v.VoteTypeId IN (2, 3, 8, 9)
+  GROUP BY p.OwnerUserId, v.VoteTypeId, DATE_TRUNC('month', v.CreationDate)
+),
+BadgeAchievementTimeline AS (
+  SELECT 
+    b.UserId,
+    b.Class,
+    b.TagBased,
+    COUNT(*) as BadgeCount,
+    MIN(b.Date) as FirstBadgeDate,
+    MAX(b.Date) as LastBadgeDate,
+    STRING_AGG(DISTINCT b.Name, '|') as BadgeNames
+  FROM Badges b
+  WHERE b.Date >= CURRENT_DATE - INTERVAL '18 months'
+  GROUP BY b.UserId, b.Class, b.TagBased
+),
+CommentEngagementMetrics AS (
+  SELECT 
+    c.UserId as CommenterId,
+    p.OwnerUserId as PostOwnerId,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    AVG(c.Score) as AvgCommentScore,
+    COUNT(DISTINCT c.PostId) as UniquePostsCommented
+  FROM Comments c
+  JOIN Posts p ON c.PostId = p.Id
+  WHERE c.CreationDate >= CURRENT_DATE - INTERVAL '18 months'
+    AND c.UserId IS NOT NULL
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY c.UserId, p.OwnerUserId
+)
+SELECT 
+  ueh.DisplayName,
+  ueh.Reputation,
+  ueh.TierLevel,
+  tpm.TagName as TopTag,
+  tpm.QuestionCount as TagQuestions,
+  tpm.AvgQuestionScore as TagAvgScore,
+  tpm.TotalViews as TagTotalViews,
+  tpm.AvgTimeToAnswerHours,
+  uin.InteractionCount,
+  uin.AcceptedAnswers,
+  vpa_up.VoteCount as UpvotesReceived,
+  vpa_down.VoteCount as DownvotesReceived,
+  vpa_bounty.TotalBounty as BountyEarned,
+  bat_gold.BadgeCount as GoldBadges,
+  bat_silver.BadgeCount as SilverBadges,
+  bat_bronze.BadgeCount as BronzeBadges,
+  cem.CommentCount as CommentsGiven,
+  cem.AvgCommentScore,
+  RANK() OVER (PARTITION BY ueh.TierLevel ORDER BY ueh.Reputation DESC) as RankInTier,
+  PERCENT_RANK() OVER (ORDER BY tpm.TotalViews) as ViewPercentile
+FROM UserEngagementHierarchy ueh
+LEFT JOIN QuestionAnswerGraph qag ON ueh.Id = qag.QuestionOwnerId
+LEFT JOIN TagPerformanceMetrics tpm ON tpm.TagName = (
+  SELECT UNNEST(qag2.TagArray) as tag
+  FROM QuestionAnswerGraph qag2
+  WHERE qag2.QuestionOwnerId = ueh.Id
+  GROUP BY tag
+  ORDER BY COUNT(*) DESC
+  LIMIT 1
+)
+LEFT JOIN UserInteractionNetwork uin ON ueh.Id = uin.UserId1
+LEFT JOIN VotePatternAnalysis vpa_up ON ueh.Id = vpa_up.OwnerUserId AND vpa_up.VoteTypeId = 2
+LEFT JOIN VotePatternAnalysis vpa_down ON ueh.Id = vpa_down.OwnerUserId AND vpa_down.VoteTypeId = 3
+LEFT JOIN VotePatternAnalysis vpa_bounty ON ueh.Id = vpa_bounty.OwnerUserId AND vpa_bounty.VoteTypeId IN (8,9)
+LEFT JOIN BadgeAchievementTimeline bat_gold ON ueh.Id = bat_gold.UserId AND bat_gold.Class = 1
+LEFT JOIN BadgeAchievementTimeline bat_silver ON ueh.Id = bat_silver.UserId AND bat_silver.Class = 2
+LEFT JOIN BadgeAchievementTimeline bat_bronze ON ueh.Id = bat_bronze.UserId AND bat_bronze.Class = 3
+LEFT JOIN CommentEngagementMetrics cem ON ueh.Id = cem.CommenterId
+WHERE ueh.Reputation > 500
+GROUP BY 
+  ueh.DisplayName, ueh.Reputation, ueh.TierLevel, tpm.TagName, 
+  tpm.QuestionCount, tpm.AvgQuestionScore, tpm.TotalViews, tpm.AvgTimeToAnswerHours,
+  uin.InteractionCount, uin.AcceptedAnswers, vpa_up.VoteCount, vpa_down.VoteCount,
+  vpa_bounty.TotalBounty, bat_gold.BadgeCount, bat_silver.BadgeCount, bat_bronze.BadgeCount,
+  cem.CommentCount, cem.AvgCommentScore
+ORDER BY ueh.Reputation DESC, tpm.TotalViews DESC
+LIMIT 1000;

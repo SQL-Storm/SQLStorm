@@ -1,0 +1,121 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.OwnerUserId = -1 THEN 1 ELSE 0 END AS IsCommunityOwned,
+        REGEXP_REPLACE(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '\\s+', '', 'g') AS TagsArray
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId,
+        COUNT(p.Id) AS AnswerCountForQuestion,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.OwnerUserId = pq.OwnerUserId THEN 1 ELSE 0 END) AS AnswersByQuestionOwner
+    FROM Posts p
+    JOIN Posts pq ON p.ParentId = pq.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCountForPost,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId ELSE NULL END) AS DuplicatePostsCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.PostTypeName,
+    pd.OwnerDisplayName,
+    pd.PostCreationDate,
+    pd.Score,
+    pd.ViewCount,
+    pd.IsClosed,
+    pd.IsCommunityOwned,
+    COALESCE(ans.AnswerCountForQuestion, 0) AS TotalAnswers,
+    COALESCE(ans.AvgAnswerScore, 0) AS AverageAnswerScore,
+    COALESCE(ans.AnswersByQuestionOwner, 0) AS AnswersByQuestionOwnerCount,
+    COALESCE(cs.CommentCountForPost, 0) AS TotalComments,
+    COALESCE(cs.AvgCommentScore, 0) AS AverageCommentScore,
+    COALESCE(pla.LinkedPostsCount, 0) AS TotalLinkedPosts,
+    COALESCE(pla.DuplicatePostsCount, 0) AS TotalDuplicatePosts,
+    ua.TotalPosts AS UserTotalPosts,
+    ua.QuestionCount AS UserQuestionCount,
+    ua.AnswerCount AS UserAnswerCount,
+    re.CreationDate AS LastEditDate,
+    CASE
+        WHEN pd.Score > 100 AND pd.AnswerCount > 10 THEN 'Highly Engaged Question'
+        WHEN pd.Score < 0 AND pd.IsClosed = 1 THEN 'Closed Negative Score Post'
+        WHEN pd.PostTypeName = 'Answer' AND pd.Score > 50 THEN 'Highly Rated Answer'
+        WHEN pd.PostTypeName = 'Question' AND pd.FavoriteCount > 50 THEN 'Very Popular Question'
+        WHEN pd.PostTypeName = 'Question' AND pd.TagsArray LIKE '%javascript%' THEN 'JavaScript Related Question'
+        WHEN pd.PostTypeName = 'Answer' AND pd.OwnerUserId = -1 THEN 'Community Owned Answer'
+        ELSE 'Standard Post'
+    END AS PostEngagementCategory,
+    CONCAT(pd.OwnerDisplayName, ' (', ua.Reputation, ')') AS OwnerInfoWithRep,
+    DATEDIFF(day, pd.PostCreationDate, TIMESTAMP '2024-10-01 12:34:56') AS DaysSinceCreation,
+    CASE
+        WHEN re.rn = 1 THEN 'Most Recent Edit'
+        WHEN re.rn <= 3 THEN 'One of Top 3 Edits'
+        ELSE 'Other Edit'
+    END AS EditRecency
+FROM PostDetails pd
+LEFT JOIN AnswerStats ans ON pd.PostId = ans.ParentId
+LEFT JOIN CommentStats cs ON pd.PostId = cs.PostId
+LEFT JOIN PostLinkAnalysis pla ON pd.PostId = pla.PostId
+LEFT JOIN UserActivity ua ON pd.OwnerUserId = ua.UserId
+LEFT JOIN RankedPostEdits re ON pd.PostId = re.PostId AND re.rn = 1
+WHERE pd.PostCreationDate > TIMESTAMP '2023-01-01'
+ORDER BY pd.Score DESC, pd.ViewCount DESC
+LIMIT 100;

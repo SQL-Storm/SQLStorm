@@ -1,0 +1,81 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(b.Id) AS GoldBadges
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 100000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts AS p
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate BETWEEN TIMESTAMP '2022-01-01 00:00:00' AND TIMESTAMP '2023-01-01 00:00:00'
+    GROUP BY p.OwnerUserId, p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        pt.PostId,
+        t.TagName,
+        COUNT(*) OVER (PARTITION BY t.TagName) AS GlobalTagUsage
+    FROM Posts AS p
+    CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS pt(TagName)
+    JOIN Tags AS t ON pt.TagName = t.TagName
+    WHERE t.IsModeratorOnly = FALSE
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    au.GoldBadges,
+    ps.PostId,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.Upvotes,
+    ta.TagName,
+    ta.GlobalTagUsage,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = au.Id AND PostTypeId = 1) AS AvgUserPostScore,
+    (SELECT COUNT(*) FROM PostLinks AS pl WHERE pl.PostId = ps.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM ActiveUsers AS au
+JOIN PostStats AS ps ON au.Id = ps.OwnerUserId AND ps.PostRank <= 3
+JOIN TagAnalysis AS ta ON ps.PostId = ta.PostId
+WHERE EXISTS (
+    SELECT 1 
+    FROM Votes AS v 
+    WHERE v.PostId = ps.PostId 
+      AND v.VoteTypeId IN (2,8)
+    GROUP BY v.PostId
+    HAVING COUNT(*) > 50
+)
+AND ta.TagName IN ('javascript', 'python', 'sql', 'java')
+GROUP BY
+    au.DisplayName,
+    au.Reputation,
+    au.GoldBadges,
+    ps.PostId,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.Upvotes,
+    ta.TagName,
+    ta.GlobalTagUsage
+ORDER BY 
+    au.Reputation DESC, 
+    ps.Score DESC, 
+    ta.GlobalTagUsage DESC
+LIMIT 100;

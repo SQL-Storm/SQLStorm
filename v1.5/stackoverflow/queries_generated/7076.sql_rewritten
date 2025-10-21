@@ -1,0 +1,196 @@
+-- {"query": "7076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2441} 
+WITH
+-- recent active questions with parsed tag arrays and basic metrics
+RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.CreationDate,
+    p.Score,
+    COALESCE(p.ViewCount,0) AS Views,
+    COALESCE(p.AnswerCount,0) AS AnswerCount,
+    COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+    -- normalize Tags: input like '<tag1><tag2>' -> array ['tag1','tag2']
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') END AS TagArray
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days')
+),
+
+-- answers and aggregates per question, plus best answer info
+AnswerMetrics AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.Score > 0) AS PositiveAnswerCount,
+    COUNT(*) FILTER (WHERE a.Score <= 0) AS NonPositiveAnswerCount,
+    AVG(a.Score) AS AvgAnswerScore,
+    MAX(a.Score) AS MaxAnswerScore,
+    MIN(a.Score) AS MinAnswerScore,
+    -- identify answer with max score (tie-breaker: earliest CreationDate)
+    (SELECT aa.Id
+     FROM Posts aa
+     WHERE aa.ParentId = a.ParentId AND aa.PostTypeId = 2
+     ORDER BY aa.Score DESC NULLS LAST, aa.CreationDate ASC
+     LIMIT 1) AS TopAnswerId,
+    (SELECT aa.OwnerUserId
+     FROM Posts aa
+     WHERE aa.ParentId = a.ParentId AND aa.PostTypeId = 2
+     ORDER BY aa.Score DESC NULLS LAST, aa.CreationDate ASC
+     LIMIT 1) AS TopAnswerOwnerId
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days')
+  GROUP BY a.ParentId
+),
+
+-- user-level rolling and badge metrics used later in window funcs
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days') AS QuestionsPostedLastYear,
+    COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2 AND p2.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days') AS AnswersPostedLastYear,
+    COALESCE(MAX(b.Date), TIMESTAMP '1970-01-01') AS LastBadgeDate,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    -- a synthetic "activity score" combining reputation, posts and badges
+    (u.Reputation * 0.6
+     + COALESCE(COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days') * 5,0)
+     + COALESCE(SUM(CASE WHEN b.Class = 1 THEN 50 WHEN b.Class = 2 THEN 20 WHEN b.Class = 3 THEN 5 ELSE 0 END),0)
+    ) AS ActivityScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- compute recent comment sentiment/length heuristics per post using string ops and null logic
+CommentMetrics AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    AVG(LENGTH(c.Text)) AS AvgCommentLen,
+    MAX(LENGTH(c.Text)) AS MaxCommentLen,
+    SUM(CASE WHEN c.Text ~* '\\b(thanks|thank you|ty|appreciate)\\b' THEN 1 ELSE 0 END) AS ThanksMentions,
+    SUM(CASE WHEN c.Text IS NULL OR btrim(c.Text) = '' THEN 1 ELSE 0 END) AS EmptyComments
+  FROM Comments c
+  WHERE c.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days')
+  GROUP BY c.PostId
+),
+
+-- correlate duplicates and links (set operator style using UNION ALL over link types)
+LinkedQuestions AS (
+  SELECT pl.PostId AS SourceId, pl.RelatedPostId AS TargetId, lt.Name AS LinkType, pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '730 days')
+  UNION ALL
+  -- reversed perspective for symmetry
+  SELECT pl.RelatedPostId AS SourceId, pl.PostId AS TargetId, lt.Name AS LinkType, pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '730 days')
+),
+
+-- hotness ranking using window functions and a somewhat contrived formula
+Hotness AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score,
+    rq.Views,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    COALESCE(am.PositiveAnswerCount,0) AS PositiveAnswerCount,
+    COALESCE(am.AvgAnswerScore,0) AS AvgAnswerScore,
+    COALESCE(cm.CommentCount,0) AS RecentCommentCount,
+    -- tag-based novelty factor: more rare tags (lower total Count in Tags table) increases novelty
+    COALESCE((
+      SELECT SUM(1.0 / NULLIF(t.Count,0))
+      FROM UNNEST(rq.TagArray) AS tagname
+      LEFT JOIN Tags t ON t.TagName = tagname
+    ),0) AS TagRarityScore,
+    -- composite hotness (arbitrary weights + time decay)
+    (
+      (rq.Score * 4.0)
+      + (LEAST(rq.Views, 100000)::float / 1000.0)
+      + (COALESCE(am.AvgAnswerScore,0) * 10.0)
+      + (COALESCE(cm.CommentCount,0) * 2.0)
+      + (COALESCE(rq.FavoriteCount,0) * 3.0)
+      + (COALESCE((SELECT COUNT(*) FROM LinkedQuestions lq WHERE lq.TargetId = rq.QuestionId),0) * 2.5)
+      + (COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rq.QuestionId AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'),0) * 1.5)
+      + (TagRarityScore * 20.0)
+      - (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - rq.CreationDate)) / 86400.0) * 0.1
+    ) AS HotnessRaw,
+    -- window rank
+    RANK() OVER (ORDER BY (
+      (
+        (rq.Score * 4.0)
+        + (LEAST(rq.Views, 100000)::float / 1000.0)
+        + (COALESCE(am.AvgAnswerScore,0) * 10.0)
+        + (COALESCE(cm.CommentCount,0) * 2.0)
+        + (COALESCE(rq.FavoriteCount,0) * 3.0)
+        + (COALESCE((SELECT COUNT(*) FROM LinkedQuestions lq WHERE lq.TargetId = rq.QuestionId),0) * 2.5)
+        + (COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rq.QuestionId AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'),0) * 1.5)
+        + (TagRarityScore * 20.0)
+        - (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - rq.CreationDate)) / 86400.0) * 0.1
+      )
+    ) DESC) AS HotRank
+  FROM RecentQuestions rq
+  LEFT JOIN AnswerMetrics am ON am.QuestionId = rq.QuestionId
+  LEFT JOIN CommentMetrics cm ON cm.PostId = rq.QuestionId
+)
+
+SELECT
+  h.HotRank,
+  h.QuestionId,
+  h.Title,
+  h.OwnerUserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  h.CreationDate,
+  ROUND(h.HotnessRaw,3) AS HotnessScore,
+  h.Score AS QuestionScore,
+  h.Views,
+  h.AnswerCount,
+  h.PositiveAnswerCount,
+  ROUND(h.AvgAnswerScore::numeric,3) AS AvgAnswerScore,
+  h.RecentCommentCount,
+  h.TagRarityScore,
+  -- include top answer info via correlated subquery with null handling
+  COALESCE((SELECT p.Body FROM Posts p WHERE p.Id = (SELECT am.TopAnswerId FROM AnswerMetrics am WHERE am.QuestionId = h.QuestionId) LIMIT 1), '[no top answer body]') AS TopAnswerBodySnippet,
+  -- list of top 3 linked question ids by recency
+  (
+    SELECT string_agg(CAST(lq.TargetId AS varchar), ',')
+    FROM (
+      SELECT DISTINCT TargetId FROM LinkedQuestions lq
+      WHERE lq.TargetId IS NOT NULL AND lq.SourceId = h.QuestionId
+      ORDER BY lq.CreationDate DESC
+      LIMIT 3
+    ) AS lq
+  ) AS RecentLinkedIds,
+  -- unusual predicates: flag if any close events in post history with specific reason codes
+  EXISTS(
+    SELECT 1 FROM PostHistory ph
+    WHERE ph.PostId = h.QuestionId
+      AND ph.PostHistoryTypeId = 10
+      AND (ph.Comment::int IS NOT NULL AND ph.Comment::int IN (101,102,103,104,105))
+      AND ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+  ) AS HasRecentCloseVoteOfCurrentKinds,
+  -- show activity rank of the owner among users (dense rank)
+  DENSE_RANK() OVER (ORDER BY ua.ActivityScore DESC) AS OwnerActivityRank,
+  ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+  -- engineered confidence: combine owner activity and question hotness
+  ROUND( (h.HotnessRaw * 0.7) + (COALESCE(ua.ActivityScore,0) * 0.03), 3) AS ConfidenceIndex
+FROM Hotness h
+LEFT JOIN UserActivity ua ON ua.UserId = h.OwnerUserId
+ORDER BY h.HotRank
+LIMIT 100;

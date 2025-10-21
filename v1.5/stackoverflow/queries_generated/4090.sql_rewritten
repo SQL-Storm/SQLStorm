@@ -1,0 +1,136 @@
+-- {"query": "4090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1328} 
+with RecursiveCTE as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+), 
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), 
+CloseReasonCounts as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on try_cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+AnswerStats as (
+    select 
+        p.ParentId,
+        count(*) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore,
+        sum(case when p.Score < 0 then 1 else 0 end) as NegativeScoreAnswers
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+VotesSummary as (
+    select 
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBounty
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+),
+PostLinksSummary as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as LinksCount,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+RankedUserPosts as (
+    select 
+        r.PostId,
+        r.Title,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        r.OwnerUserId,
+        r.DisplayName,
+        ub_gold.BadgeCount as GoldBadges,
+        ub_silver.BadgeCount as SilverBadges,
+        ub_bronze.BadgeCount as BronzeBadges,
+        coalesce(crc.CloseCount,0) as CloseVotes,
+        coalesce(as.AnswerCount,0) as Answers,
+        coalesce(as.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(vs.UpVotes,0) as UpVotes,
+        coalesce(vs.DownVotes,0) as DownVotes,
+        coalesce(vs.FavoriteVotes,0) as Favorites,
+        coalesce(vs.TotalBounty,0) as TotalBounty,
+        coalesce(pls.LinksCount,0) as LinksCount,
+        coalesce(pls.DuplicateLinks,0) as DuplicateLinks,
+        r.rn
+    from RecursiveCTE r 
+    left join UserBadgeCounts ub_gold on r.OwnerUserId = ub_gold.UserId and ub_gold.Class = 1
+    left join UserBadgeCounts ub_silver on r.OwnerUserId = ub_silver.UserId and ub_silver.Class = 2
+    left join UserBadgeCounts ub_bronze on r.OwnerUserId = ub_bronze.UserId and ub_bronze.Class = 3
+    left join CloseReasonCounts crc on r.PostId = crc.PostId
+    left join AnswerStats as on r.PostId = as.ParentId
+    left join VotesSummary vs on r.PostId = vs.PostId
+    left join PostLinksSummary pls on r.PostId = pls.PostId
+)
+select 
+    p.PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.DisplayName as OwnerName,
+    coalesce(p.GoldBadges,0) as GoldBadges,
+    coalesce(p.SilverBadges,0) as SilverBadges,
+    coalesce(p.BronzeBadges,0) as BronzeBadges,
+    p.CloseVotes,
+    p.Answers,
+    round(p.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    p.UpVotes,
+    p.DownVotes,
+    p.Favorites,
+    p.TotalBounty,
+    p.LinksCount,
+    p.DuplicateLinks,
+    case 
+        when p.Score > 100 and p.ViewCount > 10000 then 'High Impact'
+        when p.Score between 50 and 100 then 'Moderate Impact'
+        else 'Low Impact'
+    end as ImpactCategory,
+    concat_ws(' / ', 
+        case when p.GoldBadges is null then '0 Gold' else concat(p.GoldBadges,' Gold') end,
+        case when p.SilverBadges is null then '0 Silver' else concat(p.SilverBadges,' Silver') end,
+        case when p.BronzeBadges is null then '0 Bronze' else concat(p.BronzeBadges,' Bronze') end
+    ) as BadgeSummary,
+    case 
+        when p.DuplicateLinks > 0 then 'Has Duplicates'
+        else 'Original or Unlinked'
+    end as DuplicationStatus,
+    row_number() over (partition by p.DisplayName order by p.Score desc) as UserPostRank,
+    count(*) over (partition by p.DisplayName) as TotalPostsByUser
+from RankedUserPosts p
+where (p.Score > 0 or p.Answers > 0 or p.UpVotes > 0)
+and p.rn <= 10
+order by p.UpVotes desc, p.Score desc, p.ViewCount desc, p.CreationDate desc
+limit 50;

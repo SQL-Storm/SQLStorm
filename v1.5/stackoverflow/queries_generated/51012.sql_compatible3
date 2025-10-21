@@ -1,0 +1,93 @@
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, u.Reputation,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank
+  FROM Users u
+  WHERE u.CreationDate >= DATE '2010-01-01' AND u.Reputation >= 1000
+),
+active_posts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate,
+         p.OwnerUserId, p.PostTypeId,
+         STRING_AGG(DISTINCT substring(t.TagName from 1 for 20), ', ') as tag_names
+  FROM Posts p
+  LEFT JOIN Posts ph ON ph.Id = p.Id AND ph.PostHistoryTypeId IN (1,4,6,10,11,24)
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(
+      substring(p.Tags, 2, length(p.Tags)-2),
+      '><'
+    )) as tag
+  ) tags_parsed
+  INNER JOIN Tags t ON t.TagName = tags_parsed.tag AND t.Count > 50
+  WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2015-01-01'
+    AND p.Score > 0 AND p.ViewCount > 100
+    AND p.ClosedDate IS NULL
+  GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeId
+  HAVING COUNT(ph.Id) > 5
+),
+user_engagement AS (
+  SELECT tu.Id as user_id,
+         COUNT(ap.Id) as question_count,
+         AVG(ap.Score) as avg_score,
+         SUM(ap.ViewCount) as total_views,
+         COUNT(DISTINCT v.Id) as vote_count,
+         COUNT(DISTINCT c.Id) as comment_count,
+         COUNT(DISTINCT b.Id) as badge_count
+  FROM top_users tu
+  INNER JOIN active_posts ap ON ap.OwnerUserId = tu.Id
+  LEFT JOIN Votes v ON v.PostId = ap.Id AND v.VoteTypeId IN (2,3)
+  LEFT JOIN Comments c ON c.PostId = ap.Id AND c.Score >= 0
+  LEFT JOIN Badges b ON b.UserId = tu.Id AND b.Date >= DATE '2015-01-01'
+    AND b.Class IN (1,2)
+  GROUP BY tu.Id
+  HAVING COUNT(ap.Id) >= 10
+),
+monthly_trends AS (
+  SELECT DATE_TRUNC('month', ap.CreationDate) as month,
+         COUNT(*) as post_volume,
+         AVG(ap.Score) as avg_score,
+         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ap.ViewCount) as p95_views
+  FROM active_posts ap
+  GROUP BY DATE_TRUNC('month', ap.CreationDate)
+),
+linked_network AS (
+  SELECT pl.PostId,
+         COUNT(DISTINCT pl.RelatedPostId) as link_degree,
+         AVG(p2.Score) as avg_linked_score
+  FROM PostLinks pl
+  INNER JOIN active_posts p ON pl.PostId = p.Id
+  INNER JOIN active_posts p2 ON pl.RelatedPostId = p2.Id
+    AND pl.LinkTypeId = 1
+  WHERE pl.CreationDate >= DATE '2015-01-01'
+  GROUP BY pl.PostId
+)
+SELECT 
+  tu.DisplayName as top_user,
+  ue.question_count,
+  ue.avg_score,
+  (ue.total_views / 1000) as total_views_k,
+  ue.vote_count,
+  ue.comment_count,
+  ue.badge_count,
+  ap.Title as sample_question,
+  ap.tag_names,
+  ln.link_degree,
+  ln.avg_linked_score,
+  mt.post_volume as monthly_activity,
+  (ue.total_views::numeric / NULLIF(ue.question_count, 0)) as views_per_question,
+  CASE 
+    WHEN ue.badge_count >= 10 THEN 'Highly Badged'
+    WHEN ue.question_count >= 50 THEN 'Prolific'
+    ELSE 'Emerging'
+  END as user_tier,
+  ROW_NUMBER() OVER (
+    PARTITION BY mt.month 
+    ORDER BY ue.total_views DESC
+  ) as monthly_rank
+FROM user_engagement ue
+INNER JOIN top_users tu ON ue.user_id = tu.Id
+INNER JOIN active_posts ap ON ap.OwnerUserId = tu.Id
+INNER JOIN monthly_trends mt ON mt.month = DATE_TRUNC('month', ap.CreationDate)
+LEFT JOIN linked_network ln ON ln.PostId = ap.Id
+WHERE tu.rep_rank <= 100
+  AND ap.CreationDate >= DATE '2020-01-01'
+ORDER BY ue.total_views DESC, ue.badge_count DESC
+LIMIT 50;

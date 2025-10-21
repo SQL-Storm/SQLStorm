@@ -1,0 +1,253 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '6 months' from users)
+),
+active_questions as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         coalesce(p.answercount, 0) as answercount,
+         p.tags
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+),
+answers as (
+  select a.id as answer_id, a.parentid as question_id, a.owneruserid, a.score, a.creationdate
+  from posts a
+  where a.posttypeid = 2
+),
+q_votes as (
+  select v.postid as question_id,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 5) as favorites,
+         max(v.creationdate) as last_vote_at
+  from votes v
+  join active_questions q on q.question_id = v.postid
+  group by v.postid
+),
+a_votes as (
+  select a.parentid as question_id,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as answers_net_votes,
+         count(*) filter (where v.votetypeid = 2) as answers_upvotes,
+         count(*) filter (where v.votetypeid = 3) as answers_downvotes,
+         max(v.creationdate) as last_answer_vote_at
+  from votes v
+  join posts a on a.id = v.postid and a.posttypeid = 2
+  join active_questions q on q.question_id = a.parentid
+  group by a.parentid
+),
+q_comments as (
+  select c.postid as question_id,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  join active_questions q on q.question_id = c.postid
+  group by c.postid
+),
+q_edits as (
+  select ph.postid as question_id,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         count(distinct ph.userid) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as distinct_editors,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as last_edit_at,
+         count(*) filter (where ph.posthistorytypeid in (10,35)) as close_events,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as last_close_at,
+         count(*) filter (where ph.posthistorytypeid in (11)) as reopen_events,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (11)) as last_reopen_at
+  from posthistory ph
+  join active_questions q on q.question_id = ph.postid
+  group by ph.postid
+),
+dup_links as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as related_links,
+         max(pl.creationdate) as last_link_at
+  from postlinks pl
+  join active_questions q on q.question_id = pl.postid
+  group by pl.postid
+),
+tag_expansion as (
+  select q.question_id, unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from active_questions q
+  where q.tags is not null and q.tags <> ''
+),
+tag_rank as (
+  select te.question_id,
+         t.tagname,
+         t.count as global_tag_count,
+         row_number() over (partition by te.question_id order by t.count desc nulls last, t.tagname) as tag_rank
+  from tag_expansion te
+  left join tags t on lower(t.tagname) = lower(te.tag)
+),
+top_tags as (
+  select question_id,
+         max(tagname) filter (where tag_rank = 1) as top_tag_1,
+         max(global_tag_count) filter (where tag_rank = 1) as top_tag_1_popularity,
+         max(tagname) filter (where tag_rank = 2) as top_tag_2,
+         max(global_tag_count) filter (where tag_rank = 2) as top_tag_2_popularity,
+         count(*) as tag_count
+  from tag_rank
+  group by question_id
+),
+answer_agg as (
+  select a.question_id,
+         count(*) as answers_count,
+         count(*) filter (where a.score > 0) as positive_answers,
+         max(a.score) as max_answer_score,
+         min(a.creationdate) as first_answer_at,
+         max(a.creationdate) as last_answer_at,
+         count(distinct a.owneruserid) as distinct_answerers
+  from answers a
+  join active_questions q on q.question_id = a.question_id
+  group by a.question_id
+),
+owner_stats as (
+  select q.question_id,
+         u.userid as owner_id,
+         ru.displayname as owner_name,
+         ru.reputation as owner_reputation,
+         ru.creationdate as owner_created_at,
+         sum(u_cnt) as owner_total_posts_last_year,
+         max(last_post_at) as owner_last_post_at
+  from (
+    select p.owneruserid as userid,
+           count(*) as u_cnt,
+           max(p.creationdate) as last_post_at
+    from posts p
+    where p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+      and p.owneruserid is not null
+    group by p.owneruserid
+  ) u
+  join active_questions q on q.owneruserid = u.userid
+  left join recent_users ru on ru.user_id = u.userid
+  group by q.question_id, u.userid, ru.displayname, ru.reputation, ru.creationdate
+),
+question_activity as (
+  select q.question_id,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         coalesce(qv.net_votes, 0) as q_net_votes,
+         coalesce(qv.upvotes, 0) as q_upvotes,
+         coalesce(qv.downvotes, 0) as q_downvotes,
+         coalesce(qv.favorites, 0) as q_favorites,
+         qv.last_vote_at,
+         coalesce(av.answers_net_votes, 0) as a_net_votes,
+         coalesce(av.answers_upvotes, 0) as a_upvotes,
+         coalesce(av.answers_downvotes, 0) as a_downvotes,
+         av.last_answer_vote_at,
+         coalesce(qc.comment_count, 0) as comment_count,
+         qc.last_comment_at,
+         coalesce(qe.edit_events, 0) as edit_events,
+         coalesce(qe.distinct_editors, 0) as distinct_editors,
+         qe.last_edit_at,
+         coalesce(qe.close_events, 0) as close_events,
+         qe.last_close_at,
+         coalesce(qe.reopen_events, 0) as reopen_events,
+         qe.last_reopen_at,
+         coalesce(dl.duplicate_links, 0) as duplicate_links,
+         coalesce(dl.related_links, 0) as related_links,
+         dl.last_link_at
+  from active_questions q
+  left join q_votes qv on qv.question_id = q.question_id
+  left join a_votes av on av.question_id = q.question_id
+  left join q_comments qc on qc.question_id = q.question_id
+  left join q_edits qe on qe.question_id = q.question_id
+  left join dup_links dl on dl.question_id = q.question_id
+),
+score_buckets as (
+  select qa.*,
+         case
+           when qa.score >= 50 then 'very_high'
+           when qa.score between 20 and 49 then 'high'
+           when qa.score between 5 and 19 then 'medium'
+           when qa.score between 0 and 4 then 'low'
+           else 'negative'
+         end as score_bucket,
+         case
+           when qa.viewcount >= 100000 then 'viral'
+           when qa.viewcount >= 25000 then 'popular'
+           when qa.viewcount >= 5000 then 'noticed'
+           else 'niche'
+         end as view_bucket
+  from question_activity qa
+),
+time_windows as (
+  select sb.*,
+         date_trunc('week', sb.creationdate) as week_bucket,
+         date_trunc('month', sb.creationdate) as month_bucket
+  from score_buckets sb
+),
+engagement as (
+  select tw.*,
+         coalesce(aa.answers_count, 0) as answers_count,
+         coalesce(aa.positive_answers, 0) as positive_answers,
+         aa.max_answer_score,
+         aa.first_answer_at,
+         aa.last_answer_at,
+         coalesce(aa.distinct_answerers, 0) as distinct_answerers,
+         tt.top_tag_1,
+         tt.top_tag_1_popularity,
+         tt.top_tag_2,
+         tt.top_tag_2_popularity,
+         tt.tag_count,
+         os.owner_id,
+         os.owner_name,
+         os.owner_reputation,
+         os.owner_created_at,
+         os.owner_total_posts_last_year,
+         os.owner_last_post_at
+  from time_windows tw
+  left join answer_agg aa on aa.question_id = tw.question_id
+  left join top_tags tt on tt.question_id = tw.question_id
+  left join owner_stats os on os.question_id = tw.question_id
+),
+ranked as (
+  select e.*,
+         row_number() over (
+           partition by e.view_bucket, e.score_bucket
+           order by
+             (coalesce(e.q_upvotes,0) + coalesce(e.a_upvotes,0) - coalesce(e.q_downvotes,0) - coalesce(e.a_downvotes,0)) desc,
+             coalesce(e.viewcount,0) desc,
+             coalesce(e.answers_count,0) desc
+         ) as bucket_rank,
+         (percentile_disc(0.9) within group (order by coalesce(e.viewcount,0))) over () as p90_views,
+         (percentile_disc(0.9) within group (order by coalesce(e.q_favorites,0))) over () as p90_favs
+  from engagement e
+),
+final as (
+  select r.question_id,
+         r.owner_id,
+         r.owner_name,
+         r.owner_reputation,
+         r.creationdate as question_created_at,
+         r.score,
+         r.viewcount,
+         r.answercount as initial_answercount,
+         r.q_upvotes, r.q_downvotes, r.q_favorites,
+         r.a_upvotes, r.a_downvotes,
+         r.comment_count, r.edit_events, r.distinct_editors,
+         r.close_events, r.reopen_events, r.duplicate_links, r.related_links,
+         r.first_answer_at, r.last_answer_at, r.last_vote_at, r.last_answer_vote_at, r.last_comment_at, r.last_edit_at, r.last_close_at, r.last_reopen_at, r.last_link_at,
+         r.answers_count, r.positive_answers, r.max_answer_score, r.distinct_answerers,
+         r.top_tag_1, r.top_tag_1_popularity, r.top_tag_2, r.top_tag_2_popularity, r.tag_count,
+         r.owner_total_posts_last_year, r.owner_last_post_at, r.owner_created_at,
+         r.view_bucket, r.score_bucket, r.week_bucket, r.month_bucket,
+         r.bucket_rank,
+         r.p90_views, r.p90_favs,
+         case when r.viewcount >= r.p90_views then 1 else 0 end as is_top10pct_views,
+         case when r.q_favorites >= r.p90_favs then 1 else 0 end as is_top10pct_favs
+  from ranked r
+)
+select *
+from final
+where bucket_rank <= 100
+order by view_bucket, score_bucket, bucket_rank, question_created_at desc;

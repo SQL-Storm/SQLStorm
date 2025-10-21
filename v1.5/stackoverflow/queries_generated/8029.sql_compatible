@@ -1,0 +1,252 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+top_tags as (
+    select t.tagname,
+           t.count,
+           t.isrequired,
+           t.ismoderatoronly,
+           row_number() over (order by t.count desc, t.tagname) as rn
+    from tags t
+    where t.count > 0
+),
+question_stats as (
+    select p.id as post_id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.title,
+           p.tags,
+           coalesce(p.favoritecount, 0) as favoritecount,
+           count(distinct c.id) as comment_count,
+           sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+           max(case when v.votetypeid = 8 then v.bountyamount else null end) as max_bounty,
+           min(p.lastactivitydate) filter (where p.lastactivitydate is not null) as last_activity,
+           string_agg(distinct substr(coalesce(c.userdisplayname, ''), 1, 20), ',') filter (where c.id is not null) as commenters_sample
+    from posts p
+    left join comments c on c.postid = p.id
+    left join votes v on v.postid = p.id
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(p2.creationdate) - interval '365 days' from posts p2 where p2.posttypeid = 1)
+    group by p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.title, p.tags, p.favoritecount
+),
+question_tags as (
+    select qs.post_id,
+           unnest(string_to_array(substring(qs.tags, 2, greatest(length(qs.tags)-2,0)), '><'))::varchar as tagname
+    from question_stats qs
+    where qs.tags is not null and qs.tags like '<%>'
+),
+tag_affinity as (
+    select qt.tagname,
+           count(*) as q_count,
+           sum(qs.viewcount) as total_views,
+           avg(qs.score) as avg_score,
+           percentile_disc(0.5) within group (order by qs.score) as med_score
+    from question_tags qt
+    join question_stats qs on qs.post_id = qt.post_id
+    group by qt.tagname
+),
+user_activity as (
+    select ru.user_id,
+           count(distinct qs.post_id) as questions_asked,
+           sum(qs.viewcount) as views_sum,
+           sum(coalesce(qs.answercount,0)) as answers_total,
+           sum(qs.net_votes) as net_votes_sum,
+           avg(qs.score) as avg_q_score,
+           max(qs.max_bounty) as max_bounty_received,
+           count(distinct b.id) filter (where b.class = 1) as gold_badges,
+           count(distinct b.id) filter (where b.class = 2) as silver_badges,
+           count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+           count(distinct ph.id) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_events
+    from recent_users ru
+    left join posts p on p.owneruserid = ru.user_id and p.posttypeid = 1
+    left join question_stats qs on qs.post_id = p.id
+    left join badges b on b.userid = ru.user_id
+    left join posthistory ph on ph.postid = p.id
+    group by ru.user_id
+),
+dupe_graph as (
+    select pl.postid as src_id,
+           pl.relatedpostid as dst_id,
+           pl.creationdate as link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+dupe_clusters as (
+    select src_id,
+           dst_id,
+           link_date,
+           row_number() over (partition by least(src_id, dst_id), greatest(src_id, dst_id) order by link_date desc) as rn
+    from dupe_graph
+),
+recent_dupes as (
+    select dc.src_id,
+           dc.dst_id,
+           dc.link_date
+    from dupe_clusters dc
+    where dc.rn = 1
+),
+post_closure as (
+    select ph.postid,
+           min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+           max(case when ph.posthistorytypeid = 10 then cast(ph.comment as int) end) as close_reason_raw,
+           bool_or(ph.posthistorytypeid = 11) as reopened
+    from posthistory ph
+    group by ph.postid
+),
+post_close_reason as (
+    select pc.postid,
+           coalesce(crt.name, case when pc.close_reason_raw is null then 'Unknown' else 'Unknown('||pc.close_reason_raw||')' end) as close_reason,
+           pc.first_closed_at,
+           pc.reopened
+    from post_closure pc
+    left join closerreasontypes crt on crt.id = pc.close_reason_raw
+),
+post_enriched as (
+    select qs.*,
+           ru.displayname as owner_name,
+           ru.location as owner_location,
+           ua.questions_asked,
+           ua.views_sum as owner_views_sum,
+           ua.answers_total as owner_answers_total,
+           ua.net_votes_sum as owner_net_votes_sum,
+           ua.avg_q_score as owner_avg_q_score,
+           ua.max_bounty_received,
+           ua.gold_badges,
+           ua.silver_badges,
+           ua.bronze_badges,
+           pcr.close_reason,
+           pcr.first_closed_at,
+           pcr.reopened,
+           coalesce(td.tagname, split_part(qs.title, ' ', 1)) as primary_tag_guess
+    from question_stats qs
+    left join recent_users ru on ru.user_id = qs.owneruserid
+    left join user_activity ua on ua.user_id = qs.owneruserid
+    left join post_close_reason pcr on pcr.postid = qs.post_id
+    left join lateral (
+        select qt.tagname
+        from question_tags qt
+        where qt.post_id = qs.post_id
+        order by (select ta.total_views from tag_affinity ta where ta.tagname = qt.tagname) desc nulls last,
+                 qt.tagname
+        limit 1
+    ) td on true
+),
+ranked_posts as (
+    select pe.*,
+           coalesce(ta.avg_score, 0) as tag_avg_score,
+           coalesce(ta.med_score, 0) as tag_med_score,
+           coalesce(ta.total_views, 0) as tag_total_views,
+           dense_rank() over (order by
+               case when pe.close_reason is null then 0 else 1 end,
+               pe.score desc,
+               pe.viewcount desc,
+               pe.net_votes desc,
+               pe.answercount desc,
+               pe.creationdate desc
+           ) as quality_rank,
+           row_number() over (partition by pe.owneruserid order by pe.score desc, pe.viewcount desc, pe.creationdate desc) as per_user_best_rank
+    from post_enriched pe
+    left join tag_affinity ta on ta.tagname = pe.primary_tag_guess
+),
+post_pairs as (
+    select rp1.post_id as a_id,
+           rp2.post_id as b_id,
+           rp1.owneruserid as a_user,
+           rp2.owneruserid as b_user,
+           abs(rp1.score - rp2.score) as score_delta,
+           abs(coalesce(rp1.viewcount,0) - coalesce(rp2.viewcount,0)) as view_delta
+    from ranked_posts rp1
+    join ranked_posts rp2
+      on rp1.owneruserid = rp2.owneruserid
+     and rp1.post_id < rp2.post_id
+     and rp1.primary_tag_guess = rp2.primary_tag_guess
+     and abs(rp1.score - rp2.score) <= 2
+),
+final_set as (
+    select rp.post_id,
+           rp.title,
+           rp.owneruserid,
+           rp.owner_name,
+           rp.owner_location,
+           rp.primary_tag_guess as tagname,
+           rp.score,
+           rp.viewcount,
+           rp.answercount,
+           rp.net_votes,
+           rp.favoritecount,
+           rp.comment_count,
+           rp.max_bounty,
+           rp.last_activity,
+           rp.close_reason,
+           rp.first_closed_at,
+           rp.reopened,
+           rp.tag_avg_score,
+           rp.tag_med_score,
+           rp.tag_total_views,
+           rp.quality_rank,
+           rp.per_user_best_rank,
+           (select count(*) from recent_dupes d where d.src_id = rp.post_id or d.dst_id = rp.post_id) as dupe_links,
+           exists (
+             select 1
+             from post_pairs pp
+             where pp.a_id = rp.post_id or pp.b_id = rp.post_id
+           ) as has_similar_by_owner,
+           case
+             when rp.close_reason is not null then 'closed'
+             when rp.score >= 10 and rp.viewcount >= 1000 then 'hot'
+             when rp.answercount = 0 and timestamp '2024-10-01 12:34:56' - rp.creationdate > interval '30 days' then 'stale'
+             else 'normal'
+           end as post_bucket
+    from ranked_posts rp
+),
+cohort as (
+    select *
+    from final_set
+    where quality_rank <= 500
+      or post_bucket in ('hot','stale')
+)
+select *
+from (
+    select
+      'A' as segment,
+      c.*
+    from cohort c
+    where c.post_bucket <> 'closed'
+  union all
+    select
+      'B' as segment,
+      c.*
+    from cohort c
+    where c.post_bucket = 'closed'
+) segmented
+where (
+        segmented.has_similar_by_owner
+        or segmented.dupe_links > 0
+      )
+  and (
+        segmented.tagname in (
+            select tagname from top_tags where rn <= 50
+        )
+        or segmented.owneruserid in (
+            select user_id from recent_users where rn <= 200
+        )
+      )
+order by
+    segment,
+    post_bucket,
+    quality_rank,
+    coalesce(viewcount, 0) desc,
+    score desc,
+    post_id
+limit 1000;

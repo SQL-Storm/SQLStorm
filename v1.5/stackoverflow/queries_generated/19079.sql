@@ -1,0 +1,216 @@
+-- {"query": "19079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3321} 
+WITH UserEngagementStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS UserAccountAgeDays,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT COUNT(DISTINCT p_sub.Id) FROM Posts AS p_sub WHERE p_sub.OwnerUserId = u.Id AND p_sub.PostTypeId IN (1, 2)) AS TotalPostsContributions,
+        (SELECT COUNT(DISTINCT c_sub.Id) FROM Comments AS c_sub WHERE c_sub.UserId = u.Id) AS TotalCommentsMade,
+        -- Calculate a UserEngagementScore based on various factors, with NULL handling
+        (COALESCE(u.Reputation, 0) * 0.5 + COALESCE(u.UpVotes, 0) * 0.2 - COALESCE(u.DownVotes, 0) * 0.1 + COUNT(DISTINCT b.Id) * 5) AS CalculatedEngagementScore,
+        -- Check if user has ever posted a question using EXISTS
+        EXISTS(SELECT 1 FROM Posts p_q WHERE p_q.OwnerUserId = u.Id AND p_q.PostTypeId = 1) AS HasPostedQuestion
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+PostActivityDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.Body, -- Include body for string expressions on content
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId, -- ParentId is crucial for answers
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Tags,
+        -- Correlated subquery: count upvotes for this post
+        (SELECT COUNT(pv.Id) FROM Votes AS pv WHERE pv.PostId = p.Id AND pv.VoteTypeId = 2) AS PostUpVotes,
+        -- Correlated subquery: count downvotes for this post
+        (SELECT COUNT(pv.Id) FROM Votes AS pv WHERE pv.PostId = p.Id AND pv.VoteTypeId = 3) AS PostDownVotes,
+        -- Correlated subquery for latest editor info from PostHistory
+        (SELECT ph.UserId FROM PostHistory AS ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6) ORDER BY ph.CreationDate DESC LIMIT 1) AS LastEditorUserId,
+        (SELECT ph.CreationDate FROM PostHistory AS ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6) ORDER BY ph.CreationDate DESC LIMIT 1) AS LatestEditHistoryDate,
+        -- Correlated subquery for first comment details (date and excerpt)
+        (SELECT c.CreationDate FROM Comments AS c WHERE c.PostId = p.Id ORDER BY c.CreationDate ASC LIMIT 1) AS FirstCommentCreationDate,
+        (SELECT SUBSTRING(c.Text FROM 1 FOR 100) FROM Comments AS c WHERE c.PostId = p.Id ORDER BY c.CreationDate ASC LIMIT 1) AS FirstCommentExcerpt,
+        -- Check if post has a 'Duplicate' link using EXISTS
+        EXISTS (SELECT 1 FROM PostLinks AS pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS HasDuplicateLink,
+        -- Count post history entries related to migration
+        (SELECT COUNT(*) FROM PostHistory ph_mig WHERE ph_mig.PostId = p.Id AND ph_mig.PostHistoryTypeId IN (17, 35, 36)) AS MigrationCount
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL -- Exclude community-owned posts or posts by deleted users
+      AND p.CreationDate IS NOT NULL -- Ensure valid creation date for analysis
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))) AS TagName
+    FROM Posts AS p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+BaseQueryResult AS (
+    SELECT
+        ues.DisplayName,
+        ues.Reputation,
+        ues.CalculatedEngagementScore,
+        pa.PostTypeName,
+        pa.Title,
+        pa.Body,
+        pa.PostScore,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.PostCommentCount,
+        pa.FavoriteCount,
+        pa.OwnerUserId,
+        pa.AcceptedAnswerId,
+        pa.ParentId,
+        pa.PostCreationDate,
+        pa.LastActivityDate,
+        pa.LatestEditHistoryDate,
+        pa.FirstCommentExcerpt,
+        pa.HasDuplicateLink,
+        pa.MigrationCount,
+        pa.PostTypeId,
+        -- Window function: Rank posts by score within each post type and year of creation
+        RANK() OVER (PARTITION BY pa.PostTypeId, EXTRACT(YEAR FROM pa.PostCreationDate) ORDER BY pa.PostScore DESC, pa.ViewCount DESC) AS RankByScoreInTypeAndYear,
+        -- Window function: Calculate average score of posts by the same user, over a rolling 30-day window
+        AVG(pa.PostScore) OVER (PARTITION BY ues.UserId ORDER BY pa.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreByUser,
+        -- Window function: Get the score of the user's previous post (default to 0 if no previous post)
+        LAG(pa.PostScore, 1, 0) OVER (PARTITION BY ues.UserId ORDER BY pa.PostCreationDate) AS PrevPostScoreByUser,
+        -- Case statement with complicated logic for post quality classification, including NULL handling
+        CASE
+            WHEN pa.ClosedDate IS NOT NULL AND COALESCE(pa.PostScore, 0) < 0 THEN 'Closed & Low Quality'
+            WHEN pa.PostTypeId = 1 AND COALESCE(pa.AnswerCount, 0) = 0 AND pa.PostCreationDate < NOW() - INTERVAL '1 year' THEN 'Unanswered Old Question'
+            WHEN COALESCE(pa.PostScore, 0) >= 100 AND COALESCE(pa.ViewCount, 0) >= 10000 AND COALESCE(pa.FavoriteCount, 0) >= 50 THEN 'Viral & Highly Favorited'
+            WHEN COALESCE(pa.PostScore, 0) BETWEEN 50 AND 99 AND COALESCE(pa.ViewCount, 0) BETWEEN 5000 AND 9999 THEN 'Popular & Good'
+            WHEN pa.CommunityOwnedDate IS NOT NULL AND COALESCE(pa.PostScore, 0) >= 20 THEN 'Community Vetted & Valued'
+            WHEN pa.PostScore IS NULL OR pa.ViewCount IS NULL OR pa.FavoriteCount IS NULL THEN 'Data Missing/New'
+            ELSE 'Regular Activity'
+        END AS PostQualityCategory,
+        -- Conditional check for 'hot' posts using LOG, COALESCE, and incorporating user reputation
+        (COALESCE(pa.PostScore, 0) * LOG(COALESCE(pa.ViewCount, 1) + 1) + (COALESCE(ues.Reputation, 0) / 1000.0) * 0.1) AS HotnessMetric,
+        -- String expression: Extract the first tag (alphabetically) and convert to uppercase, with default for NULLs
+        UPPER(COALESCE((SELECT MIN(pta.TagName) FROM PostTagAnalysis AS pta WHERE pta.PostId = pa.PostId), 'NO_TAGS')) AS PrimaryTag,
+        -- Calculate time difference in hours, with NULL check
+        DATE_PART('hour', pa.FirstCommentCreationDate - pa.PostCreationDate) AS TimeToFirstCommentHours,
+        -- Boolean check for specific keywords in the post body (case-insensitive)
+        (pa.Body ILIKE '%performance%' OR pa.Body ILIKE '%optimization%' OR pa.Body ILIKE '%benchmark%') AS ContainsPerformanceKeywords,
+        -- Correlated subquery for average post score for the top 3 most frequent tags of this user over their last 10 posts
+        (SELECT AVG(p2.Score) FROM Posts AS p2
+         INNER JOIN PostTagAnalysis AS pta2 ON p2.Id = pta2.PostId
+         WHERE p2.OwnerUserId = ues.UserId
+           AND p2.CreationDate <= pa.PostCreationDate -- Only consider posts up to this point
+           AND pta2.TagName IN (
+               SELECT pta3.TagName FROM PostTagAnalysis AS pta3
+               WHERE pta3.PostId IN (
+                   SELECT p4.Id FROM Posts AS p4
+                   WHERE p4.OwnerUserId = ues.UserId
+                   ORDER BY p4.CreationDate DESC LIMIT 10
+               )
+               GROUP BY pta3.TagName
+               ORDER BY COUNT(*) DESC LIMIT 3
+           )
+        ) AS AvgScoreForUsersRecentTopTags
+    FROM UserEngagementStats AS ues
+    JOIN PostActivityDetails AS pa ON ues.UserId = pa.OwnerUserId
+    WHERE ues.Reputation >= 500 -- Filter for reasonably active users
+      AND pa.PostScore IS NOT NULL -- Exclude posts with no score (or very new ones)
+      AND pa.Title IS NOT NULL AND LENGTH(pa.Title) > 15 -- Ensure meaningful titles
+      AND pa.CreationDate BETWEEN '2019-01-01' AND '2023-12-31' -- Date range for analysis
+)
+-- Main query combining "Hot Questions" and "Highly Accepted Answers" using UNION ALL
+SELECT
+    b.DisplayName,
+    b.Reputation,
+    b.CalculatedEngagementScore,
+    b.PostTypeName,
+    b.Title,
+    b.PostScore,
+    b.ViewCount,
+    b.PostUpVotes,
+    b.PostDownVotes,
+    b.PostCommentCount,
+    b.FavoriteCount,
+    b.PrimaryTag,
+    b.PostQualityCategory,
+    b.HotnessMetric,
+    b.RankByScoreInTypeAndYear,
+    b.RollingAvgPostScoreByUser,
+    b.PrevPostScoreByUser,
+    b.TimeToFirstCommentHours,
+    b.HasDuplicateLink,
+    b.MigrationCount,
+    b.ContainsPerformanceKeywords,
+    b.AvgScoreForUsersRecentTopTags,
+    'QuestionAnalysis' AS ResultCategory -- Differentiator for UNION ALL
+FROM BaseQueryResult AS b
+WHERE b.PostTypeId = 1 -- Only questions for this branch
+  AND b.AnswerCount > 0 -- Questions with at least one answer
+  AND b.HotnessMetric > 50 -- Only very 'hot' questions
+  AND b.HasDuplicateLink = FALSE -- Exclude questions marked as duplicate
+  AND COALESCE(b.TimeToFirstCommentHours, 9999) < 48 -- Questions with quick initial engagement (within 48 hours)
+  AND b.ContainsPerformanceKeywords = TRUE -- Focus on specific content
+  AND b.AvgScoreForUsersRecentTopTags IS NOT NULL -- Users with enough history to calculate this metric
+  AND b.PostQualityCategory NOT LIKE 'Closed%' -- Exclude closed questions
+
+UNION ALL
+
+SELECT
+    b.DisplayName,
+    b.Reputation,
+    b.CalculatedEngagementScore,
+    b.PostTypeName,
+    b.Title,
+    b.PostScore,
+    b.ViewCount,
+    b.PostUpVotes,
+    b.PostDownVotes,
+    b.PostCommentCount,
+    b.FavoriteCount,
+    b.PrimaryTag,
+    b.PostQualityCategory,
+    b.HotnessMetric,
+    b.RankByScoreInTypeAndYear,
+    b.RollingAvgPostScoreByUser,
+    b.PrevPostScoreByUser,
+    b.TimeToFirstCommentHours,
+    b.HasDuplicateLink,
+    b.MigrationCount,
+    b.ContainsPerformanceKeywords,
+    b.AvgScoreForUsersRecentTopTags,
+    'AcceptedAnswerAnalysis' AS ResultCategory -- Differentiator for UNION ALL
+FROM BaseQueryResult AS b
+WHERE b.PostTypeId = 2 -- Only answers for this branch
+  -- Correlated subquery: check if this answer is the accepted answer for its parent question
+  AND b.Id = (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = b.ParentId AND q.PostTypeId = 1)
+  AND b.PostScore >= 20 -- Only highly scored answers
+  AND b.PostQualityCategory LIKE 'Viral%' -- Focus on top tier answers
+  AND b.LatestEditHistoryDate IS NOT NULL -- Answers that have been refined
+  AND COALESCE(b.TimeToFirstCommentHours, 9999) <= 72 -- Answers that got comments within 3 days
+  AND b.MigrationCount = 0 -- Exclude answers from migrated posts
+  AND b.OwnerUserId = (SELECT q_owner.OwnerUserId FROM Posts q_owner WHERE q_owner.Id = b.ParentId) -- Answer by the question's original author
+
+ORDER BY Reputation DESC, HotnessMetric DESC, PostCreationDate DESC
+LIMIT 5000;

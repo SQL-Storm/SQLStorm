@@ -1,0 +1,68 @@
+-- {"query": "57052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 614} 
+
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        p.LastActivityDate >= DATEADD(DAY, -30, GETDATE())
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        COUNT(v.Id)
+        AS VoteCount
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), ''><''))
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count, p.Id
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.PostCount,
+    rau.TotalScore,
+    rau.LastActivity,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.Title AS PostTitle,
+    tt.Tags AS PostTags,
+    tt.Score AS PostScore,
+    tt.ViewCount,
+    SUM(tt.PostTypeId) as PostTypeIdSum,
+    tt.VoteCount
+FROM
+    RecentActiveUsers rau
+JOIN
+    TopTags tt ON tt.Tags = ANY(string_to_array(substring(tt.Tags from 2 for length(tt.Tags) - 2), ''><''))
+
+GROUP BY rau.UserId, rau.DisplayName, rau.Reputation, rau.PostCount, rau.TotalScore, rau.LastActivity, tt.TagName, tt.Count, tt.Title, tt.Tags, tt.Score, tt.ViewCount, tt.VoteCount
+ORDER BY
+    rau.Reputation DESC,
+    tt.TagCount DESC,
+    tt.ViewCount
+LIMIT
+    100;

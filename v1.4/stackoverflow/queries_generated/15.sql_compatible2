@@ -1,0 +1,48 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COALESCE(u.Views, 0) AS Views,
+  u.CreationDate,
+  u.LastAccessDate,
+  COUNT(DISTINCT p.Id) AS TotalPosts,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+  MAX(p.LastActivityDate) AS LastActivePostDate,
+  AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgOpenBounty,
+  STRING_AGG(DISTINCT bt.Name, ',') AS TopVoteTypes,
+  MAX(CASE WHEN b.Id IS NOT NULL THEN 1 ELSE 0 END) AS HasBadges,
+  SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+  SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+  SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+  vt_summary.TopVoteTypes
+FROM
+  Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN (SELECT DISTINCT UserId, Name FROM Badges WHERE Class = 1) hb ON hb.UserId = u.Id
+LEFT JOIN (
+  SELECT
+    u2.Id AS UserId,
+    STRING_AGG(DISTINCT vt.Name, ',') AS TopVoteTypes
+  FROM Users u2
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u2.Id
+  LEFT JOIN Votes v2 ON v2.PostId = p2.Id
+  LEFT JOIN VoteTypes vt ON v2.VoteTypeId = vt.Id
+  GROUP BY u2.Id
+) vt_summary ON vt_summary.UserId = u.Id
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Views,
+  u.CreationDate,
+  u.LastAccessDate,
+  vt_summary.TopVoteTypes
+ORDER BY
+  u.Reputation DESC,
+  MAX(p.LastActivityDate) DESC
+LIMIT 100;

@@ -1,0 +1,62 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RN
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate >= DATE_SUB('SECOND', 31536000 * 2, TIMESTAMP '2024-10-01 12:34:56')
+    GROUP BY
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName
+),
+FilteredPosts AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerDisplayName,
+        rp.CommentCount,
+        rp.VoteCount,
+        (
+            SELECT
+                LISTAGG(t.TagName, ', ')
+            FROM
+                (SELECT TRIM(tag) AS TagName FROM (VALUES (regexp_split_to_table(p.Tags, ','))) AS t(tag)) AS t2
+            JOIN
+                Tags t ON t.TagName = t2.TagName
+        ) AS Tags
+    FROM
+        RankedPosts rp
+    WHERE
+        rp.RN <= 5
+)
+SELECT
+    fp.PostId,
+    fp.Title,
+    fp.CreationDate,
+    fp.Score,
+    fp.ViewCount,
+    fp.OwnerDisplayName,
+    fp.CommentCount,
+    fp.VoteCount,
+    fp.Tags
+FROM
+    FilteredPosts fp
+ORDER BY
+    fp.Score DESC,
+    fp.ViewCount DESC;

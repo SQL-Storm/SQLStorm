@@ -1,0 +1,92 @@
+WITH RECURSIVE
+TagWikis AS (
+  SELECT p.Id AS PostId, p.Title, p.OwnerUserId, p.CreationDate,
+         p.LastActivityDate, p.Score, p.ViewCount, p.Tags,
+         'Wiki' AS Source
+  FROM Posts p
+  WHERE p.PostTypeId IN (4,5) -- TagWikiExcerpt/TagWiki
+),
+RecentActivity AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.LastActivityDate,
+         p.Score, p.ViewCount, p.Tags, p.PostTypeId,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+TopOwners AS (
+  SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         SUM(p.ViewCount) AS TotalViews,
+         SUM(p.Score) AS TotalScore
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ComplexMetrics AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    tc.TotalViews,
+    tc.TotalScore,
+    qn.QuestionCount,
+    an.AnswerCount,
+    CASE
+      WHEN tc.TotalViews > 1000 AND tc.TotalScore > 50 THEN true
+      ELSE false
+    END AS HighImpact,
+    MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS LastUpvoteDate,
+    MAX(CASE WHEN v.VoteTypeId = 1 THEN v.CreationDate END) AS LastAcceptanceDate
+  FROM TopOwners u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.UserId
+  LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS QuestionCount
+      FROM Posts
+      WHERE PostTypeId = 1
+      GROUP BY OwnerUserId
+  ) qn ON qn.OwnerUserId = u.UserId
+  LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS AnswerCount
+      FROM Posts
+      WHERE PostTypeId = 2
+      GROUP BY OwnerUserId
+  ) an ON an.OwnerUserId = u.UserId
+  LEFT JOIN Posts t ON t.OwnerUserId = u.UserId
+  LEFT JOIN Votes v ON v.PostId = t.Id
+  LEFT JOIN (
+      SELECT Id, OwnerUserId, SUM(ViewCount) AS TotalViews, SUM(Score) AS TotalScore
+      FROM Posts
+      GROUP BY Id, OwnerUserId
+  ) tc ON tc.OwnerUserId = u.UserId
+  GROUP BY u.UserId, u.DisplayName, u.Reputation, tc.TotalViews, tc.TotalScore, qn.QuestionCount, an.AnswerCount
+)
+SELECT
+  cm.UserId,
+  cm.DisplayName,
+  cm.Reputation,
+  cm.TotalViews,
+  cm.TotalScore,
+  cm.QuestionCount,
+  cm.AnswerCount,
+  cm.HighImpact,
+  cm.LastUpvoteDate,
+  cm.LastAcceptanceDate,
+  ARRAY_AGG(DISTINCT pt.Name) FILTER (WHERE p.PostTypeId = 1) AS RecentQuestionTypes,
+  STRING_AGG(DISTINCT t.TagName, ',') AS PopularTags,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cm.UserId) AS BadgeCount
+FROM ComplexMetrics cm
+LEFT JOIN Posts p ON p.OwnerUserId = cm.UserId
+LEFT JOIN Tags t ON t.Id IN (
+  SELECT CAST(value AS BIGINT)
+  FROM (
+    SELECT UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ',')) AS value
+  ) s
+)
+LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+GROUP BY cm.UserId, cm.DisplayName, cm.Reputation, cm.TotalViews, cm.TotalScore, cm.QuestionCount, cm.AnswerCount, cm.HighImpact, cm.LastUpvoteDate, cm.LastAcceptanceDate
+ORDER BY cm.TotalScore DESC, cm.TotalViews DESC
+LIMIT 100;

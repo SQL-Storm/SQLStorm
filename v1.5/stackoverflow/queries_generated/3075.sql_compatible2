@@ -1,0 +1,154 @@
+WITH UserReputation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS Rank
+    FROM Users u
+),
+RecentBadges AS (
+    SELECT 
+        b.Id AS BadgeId,
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class,
+        b.TagBased
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ContentLicense,
+        p.OwnerUserId,
+        ut.Name AS PostTypeName
+    FROM Posts p
+    LEFT JOIN PostTypes ut ON p.PostTypeId = ut.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.ViewCount AS AnswerViewCount,
+        a.CreationDate AS AnswerCreationDate,
+        a.LastActivityDate AS AnswerLastActivity,
+        a.OwnerUserId AS AnswerOwner,
+        a.Body AS AnswerBody
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+FilteredVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+),
+AggregatedVotes AS (
+    SELECT
+        fv.PostId,
+        COUNT(CASE WHEN fv.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN fv.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        AVG(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.LastAccessDate)) AS AvgDaysSinceLastAccess
+    FROM FilteredVotes fv
+    JOIN Users u ON fv.UserId = u.Id
+    GROUP BY fv.PostId
+),
+Links AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+TagsInfo AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired
+    FROM Tags t
+),
+QuestionTags AS (
+    SELECT 
+        p.Id AS PostId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagDetails AS (
+    SELECT 
+        qt.PostId,
+        t.TagName,
+        t.Count
+    FROM QuestionTags qt
+    JOIN TagsInfo t ON qt.TagName = t.TagName
+),
+FinalResult AS (
+    SELECT DISTINCT ON (p.Id)
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ContentLicense,
+        p.OwnerUserId,
+        ut.Name AS PostTypeName,
+        u.Reputation,
+        rb.BadgeName,
+        rb.BadgeDate,
+        rb.Class AS BadgeClass,
+        rb.TagBased,
+        av.UpVotes,
+        av.DownVotes,
+        av.AvgDaysSinceLastAccess,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerViewCount,
+        a.AnswerCreationDate,
+        a.AnswerLastActivity,
+        a.AnswerOwner,
+        a.AnswerBody,
+        l.LinkTypeName,
+        l.RelatedPostId,
+        td.TagName,
+        td.Count AS TagUsageCount
+    FROM Posts p
+    LEFT JOIN PostTypes ut ON p.PostTypeId = ut.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN RecentBadges rb ON u.Id = rb.UserId AND rb.Rank = 1
+    LEFT JOIN AnswerStats a ON p.Id = a.QuestionId
+    LEFT JOIN AggregatedVotes av ON p.Id = av.PostId
+    LEFT JOIN Links l ON p.Id = l.PostId
+    LEFT JOIN TagDetails td ON p.Id = td.PostId
+)
+SELECT *
+FROM FinalResult
+WHERE 
+    Reputation IS NOT NULL
+    AND (AnswerCount > 0 OR ViewCount > 100)
+    AND (
+        (UpVotes - DownVotes) > 10
+        OR EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = FinalResult.QuestionId)
+    )
+ORDER BY CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,104 @@
+WITH UserReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounty,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS QuestionRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE 
+        p.PostTypeId = 1
+        AND p.ClosedDate IS NULL
+    GROUP BY 
+        p.Id, p.OwnerUserId, p.Title, p.Score, p.CreationDate
+),
+HighScoreAnswers AS (
+    SELECT 
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        COUNT(c.Id) AS CommentCount
+    FROM 
+        Posts a
+    LEFT JOIN 
+        Comments c ON a.Id = c.PostId
+    WHERE 
+        a.PostTypeId = 2
+    GROUP BY 
+        a.Id, a.ParentId, a.OwnerUserId, a.Score
+    HAVING 
+        COUNT(c.Id) > 3
+),
+CombinedData AS (
+    SELECT 
+        ur.Id AS UserId,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.BadgeCount,
+        tq.Title AS TopQuestionTitle,
+        tq.Score AS TopQuestionScore,
+        tq.TotalBounty,
+        hsa.Score AS HighScoreAnswerScore,
+        (ur.Reputation + COALESCE(tq.TotalBounty, 0) + hsa.Score) AS CompositeScore
+    FROM 
+        UserReputation ur
+    LEFT JOIN 
+        TopQuestions tq ON ur.Id = tq.OwnerUserId AND tq.QuestionRank = 1
+    LEFT JOIN 
+        HighScoreAnswers hsa ON ur.Id = hsa.OwnerUserId
+    WHERE 
+        ur.ReputationRank <= 100
+)
+SELECT 
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.BadgeCount,
+    cd.TopQuestionTitle,
+    cd.TopQuestionScore,
+    cd.TotalBounty,
+    cd.HighScoreAnswerScore,
+    cd.CompositeScore,
+    -- Construct ActivitySummary in a dialect-agnostic way
+    STRING_AGG(
+        COALESCE(cd.TopQuestionTitle, ''),
+        CASE WHEN 1=1 THEN ' - ' ELSE '' END || COALESCE(CAST(cd.HighScoreAnswerScore AS VARCHAR(20)), '')
+    ) AS ActivitySummary
+FROM 
+    CombinedData cd
+WHERE 
+    (cd.TopQuestionScore > 100 OR cd.HighScoreAnswerScore > 50)
+    AND cd.CompositeScore > 500
+GROUP BY
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.BadgeCount,
+    cd.TopQuestionTitle,
+    cd.TopQuestionScore,
+    cd.TotalBounty,
+    cd.HighScoreAnswerScore,
+    cd.CompositeScore
+ORDER BY 
+    cd.CompositeScore DESC
+LIMIT 20;

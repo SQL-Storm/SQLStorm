@@ -1,0 +1,65 @@
+-- {"query": "11072.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 591} 
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+PostTags AS (
+    SELECT 
+        PostId,
+        STRING_TO_ARRAY(substring(Tags, 2, length(Tags)-2), ''><'') AS TagsArray
+    FROM Posts
+    WHERE Tags IS NOT NULL
+),
+TagCounts AS (
+    SELECT 
+        TagsArray[1] AS TagName, 
+        COUNT(*) AS PostCount
+    FROM PostTags
+    GROUP BY TagsArray[1]
+),
+UserActivity AS (
+    SELECT 
+        UserId, 
+        COUNT(DISTINCT p.Id) AS PostsCreated, 
+        COUNT(DISTINCT c.Id) AS CommentsCreated, 
+        SUM(p.Score) AS TotalScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY UserId
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    rp.VoteCount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount,
+    ua.PostsCreated, 
+    ua.CommentsCreated, 
+    ua.TotalScore,
+    tc.TagName, 
+    tc.PostCount
+FROM RecentPosts rp
+JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN TagCounts tc ON rp.Id IN (SELECT PostId FROM PostTags WHERE TagsArray @> ARRAY[tc.TagName])
+ORDER BY rp.CreationDate DESC, rp.Score DESC, ua.TotalScore DESC
+LIMIT 100;

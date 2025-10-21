@@ -1,0 +1,72 @@
+-- {"query": "28062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1614} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        RANK() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, b.Class
+),
+PostClosures AS (
+    SELECT 
+        PostId,
+        MAX(CreationDate) AS LastCloseDate,
+        (SELECT Name FROM CloseReasonTypes WHERE Id = (ph.Comment::json->>'CloseReasonId')::int) AS CloseReason
+    FROM PostHistory ph
+    WHERE PostHistoryTypeId = 10
+    GROUP BY PostId, ph.Comment
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+    (us.UpVotes - us.DownVotes) * 0.5 + us.Reputation * 0.1 AS WeightedScore,
+    pc.CloseReason,
+    STRING_AGG(DISTINCT t.TagName, '; ') AS FrequentTags,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+    AVG(p.Score) OVER (PARTITION BY us.UserId) AS AvgPostScore,
+    CASE 
+        WHEN us.Reputation > 100000 THEN 'Legendary'
+        WHEN us.Reputation BETWEEN 50000 AND 100000 THEN 'Epic'
+        ELSE 'Regular'
+    END AS UserTier
+FROM UserStats us
+JOIN Users u ON us.UserId = u.Id
+LEFT JOIN Posts p ON us.UserId = p.OwnerUserId
+LEFT JOIN PostClosures pc ON p.Id = pc.PostId
+LEFT JOIN LATERAL (
+    SELECT DISTINCT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagName
+) pt ON TRUE
+LEFT JOIN Tags t ON pt.TagName = t.TagName
+WHERE p.CreationDate BETWEEN '2015-01-01' AND '2023-12-31'
+    AND (p.ClosedDate IS NOT NULL OR pc.CloseReason IS NULL)
+    AND (p.OwnerUserId IS NOT NULL OR p.OwnerDisplayName LIKE '%Community%')
+GROUP BY us.UserId, us.Reputation, u.DisplayName, us.UpVotes, us.DownVotes, pc.CloseReason, p.Score
+HAVING COUNT(DISTINCT p.Id) > 10 AND COUNT(DISTINCT c.Id) > 50
+UNION ALL
+SELECT 
+    pl.RelatedPostId AS UserId,
+    0 AS Reputation,
+    'Duplicate Post' AS DisplayName,
+    NULL AS WeightedScore,
+    'Duplicate' AS CloseReason,
+    (SELECT STRING_AGG(TagName, '; ') FROM Tags WHERE Id IN (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))),
+    0,
+    0,
+    0,
+    'System'
+FROM PostLinks pl
+JOIN Posts p ON pl.PostId = p.Id
+WHERE pl.LinkTypeId = 3
+ORDER BY WeightedScore DESC NULLS LAST
+LIMIT 100;

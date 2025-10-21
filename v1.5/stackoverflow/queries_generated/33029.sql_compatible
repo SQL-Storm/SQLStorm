@@ -1,0 +1,89 @@
+WITH TopTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) AS TagUsageCount,
+        AVG(p.Score) AS AverageScorePerPost,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthorCount
+    FROM 
+        Tags t
+        JOIN Posts p ON t.Id = CAST(p.Tags AS TEXT) -- cast to text then compare to TagName if stored as text
+    GROUP BY 
+        t.TagName
+), 
+ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionsCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        AVG(p.Score) AS AveragePostScore
+    FROM 
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 4) AS TitleEdits,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 5) AS BodyEdits,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS ClosureReopenEvents
+    FROM 
+        PostHistory ph
+    GROUP BY 
+        ph.PostId
+),
+VoteStatistics AS (
+    SELECT 
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM 
+        Votes v
+    GROUP BY 
+        v.VoteTypeId
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsMade,
+        COUNT(c.Id) AS CommentsMade,
+        COUNT(v.Id) AS VotesCast
+    FROM 
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Comments c ON u.Id = c.UserId
+        LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    tt.TagName,
+    tt.TagUsageCount,
+    tt.AverageScorePerPost,
+    tt.UniqueAuthorCount,
+    AU.UserId,
+    AU.DisplayName,
+    AU.QuestionsCount,
+    AU.AnswersCount,
+    AU.AveragePostScore,
+    PA.TitleEdits,
+    PA.BodyEdits,
+    PA.ClosureReopenEvents,
+    VS.VoteCount,
+    VS.VoteTypeId,
+    UA.PostsMade,
+    UA.CommentsMade,
+    UA.VotesCast
+FROM 
+    TopTags tt
+    CROSS JOIN ActiveUsers AU
+    CROSS JOIN PostHistoryAnalysis PA
+    CROSS JOIN VoteStatistics VS
+    CROSS JOIN UserActivity UA
+ORDER BY 
+    tt.TagUsageCount DESC
+LIMIT 100;

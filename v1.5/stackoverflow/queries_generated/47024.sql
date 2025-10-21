@@ -1,0 +1,158 @@
+-- {"query": "47024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 55056, "output_tokens": 48928} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    JOIN Posts pt ON pt.Id = p.Id AND pt.PostTypeId = 1
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        th.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_posted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as total_answer_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN p.Id END) as great_answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CASE WHEN p.PostTypeId = 2 THEN p.Score END) as median_answer_score
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts q ON q.AcceptedAnswerId = p.Id
+    JOIN tag_hierarchy th ON q.Tags LIKE '%<' || th.TagName || '>%' OR p.Tags LIKE '%<' || th.TagName || '>%'
+    WHERE u.Reputation > 5000
+        AND p.CreationDate > CURRENT_TIMESTAMP - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, th.TagName
+    HAVING COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 5
+),
+badge_achievements AS (
+    SELECT 
+        ue.UserId,
+        ue.TagName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as bronze_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') as gold_badge_names
+    FROM user_expertise ue
+    LEFT JOIN Badges b ON b.UserId = ue.UserId 
+        AND (b.TagBased = 1 OR b.Name IN ('Great Answer', 'Good Answer', 'Nice Answer', 'Enlightened', 'Guru'))
+    GROUP BY ue.UserId, ue.TagName
+),
+engagement_metrics AS (
+    SELECT 
+        p.OwnerUserId,
+        th.TagName,
+        COUNT(DISTINCT c.Id) as comments_received,
+        SUM(c.Score) as total_comment_score,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes_received,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes_received,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) as edits_made,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) as times_linked,
+        AVG(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, CURRENT_TIMESTAMP) - p.CreationDate))/3600)::numeric(10,2) as avg_hours_to_close
+    FROM Posts p
+    JOIN tag_hierarchy th ON p.Tags LIKE '%<' || th.TagName || '>%'
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.RelatedPostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+        AND p.CreationDate > CURRENT_TIMESTAMP - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId, th.TagName
+),
+final_rankings AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TagName,
+        ue.answers_posted,
+        ue.total_answer_score,
+        ue.great_answers,
+        ue.accepted_answers,
+        ROUND(ue.avg_answer_score::numeric, 2) as avg_answer_score,
+        ue.median_answer_score,
+        COALESCE(ba.gold_badges, 0) as gold_badges,
+        COALESCE(ba.silver_badges, 0) as silver_badges,
+        COALESCE(ba.bronze_badges, 0) as bronze_badges,
+        ba.gold_badge_names,
+        COALESCE(em.comments_received, 0) as comments_received,
+        COALESCE(em.total_comment_score, 0) as total_comment_score,
+        COALESCE(em.upvotes_received, 0) as upvotes_received,
+        COALESCE(em.downvotes_received, 0) as downvotes_received,
+        COALESCE(em.edits_made, 0) as edits_made,
+        COALESCE(em.times_linked, 0) as times_linked,
+        COALESCE(em.avg_hours_to_close, 0) as avg_hours_to_close,
+        (ue.total_answer_score * 0.3 + 
+         ue.accepted_answers * 10 + 
+         ue.great_answers * 5 +
+         COALESCE(ba.gold_badges, 0) * 20 +
+         COALESCE(ba.silver_badges, 0) * 10 +
+         COALESCE(ba.bronze_badges, 0) * 5 +
+         COALESCE(em.upvotes_received, 0) * 0.1 -
+         COALESCE(em.downvotes_received, 0) * 0.2 +
+         COALESCE(em.times_linked, 0) * 2) as expertise_score,
+        DENSE_RANK() OVER (PARTITION BY ue.TagName ORDER BY 
+            (ue.total_answer_score * 0.3 + 
+             ue.accepted_answers * 10 + 
+             ue.great_answers * 5 +
+             COALESCE(ba.gold_badges, 0) * 20 +
+             COALESCE(ba.silver_badges, 0) * 10 +
+             COALESCE(ba.bronze_badges, 0) * 5 +
+             COALESCE(em.upvotes_received, 0) * 0.1 -
+             COALESCE(em.downvotes_received, 0) * 0.2 +
+             COALESCE(em.times_linked, 0) * 2) DESC) as tag_rank,
+        ROW_NUMBER() OVER (PARTITION BY ue.UserId ORDER BY ue.total_answer_score DESC) as user_best_tag_rank
+    FROM user_expertise ue
+    LEFT JOIN badge_achievements ba ON ba.UserId = ue.UserId AND ba.TagName = ue.TagName
+    LEFT JOIN engagement_metrics em ON em.OwnerUserId = ue.UserId AND em.TagName = ue.TagName
+)
+SELECT 
+    fr.TagName,
+    fr.tag_rank,
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.answers_posted,
+    fr.total_answer_score,
+    fr.great_answers,
+    fr.accepted_answers,
+    fr.avg_answer_score,
+    fr.median_answer_score,
+    fr.gold_badges,
+    fr.silver_badges,
+    fr.bronze_badges,
+    fr.gold_badge_names,
+    fr.comments_received,
+    fr.total_comment_score,
+    fr.upvotes_received,
+    fr.downvotes_received,
+    fr.edits_made,
+    fr.times_linked,
+    fr.avg_hours_to_close,
+    ROUND(fr.expertise_score::numeric, 2) as expertise_score,
+    CASE 
+        WHEN fr.tag_rank <= 3 THEN 'Elite Expert'
+        WHEN fr.tag_rank <= 10 THEN 'Top Expert'
+        WHEN fr.tag_rank <= 25 THEN 'Senior Expert'
+        WHEN fr.tag_rank <= 50 THEN 'Expert'
+        ELSE 'Active Contributor'
+    END as expertise_level,
+    COUNT(*) OVER (PARTITION BY fr.TagName) as total_experts_in_tag,
+    FIRST_VALUE(fr.DisplayName) OVER (PARTITION BY fr.TagName ORDER BY fr.expertise_score DESC) as top_expert_in_tag,
+    LAG(fr.expertise_score, 1) OVER (PARTITION BY fr.TagName ORDER BY fr.expertise_score DESC) as previous_expert_score,
+    LEAD(fr.expertise_score, 1) OVER (PARTITION BY fr.TagName ORDER BY fr.expertise_score DESC) as next_expert_score,
+    ROUND(((fr.expertise_score - MIN(fr.expertise_score) OVER (PARTITION BY fr.TagName)) / 
+           NULLIF((MAX(fr.expertise_score) OVER (PARTITION BY fr.TagName) - MIN(fr.expertise_score) OVER (PARTITION BY fr.TagName)), 0) * 100)::numeric, 2) as percentile_in_tag
+FROM final_rankings fr
+WHERE fr.user_best_tag_rank = 1
+    AND fr.tag_rank <= 100
+ORDER BY fr.TagName, fr.tag_rank;

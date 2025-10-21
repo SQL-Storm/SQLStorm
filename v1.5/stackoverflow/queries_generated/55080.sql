@@ -1,0 +1,103 @@
+-- {"query": "55080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1013} 
+
+WITH RECURSIVE TagTree AS (
+    SELECT t.Id, t.TagName, 0 AS depth
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+    UNION ALL
+    SELECT t.Id, t.TagName, tt.depth + 1
+    FROM Tags t
+    JOIN TagTree tt ON t.TagName ILIKE '%' || tt.TagName || '%'
+    WHERE tt.depth < 2
+),
+-- All questions that contain at least one tag from the TagTree
+TaggedQuestions AS (
+    SELECT p.Id AS QuestionId,
+           unnest(string_to_array(trim(both '><' FROM p.Tags), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1                     -- Question
+      AND p.Tags IS NOT NULL
+),
+-- Answers to those questions
+Answers AS (
+    SELECT a.Id AS AnswerId,
+           a.ParentId AS QuestionId,
+           a.OwnerUserId,
+           a.Score,
+           a.CreationDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2                     -- Answer
+),
+-- Join answers with their question tags
+AnswerTagMap AS (
+    SELECT a.AnswerId,
+           a.OwnerUserId,
+           a.Score,
+           a.CreationDate,
+           tq.TagName
+    FROM Answers a
+    JOIN TaggedQuestions tq ON a.QuestionId = tq.QuestionId
+),
+-- Aggregate per user per tag
+UserTagStats AS (
+    SELECT at.OwnerUserId,
+           at.TagName,
+           COUNT(*) AS AnswerCount,
+           AVG(at.Score)::numeric(10,2) AS AvgScore,
+           SUM(at.Score) AS TotalScore,
+           MIN(at.CreationDate) AS FirstAnswerDate,
+           MAX(at.CreationDate) AS LastAnswerDate
+    FROM AnswerTagMap at
+    GROUP BY at.OwnerUserId, at.TagName
+),
+-- Retrieve user reputation and gold badge status per tag
+UserInfo AS (
+    SELECT u.Id AS UserId,
+           u.Reputation,
+           u.DisplayName,
+           CASE 
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM Badges b
+                   WHERE b.UserId = u.Id
+                     AND b.Class = 1               -- Gold badge
+                     AND b.TagBased = 1
+                     AND b.Name = ut.TagName
+               ) THEN true ELSE false END AS HasGoldBadgeInTag
+    FROM Users u
+    JOIN UserTagStats ut ON u.Id = ut.OwnerUserId
+),
+-- Rank users per tag by reputation and answer count
+RankedUsers AS (
+    SELECT ui.UserId,
+           ui.DisplayName,
+           ui.Reputation,
+           ui.HasGoldBadgeInTag,
+           uts.TagName,
+           uts.AnswerCount,
+           uts.AvgScore,
+           uts.TotalScore,
+           ROW_NUMBER() OVER (PARTITION BY uts.TagName
+                              ORDER BY ui.Reputation DESC, uts.AnswerCount DESC) AS RankInTag
+    FROM UserInfo ui
+    JOIN UserTagStats uts ON ui.UserId = uts.OwnerUserId AND ui.DisplayName = ui.DisplayName
+)
+SELECT jsonb_build_object(
+           'tag', ru.TagName,
+           'top_users', jsonb_agg(
+               jsonb_build_object(
+                   'rank', ru.RankInTag,
+                   'user_id', ru.UserId,
+                   'display_name', ru.DisplayName,
+                   'reputation', ru.Reputation,
+                   'has_gold_badge', ru.HasGoldBadgeInTag,
+                   'answers', ru.AnswerCount,
+                   'average_score', ru.AvgScore,
+                   'total_score', ru.TotalScore
+               ) ORDER BY ru.RankInTag
+           )
+       ) AS tag_user_summary
+FROM RankedUsers ru
+WHERE ru.RankInTag <= 5
+GROUP BY ru.TagName
+ORDER BY ru.TagName;

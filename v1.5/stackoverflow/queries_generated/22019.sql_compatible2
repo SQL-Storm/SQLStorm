@@ -1,0 +1,98 @@
+WITH UserAggregates AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(b.Id) AS BadgeCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViews,
+        SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END ELSE 0 END) AS VoteBalance
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT OUTER JOIN Comments c ON u.Id = c.UserId
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    LEFT OUTER JOIN Votes v ON u.Id = v.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+TopUsers AS (
+    SELECT *,
+        ROW_NUMBER() OVER (ORDER BY (QuestionScore + AnswerScore + BadgeCount * 10 + COALESCE(AvgQuestionViews, 0) / 100 + VoteBalance) DESC) AS UserRank,
+        RANK() OVER (ORDER BY CommentCount DESC) AS CommentRank
+    FROM UserAggregates
+    WHERE BadgeCount > 0
+),
+UserPostsDetails AS (
+    SELECT
+        ua.Id AS UserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 4 THEN STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')
+            ELSE ARRAY[]::VARCHAR(35)[]
+        END AS TagArray,
+        ph.Id AS HistoryId,
+        ph.PostHistoryTypeId,
+        pl.RelatedPostId AS LinkedPostId
+    FROM TopUsers ua
+    LEFT OUTER JOIN Posts p ON ua.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT OUTER JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1,2,4,5)
+    LEFT OUTER JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    WHERE ua.UserRank <= 100
+),
+CorrelatedSub AS (
+    SELECT
+        up.UserId,
+        COUNT(DISTINCT up.PostId) AS ActivePosts,
+        ARRAY_AGG(DISTINCT tag) AS AllTags,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS EditCount
+    FROM (
+        SELECT
+            up.UserId,
+            up.PostId,
+            UNNEST(up.TagArray) AS tag,
+            up.HistoryId
+        FROM UserPostsDetails up
+    ) AS t
+    LEFT OUTER JOIN PostHistory ph ON t.HistoryId = ph.Id
+    GROUP BY t.UserId
+),
+FinalResult AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.QuestionScore,
+        tu.AnswerScore,
+        tu.BadgeCount,
+        COALESCE(tu.AvgQuestionViews, 0) AS AvgQuestionViews,
+        tu.VoteBalance,
+        cs.ActivePosts,
+        cs.EditCount,
+        tu.UserRank,
+        tu.CommentRank,
+        CASE
+            WHEN cs.AllTags IS NOT NULL THEN CONCAT('Tags: ', ARRAY_TO_STRING(cs.AllTags, ', '))
+            ELSE 'No Tags'
+        END AS TagSummary
+    FROM TopUsers tu
+    LEFT OUTER JOIN CorrelatedSub cs ON tu.Id = cs.UserId
+    WHERE tu.UserRank <= 50 OR tu.CommentRank <= 50
+)
+SELECT * FROM FinalResult
+UNION ALL
+SELECT
+    NULL AS Id,
+    'Summary' AS DisplayName,
+    AVG(QuestionScore) AS QuestionScore,
+    AVG(AnswerScore) AS AnswerScore,
+    AVG(BadgeCount) AS BadgeCount,
+    AVG(AvgQuestionViews) AS AvgQuestionViews,
+    AVG(VoteBalance) AS VoteBalance,
+    SUM(ActivePosts) AS ActivePosts,
+    SUM(EditCount) AS EditCount,
+    NULL AS UserRank,
+    NULL AS CommentRank,
+    'Overall Averages' AS TagSummary
+FROM FinalResult
+ORDER BY Id NULLS LAST, UserRank;

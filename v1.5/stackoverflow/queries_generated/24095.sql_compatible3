@@ -1,0 +1,96 @@
+WITH
+TaggedPosts AS (
+  SELECT
+    t.TagName,
+    t.Count AS tag_count,
+    p.Id AS post_id,
+    p.Score AS post_score,
+    p.OwnerUserId AS owner_id,
+    p.LastActivityDate,
+    p.Title,
+    p.ViewCount,
+    p.CreationDate
+  FROM Tags t
+  CROSS JOIN LATERAL (
+    SELECT p.Id, p.Score, p.OwnerUserId, p.LastActivityDate,
+           p.Title, p.ViewCount, p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags LIKE '%' || t.TagName || '%'
+    ORDER BY p.Score DESC, p.CreationDate DESC
+    LIMIT 5
+  ) AS p
+),
+PostVotes AS (
+  SELECT
+    pv.PostId,
+    SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1
+             WHEN pv.VoteTypeId = 3 THEN -1
+             ELSE 0 END) AS net_votes,
+    SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+    SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+  FROM Votes pv
+  GROUP BY pv.PostId
+),
+TagAggregates AS (
+  SELECT
+    tp.TagName,
+    COUNT(*) AS linked_posts,
+    AVG(tp.post_score) AS avg_score,
+    SUM(COALESCE(pv.net_votes, 0)) AS total_net_votes,
+    STRING_AGG(COALESCE(CAST(tp.owner_id AS VARCHAR), CAST(-1 AS VARCHAR)), ',') AS owners
+  FROM TaggedPosts tp
+  LEFT JOIN PostVotes pv
+    ON pv.PostId = tp.post_id
+  GROUP BY tp.TagName
+),
+ActivityWindow AS (
+  SELECT
+    ta.TagName,
+    ta.linked_posts,
+    ta.avg_score,
+    ta.total_net_votes,
+    ta.owners,
+    ROW_NUMBER() OVER (ORDER BY ta.total_net_votes DESC) AS vn_rnk,
+    NULLIF(SUM(ABS(ta.avg_score)) OVER (), 0) AS norm_factor
+  FROM TagAggregates ta
+),
+SetOps AS (
+  SELECT
+    aw.TagName,
+    aw.linked_posts,
+    aw.avg_score,
+    aw.total_net_votes,
+    aw.owners
+  FROM ActivityWindow aw
+  UNION ALL
+  SELECT
+    'All' AS TagName,
+    SUM(linked_posts) AS linked_posts,
+    SUM(avg_score) AS avg_score,
+    SUM(total_net_votes) AS total_net_votes,
+    NULL AS owners
+  FROM ActivityWindow
+)
+/* Final selection – mix of complex predicates, NULL juggling and
+   string concatenation logic */
+SELECT
+  so.TagName,
+  so.linked_posts,
+  so.avg_score,
+  so.total_net_votes,
+  so.owners,
+  CASE
+    WHEN so.total_net_votes > 0 THEN '+' || CAST(ROUND(so.total_net_votes, 0) AS VARCHAR)
+    WHEN so.total_net_votes < 0 THEN '-' || CAST(ROUND(ABS(so.total_net_votes), 0) AS VARCHAR)
+    ELSE '0'
+  END AS net_vote_str,
+  'https://stackoverflow.com/tags/' || LOWER(so.TagName) AS tag_url
+FROM SetOps so
+WHERE
+  (so.TagName <> 'All' AND so.linked_posts > 10) OR so.TagName = 'All'
+  AND (so.avg_score > 0 OR so.avg_score IS NULL)
+ORDER BY
+  CASE WHEN so.TagName = 'All' THEN 9999 ELSE so.vn_rnk END,
+  so.total_net_votes DESC NULLS LAST
+LIMIT 20;

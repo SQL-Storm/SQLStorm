@@ -1,0 +1,47 @@
+WITH TopActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.Location,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+    FROM Users u
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+BadgeCounts AS (
+    SELECT b.UserId, COUNT(*) AS TotalBadges, 
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentPosts AS (
+    SELECT p.OwnerUserId, COUNT(*) AS PostCount,
+           SUM(p.ViewCount) AS TotalViews,
+           SUM(p.CommentCount) AS TotalComments
+    FROM Posts p
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month'
+    GROUP BY p.OwnerUserId
+)
+SELECT u.UserId,
+       u.DisplayName,
+       u.Reputation,
+       COALESCE(b.TotalBadges, 0) AS TotalBadges,
+       COALESCE(b.GoldBadges, 0) AS GoldBadges,
+       COALESCE(b.SilverBadges, 0) AS SilverBadges,
+       COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+       COALESCE(rp.PostCount, 0) AS PostCount,
+       COALESCE(rp.TotalViews, 0) AS TotalViews,
+       COALESCE(rp.TotalComments, 0) AS TotalComments,
+       CASE 
+           WHEN COALESCE(rp.PostCount, 0) = 0 THEN 'New User'
+           WHEN COALESCE(rp.PostCount, 0) > 50 THEN 'Prolific Poster'
+           ELSE 'Active User'
+       END AS UserActivity
+FROM TopActiveUsers u
+LEFT JOIN BadgeCounts b ON u.UserId = b.UserId
+LEFT JOIN RecentPosts rp ON u.UserId = rp.OwnerUserId
+LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS PostCount
+    FROM Posts
+    GROUP BY OwnerUserId
+) r ON u.UserId = r.OwnerUserId
+WHERE EXTRACT(DAY FROM CAST(u.LastAccessDate AS TIMESTAMP) AT TIME ZONE 'UTC') = EXTRACT(DAY FROM CAST('2024-10-01 12:34:56' AS TIMESTAMP) AT TIME ZONE 'UTC')
+ORDER BY u.Rank;

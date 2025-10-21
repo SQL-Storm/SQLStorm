@@ -1,0 +1,160 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(COALESCE(vt2.CountUpVotes, 0)) AS TotalUpVotesReceived,
+        SUM(COALESCE(vt3.CountDownVotes, 0)) AS TotalDownVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS CountUpVotes
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vt2 ON vt2.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS CountDownVotes
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 3
+        GROUP BY p.OwnerUserId
+    ) vt3 ON vt3.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        PT.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(PT.Tags FROM 2 FOR LENGTH(PT.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS TagUsageCount
+    FROM Posts PT
+    WHERE PT.PostTypeId = 1 AND PT.Tags IS NOT NULL
+    GROUP BY PT.OwnerUserId, Tag
+),
+UserTopTags AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        TagUsageCount,
+        RANK() OVER (PARTITION BY OwnerUserId ORDER BY TagUsageCount DESC) AS Rnk
+    FROM TopTags
+),
+TopUserTags AS (
+    SELECT OwnerUserId, Tag, TagUsageCount
+    FROM UserTopTags
+    WHERE Rnk <= 3
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.OwnerUserId AS QuestionOwner,
+        a.OwnerUserId AS AnswerOwner,
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(COALESCE(v2.CountUpVotes,0)) AS TotalAnswerUpVotes
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT p.Id, COUNT(*) AS CountUpVotes
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+        GROUP BY p.Id
+    ) v2 ON v2.Id = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, a.OwnerUserId
+),
+UserCloseReasons AS (
+    SELECT
+        ph.UserId,
+        c.Name AS CloseReason,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes c ON CAST(c.Id AS VARCHAR) = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, c.Name
+),
+BadgeSummary AS (
+    SELECT
+        UserId,
+        Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, Class
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    ua.LastPostDate,
+    ua.AvgPostScore,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    STRING_AGG(DISTINCT tt.Tag || '(' || CAST(tt.TagUsageCount AS VARCHAR) || ')', ', ') AS TopTags,
+    COALESCE(uc.CloseReason, 'None') AS MostCommonCloseReason,
+    bsGold.BadgeCount AS GoldBadges,
+    bsSilver.BadgeCount AS SilverBadges,
+    bsBronze.BadgeCount AS BronzeBadges,
+    qa.AnswerCount AS AnswersToUserQuestions,
+    qa.MaxAnswerScore AS MaxAnswerScoreToUserQuestions,
+    qa.TotalAnswerUpVotes AS TotalUpVotesOnUserAnswers
+FROM UserActivity ua
+LEFT JOIN (
+    SELECT OwnerUserId, STRING_AGG(Tag || '(' || CAST(TagUsageCount AS VARCHAR) || ')', ', ') AS TagList
+    FROM TopUserTags
+    GROUP BY OwnerUserId
+) tt ON tt.OwnerUserId = ua.UserId
+LEFT JOIN (
+    SELECT UserId, CloseReason, CloseCount
+    FROM (
+        SELECT UserId, CloseReason, CloseCount,
+            ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY CloseCount DESC) AS rn
+        FROM UserCloseReasons
+    ) t
+    WHERE rn = 1
+) uc ON uc.UserId = ua.UserId
+LEFT JOIN BadgeSummary bsGold ON bsGold.UserId = ua.UserId AND bsGold.Class = 1
+LEFT JOIN BadgeSummary bsSilver ON bsSilver.UserId = ua.UserId AND bsSilver.Class = 2
+LEFT JOIN BadgeSummary bsBronze ON bsBronze.UserId = ua.UserId AND bsBronze.Class = 3
+LEFT JOIN (
+    SELECT 
+        QuestionOwner,
+        COUNT(DISTINCT QuestionId) AS QuestionsCount,
+        SUM(AnswerCount) AS AnswerCount,
+        MAX(MaxAnswerScore) AS MaxAnswerScore,
+        SUM(TotalAnswerUpVotes) AS TotalAnswerUpVotes
+    FROM QuestionAnswerStats
+    GROUP BY QuestionOwner
+) qa ON qa.QuestionOwner = ua.UserId
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    ua.LastPostDate,
+    ua.AvgPostScore,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    tt.TagList,
+    uc.CloseReason,
+    bsGold.BadgeCount,
+    bsSilver.BadgeCount,
+    bsBronze.BadgeCount,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.TotalAnswerUpVotes
+ORDER BY ua.TotalPosts DESC
+LIMIT 100;

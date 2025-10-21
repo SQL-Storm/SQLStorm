@@ -1,0 +1,116 @@
+-- {"query": "49033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1465} 
+
+WITH UserPostStats AS (
+    -- Summarize user post and comment activity, calculate total scores and views for owned questions.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P_OWNED_Q.Id) AS TotalQuestionsOwned,
+        COUNT(DISTINCT P_OWNED_A.Id) AS TotalAnswersWritten,
+        SUM(P_OWNED_Q.Score) AS TotalQuestionScore,
+        SUM(P_OWNED_Q.ViewCount) AS TotalQuestionViews,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(U.LastAccessDate) AS LastSeen
+    FROM Users AS U
+    LEFT JOIN Posts AS P_OWNED_Q ON U.Id = P_OWNED_Q.OwnerUserId AND P_OWNED_Q.PostTypeId = 1 -- Questions owned
+    LEFT JOIN Posts AS P_OWNED_A ON U.Id = P_OWNED_A.OwnerUserId AND P_OWNED_A.PostTypeId = 2 -- Answers written
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+),
+UserEditActivity AS (
+    -- Count distinct posts edited by each user and total specific edit actions.
+    SELECT
+        PH.UserId,
+        COUNT(DISTINCT PH.PostId) AS DistinctPostsEdited,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditsMade -- PostHistoryTypeIds: 4=Edit Title, 5=Edit Body, 6=Edit Tags
+    FROM PostHistory AS PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+UserBadgeSummary AS (
+    -- Count different badge classes (Gold, Silver, Bronze) for each user.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+PopularTaggedPosts AS (
+    -- Identify questions that are popular (high score, high view count) and associated with specific tags.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.Title
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 -- Filter for questions
+      AND P.Score >= 100 -- High score threshold
+      AND P.ViewCount >= 5000 -- High view count threshold
+      AND P.Tags IS NOT NULL
+      AND EXISTS ( -- Efficiently check for specific tags using string_to_array and UNNEST
+            SELECT 1
+            FROM UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS Tag
+            WHERE Tag IN ('sql', 'database', 'performance', 'optimization', 'query-optimization', 'indexing')
+          )
+)
+-- Main query: Combines user statistics to find highly influential and active users contributing to key technical areas.
+SELECT
+    UPS.UserId,
+    UPS.DisplayName,
+    UPS.Reputation,
+    UPS.TotalQuestionsOwned,
+    UPS.TotalAnswersWritten,
+    UPS.TotalCommentsMade,
+    COALESCE(UEA.TotalEditsMade, 0) AS TotalEditsMade,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+    SUM(PTP.Score) AS TotalScoreFromPopularTaggedQuestions,
+    SUM(PTP.ViewCount) AS TotalViewsFromPopularTaggedQuestions,
+    COUNT(DISTINCT PTP.PostId) AS NumberOfPopularTaggedQuestionsOwned,
+    AVG(PTP.Score) AS AverageScoreOfPopularTaggedQuestions,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY PTP.Score) OVER (PARTITION BY UPS.UserId) AS MedianScoreOfPopularTaggedQuestions, -- Median score for popular questions by user
+    UPS.LastSeen
+FROM UserPostStats AS UPS
+LEFT JOIN UserEditActivity AS UEA ON UPS.UserId = UEA.UserId
+LEFT JOIN UserBadgeSummary AS UBS ON UPS.UserId = UBS.UserId
+LEFT JOIN PopularTaggedPosts AS PTP ON UPS.UserId = PTP.OwnerUserId
+WHERE
+    UPS.Reputation >= 50000 -- Filter for very high reputation users
+    AND COALESCE(UBS.GoldBadges, 0) >= 5 -- At least 5 gold badges
+    AND COALESCE(UBS.SilverBadges, 0) >= 20 -- At least 20 silver badges
+    AND UPS.TotalQuestionsOwned >= 10 -- Minimum number of questions owned
+    AND UPS.TotalAnswersWritten >= 50 -- Minimum number of answers written
+    AND COALESCE(UEA.TotalEditsMade, 0) >= 50 -- Significant editing activity
+    AND EXISTS ( -- Ensure user has contributed to popular tagged posts within the last 3 years
+        SELECT 1
+        FROM PopularTaggedPosts AS PTP_recent
+        WHERE PTP_recent.OwnerUserId = UPS.UserId
+          AND PTP_recent.CreationDate >= (NOW() - INTERVAL '3 year')
+    )
+GROUP BY
+    UPS.UserId,
+    UPS.DisplayName,
+    UPS.Reputation,
+    UPS.TotalQuestionsOwned,
+    UPS.TotalAnswersWritten,
+    UPS.TotalCommentsMade,
+    UEA.TotalEditsMade,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UPS.LastSeen
+HAVING
+    COUNT(PTP.PostId) >= 5 -- Ensure the user owns at least 5 popular tagged questions
+ORDER BY
+    TotalScoreFromPopularTaggedQuestions DESC,
+    UPS.Reputation DESC,
+    GoldBadges DESC,
+    NumberOfPopularTaggedQuestionsOwned DESC
+LIMIT 200;

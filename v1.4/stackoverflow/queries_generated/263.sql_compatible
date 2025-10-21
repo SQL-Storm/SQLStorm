@@ -1,0 +1,65 @@
+WITH
+RecentActiveUsers AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         u.LastAccessDate
+  FROM Users u
+  WHERE u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+),
+PostEngagement AS (
+  SELECT p.OwnerUserId,
+         COUNT(*) AS TotalPosts,
+         SUM(p.ViewCount) AS SumViews,
+         MAX(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+UserEngagement AS (
+  SELECT ra.Id,
+         ra.DisplayName,
+         ra.Reputation,
+         ra.LastAccessDate,
+         COALESCE(pe.TotalPosts, 0) AS TotalPosts,
+         COALESCE(pe.SumViews, 0) AS SumViews,
+         COALESCE(pe.LastActive, ra.LastAccessDate) AS LastActive,
+         (SELECT COUNT(*) 
+            FROM Comments c 
+            JOIN Posts qp ON c.PostId = qp.Id
+            WHERE qp.OwnerUserId = ra.Id) AS TotalCommentsByUser
+  FROM RecentActiveUsers ra
+  LEFT JOIN PostEngagement pe ON ra.Id = pe.OwnerUserId
+),
+RankedUsers AS (
+  SELECT ue.*,
+         ROW_NUMBER() OVER (ORDER BY ue.Reputation DESC, ue.SumViews DESC, ue.LastActive DESC) AS rn
+  FROM UserEngagement ue
+),
+Label AS (
+  SELECT Id,
+         DisplayName,
+         Reputation,
+         LastActive,
+         TotalPosts,
+         SumViews,
+         TotalCommentsByUser,
+         rn,
+         (COALESCE(DisplayName, 'Unknown') || ' | rep=' || TO_CHAR(Reputation, 'FM999,999,999') ||
+          ' last=' || COALESCE(TO_CHAR(LastActive, 'YYYY-MM-DD'), '')) AS UserLabel
+  FROM RankedUsers
+)
+SELECT Id,
+       DisplayName,
+       Reputation,
+       TotalPosts,
+       SumViews,
+       TotalCommentsByUser,
+       LastActive,
+       rn AS Rank,
+       UserLabel
+FROM Label
+WHERE rn <= 200
+ORDER BY Rank;

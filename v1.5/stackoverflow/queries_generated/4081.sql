@@ -1,0 +1,131 @@
+-- {"query": "4081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1283} 
+
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id AS ExcerptPostId,
+        p.Title AS ExcerptTitle
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.Count > (SELECT AVG(Count) FROM Tags)
+    
+    UNION ALL
+    
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        p2.Id,
+        p2.Title
+    FROM Tags t2
+    JOIN TagHierarchy th ON th.Id <> t2.Id AND t2.Count < th.Count
+    LEFT JOIN Posts p2 ON p2.Id = t2.ExcerptPostId
+    WHERE t2.Count BETWEEN 0 AND (SELECT MAX(Count) FROM Tags)/2
+), LatestUserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (
+          SELECT COUNT(*)
+          FROM Posts p
+          WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CreationDate > (CURRENT_DATE - INTERVAL '1 year')
+        ) AS RecentQuestionsCount,
+        (
+          SELECT COUNT(*)
+          FROM Posts p2
+          WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2 AND p2.Score > 0
+        ) AS PositiveAnswersCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS UserRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+), UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+), QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+), TopAnswersByUser AS (
+    SELECT
+        ua.AnswerOwnerUserId AS UserId,
+        COUNT(DISTINCT ua.AnswerId) AS HighScoreAnswers,
+        AVG(ua.AnswerScore) AS AvgAnswerScore
+    FROM QuestionAnswerStats ua
+    WHERE ua.AnswerScore > 10
+    GROUP BY ua.AnswerOwnerUserId
+)
+SELECT
+    lua.Id AS UserId,
+    lua.DisplayName,
+    lua.Reputation,
+    lua.NetVotes,
+    lua.Location,
+    COALESCE(ubs.GoldBadges,0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges,0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges,0) AS BronzeBadges,
+    ubs.TotalBadges,
+    lua.RecentQuestionsCount,
+    lua.PositiveAnswersCount,
+    COALESCE(taby.HighScoreAnswers,0) AS HighScoreAnswers,
+    COALESCE(taby.AvgAnswerScore,0) AS AverageAnswerScore,
+    th.TagName AS PopularTag,
+    LENGTH(COALESCE(lua.Location,'')) AS LocationLength,
+    CASE 
+        WHEN lua.Views IS NULL THEN 0 
+        ELSE lua.Views 
+    END AS UserViews,
+    STRING_AGG(DISTINCT th.TagName, ', ') FILTER (WHERE th.TagName IS NOT NULL) OVER (PARTITION BY lua.Id) AS UserTagPreferences,
+    LEAD(lua.Reputation) OVER (ORDER BY lua.Reputation DESC) AS NextHigherReputation,
+    LAG(lua.Reputation) OVER (ORDER BY lua.Reputation DESC) AS PreviousLowerReputation,
+    CASE WHEN lua.NetVotes > 500 THEN 'High' ELSE 'Normal' END AS VoteClassification,
+    (lua.NetVotes * COALESCE(taby.AvgAnswerScore,0))::FLOAT / NULLIF(lua.Reputation,0) AS EngagementIndex,
+    CASE 
+        WHEN ubs.LastBadgeDate IS NULL THEN 'Never'
+        ELSE TO_CHAR(ubs.LastBadgeDate, 'YYYY-MM-DD')
+    END AS LastBadgeEarnedDate,
+    CASE 
+        WHEN lua.Location IS NOT NULL AND POSITION(' ' IN lua.Location) > 0 THEN LEFT(lua.Location, POSITION(' ' IN lua.Location)-1)
+        ELSE lua.Location
+    END AS LocationFirstWord
+FROM LatestUserActivity lua
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = lua.Id
+LEFT JOIN TopAnswersByUser taby ON taby.UserId = lua.Id
+LEFT JOIN LATERAL (
+    SELECT thz.TagName
+    FROM TagHierarchy thz
+    JOIN Posts pt ON pt.Tags ILIKE CONCAT('%<', thz.TagName, '>%')
+    WHERE pt.OwnerUserId = lua.Id
+    ORDER BY thz.Count DESC
+    LIMIT 1
+) th ON true
+WHERE lua.Reputation > 1500 AND lua.RecentQuestionsCount > 0
+ORDER BY lua.Reputation DESC, HighScoreAnswers DESC
+LIMIT 100;

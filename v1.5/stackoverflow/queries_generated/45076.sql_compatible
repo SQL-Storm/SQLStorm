@@ -1,0 +1,44 @@
+WITH TopUserTags AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        CAST(value AS STRING) AS Tag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgPostScore,
+        RANK() OVER (PARTITION BY CAST(value AS STRING) ORDER BY COUNT(*) DESC) AS UserTagRank
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    CROSS APPLY (
+        SELECT 
+            TRIM(BOTH '><' FROM SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2))
+    ) AS t
+    CROSS APPLY (
+        SELECT value
+        FROM STRING_SPLIT(t.value, '><')
+    ) AS s(value)
+    WHERE 
+        p.PostTypeId = 1
+        AND p.Score > 10
+    GROUP BY 
+        u.Id, u.DisplayName, CAST(s.value AS VARCHAR)
+    HAVING 
+        COUNT(*) > 5
+)
+SELECT 
+    Tag,
+    COUNT(DISTINCT UserId) AS UniqueUserCount,
+    AVG(AvgPostScore) AS AverageTagScore,
+    MAX(TagCount) AS MaxTagQuestions,
+    SUM(CASE WHEN UserTagRank <= 3 THEN 1 ELSE 0 END) AS TopRankUsers
+FROM 
+    TopUserTags
+WHERE 
+    UserTagRank <= 10
+GROUP BY 
+    Tag
+ORDER BY 
+    UniqueUserCount DESC, 
+    AverageTagScore DESC
+LIMIT 50;

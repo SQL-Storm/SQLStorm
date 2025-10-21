@@ -1,0 +1,73 @@
+-- {"query": "13052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 696} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    WHERE 
+        u.CreationDate >= DATE_TRUNC('month', cast('2024-10-01' as date) - INTERVAL '1 year')
+        AND p.CreationDate >= DATE_TRUNC('month', cast('2024-10-01' as date) - INTERVAL '1 year')
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        STRING_AGG(DISTINCT LEFT(p.Title, 50), ', ') AS SampleTitles
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.Id = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '][')::int[])
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate >= DATE_TRUNC('month', cast('2024-10-01' as date) - INTERVAL '6 months')
+    GROUP BY 
+        t.TagName
+    ORDER BY 
+        PostCount DESC
+    LIMIT 5
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalBadges,
+    tt.TagName,
+    tt.PostCount,
+    tt.SampleTitles,
+    COALESCE(ph.EditCount, 0) AS EditCount,
+    (SELECT COUNT(*) FROM Votes WHERE PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId)) AS TotalVotes
+FROM 
+    UserActivity ua
+CROSS JOIN 
+    TopTags tt
+LEFT JOIN (
+    SELECT 
+        UserId,
+        COUNT(*) AS EditCount
+    FROM 
+        PostHistory
+    WHERE 
+        PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY 
+        UserId
+) ph ON ua.UserId = ph.UserId
+WHERE 
+    ua.AvgScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+ORDER BY 
+    ua.PostRank, tt.PostCount DESC
+LIMIT 10;

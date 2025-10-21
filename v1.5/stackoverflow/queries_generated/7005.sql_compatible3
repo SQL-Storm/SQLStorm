@@ -1,0 +1,202 @@
+with
+-- recent activity per post with complex tag split and null-safe arrays
+question_tags as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.acceptedanswerid,
+    coalesce(p.tags, '') as rawtags,
+    -- ensure an empty array when no tags
+    case when p.tags is null or p.tags = '' then array[] end as tags_arr
+  from posts p
+  where p.posttypeid = 1
+),
+-- compute user score aggregates and recency metrics
+user_metrics as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    coalesce(max(p.lastactivitydate), u.creationdate) as last_activity,
+    greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(max(p.lastactivitydate), u.creationdate)))/86400) as days_since_activity,
+    sum(coalesce(p.score,0)) as total_post_score,
+    row_number() over (order by u.reputation desc nulls last, u.id) as rep_rank
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+-- heavy join: link posts with related posts, include duplicates and linked, compute degree
+post_links_expanded as (
+  select
+    pl.id as linkid,
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linktype_name,
+    pl.creationdate as link_created,
+    p1.posttypeid as post_type,
+    p2.posttypeid as related_post_type,
+    p1.score as post_score,
+    p2.score as related_score,
+    (coalesce(p1.score,0) - coalesce(p2.score,0)) as score_diff,
+    case when pl.linktypeid = 3 then true else false end as is_duplicate
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  left join posts p1 on p1.id = pl.postid
+  left join posts p2 on p2.id = pl.relatedpostid
+),
+-- identify questions with many answers, favorites, and volatile score (stddev)
+question_stats as (
+  select
+    q.id,
+    q.title,
+    q.creationdate,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.tags,
+    coalesce(avg(a.score) filter (where a.posttypeid = 2), 0) as avg_answer_score,
+    coalesce(stddev_pop(a.score) filter (where a.posttypeid = 2), 0) as stddev_answer_score,
+    count(distinct v.id) filter (where v.votetypeid = 5) as favorites_recorded,
+    count(distinct c.id) as comments_count,
+    -- detect whether there exists an accepted answer that was later deleted (via postlinks or history)
+    exists (
+      select 1 from posts a2
+      where a2.id = q.acceptedanswerid and a2.id is not null and a2.parentid = q.id and a2.creationdate < cast('2024-10-01 12:34:56' as timestamp) + interval '1 day'
+    ) as accepted_answer_exists
+  from posts q
+  left join posts a on a.parentid = q.id
+  left join votes v on v.postid = q.id
+  left join comments c on c.postid = q.id
+  where q.posttypeid = 1
+  group by q.id, q.title, q.creationdate, q.viewcount, q.answercount, q.favoritecount, q.tags
+),
+-- correlated subquery heavy: for each question, top answerer stats
+top_answerers as (
+  select
+    q.id as questionid,
+    a.owneruserid as answererid,
+    count(*) as answers_by_user,
+    sum(coalesce(a.score,0)) as sum_answer_scores,
+    max(a.score) as best_answer_score,
+    -- user's reputation at time of query via user table
+    u.reputation as answerer_reputation,
+    dense_rank() over (partition by q.id order by sum(coalesce(a.score,0)) desc, count(*) desc) as rank_for_question
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join users u on u.id = a.owneruserid
+  group by q.id, a.owneruserid, u.reputation
+),
+-- windowed time series: per month activity and trending tags (explode tags)
+exploded_tags as (
+  select
+    q.id as questionid,
+    lower(trim(t)) as tag,
+    q.creationdate::date as qdate
+  from question_tags q
+  cross join unnest(q.tags_arr) as t
+  where array_length(q.tags_arr,1) > 0
+),
+monthly_tag_trend as (
+  select
+    date_trunc('month', qdate) as month,
+    tag,
+    count(*) as tag_count,
+    rank() over (partition by date_trunc('month', qdate) order by count(*) desc) as tag_rank
+  from exploded_tags
+  group by date_trunc('month', qdate), tag
+),
+-- assemble a final rich result mixing many constructs
+final_selection as (
+  select
+    qs.id as question_id,
+    qs.title,
+    qs.creationdate,
+    qs.viewcount,
+    qs.answercount,
+    qs.favoritecount,
+    qs.tags as raw_tags,
+    -- compute a synthetic popularity score with non-linear weighting, null-safe
+    (coalesce(qs.viewcount,0) * 0.1
+     + coalesce(qs.answercount,0) * 50
+     + coalesce(qs.favoritecount,0) * 100
+     + greatest(0, coalesce(qs.avg_answer_score,0)) * 20
+     - least(coalesce(qs.stddev_answer_score,0), 100) * 5
+     + (case when qs.accepted_answer_exists then 200 else 0 end)
+    ) as popularity_score,
+    um.userid as owner_userid,
+    um.displayname as owner_displayname,
+    um.reputation as owner_reputation,
+    um.gold_badges,
+    um.silver_badges,
+    um.bronze_badges,
+    ume.top_answerer_id,
+    ume.top_answerer_score,
+    ple.duplicates_linked,
+    ple.max_score_diff,
+    mt.month,
+    -- trending tag text concatenation with null-handling
+    coalesce(string_agg(distinct mt.tag order by mt.tag rank nulls last), '<none>') over (partition by qs.id) as trending_tags_sample
+  from question_stats qs
+  left join posts powner on powner.id = qs.id
+  left join users um on um.id = powner.owneruserid
+  -- correlated aggregation to fetch top answerer for the question
+  left join lateral (
+    select
+      ta.answererid as top_answerer_id,
+      ta.sum_answer_scores as top_answerer_score
+    from top_answerers ta
+    where ta.questionid = qs.id
+    order by ta.rank_for_question asc
+    limit 1
+  ) ume on true
+  left join lateral (
+    select
+      count(*) filter (where ple.is_duplicate) as duplicates_linked,
+      max(ple.score_diff) as max_score_diff
+    from post_links_expanded ple
+    where ple.postid = qs.id or ple.relatedpostid = qs.id
+  ) ple on true
+  left join lateral (
+    select m.month
+    from monthly_tag_trend m
+    where m.tag = (select lower((coalesce(split_part(qs.tags,'><',1),''))) ) -- trick: pick first tag heuristically
+    order by m.month desc
+    limit 1
+  ) mt on true
+)
+select
+  fs.*,
+  -- heavy computed columns: percentiles via window functions, complex string manipulations
+  percentile_cont(0.5) within group (order by fs.popularity_score) over () as global_popularity_median,
+  round(100.0 * (fs.popularity_score / nullif(max(fs.popularity_score) over (),0)),2) || '%' as popularity_pct_of_max,
+  -- extract first three tags safely and present as CSV
+  (case
+     when fs.raw_tags is null or fs.raw_tags = '' then '<no-tags>'
+     else array_to_string(
+            (select array_agg(t) from unnest(string_to_array(substring(fs.raw_tags from 2 for char_length(fs.raw_tags)-2),'><')) with ordinality where ordinality <= 3), ','
+          )
+   end) as top_3_tags,
+  -- flag suspicious records via complicated boolean logic and null checks
+  (case
+     when fs.owner_userid is null then 'orphan'
+     when fs.owner_reputation < 50 and fs.popularity_score > 500 then 'possible-sybil'
+     when fs.duplicates_linked > 5 then 'meta-duplicate-hub'
+     else 'ok'
+   end) as quality_flag
+from final_selection fs
+where
+  -- complex predicate combining ranges, string pattern, and null checks
+  (fs.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '3 years' or fs.viewcount > 10000)
+  and (
+    fs.title ilike any (array['%performance%','%benchmark%','%optimization%'])
+    or fs.raw_tags ilike '%sql%'
+    or fs.popularity_score > 1000
+  )
+order by fs.popularity_score desc nulls last, fs.viewcount desc
+limit 200;

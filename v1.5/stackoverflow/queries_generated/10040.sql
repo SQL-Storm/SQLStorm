@@ -1,0 +1,44 @@
+-- {"query": "10040.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 430} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.LastActivityDate) AS LastActivity,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS MaxAnswerCount,
+    MIN(CASE WHEN p.PostTypeId = 1 THEN p.ClosedDate ELSE p.LastActivityDate END) AS FirstClosedOrActivity,
+    b.Name AS LatestBadge,
+    b.Date AS BadgeDate,
+    ph.Comment AS LastEditComment,
+    ph.RevisionGUID,
+    ph.CreationDate AS LastEditDate
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT Id, UserId, MAX(Date) AS MaxDate
+     FROM Badges
+     GROUP BY UserId) b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT ph.PostId, ph.UserId, ph.RevisionGUID, ph.CreationDate, ph.Comment
+     FROM PostHistory ph
+     WHERE ph.PostHistoryTypeId IN (1, 2, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+     ORDER BY ph.CreationDate DESC
+     LIMIT 1) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    p.LastActivityDate > p.CreationDate
+    AND p.PostTypeId IN (1, 2)
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(p.Id) > 10
+ORDER BY 
+    TotalScore DESC, 
+    LastActivity DESC;

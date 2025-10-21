@@ -1,0 +1,116 @@
+-- {"query": "16064.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 151775, "output_tokens": 140079} 
+
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as question_score,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as answer_score,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'Unknown'), 1, 20) ORDER BY u.Reputation DESC) as location_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) as badge_rank,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) as prev_user_reputation,
+        LEAD(u.CreationDate, 1) OVER (ORDER BY u.CreationDate) - u.CreationDate as time_to_next_user
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= '2020-01-01'
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId AND b.Class <= 2
+    WHERE u.Reputation > 1000
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5 OR COUNT(DISTINCT b.Id) > 3
+),
+post_interaction_graph AS (
+    SELECT 
+        p.Id as post_id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) as answer_count,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) as positive_comments,
+        (SELECT AVG(v.CreationDate - p.CreationDate) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+         HAVING COUNT(*) > 0) as avg_vote_delay,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Unanswered'
+        END as post_status,
+        string_to_array(COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ''), '><') as tag_array
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+        AND (p.Score >= 5 OR p.ViewCount > 1000)
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId as user_id,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as tag_name,
+        COUNT(*) as tag_post_count,
+        AVG(p.Score) as avg_tag_score,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as accepted_answer_count,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Location, 'Unknown Location') as location,
+    uam.Reputation,
+    uam.post_count,
+    uam.badge_count,
+    uam.question_score + uam.answer_score as total_score,
+    ROUND(CAST(uam.question_score AS NUMERIC) / NULLIF(uam.answer_score, 0), 2) as question_answer_ratio,
+    uam.location_rank,
+    pig.post_status,
+    COUNT(DISTINCT pig.post_id) as matching_posts,
+    AVG(pig.ViewCount) as avg_views,
+    MAX(pig.Score) as max_post_score,
+    STRING_AGG(DISTINCT te.tag_name, ', ' ORDER BY te.tag_name) FILTER (WHERE te.tag_post_count >= 3) as expert_tags,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostLinks pl
+         INNER JOIN Posts linked_post ON pl.RelatedPostId = linked_post.Id
+         WHERE pl.PostId = pig.post_id 
+            AND pl.LinkTypeId = 1
+            AND linked_post.Score > pig.Score), 0) as outbound_links_to_better_posts,
+    CASE 
+        WHEN uam.badge_rank <= 10 THEN 'Elite'
+        WHEN uam.badge_rank <= 50 THEN 'Advanced'
+        WHEN uam.badge_rank <= 200 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as user_tier,
+    EXTRACT(EPOCH FROM COALESCE(pig.avg_vote_delay, INTERVAL '0 seconds'))/3600.0 as avg_vote_delay_hours
+FROM user_activity_metrics uam
+INNER JOIN post_interaction_graph pig ON uam.Id = pig.OwnerUserId
+LEFT OUTER JOIN tag_expertise te ON uam.Id = te.user_id AND te.tag_post_count >= 2
+WHERE uam.location_rank <= 100
+    AND pig.answer_count >= 1
+    AND (pig.positive_comments > 0 OR pig.Score >= 10)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.PostId = pig.post_id 
+            AND v.VoteTypeId IN (4, 12)
+    )
+GROUP BY 
+    uam.DisplayName, uam.Location, uam.Reputation, uam.post_count, 
+    uam.badge_count, uam.question_score, uam.answer_score, 
+    uam.location_rank, pig.post_status, pig.post_id, 
+    pig.Score, pig.avg_vote_delay, uam.badge_rank
+HAVING AVG(pig.ViewCount) > 500
+    AND COUNT(DISTINCT pig.post_id) BETWEEN 2 AND 100
+ORDER BY 
+    uam.Reputation DESC,
+    total_score DESC,
+    avg_views DESC NULLS LAST
+LIMIT 500;

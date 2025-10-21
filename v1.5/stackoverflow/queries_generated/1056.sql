@@ -1,0 +1,68 @@
+-- {"query": "1056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 446} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS UpVotes,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS DownVotes,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON v.PostId = p.Id
+    LEFT JOIN 
+        Comments c ON c.PostId = p.Id
+    WHERE 
+        p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        p.Id
+),
+UserWithMostPosts AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(PostId) AS TotalPosts
+    FROM 
+        RankedPosts
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(PostId) > 5
+),
+TopRankedPosts AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.CommentCount,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY rp.UpVotes DESC) AS VoteRank
+    FROM 
+        RankedPosts rp
+    JOIN 
+        Users u ON rp.OwnerUserId = u.Id
+    WHERE 
+        rp.PostRank = 1
+        AND rp.OwnerUserId IN (SELECT OwnerUserId FROM UserWithMostPosts)
+)
+SELECT 
+    trp.Title,
+    trp.UpVotes,
+    trp.DownVotes,
+    trp.CommentCount,
+    trp.DisplayName,
+    trp.Reputation,
+    CASE 
+        WHEN trp.VoteRank <= 10 THEN 'Top 10 Post'
+        ELSE 'Other Post'
+    END AS RankCategory
+FROM 
+    TopRankedPosts trp
+ORDER BY 
+    trp.UpVotes DESC, 
+    trp.CommentCount DESC;

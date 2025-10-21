@@ -1,0 +1,222 @@
+WITH RECURSIVE RecursiveUserTree AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        p.OwnerUserId,
+        COALESCE(p.LastEditorUserId, 0) AS LastEditorUserId,
+        COALESCE(pv.BountyAmount, 0) AS BountyAmount,
+        COALESCE(pv.VoteTypeId, 0) AS VoteTypeId,
+        COALESCE(v.UserId, 0) AS VoterUserId,
+        EXTRACT(YEAR FROM p.CreationDate) AS Year,
+        EXTRACT(MONTH FROM p.CreationDate) AS Month
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN LATERAL
+    (
+    SELECT v2.VoteTypeId, v2.Id, v2.BountyAmount FROM Votes v2 WHERE v2.PostId = p.Id LIMIT 1
+    ) AS pv ON TRUE
+    WHERE
+        u.Reputation > 1000
+        AND p.PostTypeId IN (1, 2)
+        AND p.CreationDate > DATE '2022-01-01'
+
+    UNION ALL
+
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        pv.BountyAmount,
+        pv.VoteTypeId,
+        v.UserId AS VoterUserId,
+        EXTRACT(YEAR FROM p.CreationDate),
+        EXTRACT(MONTH FROM p.CreationDate)
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    JOIN
+        RecursiveUserTree rut ON rut.UserId = p.OwnerUserId
+    JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN LATERAL
+    (
+    SELECT v2.VoteTypeId, v2.Id, v2.BountyAmount FROM Votes v2 WHERE v2.PostId = p.Id LIMIT 1
+    ) AS pv ON TRUE
+),
+TopUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        COUNT(PostId) AS TotalPosts,
+        SUM(PostScore) AS TotalScore,
+        AVG(PostScore) AS AverageScore,
+        SUM(ViewCount) AS TotalViews,
+        AVG(ViewCount) AS AverageViews,
+        SUM(AnswerCount) AS TotalAnswers,
+        AVG(AnswerCount) AS AverageAnswers,
+        SUM(CommentCount) AS TotalComments,
+        AVG(CommentCount) AS AverageComments,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        SUM(BountyAmount) AS TotalBountyAmount
+    FROM
+        RecursiveUserTree
+    GROUP BY
+        UserId,
+        DisplayName
+    ORDER BY
+        TotalScore DESC
+    LIMIT 50
+), TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.LastEditorUserId,
+        COALESCE(e.DisplayName, 'Unknown') AS LastEditorDisplayName,
+        p.LastEditDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.AcceptedAnswerId,
+        COALESCE(a.Title, 'No Accepted Answer') AS AcceptedAnswerTitle,
+        COALESCE(CASE
+        WHEN accepthist.userId IS NULL
+            THEN 0
+        ELSE accepthist.UserId
+        END, 0) AS AcceptedAnswerUserId,
+        accepthist.DisplayName as AcceptedAnswerDisplayName,
+        COALESCE(accepthist.CreationDate, p.CreationDate) AS acceptedAnswerDate,
+        COALESCE(accepthist.Comment, 'Not folded into the question') AS acceptedAnswerComment,
+        pv.VoteTypeId,
+        STRING_AGG( DISTINCT t.TagName, '|||' )  AS condensedTags
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    JOIN Users e ON p.LastEditorUserId = e.Id
+    LEFT JOIN
+        PostHistory accepthist ON p.PostId = accepthist.PostId and p.AcceptedAnswerId = accepthist.PostId
+    LEFT JOIN
+    PostHistory ph ON ph.PostId = p.Id AND ph.UserId = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN LATERAL
+    (
+        SELECT v2.VoteTypeId, v2.Id, v2.BountyAmount FROM Votes v2 WHERE v2.PostId = p.Id
+    ) AS pv ON TRUE
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN LATERAL
+    (
+    SELECT t2.TagName, t2.Id FROM Tags t2 WHERE (POSITION('<' IN p.Tags) - 1) / 3 = t2.Id
+    ) AS t ON TRUE
+    WHERE
+        PostTypeId IN (1,2)
+    GROUP BY
+        p.Id,
+        u.DisplayName,
+        e.DisplayName,
+        a.Title,
+         accepthist.UserId,
+         ph.UserId,
+          accepthist.DisplayName,
+          ph.DisplayName,
+          accepthist.CreationDate,
+          ph.CreationDate,
+          accepthist.Comment,
+          ph.Comment, a.Id, ph.UserId
+), MonthlyMetrics AS (
+    SELECT
+        Year,
+        Month,
+        COUNT(PostId) AS PostsCount,
+        COUNT(DISTINCT p.OwnerUserId) AS ActiveUsers,
+        AVG(p.Score) AS AveragePostScore,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.ViewCount) AS AverageViews,
+        SUM(p.AnswerCount) AS TotalAnswers,
+        AVG(p.AnswerCount) AS AverageAnswers,
+        SUM(p.CommentCount) AS TotalComments,
+        AVG(p.CommentCount) AS AverageComments,
+        SUM(pv.VoteTypeId) AS TotalVotes,
+        SUM(pv.BountyAmount) AS totalPostBountyAmount,
+        SUM(CASE WHEN pv.BountyAmount > 0 THEN ph.UserId ELSE 0 END) AS totalCommentBountyAmount
+    FROM
+        RecursiveUserTree p
+        JOIN LATERAL
+        (
+        SELECT p2.VoteTypeId, p2.Id, p2.BountyAmount FROM Votes p2 WHERE p2.PostId = p.PostId
+        ) AS pv ON pv.BountyAmount IS DISTINCT FROM 0
+        LEFT JOIN LATERAL
+        (
+           SELECT  ph2.UserId, ph2.CreationDate, ph2.Comment FROM PostHistory ph2 WHERE ph2.PostId = p.Id
+        ) AS ph ON TRUE
+    GROUP BY
+        Year,
+        Month
+    ORDER BY
+        Year DESC,
+        Month DESC
+)
+SELECT
+    t1.UserId,
+    t1.DisplayName,
+    t1.TotalPosts,
+    t1.TotalScore,
+    t1.AverageScore,
+    t1.TotalViews,
+    t1.AverageViews,
+    t1.TotalAnswers,
+    t1.AverageAnswers,
+    t1.TotalComments,
+    t1.AverageComments,
+    t1.TotalUpvotes,
+    t1.TotalDownvotes,
+    t1.TotalBountyAmount,
+    t3.*
+FROM
+    TopUsers t1
+JOIN
+    TopPosts t2 ON t1.UserId = t2.OwnerUserId
+LEFT JOIN
+    (SELECT Year, Month, totalPostBountyAmount
+        FROM MonthlyMetrics
+        GROUP BY Year, Month) t3
+        ON EXTRACT(MONTH FROM t2.CreationDate) = t3.Month AND EXTRACT(YEAR FROM t2.CreationDate) = t3.Year

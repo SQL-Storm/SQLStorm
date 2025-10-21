@@ -1,0 +1,135 @@
+-- {"query": "16007.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 18680, "output_tokens": 17525} 
+WITH RECURSIVE user_activity_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+    EXTRACT(YEAR FROM u.CreationDate) AS join_year,
+    CASE 
+      WHEN u.Reputation > 10000 THEN 'Elite'
+      WHEN u.Reputation > 1000 THEN 'Advanced'
+      WHEN u.Reputation > 100 THEN 'Intermediate'
+      ELSE 'Beginner'
+    END AS user_tier
+  FROM Users u
+  WHERE u.Reputation > 0 AND u.CreationDate IS NOT NULL
+),
+post_analytics AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(LENGTH(p.Body), 0) AS body_length,
+    CASE 
+      WHEN p.Tags IS NOT NULL THEN array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1)
+      ELSE 0 
+    END AS tag_count,
+    EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/3600.0 AS hours_active,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS user_post_rank,
+    AVG(p.Score) OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate)) AS yearly_avg_score,
+    PERCENT_RANK() OVER (ORDER BY p.ViewCount NULLS LAST) AS view_percentile
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+badge_aggregates AS (
+  SELECT 
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+    COUNT(DISTINCT b.Name) AS unique_badge_types,
+    MAX(b.Date) AS last_badge_date,
+    STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ') AS gold_badge_names
+  FROM Badges b
+  GROUP BY b.UserId
+),
+comment_sentiment AS (
+  SELECT 
+    c.UserId,
+    c.PostId,
+    COUNT(*) AS comment_count,
+    AVG(c.Score) AS avg_comment_score,
+    MAX(LENGTH(c.Text)) AS max_comment_length,
+    SUM(CASE WHEN c.Text LIKE '%thanks%' OR c.Text LIKE '%thank you%' THEN 1 ELSE 0 END) AS polite_comments
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.UserId, c.PostId
+),
+vote_patterns AS (
+  SELECT 
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS bounty_starts,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS total_bounty_amount,
+    MAX(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  GROUP BY v.PostId
+)
+SELECT 
+  uam.DisplayName,
+  uam.user_tier,
+  uam.Reputation,
+  COALESCE(ba.gold_badges, 0) + COALESCE(ba.silver_badges, 0) + COALESCE(ba.bronze_badges, 0) AS total_badges,
+  ba.gold_badge_names,
+  pa.post_id,
+  pa.Score AS post_score,
+  pa.ViewCount,
+  pa.body_length,
+  pa.tag_count,
+  ROUND(pa.hours_active::numeric, 2) AS hours_active,
+  pa.user_post_rank,
+  ROUND(pa.yearly_avg_score::numeric, 2) AS yearly_avg_score,
+  ROUND(pa.view_percentile::numeric, 4) AS view_percentile,
+  COALESCE(vp.upvotes, 0) AS post_upvotes,
+  COALESCE(vp.downvotes, 0) AS post_downvotes,
+  COALESCE(vp.total_bounty_amount, 0) AS bounty_amount,
+  COALESCE(cs.comment_count, 0) AS user_comments_on_post,
+  COALESCE(cs.avg_comment_score, 0) AS avg_comment_score,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.post_id AND pl.LinkTypeId = 3) AS duplicate_links,
+  (SELECT COUNT(DISTINCT ph.UserId) 
+   FROM PostHistory ph 
+   WHERE ph.PostId = pa.post_id 
+     AND ph.PostHistoryTypeId IN (4, 5, 6)
+     AND ph.UserId IS NOT NULL) AS unique_editors,
+  CASE 
+    WHEN EXISTS(SELECT 1 FROM Posts p2 WHERE p2.AcceptedAnswerId = pa.post_id) THEN 'Accepted Answer'
+    WHEN pa.PostTypeId = 1 AND pa.AnswerCount > 0 THEN 'Has Answers'
+    WHEN pa.PostTypeId = 1 AND pa.AnswerCount = 0 THEN 'Unanswered'
+    WHEN pa.PostTypeId = 2 THEN 'Is Answer'
+    ELSE 'Other'
+  END AS post_status,
+  COALESCE(
+    (SELECT AVG(p3.Score) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = uam.Id 
+       AND p3.PostTypeId = pa.PostTypeId
+       AND p3.CreationDate < (SELECT p4.CreationDate FROM Posts p4 WHERE p4.Id = pa.post_id)),
+    0
+  ) AS user_historical_avg_score,
+  DENSE_RANK() OVER (
+    PARTITION BY uam.user_tier 
+    ORDER BY (COALESCE(pa.Score, 0) * 10 + COALESCE(pa.ViewCount, 0) / 100.0) DESC
+  ) AS tier_rank
+FROM user_activity_metrics uam
+INNER JOIN post_analytics pa ON uam.Id = pa.OwnerUserId
+LEFT OUTER JOIN badge_aggregates ba ON uam.Id = ba.UserId
+LEFT OUTER JOIN comment_sentiment cs ON uam.Id = cs.UserId AND pa.post_id = cs.PostId
+LEFT OUTER JOIN vote_patterns vp ON pa.post_id = vp.PostId
+WHERE pa.user_post_rank <= 10
+  AND (pa.Score > 5 OR pa.ViewCount > 1000 OR COALESCE(vp.upvotes, 0) > 3)
+  AND (ba.gold_badges > 0 OR ba.silver_badges >= 3 OR uam.Reputation > 500)
+  AND pa.body_length BETWEEN 100 AND 50000
+  AND uam.join_year >= 2015
+ORDER BY 
+  uam.Reputation DESC,
+  pa.Score DESC,
+  pa.ViewCount DESC NULLS LAST
+LIMIT 1000;

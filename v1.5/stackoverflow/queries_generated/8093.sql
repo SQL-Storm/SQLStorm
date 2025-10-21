@@ -1,0 +1,294 @@
+-- {"query": "8093.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3249} 
+with
+recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.creationdate,
+         coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''),'//',2)),''),
+                  lower(replace(regexp_replace(coalesce(u.emailhash,''),'[^a-z0-9]','', 'g'), ' ', ''))) as site_or_hash,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '5 years' from users)
+),
+user_badge_agg as (
+  select b.userid,
+         count(*) as badge_count,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+q as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         p.title,
+         p.tags,
+         (p.viewcount::numeric / nullif(greatest(extract(epoch from (now() - p.creationdate)) / 3600.0, 1.0),0)) as views_per_hour,
+         case when p.closeddate is null then 0 else 1 end as is_closed
+  from posts p
+  where p.posttypeid = 1
+),
+a as (
+  select p.parentid as question_id,
+         count(*) as answers,
+         avg(p.score) as avg_answer_score,
+         max(p.score) filter (where p.score is not null) as max_answer_score,
+         count(*) filter (where p.owneruserid is null) as anon_answers
+  from posts p
+  where p.posttypeid = 2
+  group by p.parentid
+),
+q_votes as (
+  select v.postid as post_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+         count(*) filter (where v.votetypeid in (10,12)) as delete_or_spam_votes
+  from votes v
+  group by v.postid
+),
+q_comments as (
+  select c.postid as post_id,
+         count(*) as comment_count,
+         max(c.score) as max_comment_score,
+         min(c.creationdate) as first_comment_date,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+dup_links as (
+  select pl.postid as post_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as linked_links,
+         count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_duplicates
+  from postlinks pl
+  group by pl.postid
+),
+edits as (
+  select ph.postid as post_id,
+         count(*) as total_history_events,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36)) as mod_state_events,
+         max(ph.creationdate) as last_event_date,
+         min(ph.creationdate) as first_event_date,
+         sum(case when ph.posthistorytypeid = 10 and (ph.comment ~ '^[0-9]+$') then 1 else 0 end) as closed_events
+  from posthistory ph
+  group by ph.postid
+),
+tag_explode as (
+  select q.post_id,
+         unnest(string_to_array(substring(coalesce(q.tags,'<>'), 2, greatest(length(coalesce(q.tags,'<>'))-2,0)), '><')) as tagname
+  from q
+),
+tag_stats as (
+  select te.post_id,
+         count(*) as tag_count,
+         string_agg(te.tagname, ',' order by te.tagname) as tag_list,
+         max(t.count) as max_tag_popularity,
+         avg(t.count::numeric) as avg_tag_popularity
+  from tag_explode te
+  left join tags t on lower(t.tagname) = lower(te.tagname)
+  group by te.post_id
+),
+accepted_latency as (
+  select q.post_id,
+         case
+           when p.acceptedanswerid is not null then
+             extract(epoch from (coalesce(a2.creationdate, p2.creationdate) - p.creationdate))::bigint
+           else null
+         end as accept_latency_seconds
+  from q
+  join posts p on p.id = q.post_id
+  left join posts p2 on p2.id = p.acceptedanswerid
+  left join posts a2 on a2.id = p.acceptedanswerid and a2.posttypeid = 2
+),
+recent_q as (
+  select q.*,
+         coalesce(a.answers,0) as answers,
+         coalesce(a.avg_answer_score,0) as avg_answer_score,
+         coalesce(a.max_answer_score,0) as max_answer_score,
+         coalesce(a.anon_answers,0) as anon_answers,
+         coalesce(v.upvotes,0) as upvotes,
+         coalesce(v.downvotes,0) as downvotes,
+         coalesce(v.bounty_started,0) as bounty_started,
+         coalesce(v.bounty_awarded,0) as bounty_awarded,
+         coalesce(v.delete_or_spam_votes,0) as delete_or_spam_votes,
+         coalesce(c.comment_count,0) as comment_count,
+         c.max_comment_score,
+         c.first_comment_date,
+         c.last_comment_date,
+         coalesce(d.duplicate_links,0) as duplicate_links,
+         coalesce(d.linked_links,0) as linked_links,
+         coalesce(d.distinct_duplicates,0) as distinct_duplicates,
+         coalesce(e.total_history_events,0) as total_history_events,
+         coalesce(e.edit_events,0) as edit_events,
+         coalesce(e.mod_state_events,0) as mod_state_events,
+         e.last_event_date,
+         e.first_event_date
+  from q
+  left join a on a.question_id = q.post_id
+  left join q_votes v on v.post_id = q.post_id
+  left join q_comments c on c.post_id = q.post_id
+  left join dup_links d on d.post_id = q.post_id
+  left join edits e on e.post_id = q.post_id
+),
+ranked_q as (
+  select rq.*,
+         ts.tag_count,
+         ts.tag_list,
+         ts.max_tag_popularity,
+         ts.avg_tag_popularity,
+         al.accept_latency_seconds,
+         dense_rank() over (order by coalesce(rq.viewcount,0) desc, coalesce(rq.score,0) desc, rq.creationdate desc) as dr_views_score_time,
+         row_number() over (partition by (rq.is_closed) order by (coalesce(rq.upvotes,0) - coalesce(rq.downvotes,0)) desc, rq.viewcount desc) as rn_by_closed,
+         percentile_disc(0.5) within group (order by coalesce(rq.viewcount,0)) over () as p50_views_all,
+         avg(coalesce(rq.score,0)) over () as avg_score_all
+  from recent_q rq
+  left join tag_stats ts on ts.post_id = rq.post_id
+  left join accepted_latency al on al.post_id = rq.post_id
+),
+user_activity as (
+  select u.id as user_id,
+         count(*) filter (where p.posttypeid = 1) as questions_posted,
+         count(*) filter (where p.posttypeid = 2) as answers_posted,
+         sum(coalesce(p.score,0)) as total_post_score,
+         max(p.creationdate) as last_post_date
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+question_owner as (
+  select p.id as post_id,
+         coalesce(p.owneruserid, -1) as owner_id,
+         coalesce(nullif(p.ownerdisplayname,''), u.displayname) as owner_display,
+         u.reputation as owner_rep,
+         u.location as owner_loc
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.posttypeid = 1
+),
+final_scores as (
+  select rq.post_id,
+         rq.title,
+         rq.creationdate,
+         rq.viewcount,
+         rq.score,
+         rq.answers,
+         rq.upvotes,
+         rq.downvotes,
+         rq.comment_count,
+         rq.edit_events,
+         rq.mod_state_events,
+         rq.duplicate_links,
+         rq.distinct_duplicates,
+         rq.tag_count,
+         rq.avg_tag_popularity,
+         rq.views_per_hour,
+         rq.is_closed,
+         rq.accept_latency_seconds,
+         qo.owner_id,
+         qa.questions_posted,
+         qa.answers_posted,
+         uba.badge_count,
+         uba.gold_count,
+         uba.silver_count,
+         uba.bronze_count,
+         ru.displayname as user_displayname,
+         ru.reputation as user_reputation,
+         case when rq.tag_count = 0 or rq.tag_count is null then null
+              else (rq.score::numeric / rq.tag_count)::numeric end as score_per_tag,
+         case when (rq.upvotes + rq.downvotes) = 0 then null
+              else rq.upvotes::numeric / nullif((rq.upvotes + rq.downvotes),0) end as upvote_ratio,
+         case when rq.viewcount is null or rq.viewcount = 0 then null
+              else rq.comment_count::numeric / nullif(rq.viewcount,0) end as comments_per_view,
+         (coalesce(rq.viewcount,0) * 0.002
+           + coalesce(rq.score,0) * 1.5
+           + coalesce(rq.upvotes,0) * 0.75
+           - coalesce(rq.downvotes,0) * 0.9
+           + coalesce(rq.comment_count,0) * 0.1
+           - coalesce(rq.distinct_duplicates,0) * 2
+           + coalesce(rq.edit_events,0) * 0.05
+           + coalesce(rq.avg_tag_popularity,0) * 0.0005
+           + coalesce(uba.gold_count,0) * 0.7
+           + coalesce(uba.silver_count,0) * 0.3
+           + coalesce(uba.bronze_count,0) * 0.1
+           + case when rq.is_closed = 1 then -5 else 0 end
+           - least(greatest(coalesce(rq.accept_latency_seconds,0) / 3600.0, 0), 720) * 0.01
+         ) as composite_score
+  from ranked_q rq
+  left join question_owner qo on qo.post_id = rq.post_id
+  left join user_activity qa on qa.user_id = qo.owner_id
+  left join user_badge_agg uba on uba.userid = qo.owner_id
+  left join recent_users ru on ru.user_id = qo.owner_id
+),
+top_candidates as (
+  select fs.*,
+         row_number() over (order by fs.composite_score desc nulls last, fs.viewcount desc nulls last, fs.score desc nulls last) as rn_global,
+         row_number() over (partition by case when fs.is_closed = 1 then 'closed' else 'open' end
+                            order by fs.composite_score desc nulls last) as rn_by_state
+  from final_scores fs
+),
+anomalies as (
+  select fs.post_id,
+         (fs.upvote_ratio is distinct from case when fs.viewcount > fs.p50_views_all then 0.7 else 0.5 end) as ratio_vs_expectation,
+         (fs.comments_per_view > 0.05 and fs.viewcount > fs.p50_views_all) as chatty_heavy_view,
+         (fs.downvotes > fs.upvotes and fs.viewcount > 1000) as controversial_popular
+  from (
+    select tc.*,
+           percentile_disc(0.5) within group (order by coalesce(tc.viewcount,0)) over () as p50_views_all
+    from top_candidates tc
+  ) fs
+)
+select
+  tc.post_id,
+  coalesce(tc.title, '(no title)') as title,
+  tc.creationdate,
+  tc.viewcount,
+  tc.score,
+  tc.answers,
+  tc.upvotes,
+  tc.downvotes,
+  tc.comment_count,
+  tc.edit_events,
+  tc.mod_state_events,
+  tc.duplicate_links,
+  tc.distinct_duplicates,
+  tc.tag_count,
+  round(tc.avg_tag_popularity::numeric, 2) as avg_tag_popularity,
+  round(tc.views_per_hour::numeric, 4) as views_per_hour,
+  tc.is_closed,
+  tc.accept_latency_seconds,
+  tc.owner_id as owner_user_id,
+  coalesce(tc.questions_posted,0) as owner_questions_posted,
+  coalesce(tc.answers_posted,0) as owner_answers_posted,
+  coalesce(tc.badge_count,0) as owner_badge_count,
+  tc.gold_count,
+  tc.silver_count,
+  tc.bronze_count,
+  coalesce(tc.user_displayname,'(deleted)') as owner_displayname,
+  tc.user_reputation as owner_reputation,
+  round(tc.score_per_tag::numeric, 3) as score_per_tag,
+  round(tc.upvote_ratio::numeric, 3) as upvote_ratio,
+  round(tc.comments_per_view::numeric, 5) as comments_per_view,
+  round(tc.composite_score::numeric, 4) as composite_score,
+  tc.rn_global,
+  tc.rn_by_state,
+  case when an.ratio_vs_expectation then 'ratio_anomaly' end as ratio_anomaly,
+  case when an.chatty_heavy_view then 'chatty_heavy_view' end as chatty,
+  case when an.controversial_popular then 'controversial_popular' end as controversial_flag
+from top_candidates tc
+left join anomalies an on an.post_id = tc.post_id
+where tc.rn_global <= 200
+   or tc.rn_by_state <= 100
+order by tc.composite_score desc nulls last, tc.viewcount desc nulls last, tc.score desc nulls last;

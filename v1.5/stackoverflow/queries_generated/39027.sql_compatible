@@ -1,0 +1,128 @@
+WITH
+PostsWithTags AS (
+    SELECT
+        p.Id            AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        UNNEST(
+          STRING_TO_ARRAY(
+            SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2),
+            '><'
+          )
+        )           AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagStats AS (
+    SELECT
+        Tag,
+        COUNT(*)            AS QuestionCount,
+        AVG(Score)          AS AvgScore,
+        MAX(ViewCount)      AS MaxViews
+    FROM PostsWithTags
+    GROUP BY Tag
+),
+TopUsersByTag AS (
+    SELECT
+        pt.Tag,
+        u.Id                AS UserId,
+        u.DisplayName,
+        COUNT(*)            AS QuestionsAsked,
+        SUM(p.Score)        AS TotalScore,
+        RANK() OVER (
+          PARTITION BY pt.Tag
+          ORDER BY COUNT(*) DESC, SUM(p.Score) DESC
+        )                   AS TagRank
+    FROM PostsWithTags pt
+    JOIN Posts p ON p.Id = pt.PostId
+    JOIN Users u ON u.Id = pt.OwnerUserId
+    GROUP BY pt.Tag, u.Id, u.DisplayName
+),
+BadgeBreakdown AS (
+    SELECT
+        b.UserId,
+        COUNT(*)            AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS Golds,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS Silvers,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS Bronzes
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivities AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        COUNT(*) OVER (PARTITION BY ph.UserId) AS EditsCount
+    FROM PostHistory ph
+    WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+LinkedPostMetrics AS (
+    SELECT
+        l.PostId,
+        COUNT(*) FILTER (WHERE l.LinkTypeId = 1) AS OutLinks,
+        COUNT(*) FILTER (WHERE l.LinkTypeId = 3) AS Duplicates
+    FROM PostLinks l
+    GROUP BY l.PostId
+)
+SELECT
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AvgScore,
+    ts.MaxViews,
+    tu.UserId,
+    tu.DisplayName,
+    tu.QuestionsAsked,
+    tu.TotalScore,
+    bb.TotalBadges,
+    bb.Golds,
+    bb.Silvers,
+    bb.Bronzes,
+    COALESCE(la.EditsCount, 0)  AS RecentEditsLast30d,
+    COALESCE(lp.OutLinks, 0)    AS OutgoingLinks,
+    COALESCE(lp.Duplicates, 0)  AS DuplicateLinks,
+    (
+      SELECT COUNT(*)
+      FROM Comments c
+      JOIN PostsWithTags pwt ON c.PostId = pwt.PostId
+      WHERE pwt.Tag = ts.Tag
+    ) AS CommentCount,
+    (
+      SELECT json_agg(
+               json_build_object(
+                 'Id',    p2.Id,
+                 'Score', p2.Score,
+                 'Title', p2.Title
+               )
+             ORDER BY p2.Score DESC
+             LIMIT 5
+           )
+      FROM Posts p2
+      JOIN PostsWithTags pwt2 ON p2.Id = pwt2.PostId
+      WHERE pwt2.Tag = ts.Tag
+        AND p2.Score > ts.AvgScore
+    ) AS TopPostsByScore
+FROM TagStats ts
+JOIN TopUsersByTag tu
+  ON tu.Tag = ts.Tag
+ AND tu.TagRank = 1
+LEFT JOIN BadgeBreakdown bb
+  ON bb.UserId = tu.UserId
+LEFT JOIN (
+    SELECT UserId, MAX(EditsCount) AS EditsCount
+    FROM RecentActivities
+    GROUP BY UserId
+) la
+  ON la.UserId = tu.UserId
+LEFT JOIN LinkedPostMetrics lp
+  ON lp.PostId = (
+       SELECT pwt.PostId
+       FROM PostsWithTags pwt
+       WHERE pwt.Tag = ts.Tag
+       ORDER BY pwt.CreationDate DESC
+       LIMIT 1
+     )
+ORDER BY ts.QuestionCount DESC
+LIMIT 10;

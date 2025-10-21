@@ -1,0 +1,121 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) OVER (PARTITION BY u.Id) AS PostCount,
+        COUNT(c.Id) OVER (PARTITION BY u.Id) AS CommentCount,
+        COUNT(v.Id) OVER (PARTITION BY u.Id) AS VoteCount,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+), TopTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        p.Title,
+        p.Tags,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.Tags LIKE CONCAT('%<', t.TagName, '>%')) AS RelatedPostCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.ExcerptPostId = p.Id
+    WHERE
+        t.Count > 1000
+    ORDER BY
+        t.Count DESC
+    LIMIT 10
+), PopularPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        COALESCE(p.ParentId, 0) AS ParentId,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount,
+        COUNT(v.Id) OVER (PARTITION BY p.Id) AS VoteCount,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC
+    LIMIT 100
+), TaggedPosts AS (
+    SELECT
+        pp.PostId,
+        pp.Title,
+        pp.Body,
+        t.TagName,
+        STRING_AGG(DISTINCT pp.Tags, ',') OVER (PARTITION BY pp.PostId) AS AllTags,
+        COUNT(DISTINCT t.TagName) OVER (PARTITION BY pp.PostId) AS TagCount
+    FROM
+        PopularPosts pp
+    LEFT JOIN
+        Tags t ON pp.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY
+        pp.PostId, pp.Title, pp.Body, t.TagName
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.BadgeCount,
+    tp.PostId,
+    tp.Title,
+    tp.Body,
+    tp.TagName,
+    tp.AllTags,
+    tp.TagCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = tp.PostId AND v2.VoteTypeId = 2) AS UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = tp.PostId AND v3.VoteTypeId = 3) AS DownVoteCount,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = au.UserId AND b2.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b3 WHERE b3.UserId = au.UserId AND b3.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b4 WHERE b4.UserId = au.UserId AND b4.Class = 3) AS BronzeBadges,
+    (SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = au.UserId) AS MaxPostScore,
+    (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = au.UserId) AS AvgPostScore,
+    (SELECT SUM(p4.ViewCount) FROM Posts p4 WHERE p4.OwnerUserId = au.UserId) AS TotalViewCount
+FROM
+    ActiveUsers au
+JOIN
+    TaggedPosts tp ON au.UserId = tp.PostId % 10000
+ORDER BY
+    au.Reputation DESC,
+    tp.UpVoteCount DESC,
+    tp.DownVoteCount ASC;

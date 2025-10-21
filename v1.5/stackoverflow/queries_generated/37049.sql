@@ -1,0 +1,161 @@
+-- {"query": "37049.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1680} 
+WITH
+-- most active answerers in last 2 years with diverse tag coverage
+RecentAnswers AS (
+  SELECT p.Id, p.ParentId AS QuestionId, p.OwnerUserId, p.CreationDate, p.Score, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.OwnerUserId IS NOT NULL
+    AND p.CreationDate >= now() - interval '2 years'
+),
+-- explode tags into one tag row per tag (Tags stored like '<tag1><tag2>')
+ExplodedTags AS (
+  SELECT ra.*, trim(tg) AS Tag
+  FROM RecentAnswers ra,
+       regexp_split_to_table(
+         CASE WHEN ra.Tags IS NULL THEN '' ELSE substring(ra.Tags, 2, char_length(ra.Tags)-2) END,
+         '><'
+       ) AS tg
+  WHERE ra.Tags IS NOT NULL
+),
+-- compute per-user metrics: answer count, avg score, distinct tag count, avg answer-to-question-score delta
+UserMetrics AS (
+  SELECT
+    e.OwnerUserId AS UserId,
+    count(*) AS AnswerCount,
+    avg(e.Score) AS AvgAnswerScore,
+    count(DISTINCT e.Tag) AS DistinctTagCount,
+    -- score delta: answer score minus question score
+    avg(e.Score - coalesce(q.Score,0)) AS AvgAnswerMinusQuestionScore,
+    min(e.CreationDate) AS FirstRecentAnswer,
+    max(e.CreationDate) AS LastRecentAnswer
+  FROM ExplodedTags e
+  LEFT JOIN Posts q ON e.QuestionId = q.Id
+  GROUP BY e.OwnerUserId
+),
+-- top candidates by composite score favoring volume, quality and breadth
+TopCandidates AS (
+  SELECT um.*,
+    -- composite score: weighted z-scores to avoid dominance by one metric
+    (
+      ( (um.AnswerCount::double precision - avg_uc.avg_cnt)/nullif(stddev_uc.std_cnt,0) ) * 0.5
+    + ( (um.AvgAnswerScore - avg_uc.avg_avgscore)/nullif(stddev_uc.std_avgscore,0) ) * 0.3
+    + ( (um.DistinctTagCount - avg_uc.avg_tags)/nullif(stddev_uc.std_tags,0) ) * 0.2
+    ) AS CompositeZ
+  FROM UserMetrics um,
+  (
+    SELECT
+      avg(AnswerCount) AS avg_cnt,
+      stddev_pop(AnswerCount) AS std_cnt,
+      avg(AvgAnswerScore) AS avg_avgscore,
+      stddev_pop(AvgAnswerScore) AS std_avgscore,
+      avg(DistinctTagCount) AS avg_tags,
+      stddev_pop(DistinctTagCount) AS std_tags
+    FROM UserMetrics
+  ) avg_uc
+),
+-- pick top 50 candidate users
+SelectedUsers AS (
+  SELECT * FROM TopCandidates
+  ORDER BY CompositeZ DESC NULLS LAST
+  LIMIT 50
+),
+-- gather detailed contributions for selected users: their recent answers and the answered questions with context
+UserContribs AS (
+  SELECT
+    su.UserId,
+    u.DisplayName,
+    a.Id AS AnswerId,
+    a.CreationDate  AS AnswerDate,
+    a.Score AS AnswerScore,
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViews,
+    q.Tags AS QuestionTags,
+    -- rank answers per user by score and recency to get top answers
+    row_number() OVER (PARTITION BY su.UserId ORDER BY a.Score DESC, a.CreationDate DESC) AS AnswerRank
+  FROM SelectedUsers su
+  JOIN Users u ON u.Id = su.UserId
+  JOIN Posts a ON a.PostTypeId = 2 AND a.OwnerUserId = su.UserId AND a.CreationDate >= now() - interval '2 years'
+  LEFT JOIN Posts q ON a.ParentId = q.Id
+),
+-- pick top 5 answers per user
+TopAnswersPerUser AS (
+  SELECT * FROM UserContribs WHERE AnswerRank <= 5
+),
+-- compute question-level aggregated tag popularity and co-answered counts
+QuestionTagAgg AS (
+  SELECT q.Id AS QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    count(distinct a.OwnerUserId) FILTER (WHERE a.PostTypeId = 2) AS AnswererCount,
+    string_agg(distinct u.DisplayName, ', ' ORDER BY u.Reputation DESC) FILTER (WHERE u.Id IS NOT NULL) AS AnswererNames
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2 AND a.CreationDate >= now() - interval '2 years'
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount
+),
+-- recent badge boosts for selected users (gold/silver within last year)
+RecentBadges AS (
+  SELECT b.UserId, b.Name, b.Class, b.Date
+  FROM Badges b
+  WHERE b.Date >= now() - interval '1 year'
+    AND b.Class IN (1,2)
+    AND b.UserId IN (SELECT UserId FROM SelectedUsers)
+),
+-- votes distribution for selected users' answers
+AnswerVoteStats AS (
+  SELECT v.PostId AS AnswerId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) AS UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) AS DownVotes
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE v.PostId IN (SELECT AnswerId FROM TopAnswersPerUser)
+  GROUP BY v.PostId
+)
+-- final select: assemble a wide benchmarking result set with heavy joins and aggregations
+SELECT
+  su.UserId,
+  u.DisplayName,
+  su.AnswerCount,
+  round(su.AvgAnswerScore::numeric,3) AS AvgAnswerScore,
+  su.DistinctTagCount,
+  round(su.AvgAnswerMinusQuestionScore::numeric,3) AS AvgAnswerMinusQuestionScore,
+  su.FirstRecentAnswer,
+  su.LastRecentAnswer,
+  -- top answers summary
+  ta.AnswerId,
+  ta.AnswerDate,
+  ta.AnswerScore,
+  ta.QuestionId,
+  left(ta.QuestionTitle,200) AS QuestionTitleSnippet,
+  qta.QuestionViews,
+  qta.AnswererCount,
+  qta.AnswererNames,
+  -- badge boost info: latest badge name/class
+  rb.Name AS RecentBadgeName,
+  rb.Class AS RecentBadgeClass,
+  rb.Date AS RecentBadgeDate,
+  -- vote stats for the answer
+  avs.UpVotes,
+  avs.DownVotes,
+  -- add a heuristic "impact" score combining question views, answer score and answerer reputation
+  (
+    coalesce(qta.QuestionViews,0)::double precision * 0.0001
+    + ta.AnswerScore * 0.5
+    + coalesce(u.Reputation,0)::double precision * 0.00001
+  ) AS HeuristicImpactScore
+FROM SelectedUsers su
+JOIN Users u ON u.Id = su.UserId
+LEFT JOIN TopAnswersPerUser ta ON ta.UserId = su.UserId
+LEFT JOIN QuestionTagAgg qta ON qta.QuestionId = ta.QuestionId
+LEFT JOIN LATERAL (
+  SELECT b.* FROM RecentBadges b WHERE b.UserId = su.UserId ORDER BY b.Date DESC LIMIT 1
+) rb ON true
+LEFT JOIN AnswerVoteStats avs ON avs.AnswerId = ta.AnswerId
+ORDER BY su.CompositeZ DESC NULLS LAST, HeuristicImpactScore DESC NULLS LAST, ta.AnswerScore DESC NULLS LAST
+LIMIT 500;

@@ -1,0 +1,166 @@
+-- {"query": "37061.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1835} 
+WITH
+-- candidate questions with tag arrays and basic aggregates
+questions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         (CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') END) AS TagArray,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+-- recent answers joined to questions
+answers AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId AS AnswererId,
+         a.CreationDate AS AnswerDate,
+         a.Score AS AnswerScore,
+         a.CommentCount AS AnswerCommentCount,
+         a.Body AS AnswerBody
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+-- best answer per question (highest score, tie-breaker earliest)
+best_answer AS (
+  SELECT DISTINCT ON (q.QuestionId)
+         q.QuestionId,
+         a.AnswerId,
+         a.AnswererId,
+         a.AnswerDate,
+         a.AnswerScore
+  FROM questions q
+  JOIN answers a ON a.QuestionId = q.QuestionId
+  ORDER BY q.QuestionId, a.AnswerScore DESC, a.AnswerDate ASC
+),
+-- aggregates for activity windows
+activity_windows AS (
+  SELECT q.QuestionId,
+         count(DISTINCT a.AnswerId) FILTER (WHERE a.AnswerDate >= q.CreationDate AND a.AnswerDate < q.CreationDate + interval '7 days') AS Answers_7d,
+         count(DISTINCT a.AnswerId) FILTER (WHERE a.AnswerDate >= q.CreationDate AND a.AnswerDate < q.CreationDate + interval '30 days') AS Answers_30d,
+         count(DISTINCT v.Id) FILTER (WHERE v.CreationDate >= q.CreationDate AND v.CreationDate < q.CreationDate + interval '30 days' AND v.VoteTypeId = 2) AS Upvotes_30d,
+         count(c.Id) FILTER (WHERE c.CreationDate >= q.CreationDate AND c.CreationDate < q.CreationDate + interval '30 days') AS Comments_30d
+  FROM questions q
+  LEFT JOIN answers a ON a.QuestionId = q.QuestionId
+  LEFT JOIN Votes v ON v.PostId = q.QuestionId
+  LEFT JOIN Comments c ON c.PostId = q.QuestionId
+  GROUP BY q.QuestionId
+),
+-- tag popularity snapshot: top tag co-occurrence counts and average scores
+tag_pairs AS (
+  SELECT t1.tag AS tag,
+         t2.tag AS co_tag,
+         count(*) AS pair_count,
+         avg(q.Score) AS avg_question_score
+  FROM (
+    SELECT QuestionId, unnest(TagArray) AS tag
+    FROM questions
+  ) t1
+  JOIN (
+    SELECT QuestionId, unnest(TagArray) AS tag
+    FROM questions
+  ) t2 ON t1.QuestionId = t2.QuestionId AND t1.tag <> t2.tag
+  JOIN questions q ON q.QuestionId = t1.QuestionId
+  GROUP BY t1.tag, t2.tag
+),
+-- identify experienced answerers: users with many high-scoring answers and high mean score
+answerer_stats AS (
+  SELECT a.OwnerUserId AS UserId,
+         count(*) FILTER (WHERE a.Score >= 5) AS HighScoreAnswers,
+         count(*) AS TotalAnswers,
+         avg(a.Score) AS AvgAnswerScore,
+         max(a.Score) AS MaxAnswerScore,
+         percentile_cont(0.75) WITHIN GROUP (ORDER BY a.Score) AS P75Score
+  FROM Posts a
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+-- combined candidate ranking with heuristics
+ranked_questions AS (
+  SELECT q.*,
+         bw.Answers_7d,
+         bw.Answers_30d,
+         bw.Upvotes_30d,
+         bw.Comments_30d,
+         ba.AnswerId AS BestAnswerId,
+         ba.AnswererId,
+         ba.AnswerScore AS BestAnswerScore,
+         COALESCE(ansr.HighScoreAnswers,0) AS AnswererHighScoreAnswers,
+         COALESCE(ansr.TotalAnswers,0) AS AnswererTotalAnswers,
+         COALESCE(ansr.AvgAnswerScore,0) AS AnswererAvgScore,
+         -- heuristics: recency boost, answer velocity, community interest, answerer experience, and tag popularity signal
+         (
+           -- base: question score and views
+           GREATEST(q.Score,0) * 1.5 + GREATEST(q.ViewCount,0)::double precision / NULLIF(GREATEST(EXTRACT(EPOCH FROM (now() - q.CreationDate))/86400,1),0) * 0.05
+           -- answers velocity
+           + (bw.Answers_7d * 3.0) + (bw.Answers_30d * 1.0)
+           -- early upvote signal
+           + bw.Upvotes_30d * 2.0
+           -- comments indicate discussion
+           + bw.Comments_30d * 0.8
+           -- best answer quality and answerer strength
+           + COALESCE(ba.AnswerScore,0) * 2.5
+           + COALESCE(ansr.AvgAnswerScore,0) * 1.2
+           + LEAST(COALESCE(ansr.HighScoreAnswers,0),20) * 0.7
+         ) AS HotnessScore
+  FROM questions q
+  LEFT JOIN activity_windows bw ON bw.QuestionId = q.QuestionId
+  LEFT JOIN best_answer ba ON ba.QuestionId = q.QuestionId
+  LEFT JOIN answerer_stats ansr ON ansr.UserId = ba.AnswererId
+),
+-- pick top tags per question by co-occurrence prominence
+question_tag_signals AS (
+  SELECT q.QuestionId,
+         array_agg(tp.co_tag ORDER BY tp.pair_count DESC, tp.avg_question_score DESC LIMIT 3) AS TopCoTags
+  FROM questions q
+  LEFT JOIN LATERAL (
+    SELECT co_tag, pair_count, avg_question_score
+    FROM tag_pairs tp
+    WHERE tp.tag = (SELECT unnest(q.TagArray) LIMIT 1) -- pick first tag as seed for signal (fast heuristic)
+    ORDER BY pair_count DESC
+    LIMIT 10
+  ) tp ON true
+  GROUP BY q.QuestionId
+)
+-- final selection: heavy analytics join, windowed ranking and top-N extraction with diverse tags and temporal partitions
+SELECT q.QuestionId,
+       q.Title,
+       q.CreationDate,
+       q.OwnerUserId,
+       q.Score,
+       q.ViewCount,
+       q.TagArray,
+       r.Answers_7d,
+       r.Answers_30d,
+       r.Upvotes_30d,
+       r.Comments_30d,
+       r.BestAnswerId,
+       r.AnswererId,
+       r.BestAnswerScore,
+       r.AnswererHighScoreAnswers,
+       r.AnswererAvgScore,
+       q.FavoriteCount,
+       q.AnswerCount,
+       q.CommentCount,
+       q.Body IS NOT NULL AS HasBody,
+       (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = q.QuestionId) AS OutboundLinks,
+       (SELECT count(*) FROM PostLinks pl WHERE pl.RelatedPostId = q.QuestionId) AS InboundLinks,
+       qs.TopCoTags,
+       r.HotnessScore,
+       -- window rank within weekly partitions to force sorting and window functions for benchmarking
+       row_number() OVER (PARTITION BY date_trunc('week', q.CreationDate) ORDER BY r.HotnessScore DESC, q.ViewCount DESC) AS WeeklyRank,
+       dense_rank() OVER (ORDER BY r.HotnessScore DESC NULLS LAST) AS GlobalDenseRank
+FROM ranked_questions r
+JOIN questions q ON q.QuestionId = r.QuestionId
+LEFT JOIN question_tag_signals qs ON qs.QuestionId = q.QuestionId
+WHERE q.CreationDate >= now() - interval '365 days' -- recent year for heavier activity
+  AND (r.HotnessScore IS NOT NULL AND r.HotnessScore > 5) -- focus on interesting items
+ORDER BY date_trunc('week', q.CreationDate) DESC, r.HotnessScore DESC
+LIMIT 500;

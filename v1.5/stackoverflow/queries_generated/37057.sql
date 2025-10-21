@@ -1,0 +1,154 @@
+-- {"query": "37057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1744} 
+WITH
+-- recent activity per post: last 6 months
+recent_posts AS (
+  SELECT p.*,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS comment_count,
+         (SELECT SUM(CASE WHEN v.VoteTypeId=2 THEN 1 WHEN v.VoteTypeId=3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS vote_balance,
+         regexp_split_to_table(substring(coalesce(p.Tags,''),2,length(coalesce(p.Tags,''))-2), E'\\><') AS single_tag
+  FROM Posts p
+  WHERE p.CreationDate >= now() - interval '6 months'
+),
+-- tag aggregates for recent posts
+tag_aggs AS (
+  SELECT single_tag AS tag,
+         COUNT(*) AS posts_in_tag,
+         SUM(comment_count) AS total_comments,
+         SUM(coalesce(vote_balance,0)) AS total_vote_balance,
+         AVG(coalesce(ViewCount,0)) AS avg_views,
+         SUM(CASE WHEN PostTypeId=1 THEN 1 ELSE 0 END) AS questions,
+         SUM(CASE WHEN PostTypeId=2 THEN 1 ELSE 0 END) AS answers
+  FROM recent_posts
+  GROUP BY single_tag
+),
+-- identify highly active tags
+hot_tags AS (
+  SELECT tag
+  FROM tag_aggs
+  WHERE posts_in_tag >= (SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY posts_in_tag) FROM tag_aggs)
+    AND total_comments >= (SELECT percentile_cont(0.6) WITHIN GROUP (ORDER BY total_comments) FROM tag_aggs)
+),
+-- users who contributed to hot tags recently (authors or editors or commenters or voters)
+hot_contributors AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         r.single_tag AS tag,
+         COUNT(DISTINCT r.Id) FILTER (WHERE r.PostTypeId=1) AS q_count,
+         COUNT(DISTINCT r.Id) FILTER (WHERE r.PostTypeId=2) AS a_count,
+         SUM(coalesce(r.comment_count,0)) AS post_comments,
+         SUM(coalesce(r.vote_balance,0)) AS post_vote_balance,
+         MAX(r.CreationDate) AS last_activity
+  FROM recent_posts r
+  JOIN hot_tags ht ON ht.tag = r.single_tag
+  LEFT JOIN Users u ON u.Id = r.OwnerUserId
+  LEFT JOIN Comments c ON c.PostId = r.Id
+  LEFT JOIN Votes v ON v.PostId = r.Id
+  WHERE r.OwnerUserId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, r.single_tag
+),
+-- compute badge signal for those users in last year
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) FILTER (WHERE b.Class=1) AS gold_badges,
+         COUNT(*) FILTER (WHERE b.Class=2) AS silver_badges,
+         COUNT(*) FILTER (WHERE b.Class=3) AS bronze_badges,
+         COUNT(*) FILTER (WHERE b.Date >= now() - interval '1 year') AS badges_last_year
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- compute cross-linking/duplicate patterns among recent questions
+duplicate_graph AS (
+  SELECT pl.PostId AS src, pl.RelatedPostId AS dst, lt.Name AS link_type, p_src.Tags AS src_tags, p_dst.Tags AS dst_tags
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  JOIN Posts p_src ON p_src.Id = pl.PostId
+  JOIN Posts p_dst ON p_dst.Id = pl.RelatedPostId
+  WHERE pl.CreationDate >= now() - interval '1 year' AND pl.LinkTypeId = 3 -- duplicates
+),
+-- compute highly duplicated questions and their cluster metrics
+duplicate_clusters AS (
+  SELECT dst AS canonical_q,
+         COUNT(*) AS duplicate_count,
+         ARRAY_AGG(DISTINCT src) AS duplicates,
+         MAX(p.Score) AS max_score_in_cluster,
+         AVG(p.ViewCount) AS avg_views_in_cluster
+  FROM duplicate_graph dg
+  JOIN Posts p ON p.Id = dg.dst
+  GROUP BY dst
+),
+-- final scoring of contributors combining reputation, activity, badges, and cluster interactions
+contributor_scores AS (
+  SELECT hc.user_id,
+         hc.DisplayName,
+         hc.tag,
+         hc.Reputation,
+         hc.q_count,
+         hc.a_count,
+         coalesce(ub.gold_badges,0) AS gold_badges,
+         coalesce(ub.silver_badges,0) AS silver_badges,
+         coalesce(ub.bronze_badges,0) AS bronze_badges,
+         hc.post_comments,
+         hc.post_vote_balance,
+         hc.last_activity,
+         /* composite score: weighted factors with non-linear boosts */
+         (
+           LEAST(1000, GREATEST(0, hc.Reputation))/1000.0 * 0.35
+           + LOG(GREATEST(1, hc.q_count + hc.a_count)) * 0.20
+           + (LEAST(50, coalesce(ub.gold_badges,0))*3 + LEAST(100, coalesce(ub.silver_badges,0))*1 + LEAST(200, coalesce(ub.bronze_badges,0))*0.2)/100.0 * 0.20
+           + (GREATEST(0, hc.post_vote_balance)/50.0) * 0.15
+           + (CASE WHEN hc.last_activity >= now() - interval '7 days' THEN 0.10 WHEN hc.last_activity >= now() - interval '30 days' THEN 0.06 WHEN hc.last_activity >= now() - interval '90 days' THEN 0.03 ELSE 0 END)
+         ) AS composite_score
+  FROM hot_contributors hc
+  LEFT JOIN user_badges ub ON ub.UserId = hc.user_id
+),
+-- select top contributor per hot tag and enrich with recent posts and duplicate cluster involvement
+top_contributors AS (
+  SELECT DISTINCT ON (cs.tag) cs.tag, cs.user_id, cs.DisplayName, cs.Reputation, cs.composite_score
+  FROM contributor_scores cs
+  ORDER BY cs.tag, cs.composite_score DESC
+)
+SELECT
+  ht.tag,
+  ht.posts_in_tag,
+  ht.total_comments,
+  ht.total_vote_balance,
+  ht.avg_views,
+  tc.user_id AS top_user_id,
+  tc.DisplayName AS top_user,
+  tc.Reputation AS top_user_reputation,
+  tc.composite_score,
+  jsonb_build_object(
+    'recent_posts', (
+      SELECT jsonb_agg(jsonb_build_object(
+         'Id', p.Id,
+         'PostTypeId', p.PostTypeId,
+         'Title', p.Title,
+         'Score', p.Score,
+         'Views', p.ViewCount,
+         'CreationDate', p.CreationDate,
+         'CommentCount', (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = p.Id),
+         'VoteBalance', (SELECT SUM(CASE WHEN v2.VoteTypeId=2 THEN 1 WHEN v2.VoteTypeId=3 THEN -1 ELSE 0 END) FROM Votes v2 WHERE v2.PostId = p.Id)
+      ) ORDER BY p.CreationDate DESC LIMIT 5)
+      FROM recent_posts p
+      WHERE p.single_tag = ht.tag
+    ),
+    'duplicate_clusters', (
+      SELECT jsonb_agg(jsonb_build_object(
+         'canonical_q', dc.canonical_q,
+         'duplicate_count', dc.duplicate_count,
+         'duplicates_sample', dc.duplicates[1:5],
+         'max_score', dc.max_score_in_cluster,
+         'avg_views', dc.avg_views_in_cluster
+      ))
+      FROM duplicate_clusters dc
+      WHERE EXISTS (
+        SELECT 1 FROM Posts p2 WHERE p2.Id = dc.canonical_q AND regexp_split_to_table(coalesce(p2.Tags,''), E'\\><') = ht.tag
+      )
+    )
+  ) AS diagnostics
+FROM hot_tags ht
+LEFT JOIN tag_aggs ta ON ta.tag = ht.tag
+LEFT JOIN top_contributors tc ON tc.tag = ht.tag
+ORDER BY ht.posts_in_tag DESC, ht.total_comments DESC
+LIMIT 25;

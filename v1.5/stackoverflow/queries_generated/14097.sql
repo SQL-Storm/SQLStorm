@@ -1,0 +1,35 @@
+-- {"query": "14097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 228830, "output_tokens": 100093} 
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.OwnerUserId, p.LastEditorUserId, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate,
+         CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END AS AnswerCount,
+         CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId ELSE NULL END AS AcceptedAnswerId,
+         STRING_AGG(DISTINCT t.TagName, '><') AS Tags,
+         MAX(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.Text END) AS InitialBody,
+         MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Text END) AS LastEditBody,
+         MAX(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.Text END) AS InitialTitle,
+         MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.Text END) AS LastEditTitle
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+  LEFT JOIN Tags t ON STRING_CONTAINS(p.Tags, CONCAT('><', t.TagName, '><'))
+  GROUP BY p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.OwnerUserId, p.LastEditorUserId, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate
+),
+vote_counts AS (
+  SELECT PostId, 
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+  FROM Votes
+  GROUP BY PostId
+),
+user_rep AS (
+  SELECT u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.DisplayName, u.WebsiteUrl, u.Location, u.AboutMe, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl, u.EmailHash, u.AccountId
+  FROM Users u
+)
+SELECT c.Id, c.PostTypeId, c.ParentId, c.CreationDate, c.OwnerUserId, c.LastEditorUserId, c.CommentCount, c.FavoriteCount, c.ClosedDate, c.CommunityOwnedDate, 
+       c.AnswerCount, c.AcceptedAnswerId, c.Tags, c.InitialBody, c.LastEditBody, c.InitialTitle, c.LastEditTitle,
+       vc.UpVoteCount, vc.DownVoteCount,
+       ur.Reputation AS OwnerReputation, ur.CreationDate AS OwnerCreationDate, ur.LastAccessDate AS OwnerLastAccessDate, ur.DisplayName AS OwnerDisplayName, ur.WebsiteUrl AS OwnerWebsiteUrl, ur.Location AS OwnerLocation, ur.AboutMe AS OwnerAboutMe, ur.Views AS OwnerViews, ur.UpVotes AS OwnerUpVotes, ur.DownVotes AS OwnerDownVotes, ur.ProfileImageUrl AS OwnerProfileImageUrl, ur.EmailHash AS OwnerEmailHash, ur.AccountId AS OwnerAccountId
+FROM cte c
+LEFT JOIN vote_counts vc ON c.Id = vc.PostId
+LEFT JOIN user_rep ur ON c.OwnerUserId = ur.Id
+ORDER BY c.CreationDate DESC
+LIMIT 100;

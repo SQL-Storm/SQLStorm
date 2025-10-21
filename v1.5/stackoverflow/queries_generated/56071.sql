@@ -1,0 +1,42 @@
+-- {"query": "56071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 360} 
+
+WITH top_100_users AS (
+  SELECT Id, Reputation, DisplayName, 
+  ROW_NUMBER() OVER (ORDER BY Reputation DESC) as row_num
+  FROM Users
+),
+top_100_posts AS (
+  SELECT Id, Score, ViewCount, 
+  ROW_NUMBER() OVER (ORDER BY Score DESC) as row_num
+  FROM Posts
+),
+user_post_history AS (
+  SELECT ph.UserId, ph.PostId, ph.PostHistoryTypeId, 
+  ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as row_num
+  FROM PostHistory ph
+  JOIN top_100_users u ON ph.UserId = u.Id
+  WHERE u.row_num <= 100
+),
+post_links AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, 
+  ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) as row_num
+  FROM PostLinks pl
+  JOIN top_100_posts p ON pl.PostId = p.Id
+  WHERE p.row_num <= 100
+)
+SELECT 
+  u.DisplayName, 
+  p.Title, 
+  ph.PostHistoryTypeId, 
+  pl.RelatedPostId, 
+  pl.LinkTypeId, 
+  v.VoteTypeId, 
+  v.UserId, 
+  v.CreationDate
+FROM top_100_users u
+JOIN user_post_history ph ON u.Id = ph.UserId
+JOIN top_100_posts p ON ph.PostId = p.Id
+JOIN post_links pl ON p.Id = pl.PostId
+JOIN Votes v ON p.Id = v.PostId
+WHERE ph.row_num = 1 AND pl.row_num = 1
+ORDER BY u.Reputation DESC, p.Score DESC;

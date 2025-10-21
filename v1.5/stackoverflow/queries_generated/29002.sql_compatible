@@ -1,0 +1,163 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgesList,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) AS TotalAnswerViews,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount END) AS QuestionsWithAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.CommentCount ELSE 0 END), 0) AS TotalQuestionComments,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.CommentCount ELSE 0 END), 0) AS TotalAnswerComments,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Tags END) AS UniqueTagsUsed,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.FavoriteCount END) AS TotalFavorites,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.ClosedDate END) AS LastQuestionClosedDate,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.Score >= 10 THEN 1 ELSE 0 END), 0) AS HighScoreQuestions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN 1 ELSE 0 END), 0) AS HighScoreAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS PopularQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0) / COUNT(DISTINCT p.Id)
+        ELSE 0 
+    END AS QuestionPercentage,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT pt.Name, ', ') 
+         FROM Posts p2 
+         JOIN PostTypes pt ON p2.PostTypeId = pt.Id 
+         WHERE p2.OwnerUserId = u.Id
+         GROUP BY p2.OwnerUserId),
+        'No Posts'
+    ) AS PostTypesOwned,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.ParentId END) AS QuestionsAnswered,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.ParentId END) AS AnswersToQuestions,
+    LAG(COUNT(DISTINCT p.Id)) OVER (ORDER BY u.CreationDate) AS PreviousUserPosts,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'High'
+        WHEN u.Reputation >= 1000 THEN 'Medium'
+        ELSE 'Low'
+    END AS ReputationLevel,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    AVG(CASE WHEN c.Score IS NOT NULL THEN c.Score END) AS AvgCommentScore,
+    RANK() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) DESC) AS QuestionScoreRank,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) AS QuestionCountRank,
+    ROW_NUMBER() OVER (ORDER BY u.CreationDate) AS UserOrder,
+    COALESCE(
+        COUNT(DISTINCT ph.Id),
+        0
+    ) AS PostHistoryEvents,
+    COALESCE(
+        STRING_AGG(DISTINCT ph.Comment, ', '),
+        'No Comments'
+    ) AS PostHistoryComments,
+    CASE 
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl != '' THEN 'Has Website'
+        ELSE 'No Website'
+    END AS WebsiteStatus,
+    COALESCE(
+        COUNT(DISTINCT pl.Id),
+        0
+    ) AS PostLinksCreated,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN p.Id END) AS TaggedQuestions,
+    COALESCE(
+        COUNT(DISTINCT v.Id),
+        0
+    ) AS TotalVotes,
+    COALESCE(
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END),
+        0
+    ) AS UpVotesReceived,
+    COALESCE(
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END),
+        0
+    ) AS DownVotesReceived,
+    CASE 
+        WHEN u.Views IS NOT NULL THEN 
+            CASE 
+                WHEN u.Views > 10000 THEN 'Very High'
+                WHEN u.Views > 1000 THEN 'High'
+                WHEN u.Views > 100 THEN 'Medium'
+                ELSE 'Low'
+            END
+        ELSE 'Unknown'
+    END AS ViewLevel,
+    COALESCE(
+        (SELECT MAX(h.CreationDate)
+         FROM PostHistory h
+         WHERE h.UserId = u.Id
+         AND h.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)),
+        'Never Edited'
+    ) AS LastEditDate,
+    CASE 
+        WHEN (COUNT(DISTINCT p.Id) = 0) THEN 'Inactive'
+        WHEN (COUNT(DISTINCT p.Id) BETWEEN 1 AND 10) THEN 'Low Activity'
+        WHEN (COUNT(DISTINCT p.Id) BETWEEN 11 AND 50) THEN 'Medium Activity'
+        WHEN (COUNT(DISTINCT p.Id) BETWEEN 51 AND 100) THEN 'High Activity'
+        ELSE 'Very High Activity'
+    END AS ActivityLevel,
+    ABS(
+        (COUNT(DISTINCT p.Id) - 
+        LAG(COUNT(DISTINCT p.Id)) OVER (ORDER BY u.CreationDate, u.Id))
+    ) AS PostCountChange,
+    CAST(
+        (SELECT AVG(p2.Score) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 1) AS DECIMAL(10,2)
+    ) AS AvgQuestionScorePerUser,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT tag.TagName, ' | ')
+         FROM Posts p3
+         JOIN UNNEST(STRING_TO_ARRAY(p3.Tags, '<>')) AS tag(TagName)
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 1
+         GROUP BY p3.OwnerUserId),
+        'No Tags'
+    ) AS UserTagList
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN Tags tag ON tag.Id IN (
+    SELECT t.Id 
+    FROM Tags t 
+    WHERE t.TagName IN (
+        SELECT TRIM(SUBSTRING(p2.Tags, 2, LENGTH(p2.Tags) - 2)) 
+        FROM Posts p2 
+        WHERE p2.PostTypeId = 1 
+        AND p2.OwnerUserId = u.Id
+    )
+)
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate, 
+    u.WebsiteUrl, 
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+ORDER BY 
+    u.Reputation DESC,
+    TotalPosts DESC,
+    TotalQuestionScore DESC,
+    LastPostDate DESC
+LIMIT 1000;

@@ -1,0 +1,171 @@
+-- {"query": "37026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1834} 
+WITH
+-- active questions in last 2 years with tag arrays
+Q AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         p.OwnerUserId, p.AcceptedAnswerId,
+         regexp_split_to_array(substring(p.Tags,2,length(p.Tags)-2), E'><') AS Tags,
+         p.CommentCount, p.FavoriteCount, p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '2 years'
+),
+-- answers joined to questions
+A AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.CreationDate, a.Score, a.OwnerUserId, a.CommentCount, a.LastActivityDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= now() - interval '2 years'
+),
+-- user aggregates (recent activity, reputation buckets)
+U AS (
+  SELECT u.Id,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         u.Views AS UserViews,
+         u.UpVotes, u.DownVotes,
+         CASE
+           WHEN u.Reputation >= 20000 THEN '>=20k'
+           WHEN u.Reputation >= 5000 THEN '5k-19k'
+           WHEN u.Reputation >= 1000 THEN '1k-4k'
+           WHEN u.Reputation >= 100 THEN '100-999'
+           ELSE '<100'
+         END AS RepBucket
+  FROM Users u
+),
+-- top tag popularity across selected questions
+TagExplode AS (
+  SELECT q.Id AS QuestionId, lower(trim(t)) AS Tag
+  FROM Q q,
+       unnest(q.Tags) t
+),
+TagStats AS (
+  SELECT te.Tag,
+         count(*) AS Questions,
+         avg(q.Score) AS AvgQuestionScore,
+         sum(q.ViewCount) AS TotalViews
+  FROM TagExplode te
+  JOIN Q q ON q.Id = te.QuestionId
+  GROUP BY te.Tag
+),
+-- compute per-question answer distributions and timing metrics
+AnswerStats AS (
+  SELECT q.Id AS QuestionId,
+         count(a.Id) AS NumAnswers,
+         max(CASE WHEN a.Id = q.AcceptedAnswerId THEN a.Score ELSE NULL END) AS AcceptedAnswerScore,
+         avg(a.Score) FILTER (WHERE a.CreationDate <= q.CreationDate + interval '7 days') AS AvgScore7d,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (a.CreationDate - q.CreationDate))) AS MedianAnswerLatencySec,
+         min(a.CreationDate) AS FirstAnswerDate
+  FROM Q q
+  LEFT JOIN A a ON a.ParentId = q.Id
+  GROUP BY q.Id
+),
+-- comments per post (questions + their answers) in first week
+PostComments AS (
+  SELECT p.Id AS PostId,
+         sum(CASE WHEN c.CreationDate <= (p.CreationDate + interval '7 days') THEN 1 ELSE 0 END) AS CommentsFirst7d,
+         count(c.Id) AS TotalComments
+  FROM (
+    SELECT Id, CreationDate FROM Posts WHERE PostTypeId IN (1,2) AND CreationDate >= now() - interval '2 years'
+  ) p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+-- recent votes summary per post
+VoteAgg AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+         count(*) FILTER (WHERE v.CreationDate >= now() - interval '30 days') AS Votes30d
+  FROM Votes v
+  WHERE v.CreationDate >= now() - interval '2 years'
+  GROUP BY v.PostId
+),
+-- link network: number of incoming links and duplicates
+LinksAgg AS (
+  SELECT pl.RelatedPostId AS PostId,
+         count(*) FILTER (WHERE lt.Name = 'Linked') AS InboundLinks,
+         count(*) FILTER (WHERE lt.Name = 'Duplicate') AS InboundDuplicates
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  GROUP BY pl.RelatedPostId
+),
+-- assemble enriched question view
+EnrichedQ AS (
+  SELECT q.*,
+         asx.NumAnswers, asx.MedianAnswerLatencySec, asx.AvgScore7d, asx.AcceptedAnswerScore,
+         ta.CommentsFirst7d, ta.TotalComments,
+         coalesce(v.UpVotes,0) AS UpVotes, coalesce(v.DownVotes,0) AS DownVotes, coalesce(v.Favorites,0) AS Favorites, coalesce(v.Votes30d,0) AS Votes30d,
+         coalesce(l.InboundLinks,0) AS InboundLinks, coalesce(l.InboundDuplicates,0) AS InboundDuplicates,
+         (SELECT array_agg(t ORDER BY ts.Questions DESC NULLS LAST LIMIT 3) FROM unnest(q.Tags) t JOIN TagStats ts ON lower(trim(t)) = ts.Tag) AS Top3TagContext,
+         u.Reputation AS OwnerReputation, u.RepBucket
+  FROM Q q
+  LEFT JOIN AnswerStats asx ON asx.QuestionId = q.Id
+  LEFT JOIN PostComments ta ON ta.PostId = q.Id
+  LEFT JOIN VoteAgg v ON v.PostId = q.Id
+  LEFT JOIN LinksAgg l ON l.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+)
+-- final expensive benchmark query: window functions, json, lateral, joins, CTE scans
+SELECT
+  eq.Id,
+  eq.Title,
+  eq.CreationDate,
+  eq.Score,
+  eq.ViewCount,
+  eq.NumAnswers,
+  eq.AcceptedAnswerScore,
+  eq.MedianAnswerLatencySec,
+  eq.AvgScore7d,
+  eq.CommentsFirst7d,
+  eq.UpVotes,
+  eq.DownVotes,
+  eq.Votes30d,
+  eq.InboundLinks,
+  eq.InboundDuplicates,
+  eq.OwnerReputation,
+  eq.RepBucket,
+  eq.Top3TagContext,
+  -- hotness score combining signals
+  ( (coalesce(eq.Score,0)::numeric * 2)
+    + ln(1 + greatest(eq.ViewCount,0)) * 1.5
+    + coalesce(eq.UpVotes,0) * 3
+    - coalesce(eq.DownVotes,0) * 2
+    + coalesce(eq.NumAnswers,0) * 5
+    + (case when eq.AcceptedAnswerScore IS NOT NULL then 20 else 0 end)
+    - coalesce(eq.InboundDuplicates,0) * 10
+    + coalesce(eq.CommentsFirst7d,0) * 1.2
+  ) AS HotnessScore,
+  -- top answer snippet via lateral (joins to A and Comments)
+  ta.TopAnswerId,
+  ta.TopAnswerScore,
+  ta.TopAnswerCommentCount,
+  -- small JSON summary of related tag stats
+  json_build_object(
+    'top_tags', (SELECT json_agg(json_build_object('tag', t.tag, 'questions', t.questions, 'avg_q_score', round(t.avgquestionscore::numeric,2)))
+                 FROM (
+                   SELECT ts.tag, ts.questions, ts.avgquestionscore
+                   FROM TagStats ts
+                   WHERE ts.tag = any((eq.Top3TagContext::text[])::text[])
+                 ) t),
+    'owner_rep', eq.OwnerReputation,
+    'owner_bucket', eq.RepBucket
+  ) AS Summary
+FROM EnrichedQ eq
+LEFT JOIN LATERAL (
+  SELECT a.Id AS TopAnswerId, a.Score AS TopAnswerScore, coalesce(pc.TotalComments,0) AS TopAnswerCommentCount
+  FROM Posts a
+  LEFT JOIN (
+    SELECT p.Id, count(c.Id) AS TotalComments
+    FROM Posts p LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.Id
+  ) pc ON pc.Id = a.Id
+  WHERE a.PostTypeId = 2 AND a.ParentId = eq.Id
+  ORDER BY (a.Score * 3 + coalesce(pc.TotalComments,0)) DESC NULLS LAST
+  LIMIT 1
+) ta ON true
+WHERE eq.NumAnswers IS NOT NULL
+ORDER BY HotnessScore DESC NULLS LAST
+LIMIT 250;

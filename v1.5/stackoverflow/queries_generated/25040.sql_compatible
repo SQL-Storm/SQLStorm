@@ -1,0 +1,140 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0) + COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetEngagement,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                 AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                 AS AnswerCount,
+        COUNT(c.Id)                                                AS CommentCount,
+        MAX(p.CreationDate)                                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+
+UserTagStats AS (
+    SELECT
+        ua.UserId,
+        tt.TagName,
+        COUNT(*)                         AS TagUsage,
+        SUM(p.Score)                     AS TagScore,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserActivity ua
+    JOIN Posts p ON p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag(tagraw)
+    JOIN Tags tt ON tt.TagName = trim(both '<>' FROM tag.tagraw)
+    GROUP BY ua.UserId, tt.TagName
+),
+
+BadgeStats AS (
+    SELECT
+        b.UserId,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGold,
+        MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS HasSilver,
+        MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS HasBronze,
+        COUNT(*) FILTER (WHERE CAST(b.TagBased AS INTEGER) = 1)        AS TagBasedCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+RecentCloseVotes AS (
+    SELECT
+        ph.PostId,
+        COUNT(*)            AS CloseVoteCount,
+        MAX(ph.CreationDate) AS LastCloseVote
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10            -- close vote
+    GROUP BY ph.PostId
+),
+
+FinalScore AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.NetEngagement,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        COALESCE(bs.HasGold,0)   * 1000 +
+        COALESCE(bs.HasSilver,0) * 500  +
+        COALESCE(bs.HasBronze,0) * 200  -
+        COALESCE(rc.CloseVoteCount,0) * 50 AS PenaltyScore,
+        ROW_NUMBER() OVER (ORDER BY (ua.NetEngagement
+                                     + ua.QuestionCount*3
+                                     + ua.AnswerCount*5) DESC) AS OverallRank
+    FROM UserActivity ua
+    LEFT JOIN BadgeStats   bs ON bs.UserId = ua.UserId
+    LEFT JOIN RecentCloseVotes rc ON rc.PostId = (
+        SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId LIMIT 1
+    )
+),
+
+TagPopularity AS (
+    SELECT
+        TagName,
+        Count,
+        NTILE(4) OVER (ORDER BY Count DESC) AS Quartile
+    FROM TopTags
+)
+
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.NetEngagement,
+    f.QuestionCount,
+    f.AnswerCount,
+    f.CommentCount,
+    f.PenaltyScore,
+    f.OverallRank,
+    COALESCE(ut.TagName, 'N/A')           AS TopTag,
+    COALESCE(ut.TagUsage,0)               AS TopTagUsage,
+    CASE
+        WHEN bs.HasGold   = 1 THEN 'Gold'
+        WHEN bs.HasSilver = 1 THEN 'Silver'
+        ELSE                     'Bronze'
+    END                                   AS HighestBadgeClass,
+    tp.Quartile                           AS TagPopularityQuartile
+FROM FinalScore f
+LEFT JOIN LATERAL (
+    SELECT uts.TagName, uts.TagUsage
+    FROM UserTagStats uts
+    WHERE uts.UserId = f.UserId
+    ORDER BY uts.TagRank
+    LIMIT 1
+) ut ON true
+LEFT JOIN BadgeStats   bs ON bs.UserId = f.UserId
+LEFT JOIN TagPopularity tp ON tp.TagName = ut.TagName
+WHERE f.OverallRank <= 100
+
+UNION ALL
+
+SELECT
+    NULL,
+    '--- Summary ---',
+    NULL,
+    NULL,
+    SUM(QuestionCount),
+    SUM(AnswerCount),
+    SUM(CommentCount),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM FinalScore
+WHERE OverallRank <= 100
+ORDER BY OverallRank;

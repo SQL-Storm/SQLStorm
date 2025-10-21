@@ -1,0 +1,101 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+top_tags AS (
+  SELECT
+    CAST(unnest(string_to_array(substr(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS VARCHAR) AS TagName,
+    p.Id AS PostId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM top_tags t
+  JOIN recent_questions p ON p.PostId = t.PostId
+  GROUP BY t.TagName
+),
+correlated_activity AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.OwnerUserId,
+    q.Reputation,
+    q.OwnerDisplayName,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.TagName,
+    v_v.CountVotes,
+    v_v.UpModRate,
+    v_v.BountyImpact
+  FROM recent_questions q
+  CROSS JOIN LATERAL (
+    SELECT
+      COUNT(*) AS CountVotes,
+      AVG(CASE WHEN vt.Id = 2 THEN 1.0 ELSE 0 END) AS UpModRate,
+      SUM(CASE WHEN vt.Id = 8 THEN v.BountyAmount ELSE 0 END) AS BountyImpact
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.PostId = q.PostId
+      AND v.CreationDate >= q.CreationDate - INTERVAL '30 days'
+  ) AS v_v
+  LEFT JOIN (
+    SELECT
+      unnest(string_to_array(substr(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) AS TagName
+  ) AS t ON TRUE
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.OwnerDisplayName,
+  r.Reputation,
+  r.CreationDate,
+  r.LastActivityDate,
+  r.Score,
+  r.ViewCount,
+  r.AnswerCount,
+  r.CommentCount,
+  r.FavoriteCount,
+  r.TagName,
+  cc.CountVotes,
+  cc.UpModRate,
+  cc.BountyImpact,
+  ts.TagQuestionCount,
+  ts.AvgScore AS AvgTagScore,
+  ts.MaxViews AS TagMaxViews
+FROM correlated_activity r
+LEFT JOIN tag_summary ts ON r.TagName = ts.TagName
+ORDER BY r.LastActivityDate DESC
+LIMIT 100;

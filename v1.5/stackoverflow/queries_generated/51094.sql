@@ -1,0 +1,134 @@
+-- {"query": "51094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1353} 
+
+WITH top_users AS (
+    SELECT u.Id, u.Reputation, u.DisplayName
+    FROM Users u
+    WHERE u.Reputation >= 10000
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+),
+active_posts AS (
+    SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+           p.OwnerUserId, p.Title, p.Tags
+    FROM Posts p
+    INNER JOIN top_users tu ON p.OwnerUserId = tu.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    AND p.Score > 0
+    AND p.ViewCount > 100
+),
+tag_stats AS (
+    SELECT ap.Id as post_id,
+           COUNT(DISTINCT TRIM(BOTH '"' FROM unnest(string_to_array(
+               substring(ap.Tags, 2, length(ap.Tags) - 2), '"><"'
+           )))) as tag_count,
+           string_agg(TRIM(BOTH '"' FROM unnest(string_to_array(
+               substring(ap.Tags, 2, length(ap.Tags) - 2), '"><"'
+           ))), ', ') as tag_list
+    FROM active_posts ap
+    GROUP BY ap.Id
+    HAVING COUNT(DISTINCT TRIM(BOTH '"' FROM unnest(string_to_array(
+        substring(ap.Tags, 2, length(ap.Tags) - 2), '"><"'
+    )))) >= 3
+),
+engagement_metrics AS (
+    SELECT ap.Id,
+           COALESCE(v.upvotes, 0) as upvotes,
+           COALESCE(v.downvotes, 0) as downvotes,
+           COALESCE(v.net_score, 0) as net_score,
+           COALESCE(c.comment_count, 0) as comment_count,
+           COALESCE(l.link_count, 0) as link_count,
+           COALESCE(b.badge_count, 0) as owner_badges
+    FROM active_posts ap
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as downvotes,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 
+                       WHEN VoteTypeId = 3 THEN -1 
+                       ELSE 0 END) as net_score
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) v ON ap.Id = v.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) as comment_count
+        FROM Comments
+        WHERE Score >= 0
+        GROUP BY PostId
+    ) c ON ap.Id = c.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) as link_count
+        FROM PostLinks
+        WHERE LinkTypeId = 1
+        GROUP BY PostId
+    ) l ON ap.Id = l.PostId
+    LEFT JOIN (
+        SELECT u.Id as user_id, COUNT(DISTINCT b.Id) as badge_count
+        FROM Users u
+        INNER JOIN Badges b ON u.Id = b.UserId
+        WHERE b.Class IN (1, 2)
+        GROUP BY u.Id
+    ) b ON ap.OwnerUserId = b.user_id
+),
+post_history_summary AS (
+    SELECT ph.PostId,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) as edit_count,
+           MAX(ph.CreationDate) as last_edit_date,
+           AVG(EXTRACT(EPOCH FROM (ph.CreationDate - ap.CreationDate))/3600) as avg_hours_to_edit
+    FROM PostHistory ph
+    INNER JOIN active_posts ap ON ph.PostId = ap.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+    GROUP BY ph.PostId
+)
+SELECT 
+    ap.Id as post_id,
+    ap.Title,
+    ap.CreationDate as post_date,
+    ap.Score as post_score,
+    ap.ViewCount,
+    ap.AnswerCount,
+    ts.tag_count,
+    ts.tag_list,
+    em.upvotes,
+    em.downvotes,
+    em.net_score,
+    em.comment_count,
+    em.link_count,
+    em.owner_badges,
+    phs.edit_count,
+    phs.last_edit_date,
+    phs.avg_hours_to_edit,
+    tu.DisplayName as owner_name,
+    tu.Reputation as owner_reputation,
+    ROW_NUMBER() OVER (
+        PARTITION BY EXTRACT(MONTH FROM ap.CreationDate), EXTRACT(YEAR FROM ap.CreationDate)
+        ORDER BY (em.net_score * 0.6 + ap.ViewCount * 0.3 + em.comment_count * 0.1) DESC
+    ) as monthly_rank,
+    NTILE(4) OVER (
+        ORDER BY em.net_score DESC, ap.ViewCount DESC
+    ) as performance_quartile
+FROM active_posts ap
+INNER JOIN top_users tu ON ap.OwnerUserId = tu.Id
+INNER JOIN tag_stats ts ON ap.Id = ts.post_id
+LEFT JOIN engagement_metrics em ON ap.Id = em.Id
+LEFT JOIN post_history_summary phs ON ap.Id = phs.PostId
+WHERE (em.net_score * 0.6 + ap.ViewCount * 0.3 + em.comment_count * 0.1) > (
+    SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY (net_score * 0.6 + view_count * 0.3 + comment_count * 0.1))
+    FROM (
+        SELECT v2.net_score, ap2.ViewCount, em2.comment_count
+        FROM active_posts ap2
+        LEFT JOIN engagement_metrics em2 ON ap2.Id = em2.Id
+        LEFT JOIN (
+            SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 
+                                   WHEN VoteTypeId = 3 THEN -1 
+                                   ELSE 0 END) as net_score
+            FROM Votes WHERE VoteTypeId IN (2, 3)
+            GROUP BY PostId
+        ) v2 ON ap2.Id = v2.PostId
+    ) stats
+)
+ORDER BY 
+    (em.net_score * 0.6 + ap.ViewCount * 0.3 + em.comment_count * 0.1) DESC,
+    ap.CreationDate DESC
+LIMIT 500;

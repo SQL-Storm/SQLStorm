@@ -1,0 +1,152 @@
+WITH
+  posts_per_user AS (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS PostCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ),
+  questions_per_user AS (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS QuestionCount
+    FROM Posts
+    WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ),
+  answers_per_user AS (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ),
+  accepted_answers AS (
+    SELECT a.OwnerUserId AS UserId, COUNT(*) AS AcceptedAnswerCount
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2 AND q.AcceptedAnswerId = a.Id
+    GROUP BY a.OwnerUserId
+  ),
+  upvotes_per_user AS (
+    SELECT p.OwnerUserId AS UserId, COUNT(*) AS UpVotes
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId = 2
+    GROUP BY p.OwnerUserId
+  ),
+  downvotes_per_user AS (
+    SELECT p.OwnerUserId AS UserId, COUNT(*) AS DownVotes
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId = 3
+    GROUP BY p.OwnerUserId
+  ),
+  last_activity_per_user AS (
+    SELECT OwnerUserId AS UserId, MAX(LastActivityDate) AS LastActivityDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ),
+  distinct_tag_count_per_user AS (
+    SELECT p.OwnerUserId AS UserId, COUNT(DISTINCT t.Tag) AS DistinctTagCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      SELECT Tag
+      FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+    ) AS t
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ),
+  user_all AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           COALESCE(pp.PostCount, 0) AS PostCount,
+           COALESCE(qp.QuestionCount, 0) AS QuestionCount,
+           COALESCE(ap.AnswerCount, 0) AS AnswerCount,
+           COALESCE(aa.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+           COALESCE(uv.UpVotes, 0) AS UpVotes,
+           COALESCE(dv.DownVotes, 0) AS DownVotes,
+           COALESCE(lap.LastActivityDate, u.LastAccessDate) AS LastActivityDate,
+           COALESCE(dt.DistinctTagCount, 0) AS DistinctTagCount,
+           (COALESCE(pp.PostCount, 0) * 1.0
+            + COALESCE(uv.UpVotes, 0) * 2.0
+            - COALESCE(dv.DownVotes, 0) * 1.0
+            + COALESCE(aa.AcceptedAnswers, 0) * 3.0
+            + COALESCE(dt.DistinctTagCount, 0) * 0.5) AS BenchScore
+    FROM Users u
+    LEFT JOIN posts_per_user pp ON pp.UserId = u.Id
+    LEFT JOIN questions_per_user qp ON qp.UserId = u.Id
+    LEFT JOIN answers_per_user ap ON ap.UserId = u.Id
+    LEFT JOIN accepted_answers aa ON aa.UserId = u.Id
+    LEFT JOIN upvotes_per_user uv ON uv.UserId = u.Id
+    LEFT JOIN downvotes_per_user dv ON dv.UserId = u.Id
+    LEFT JOIN last_activity_per_user lap ON lap.UserId = u.Id
+    LEFT JOIN distinct_tag_count_per_user dt ON dt.UserId = u.Id
+  ),
+  bench_set AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY us.BenchScore DESC) AS RowNum,
+           us.UserId,
+           us.DisplayName,
+           us.Reputation,
+           us.PostCount,
+           us.UpVotes,
+           us.DownVotes,
+           us.AcceptedAnswers,
+           us.DistinctTagCount,
+           us.LastActivityDate,
+           us.BenchScore,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 1) AS GoldBadges,
+           (SELECT STRING_AGG(DISTINCT t.Tag, ',')
+            FROM Posts p
+            JOIN LATERAL (
+              SELECT Tag
+              FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+            ) AS t(Tag)
+            WHERE p.OwnerUserId = us.UserId) AS UsedTags,
+           'Bench' AS Source,
+           CASE
+             WHEN us.LastActivityDate IS NULL THEN 'NoActivity'
+             WHEN us.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Active'
+             ELSE 'Dormant'
+           END AS ActivityStatus
+    FROM user_all us
+    ORDER BY us.BenchScore DESC
+    LIMIT 100
+  ),
+  rep_set AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RowNum,
+           us.UserId,
+           us.DisplayName,
+           us.Reputation,
+           us.PostCount,
+           us.UpVotes,
+           us.DownVotes,
+           us.AcceptedAnswers,
+           us.DistinctTagCount,
+           us.LastActivityDate,
+           us.Reputation AS BenchScore,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 1) AS GoldBadges,
+           (SELECT STRING_AGG(DISTINCT t.Tag, ',')
+            FROM Posts p
+            JOIN LATERAL (
+              SELECT Tag
+              FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+            ) AS t(Tag)
+            WHERE p.OwnerUserId = us.UserId) AS UsedTags,
+           'Rep' AS Source,
+           CASE
+             WHEN us.LastActivityDate IS NULL THEN 'NoActivity'
+             WHEN us.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Active'
+             ELSE 'Dormant'
+           END AS ActivityStatus
+    FROM user_all us
+    ORDER BY us.Reputation DESC
+    LIMIT 100
+  )
+SELECT *
+FROM bench_set
+UNION ALL
+SELECT *
+FROM rep_set
+ORDER BY BenchScore DESC
+LIMIT 100;

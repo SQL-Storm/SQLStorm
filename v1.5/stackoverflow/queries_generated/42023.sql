@@ -1,0 +1,105 @@
+-- {"query": "42023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2057, "output_tokens": 741} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS Rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) -- Questions and Answers
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.Id = ANY(string_to_array(P.Tags, '<'))
+    WHERE 
+        P.PostTypeId = 1 -- Questions
+    GROUP BY 
+        T.TagName
+),
+PostHistoryStats AS (
+    SELECT 
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS EditCount,
+        MAX(PH.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory PH
+    WHERE 
+        PH.PostHistoryTypeId IN (5, 6, 8, 24) -- Edit Body, Rollback Body, Edit Title, Suggested Edit Applied
+    GROUP BY 
+        PH.PostId
+),
+CommentActivity AS (
+    SELECT 
+        C.PostId,
+        COUNT(C.Id) AS CommentCount
+    FROM 
+        Comments C
+    GROUP BY 
+        C.PostId
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.Title,
+    RP.Tags,
+    RP.OwnerDisplayName,
+    TU.DisplayName AS TopUser,
+    TU.Reputation,
+    TU.PostCount AS UserPostCount,
+    TS.TagName,
+    TS.PostCount AS TagPostCount,
+    TS.AvgScore AS TagAvgScore,
+    PHS.EditCount,
+    PHS.LastEditDate,
+    CA.CommentCount
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+JOIN 
+    TagStats TS ON RP.Tags LIKE '%' || TS.TagName || '%'
+LEFT JOIN 
+    PostHistoryStats PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    CommentActivity CA ON RP.Id = CA.PostId
+WHERE 
+    RP.Rank <= 10 -- Top 10 ranked posts
+    AND TU.UserRank <= 10 -- Top 10 ranked users
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

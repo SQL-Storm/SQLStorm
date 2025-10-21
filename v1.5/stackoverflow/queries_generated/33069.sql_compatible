@@ -1,0 +1,102 @@
+WITH TopActiveTags AS (
+    SELECT unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS TagName,
+           COUNT(*) AS QuestionCount
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND Tags IS NOT NULL
+    GROUP BY TagName
+),
+TopTags AS (
+    SELECT TagName
+    FROM TopActiveTags
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+QuestionStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        ARRAY_AGG(t.TagName) AS TagsArray
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(TagName)
+        ON t.TagName = ANY(ARRAY(SELECT TagName FROM TopTags))
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.CreationDate, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, u.DisplayName, u.Reputation
+),
+AnswerCounts AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+DetailedPosts AS (
+    SELECT
+        qs.PostId,
+        qs.CreationDate,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.OwnerDisplayName,
+        qs.Reputation,
+        qs.TagsArray,
+        ac.AnswerCount AS NumberOfAnswers
+    FROM QuestionStats qs
+    LEFT JOIN AnswerCounts ac ON qs.PostId = ac.QuestionId
+),
+LatestComments AS (
+    SELECT
+        c.PostId,
+        c.CreationDate AS CommentDate,
+        c.UserDisplayName,
+        c.Text AS CommentText
+    FROM Comments c
+    WHERE c.CreationDate = (
+        SELECT MAX(c2.CreationDate)
+        FROM Comments c2
+        WHERE c2.PostId = c.PostId
+    )
+),
+PostOrder AS (
+    SELECT
+        p.PostId,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS PostRank
+    FROM (
+        SELECT PostId FROM Posts WHERE PostTypeId IN (1,2)
+        UNION
+        SELECT PostId FROM Comments
+    ) p
+)
+SELECT
+    dp.PostId,
+    dp.Title,
+    dp.CreationDate,
+    dp.Score,
+    dp.ViewCount,
+    dp.NumberOfAnswers,
+    dp.OwnerDisplayName,
+    dp.Reputation,
+    array_to_string(dp.TagsArray, ', ') AS Tags,
+    lc.CommentDate,
+    lc.UserDisplayName AS CommentAuthor,
+    lc.CommentText,
+    po.PostRank
+FROM
+    DetailedPosts dp
+LEFT JOIN LatestComments lc ON dp.PostId = lc.PostId
+JOIN PostOrder po ON dp.PostId = po.PostId
+WHERE
+    po.PostRank <= 100
+ORDER BY
+    dp.CreationDate DESC;

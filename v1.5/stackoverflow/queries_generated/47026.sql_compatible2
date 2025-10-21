@@ -1,0 +1,144 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as question_count,
+        1 as level
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.question_count,
+        th.level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON t.Id != th.Id
+    WHERE th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers_in_tag,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+        AND u.Reputation > 5000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+question_lifecycle AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate as question_created,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) as first_edit,
+        MIN(CASE WHEN a.PostTypeId = 2 THEN a.CreationDate END) as first_answer,
+        MIN(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN aa.CreationDate END) as answer_accepted,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) as closed_date,
+        COUNT(DISTINCT a.Id) as total_answers,
+        COUNT(DISTINCT c.Id) as total_comments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id
+    LEFT JOIN Posts aa ON aa.Id = p.AcceptedAnswerId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND p.Score >= 5
+    GROUP BY p.Id, p.Title, p.CreationDate
+),
+badge_correlation AS (
+    SELECT 
+        b1.Name as badge1,
+        b2.Name as badge2,
+        COUNT(DISTINCT b1.UserId) as users_with_both,
+        CAST(COUNT(DISTINCT b1.UserId) AS float) / NULLIF(COUNT(DISTINCT u.Id), 0) as correlation_coefficient
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b1.UserId = b2.UserId AND b1.Id < b2.Id
+    INNER JOIN Users u ON u.Id = b1.UserId
+    WHERE b1.Class = 1 
+        AND b2.Class = 1
+    GROUP BY b1.Name, b2.Name
+    HAVING COUNT(DISTINCT b1.UserId) >= 50
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.total_score,
+    ue.avg_score,
+    ue.accepted_answers,
+    ROUND(ue.accepted_answers / NULLIF(ue.answers_in_tag, 0) * 100, 2) as acceptance_rate,
+    ql.total_answers as avg_answers_to_questions,
+    ql.total_comments as avg_comments_on_questions,
+    EXTRACT(EPOCH FROM (ql.first_answer - ql.question_created)) / 3600 as avg_hours_to_first_answer,
+    EXTRACT(EPOCH FROM (ql.answer_accepted - ql.first_answer)) / 86400 as avg_days_to_acceptance,
+    bc.badge1,
+    bc.badge2,
+    bc.correlation_coefficient,
+    DENSE_RANK() OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC) as rank_in_tag,
+    PERCENT_RANK() OVER (ORDER BY ue.Reputation DESC) as reputation_percentile,
+    LAG(ue.total_score, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC) as next_higher_score,
+    LEAD(ue.total_score, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC) as next_lower_score
+FROM user_expertise ue
+CROSS JOIN LATERAL (
+    SELECT 
+        AVG(ql.total_answers) as total_answers,
+        AVG(ql.total_comments) as total_comments,
+        AVG(EXTRACT(EPOCH FROM (ql.first_answer - ql.question_created)) / 3600) as avg_hours_to_first_answer,
+        AVG(EXTRACT(EPOCH FROM (ql.answer_accepted - ql.first_answer)) / 86400) as avg_days_to_acceptance
+    FROM question_lifecycle ql
+    WHERE EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.Id = ql.Id 
+            AND p.Tags LIKE '%' || '<' || ue.TagName || '>' || '%'
+    )
+) ql
+CROSS JOIN LATERAL (
+    SELECT * 
+    FROM badge_correlation bc 
+    WHERE bc.correlation_coefficient > 0.7 
+    ORDER BY bc.correlation_coefficient DESC 
+    LIMIT 1
+) bc
+WHERE ue.avg_score >= 5
+GROUP BY
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.total_score,
+    ue.avg_score,
+    ue.accepted_answers,
+    ql.total_answers,
+    ql.total_comments,
+    ql.first_answer,
+    ql.question_created,
+    ql.answer_accepted,
+    bc.badge1,
+    bc.badge2,
+    bc.correlation_coefficient,
+    ue.TagName
+ORDER BY ue.TagName, ue.total_score DESC
+LIMIT 100;

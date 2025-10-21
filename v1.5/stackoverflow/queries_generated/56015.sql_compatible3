@@ -1,0 +1,38 @@
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, COUNT(p.Id) AS post_count
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY post_count DESC
+  LIMIT 10
+),
+top_tags AS (
+  SELECT t.TagName, COUNT(p.Id) AS post_count
+  FROM Tags t
+  JOIN Posts p ON POSITION(',' || CAST(t.Id AS VARCHAR) || ',' IN (
+      SELECT STRING_AGG(CAST(id AS VARCHAR), ',')
+      FROM (
+        SELECT Id, CAST(Id AS VARCHAR) AS id
+        FROM Posts
+      ) AS sub
+  )) > 0
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+  GROUP BY t.TagName
+  ORDER BY post_count DESC
+  LIMIT 10
+)
+SELECT
+  tu.DisplayName,
+  tu.post_count,
+  tt.TagName,
+  COUNT(v.Id) AS vote_count
+FROM top_users tu
+JOIN Posts p ON tu.Id = p.OwnerUserId
+JOIN Votes v ON p.Id = v.PostId
+JOIN top_tags tt ON p.Id IN (
+  SELECT Id FROM Posts WHERE Tags LIKE CONCAT('%<', tt.TagName, '>%')
+)
+WHERE v.VoteTypeId = 2 AND p.PostTypeId = 1 AND p.Score > 10
+GROUP BY tu.DisplayName, tu.post_count, tt.TagName
+ORDER BY vote_count DESC;

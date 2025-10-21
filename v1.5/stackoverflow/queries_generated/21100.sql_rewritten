@@ -1,0 +1,110 @@
+-- {"query": "21100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1286} 
+WITH active_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) as rep_rank,
+        LAG(u.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Id) as prev_rep
+    FROM Users u
+    WHERE u.Reputation > 1000 
+      AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+top_posts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.AnswerCount, 0) as answers,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ') as top_tags,
+        AVG(p.Score) OVER (PARTITION BY EXTRACT(MONTH FROM p.CreationDate) ORDER BY p.ViewCount DESC 
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as monthly_avg_score
+    FROM Posts p
+    LEFT JOIN Tags t ON POSITION(t.TagName IN COALESCE(p.Tags, '')) > 0
+    WHERE p.PostTypeId = 1 
+      AND p.Score > 0
+      AND p.ClosedDate IS NULL
+      AND (p.ViewCount > 10000 OR p.Score > 50)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.AnswerCount
+    HAVING COUNT(DISTINCT t.Id) >= 2 OR p.ViewCount IS NULL
+),
+post_engagement AS (
+    SELECT 
+        tp.Id as post_id,
+        tp.OwnerUserId as user_id,
+        tp.Score as post_score,
+        SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) as total_votes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes,
+        COUNT(DISTINCT c.Id) as comment_count,
+        MAX(v.CreationDate) as last_vote_date,
+        (tp.upvotes * 0.8 + tp.ViewCount * 0.2)::numeric(10,2) as engagement_score,
+        CASE 
+            WHEN tp.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN tp.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Active'
+        END as post_status
+    FROM top_posts tp
+    LEFT JOIN Votes v ON v.PostId = tp.Id AND v.CreationDate > tp.CreationDate - INTERVAL '30 days'
+    LEFT JOIN Comments c ON c.PostId = tp.Id AND c.Score > -5
+    GROUP BY tp.Id, tp.OwnerUserId, tp.Score, tp.upvotes, tp.ViewCount, tp.ClosedDate, tp.CommunityOwnedDate
+),
+user_badges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) as gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) as silver_badges,
+        STRING_AGG(DISTINCT b.Name, ' | ' ORDER BY b.Date DESC) as badge_names,
+        MAX(b.Date) as latest_badge_date
+    FROM Badges b
+    WHERE b.TagBased = false
+    GROUP BY b.UserId
+),
+complex_analytics AS (
+    SELECT 
+        au.Id as user_id,
+        au.DisplayName,
+        au.Reputation,
+        au.rep_rank,
+        COALESCE(pe.total_votes, 0) as votes,
+        COALESCE(ub.gold_badges, 0) as gold_count,
+        pe.engagement_score,
+        CONCAT(
+            COALESCE(au.Location, 'Unknown'), 
+            ' (', 
+            COALESCE(TO_CHAR(pe.post_score, '9999'), '0'), 
+            ' pts)'
+        ) as profile_summary,
+        (au.Reputation - COALESCE(au.prev_rep, 0)) as rep_growth,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(pe.engagement_score, 0) DESC, au.Reputation DESC) as overall_rank,
+        LAG(pe.engagement_score) OVER (PARTITION BY EXTRACT(YEAR FROM au.CreationDate) ORDER BY pe.post_score DESC) as prev_engagement
+    FROM active_users au
+    INNER JOIN post_engagement pe ON pe.user_id = au.Id
+    FULL OUTER JOIN user_badges ub ON ub.UserId = au.Id
+    WHERE au.rep_rank <= 50 
+      OR pe.engagement_score > 100
+      OR ub.gold_badges > 2
+)
+SELECT 
+    ca.*,
+    tp.top_tags,
+    CASE 
+        WHEN ca.rep_growth > 1000 THEN 'High Growth'
+        WHEN ca.rep_growth < 0 THEN 'Decline'
+        WHEN ca.gold_count > 5 AND ca.engagement_score > 500 THEN 'Elite'
+        ELSE 'Standard'
+    END as user_category,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM au.CreationDate) ORDER BY ca.engagement_score DESC) as yearly_engagement_rank,
+    PERCENT_RANK() OVER (ORDER BY ca.reputation DESC) as reputation_percentile,
+    (ca.votes * LOG(GREATEST(ca.reputation, 1)) + COALESCE(ca.gold_count * 100, 0))::int as weighted_score
+FROM complex_analytics ca
+INNER JOIN top_posts tp ON tp.OwnerUserId = ca.user_id
+INNER JOIN active_users au ON au.Id = ca.user_id
+WHERE (ca.rep_growth IS NULL OR ABS(ca.rep_growth) > 100)
+  AND (ca.latest_badge_date > cast('2024-10-01' as date) - INTERVAL '6 months' OR ca.latest_badge_date IS NULL)
+  AND NOT (ca.DisplayName ILIKE '%bot%' OR ca.DisplayName IS NULL)
+ORDER BY ca.overall_rank, ca.engagement_score DESC, ca.reputation DESC
+LIMIT 100;

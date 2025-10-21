@@ -1,0 +1,82 @@
+WITH HighReputationUsers AS (
+    -- Step 1: Identify users who are likely experts based on reputation, badges, and high-quality contributions.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100000
+      AND p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND u.UpVotes > (u.DownVotes * 5)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(b.Id) FILTER (WHERE b.Class = 1) > 5 -- At least 5 gold badges
+       AND AVG(p.Score) > 10
+),
+UserAnswerStats AS (
+    -- Step 2: For these expert users, analyze their answering patterns.
+    SELECT
+        hru.UserId,
+        q.Id AS QuestionId,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        q.ViewCount AS QuestionViewCount,
+        a.CreationDate AS AnswerCreationDate,
+        q.CreationDate AS QuestionCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 AS HoursToAnswer,
+        -- Rank answers based on score for each user
+        ROW_NUMBER() OVER(PARTITION BY hru.UserId ORDER BY a.Score DESC, q.ViewCount DESC) as AnswerRank
+    FROM HighReputationUsers hru
+    JOIN Posts a ON hru.UserId = a.OwnerUserId AND a.PostTypeId = 2 -- Answers by the user
+    JOIN Posts q ON a.ParentId = q.Id -- The questions they answered
+    WHERE q.ClosedDate IS NULL AND q.DeletionDate IS NULL
+),
+AnswerCommentsAnalysis AS (
+    -- Step 3: Analyze the comment activity on the top-ranked answers.
+    SELECT
+        uas.UserId,
+        uas.AnswerId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        -- Find the user who left the highest-scoring comment on this answer
+        FIRST_VALUE(c.UserId) OVER (PARTITION BY uas.AnswerId ORDER BY c.Score DESC, c.CreationDate DESC) AS TopCommenterUserId
+    FROM UserAnswerStats uas
+    JOIN Comments c ON uas.AnswerId = c.PostId
+    WHERE uas.AnswerRank <= 10 -- Focus analysis on top 10 answers per user
+    GROUP BY uas.UserId, uas.AnswerId, c.UserId, c.Score, c.CreationDate
+)
+-- Step 4: Final Aggregation and Result presentation
+-- Combine user stats with their best answer's performance and the subsequent discussion quality.
+SELECT
+    hru.DisplayName,
+    hru.Reputation,
+    hru.GoldBadges,
+    uas.AnswerRank,
+    p.Title AS QuestionTitle,
+    uas.AnswerScore,
+    uas.QuestionViewCount,
+    uas.HoursToAnswer,
+    aca.TotalComments AS CommentsOnAnswer,
+    aca.TotalCommentScore AS CommentScoreOnAnswer,
+    TopCommenter.DisplayName AS TopCommenterName,
+    -- Calculate the "Impact Score" for the answer
+    (uas.AnswerScore * 10) + (uas.QuestionViewCount / 1000) + (aca.TotalCommentScore * 5) AS AnswerImpactScore,
+    -- Determine the trend of the user's activity by comparing their first and last post dates
+    (
+        SELECT MAX(CreationDate) - MIN(CreationDate)
+        FROM PostHistory
+        WHERE UserId = hru.UserId
+    ) AS UserActivitySpan
+FROM HighReputationUsers hru
+JOIN UserAnswerStats uas ON hru.UserId = uas.UserId
+JOIN Posts p ON uas.QuestionId = p.Id
+LEFT JOIN AnswerCommentsAnalysis aca ON uas.AnswerId = aca.AnswerId AND uas.UserId = aca.UserId
+LEFT JOIN Users TopCommenter ON aca.TopCommenterUserId = TopCommenter.Id
+WHERE uas.AnswerRank <= 5 -- Finally, select only the top 5 answers per expert user
+ORDER BY hru.Reputation DESC, hru.UserId, uas.AnswerRank;

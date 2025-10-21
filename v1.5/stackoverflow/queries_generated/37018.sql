@@ -1,0 +1,208 @@
+-- {"query": "37018.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2136} 
+WITH
+-- Top users by activity score (weighted: posts, answers, comments, votes, badges)
+UserActivity AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         COALESCE(p.PostCount,0) AS PostCount,
+         COALESCE(a.AnswerCount,0) AS AnswerCount,
+         COALESCE(c.CommentCount,0) AS CommentCount,
+         COALESCE(v.VoteCount,0) AS VoteCount,
+         COALESCE(b.BadgeScore,0) AS BadgeScore,
+         (COALESCE(p.PostCount,0)*3 + COALESCE(a.AnswerCount,0)*5 + COALESCE(c.CommentCount,0)*1
+          + COALESCE(v.VoteCount,0)*0.5 + COALESCE(b.BadgeScore,0)) AS ActivityScore
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS PostCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) a ON a.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CommentCount
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+  ) c ON c.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, SUM(CASE Class WHEN 1 THEN 5 WHEN 2 THEN 3 WHEN 3 THEN 1 ELSE 0 END) AS BadgeScore
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+-- Recent hot questions: combine score, views, recent activity and answer rate
+HotQuestions AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.LastActivityDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         (q.Score * 3 + COALESCE(q.ViewCount,0)/100.0 + COALESCE(q.FavoriteCount,0)*2
+          + COALESCE(q.AnswerCount,0)*4 +
+          GREATEST(0, EXTRACT(EPOCH FROM (NOW() - q.LastActivityDate))/3600)) AS HotnessBase
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+-- Tag enrichment: explode Tags string '<tag1><tag2>' into rows
+ExplodedTags AS (
+  SELECT p.Id AS PostId,
+         TRIM(tag) AS TagName
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND char_length(p.Tags) > 2
+),
+-- Tag popularity with median score and answer ratio
+TagStats AS (
+  SELECT et.TagName,
+         COUNT(DISTINCT et.PostId) AS QuestionCount,
+         SUM(COALESCE(p.Score,0)) AS TotalScore,
+         AVG(COALESCE(p.ViewCount,0)) AS AvgViews,
+         SUM(CASE WHEN COALESCE(p.AnswerCount,0) > 0 THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*),0) AS AnsweredRatio,
+         -- approximate median via percentile_cont
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(p.Score,0)) AS MedianScore
+  FROM ExplodedTags et
+  JOIN Posts p ON p.Id = et.PostId
+  GROUP BY et.TagName
+  HAVING COUNT(*) >= 50
+),
+-- Identify communities (clusters) by tag co-occurrence: for heavy pairs
+TagPairs AS (
+  SELECT t1.TagName AS TagA,
+         t2.TagName AS TagB,
+         COUNT(*) AS CoOccur
+  FROM ExplodedTags t1
+  JOIN ExplodedTags t2 ON t1.PostId = t2.PostId AND t1.TagName < t2.TagName
+  GROUP BY t1.TagName, t2.TagName
+  HAVING COUNT(*) >= 30
+),
+-- For each top user compute their best answered questions metrics and acceptance delta
+UserAnswerMetrics AS (
+  SELECT u.UserId,
+         u.DisplayName,
+         COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) FILTER (WHERE a.Score >= 0) AS PositiveAnswers,
+         AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         SUM(CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedCount,
+         MAX(a.Score) AS MaxAnswerScore,
+         MIN(a.Score) AS MinAnswerScore,
+         -- time-to-accept: average delta between answer creation and question accepted (if accepted)
+         AVG(EXTRACT(EPOCH FROM (q.LastActivityDate - a.CreationDate))/3600) FILTER (WHERE q.AcceptedAnswerId = a.Id AND q.LastActivityDate IS NOT NULL) AS AvgHoursToAccept
+  FROM UserActivity u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.UserId
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  GROUP BY u.UserId, u.DisplayName
+),
+-- Complex windowed selection: combine hotness, tag median and user activity for candidate ranking
+CandidateQuestions AS (
+  SELECT h.QuestionId,
+         h.Title,
+         h.OwnerUserId,
+         h.CreationDate,
+         h.LastActivityDate,
+         h.Score,
+         h.ViewCount,
+         h.AnswerCount,
+         h.HotnessBase,
+         COALESCE(ts.MedianScore,0) AS TagMedianScore,
+         COALESCE(ts.QuestionCount,0) AS TagQuestionCount,
+         ua.ActivityScore AS OwnerActivity,
+         ROW_NUMBER() OVER (PARTITION BY COALESCE(ts.TagName,'__none') ORDER BY h.HotnessBase DESC, h.Score DESC, h.ViewCount DESC) AS TagRank
+  FROM HotQuestions h
+  LEFT JOIN ExplodedTags et ON et.PostId = h.QuestionId
+  LEFT JOIN TagStats ts ON ts.TagName = et.TagName
+  LEFT JOIN UserActivity ua ON ua.UserId = h.OwnerUserId
+  WHERE h.CreationDate >= NOW() - INTERVAL '365 days'
+),
+-- Aggregate neighborhood info: for top candidate questions collect top answers and commenters
+QuestionNeighborhood AS (
+  SELECT cq.QuestionId,
+         cq.Title,
+         cq.OwnerUserId,
+         cq.CreationDate,
+         cq.LastActivityDate,
+         cq.Score AS QuestionScore,
+         cq.ViewCount,
+         cq.AnswerCount,
+         cq.TagMedianScore,
+         cq.TagQuestionCount,
+         cq.OwnerActivity,
+         cq.TagRank,
+         -- top 3 answers by score
+         ARRAY(
+           SELECT a2.Id FROM Posts a2
+           WHERE a2.ParentId = cq.QuestionId AND a2.PostTypeId = 2
+           ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate ASC
+           LIMIT 3
+         ) AS TopAnswerIds,
+         -- distinct top commenters on the question
+         ARRAY(
+           SELECT c.UserId FROM Comments c
+           WHERE c.PostId = cq.QuestionId AND c.UserId IS NOT NULL
+           GROUP BY c.UserId
+           ORDER BY COUNT(*) DESC
+           LIMIT 5
+         ) AS TopCommenterIds
+  FROM CandidateQuestions cq
+  WHERE cq.TagRank <= 5
+)
+-- Final selection: assemble an elaborate report combining multiple metrics, filters and subqueries
+SELECT qn.QuestionId,
+       qn.Title,
+       u.DisplayName AS OwnerName,
+       u.Reputation,
+       qn.QuestionScore,
+       qn.ViewCount,
+       qn.AnswerCount,
+       qn.TagMedianScore,
+       qn.TagQuestionCount,
+       ROUND(qn.OwnerActivity,2) AS OwnerActivityScore,
+       qn.TopAnswerIds,
+       qn.TopCommenterIds,
+       ua2.TotalAnswers,
+       ua2.AvgAnswerScore,
+       ua2.AcceptedCount,
+       ua2.AvgHoursToAccept,
+       tp.CoOccurringTags,
+       -- computed composite rank
+       RANK() OVER (ORDER BY (qn.QuestionScore*2 + qn.ViewCount/100.0 + qn.TagMedianScore*1.5 + qn.OwnerActivity/10.0) DESC) AS CompositeRank
+FROM QuestionNeighborhood qn
+LEFT JOIN Users u ON u.Id = qn.OwnerUserId
+LEFT JOIN UserAnswerMetrics ua2 ON ua2.UserId = qn.OwnerUserId
+LEFT JOIN (
+  -- top 3 co-occurring tags for question's primary tag (derived from tag with highest TagQuestionCount)
+  SELECT et.PostId,
+         ARRAY_AGG(tp.TagB ORDER BY tp.CoOccur DESC LIMIT 3) AS CoOccurringTags
+  FROM ExplodedTags et
+  JOIN TagPairs tp ON tp.TagA = (
+    SELECT et2.TagName
+    FROM ExplodedTags et2
+    WHERE et2.PostId = et.PostId
+    ORDER BY (
+      SELECT COUNT(*) FROM ExplodedTags et3 WHERE et3.TagName = et2.TagName
+    ) DESC
+    LIMIT 1
+  )
+  GROUP BY et.PostId
+) tp ON tp.PostId = qn.QuestionId
+ORDER BY CompositeRank
+LIMIT 100;

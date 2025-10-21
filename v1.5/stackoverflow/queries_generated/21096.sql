@@ -1,0 +1,147 @@
+-- {"query": "21096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1717} 
+
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS user_creation_date,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        COUNT(DISTINCT v.Id) AS total_votes_received,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes_received,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes_received,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        NTILE(10) OVER (ORDER BY u.CreationDate) AS activity_decile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) AND p.DeletedDate IS NULL
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE u.Reputation > 0 
+      AND u.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+active_tags AS (
+    SELECT 
+        t.Id AS tag_id,
+        t.TagName,
+        t.Count AS tag_usage_count,
+        COALESCE(p.Title, 'No Wiki') AS wiki_title,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(t.TagName, 1, 1) ORDER BY t.Count DESC) AS tag_rank_per_initial,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) AS prev_tag_count
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+    WHERE t.Count > 100 
+      AND t.TagName NOT LIKE '%-%'  -- Exclude compound tags for simplicity
+),
+post_engagement AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate AS post_creation_date,
+        u.DisplayName AS owner_name,
+        COALESCE(accepted_a.Score, 0) AS accepted_answer_score,
+        (SELECT STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId = 4 THEN 'Title Edit' 
+                                         WHEN ph.PostHistoryTypeId = 5 THEN 'Body Edit' 
+                                         ELSE ph.Comment END, '; ' ORDER BY ph.CreationDate)
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id 
+           AND ph.PostHistoryTypeId IN (4, 5, 10, 11)
+           AND ph.CreationDate > p.CreationDate
+         HAVING COUNT(*) > 0) AS edit_summary,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 5 THEN 'High Activity'
+            ELSE 'Standard'
+        END AS post_status,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC, p.Score DESC) AS engagement_rank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts accepted_a ON p.AcceptedAnswerId = accepted_a.Id
+    WHERE p.DeletionDate IS NULL 
+      AND p.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+      AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+)
+SELECT 
+    ua.user_id,
+    ua.DisplayName AS user_name,
+    ua.reputation_rank,
+    at.tag_name AS top_tag_used,
+    pe.post_id,
+    pe.Title AS post_title,
+    pe.post_status,
+    pe.engagement_rank,
+    pe.avg_post_score * ua.question_count AS weighted_question_impact,
+    (pe.upvotes_received + COALESCE(pe.downvotes_received, 0) * -1) AS net_votes,
+    CASE 
+        WHEN pe.ClosedDate IS NOT NULL AND pe.PostTypeId = 1 THEN 
+            CONCAT('Closed on ', TO_CHAR(pe.ClosedDate, 'YYYY-MM-DD'), ' with ', COALESCE(ph.Text, 'Unknown reason'))
+        WHEN pe.CommunityOwnedDate IS NOT NULL THEN 
+            CONCAT('Community owned since ', TO_CHAR(pe.CommunityOwnedDate, 'YYYY-MM-DD'))
+        ELSE NULL 
+    END AS closure_details,
+    GREATEST(pe.ViewCount, ua.total_votes_received * 10, 100) AS engagement_score,  -- Complex expression
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pe.post_id AND c.Score > 0) AS positive_comment_count,
+    ua.activity_decile * pe.answer_count AS activity_multiplier
+FROM user_activity ua
+INNER JOIN post_engagement pe ON ua.user_id = pe.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        pl.PostId,
+        MAX(CASE WHEN at.tag_name = SUBSTRING(pl.RelatedPostId::text, 1, LENGTH(pl.RelatedPostId::text) - 2)) THEN at.tag_name END) AS linked_tag
+    FROM PostLinks pl
+    CROSS JOIN active_tags at 
+    WHERE pl.LinkTypeId = 1  -- Linked posts
+      AND pl.CreationDate > CURRENT_DATE - INTERVAL '3 months'
+    GROUP BY pl.PostId
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 1
+) linked_posts ON pe.post_id = linked_posts.PostId
+CROSS JOIN (
+    SELECT tag_name 
+    FROM active_tags 
+    WHERE tag_rank_per_initial = 1 
+      AND tag_usage_count > (SELECT AVG(Count) FROM Tags)
+    LIMIT 5
+) at  -- Cross join for variety, limited to top tags
+LEFT JOIN PostHistory ph ON pe.post_id = ph.PostId AND ph.PostHistoryTypeId = 10  -- Close history
+WHERE ua.post_count > 5 
+  AND pe.ViewCount > 1000
+  AND (pe.post_status = 'High Activity' OR pe.post_status IS NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM Badges b 
+      WHERE b.UserId = ua.user_id 
+        AND b.Name ILIKE '%banned%' 
+        AND b.Date > CURRENT_DATE - INTERVAL '1 year'
+  )
+  AND (pe.Title ILIKE ANY (ARRAY['%sql%', '%query%', '%performance%']) 
+       OR at.tag_name IN ('sql', 'postgresql', 'database'))
+UNION ALL
+SELECT 
+    ua.user_id,
+    ua.DisplayName,
+    ua.reputation_rank,
+    NULL AS top_tag_used,  -- NULL logic test
+    NULL AS post_id,
+    'Summary User Stats' AS post_title,
+    'Aggregate' AS post_status,
+    NULL AS engagement_rank,
+    SUM(ua.weighted_question_impact) OVER (PARTITION BY ua.activity_decile) AS total_impact,
+    AVG(ua.net_votes) OVER (ORDER BY ua.reputation_rank ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS moving_avg_votes,
+    NULL AS closure_details,
+    SUM(COALESCE(ua.engagement_score, 0)) OVER () AS global_engagement,
+    COUNT(pe.post_id) FILTER (WHERE pe.positive_comment_count > 3) AS high_comment_posts,
+    MAX(ua.activity_multiplier) OVER (PARTITION BY ua.reputation_rank / 100) AS max_activity_in_band
+FROM user_activity ua
+LEFT JOIN post_engagement pe ON ua.user_id = pe.OwnerUserId
+WHERE ua.reputation_rank <= 1000
+GROUP BY ua.user_id, ua.DisplayName, ua.reputation_rank, ua.activity_decile
+HAVING COUNT(pe.post_id) > 0
+ORDER BY ua.reputation_rank, engagement_score DESC
+LIMIT 500;

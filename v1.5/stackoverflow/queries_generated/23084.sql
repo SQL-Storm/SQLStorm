@@ -1,0 +1,56 @@
+-- {"query": "23084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 713} 
+
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank,
+           COALESCE(u.UpVotes + u.DownVotes, 0) AS TotalVotes,
+           NULLIF(u.Location, '') AS CleanLocation
+    FROM Users u
+    WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users)
+),
+UserPosts AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.Score, p.ViewCount,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+           STRING_AGG(t.TagName, ', ') AS PostTags,
+           CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.ClosedDate
+),
+AggregatedBadges AS (
+    SELECT b.UserId, COUNT(b.Id) AS BadgeCount,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.Class = 1 OR b.TagBased = TRUE
+    GROUP BY b.UserId
+),
+UserActivity AS (
+    SELECT tu.Id, tu.DisplayName, tu.Reputation, tu.UserRank,
+           COALESCE(up.Score, 0) AS AvgPostScore,
+           (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = up.PostId AND c.Score > 0) AS PositiveComments,
+           ab.BadgeCount,
+           tu.TotalVotes * (SELECT AVG(VoteTypeId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = tu.Id)) AS WeightedVotes
+    FROM TopUsers tu
+    LEFT OUTER JOIN (
+        SELECT OwnerUserId, AVG(Score) AS Score
+        FROM UserPosts
+        GROUP BY OwnerUserId
+    ) up ON tu.Id = up.OwnerUserId
+    LEFT OUTER JOIN AggregatedBadges ab ON tu.Id = ab.UserId
+    WHERE tu.CleanLocation IS NOT NULL OR tu.Reputation > 10000
+)
+SELECT ua.Id, ua.DisplayName, ua.Reputation, ua.UserRank, ua.AvgPostScore, ua.PositiveComments, ua.BadgeCount, ua.WeightedVotes,
+       ph.EditCount,
+       RANK() OVER (ORDER BY ua.Reputation DESC, ua.BadgeCount DESC) AS OverallRank
+FROM UserActivity ua
+LEFT JOIN (
+    SELECT PostId, COUNT(Id) AS EditCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY PostId
+) ph ON ph.PostId IN (SELECT PostId FROM UserPosts WHERE OwnerUserId = ua.Id)
+UNION ALL
+SELECT NULL AS Id, 'Summary' AS DisplayName, SUM(Reputation) AS Reputation, NULL AS UserRank, AVG(AvgPostScore) AS AvgPostScore, SUM(PositiveComments) AS PositiveComments, SUM(BadgeCount) AS BadgeCount, SUM(WeightedVotes) AS WeightedVotes, SUM(EditCount) AS EditCount, NULL AS OverallRank
+FROM UserActivity
+ORDER BY OverallRank;

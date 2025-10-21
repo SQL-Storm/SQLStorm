@@ -1,0 +1,170 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        Users.Id, 
+        Users.Reputation, 
+        Users.CreationDate, 
+        Users.DisplayName, 
+        Users.LastAccessDate, 
+        Users.WebsiteUrl, 
+        Users.Location, 
+        Users.AboutMe, 
+        Users.Views, 
+        Users.UpVotes, 
+        Users.DownVotes, 
+        Users.ProfileImageUrl, 
+        Users.EmailHash, 
+        Users.AccountId
+    FROM 
+        Users
+    WHERE 
+        Users.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+),
+BadgesEarned AS (
+    SELECT 
+        Badges.UserId, 
+        Badges.Name, 
+        Badges.Date, 
+        Badges.Class, 
+        Badges.TagBased
+    FROM 
+        Badges
+    WHERE 
+        Badges.Date > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+),
+PostVotes AS (
+    SELECT 
+        Votes.PostId, 
+        Votes.VoteTypeId, 
+        Votes.UserId, 
+        Votes.CreationDate, 
+        Votes.BountyAmount
+    FROM 
+        Votes
+    WHERE 
+        Votes.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+),
+PostTags AS (
+    SELECT 
+        Posts.Id, 
+        Posts.Tags, 
+        Tags.TagName, 
+        Tags.Count
+    FROM 
+        Posts
+    LEFT JOIN 
+        Tags ON Posts.Tags LIKE '%' || Tags.TagName || '%'
+),
+PostHistoryCTE AS (
+    SELECT 
+        PostHistory.PostId, 
+        PostHistory.PostHistoryTypeId, 
+        PostHistory.CreationDate, 
+        PostHistory.UserId, 
+        PostHistory.UserDisplayName, 
+        PostHistory.Text, 
+        PostHistory.ContentLicense
+    FROM 
+        PostHistory
+    WHERE 
+        PostHistory.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+)
+SELECT 
+    RecentPosts.Id AS PostId, 
+    RecentPosts.PostTypeId, 
+    RecentPosts.AcceptedAnswerId, 
+    RecentPosts.ParentId, 
+    RecentPosts.CreationDate AS PostCreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    COALESCE(RecentPosts.Body, '') AS PostBody, 
+    RecentPosts.OwnerUserId, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.LastEditorUserId, 
+    RecentPosts.LastEditorDisplayName, 
+    RecentPosts.LastEditDate AS PostLastEditDate, 
+    RecentPosts.LastActivityDate AS PostLastActivityDate, 
+    RecentPosts.Title, 
+    RecentPosts.Tags, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.FavoriteCount, 
+    RecentPosts.ClosedDate, 
+    RecentPosts.CommunityOwnedDate, 
+    RecentPosts.ContentLicense, 
+    PostTags.TagName, 
+    PostTags.Count AS TagCount, 
+    UserActivity.Id AS UserId, 
+    UserActivity.Reputation, 
+    UserActivity.CreationDate AS UserCreationDate, 
+    UserActivity.DisplayName, 
+    UserActivity.LastAccessDate, 
+    UserActivity.WebsiteUrl, 
+    UserActivity.Location, 
+    UserActivity.AboutMe, 
+    UserActivity.Views, 
+    UserActivity.UpVotes, 
+    UserActivity.DownVotes, 
+    UserActivity.ProfileImageUrl, 
+    UserActivity.EmailHash, 
+    UserActivity.AccountId, 
+    BadgesEarned.Name AS BadgeName, 
+    BadgesEarned.Date AS BadgeDate, 
+    BadgesEarned.Class AS BadgeClass, 
+    BadgesEarned.TagBased AS IsTagBased, 
+    PostVotes.VoteTypeId, 
+    PostVotes.UserId AS VoteUserId, 
+    PostVotes.CreationDate AS VoteCreationDate, 
+    PostVotes.BountyAmount, 
+    PostHistoryCTE.PostHistoryTypeId AS HistoryTypeId, 
+    PostHistoryCTE.CreationDate AS HistoryCreationDate, 
+    PostHistoryCTE.UserId AS HistoryUserId, 
+    PostHistoryCTE.UserDisplayName AS HistoryUserDisplayName, 
+    PostHistoryCTE.Text AS HistoryText, 
+    PostHistoryCTE.ContentLicense AS HistoryContentLicense
+FROM 
+    RecentPosts
+LEFT JOIN 
+    PostTags ON RecentPosts.Id = PostTags.Id
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.Id
+LEFT JOIN 
+    BadgesEarned ON UserActivity.Id = BadgesEarned.UserId
+LEFT JOIN 
+    PostVotes ON RecentPosts.Id = PostVotes.PostId
+LEFT JOIN 
+    PostHistoryCTE ON RecentPosts.Id = PostHistoryCTE.PostId
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    PostTags.Count DESC, 
+    BadgesEarned.Date DESC, 
+    PostVotes.CreationDate DESC, 
+    PostHistoryCTE.CreationDate DESC;

@@ -1,0 +1,124 @@
+-- {"query": "6083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 982} 
+WITH
+-- sample time-bounded activity per user with complex joins and windowing
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(u.WebsiteUrl, '') AS Website,
+    COALESCE(u.Location, '') AS Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    MAX(p.CreationDate) AS LastPostDate,
+    AVG(vt2.Ratio) OVER () AS GlobalAverageVoteRatio
+  FROM Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a
+    ON a.ParentId = p.Id AND a.PostTypeId = 2
+  LEFT JOIN (
+      SELECT
+        PostId,
+        AVG(CASE WHEN VoteTypeId IN (2,3) THEN 1.0 ELSE 0 END) AS Ratio
+      FROM Votes
+      GROUP BY PostId
+  ) vt2
+    ON vt2.PostId = p.Id
+  WHERE u.CreationDate < NOW() - INTERVAL '7 days'
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.WebsiteUrl, u.Location, u.Views, u.UpVotes, u.DownVotes,
+    u.ProfileImageUrl, u.EmailHash, u.AccountId
+),
+-- correlated subquery with string/array manipulation and NULL handling
+RecentActivity AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.LastPostDate,
+    (
+      SELECT STRING_AGG(DISTINCT CONCAT(tp.Name, ':', COALESCE(vt.Name, '')), ',')
+      FROM Posts psub
+      JOIN PostTypes tp ON psub.PostTypeId = tp.Id
+      LEFT JOIN Votes v ON v.PostId = psub.Id
+      LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+      WHERE psub.OwnerUserId = ua.UserId
+        AND psub.CreationDate > NOW() - INTERVAL '30 days'
+    ) AS RecentVoteSummary,
+    (
+      SELECT COUNT(*) FROM PostLinks pl
+      WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId)
+        AND pl.LinkTypeId = 1
+    ) AS LinkedPostCount
+  FROM UserActivity ua
+),
+-- CTE with a set operation to combine two derived data sets
+Combined AS (
+  SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    LastPostDate,
+    RecentVoteSummary,
+    LinkedPostCount,
+    1 AS Source
+  FROM RecentActivity
+  UNION ALL
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    NULL AS LastPostDate,
+    NULL AS RecentVoteSummary,
+    NULL AS LinkedPostCount,
+    2 AS Source
+  FROM Users u
+  WHERE NOT EXISTS (SELECT 1 FROM RecentActivity ra WHERE ra.UserId = u.Id)
+),
+-- Final ranking using window functions and complex predicates
+Final AS (
+  SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.LastPostDate,
+    c.RecentVoteSummary,
+    c.LinkedPostCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.Source
+      ORDER BY
+        COALESCE(c.Reputation, 0) DESC,
+        COALESCE(c.LastPostDate, TIMESTAMP 'epoch') DESC,
+        COALESCE(c.LinkedPostCount, 0) DESC,
+        COALESCE(c.RecentVoteSummary, '') ASC
+    ) AS RankInSource
+  FROM Combined c
+)
+SELECT
+  f.UserId,
+  f.DisplayName,
+  f.Reputation,
+  f.LastPostDate,
+  f.RecentVoteSummary,
+  f.LinkedPostCount,
+  f.Source,
+  f.RankInSource,
+  CASE
+    WHEN f.LastPostDate IS NULL THEN 'No recent posts'
+    WHEN f.Reputation >= 10000 THEN 'Legend'
+    WHEN f.Reputation >= 1000 THEN 'Veteran'
+    ELSE 'New'
+  END AS Tier
+FROM Final f
+WHERE f.RankInSource <= 50
+ORDER BY f.Source, f.RankInSource;

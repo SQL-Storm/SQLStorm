@@ -1,0 +1,145 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    UNION ALL
+    SELECT
+        child.Id,
+        child.TagName,
+        th.Level + 1,
+        th.Path || child.Id
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN TagHierarchy th ON pl.RelatedPostId = th.Id
+    WHERE NOT (child.Id = ANY(th.Path)) AND th.Level < 3
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(ans.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        (CARDINALITY(string_to_array(substr(p.Tags from 2 for length(p.Tags) - 2), '><'))) AS TagCount
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT AcceptedAnswerId FROM Posts WHERE Id = p.Id
+    ) AS ans ON true
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+),
+QuestionAnswerStats AS (
+    SELECT
+        tq.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(COALESCE(vs.UpVotes, 0) - COALESCE(vs.DownVotes, 0)) AS NetVotes
+    FROM TopQuestions tq
+    LEFT JOIN Posts a ON a.ParentId = tq.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vs ON vs.PostId = a.Id
+    GROUP BY tq.Id
+),
+EngagementRankedQuestions AS (
+    SELECT
+        tq.*,
+        qas.AnswerCount,
+        qas.MaxAnswerScore,
+        qas.AvgAnswerScore,
+        qas.NetVotes,
+        RANK() OVER (ORDER BY (tq.ViewCount * 0.5 + tq.Score * 2 + qas.AnswerCount * 3) DESC) AS EngagementRank
+    FROM TopQuestions tq
+    LEFT JOIN QuestionAnswerStats qas ON qas.QuestionId = tq.Id
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEdits,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotesCast,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS CloseReopenEdits
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopActiveUsers AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.TotalPostHistoryEdits,
+        uas.TotalComments,
+        uas.TotalVotesCast,
+        uas.CloseReopenEdits,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.AvgPostScore,
+        ubs.TotalViews,
+        ubs.TotalPosts,
+        RANK() OVER (ORDER BY (uas.TotalPostHistoryEdits + uas.TotalComments * 0.5 + uas.TotalVotesCast * 0.2 + ubs.GoldBadges * 5) DESC) AS ActivityRank
+    FROM UserActivitySummary uas
+    JOIN UserBadgeSummary ubs ON ubs.UserId = uas.UserId
+    WHERE ubs.TotalPosts > 5
+)
+SELECT
+    tarq.EngagementRank,
+    tarq.Id AS QuestionId,
+    tarq.Title,
+    tarq.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    tarq.CreationDate,
+    tarq.Score AS QuestionScore,
+    tarq.ViewCount,
+    tarq.AnswerCount,
+    tarq.MaxAnswerScore,
+    tarq.AvgAnswerScore,
+    tarq.NetVotes,
+    tab.GoldBadges,
+    tab.SilverBadges,
+    tab.BronzeBadges,
+    tab.AvgPostScore,
+    tab.TotalViews,
+    tab.TotalPosts,
+    tau.ActivityRank,
+    tau.TotalPostHistoryEdits,
+    tau.TotalComments,
+    tau.TotalVotesCast,
+    tau.CloseReopenEdits
+FROM EngagementRankedQuestions tarq
+LEFT JOIN Users u ON u.Id = tarq.OwnerUserId
+LEFT JOIN UserBadgeSummary tab ON tab.UserId = u.Id
+LEFT JOIN TopActiveUsers tau ON tau.UserId = u.Id
+WHERE tarq.EngagementRank <= 20
+ORDER BY tarq.EngagementRank, tau.ActivityRank
+LIMIT 100;

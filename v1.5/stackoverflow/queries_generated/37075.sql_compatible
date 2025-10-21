@@ -1,0 +1,141 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><'), ARRAY[]::text[]) AS TagArray,
+         p.OwnerUserId, p.AcceptedAnswerId, p.AnswerCount, p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+Answers AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.Score AS AnswerScore, a.CreationDate AS AnswerDate,
+         a.CommentCount AS AnswerCommentCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+PostVotes AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE v.VoteTypeId = 2)       AS UpVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 3)       AS DownVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 5)       AS Favorites,
+         count(*) FILTER (WHERE v.VoteTypeId = 8)       AS BountyStarts,
+         count(*)                                        AS TotalVotes
+  FROM Votes v
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY v.PostId
+),
+UserMetrics AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate))/86400 AS DaysSinceLastAccess,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+         COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+         COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadges,
+         COALESCE(COUNT(distinct p.Id) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionsAsked,
+         COALESCE(COUNT(distinct p2.Id) FILTER (WHERE p2.PostTypeId = 2),0) AS AnswersGiven
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TagUnnest AS (
+  SELECT q.Id AS QuestionId, lower(trim(t)) AS Tag
+  FROM Questions q, unnest(q.TagArray) t
+),
+TagStats AS (
+  SELECT Tag,
+         count(*) AS QuestionCount,
+         avg(q.Score) AS AvgScore,
+         sum(q.ViewCount) AS TotalViews,
+         count(distinct q.OwnerUserId) AS DistinctAskers
+  FROM TagUnnest tu
+  JOIN Questions q ON q.Id = tu.QuestionId
+  GROUP BY Tag
+),
+RecentHistory AS (
+  SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId AS EditorUserId, ph.Comment, ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    AND ph.PostHistoryTypeId IN (4,5,6,10,11,12,13,24,50)
+),
+PostLinksRecent AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, pl.CreationDate
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+QuestionEnriched AS (
+  SELECT q.*,
+         pv.UpVotes, pv.DownVotes, pv.Favorites, pv.BountyStarts, pv.TotalVotes,
+         COALESCE(a.AnswerCount,0) AS CurrAnswerCount,
+         qa.TopAnswerId, qa.TopAnswerScore, qa.TopAnswererId,
+         uh.GoldBadges AS OwnerGold, uh.SilverBadges AS OwnerSilver, uh.BronzeBadges AS OwnerBronze,
+         uh.DaysSinceLastAccess AS OwnerDaysIdle
+  FROM Questions q
+  LEFT JOIN PostVotes pv ON pv.PostId = q.Id
+  LEFT JOIN (
+    SELECT QuestionId,
+           max(Id) FILTER (WHERE AnswerScore = max_score) AS TopAnswerId,
+           max(AnswerScore) AS TopAnswerScore,
+           max(AnswererId) FILTER (WHERE AnswerScore = max_score) AS TopAnswererId
+    FROM (
+      SELECT a.QuestionId, a.Id, a.AnswererId, a.AnswerScore,
+             max(a.AnswerScore) OVER (PARTITION BY a.QuestionId) AS max_score
+      FROM Answers a
+    ) t
+    GROUP BY QuestionId
+  ) qa ON qa.QuestionId = q.Id
+  LEFT JOIN UserMetrics uh ON uh.UserId = q.OwnerUserId
+)
+SELECT
+  qe.Id AS QuestionId,
+  qe.Title,
+  qe.CreationDate,
+  qe.Score AS QuestionScore,
+  qe.ViewCount,
+  qe.TotalVotes,
+  qe.UpVotes, qe.DownVotes, qe.Favorites,
+  qe.CurrAnswerCount,
+  qe.AcceptedAnswerId,
+  qe.TopAnswerId,
+  qe.TopAnswerScore,
+  qe.OwnerUserId,
+  qe.OwnerGold, qe.OwnerSilver, qe.OwnerBronze,
+  qe.OwnerDaysIdle,
+  ts.TagList,
+  ts.TopTags,
+  rh.RecentEditsLast30Days,
+  plinks.RecentLinkCount,
+  rank() OVER (ORDER BY (COALESCE(qe.UpVotes,0) * 2 + COALESCE(qe.ViewCount,0)/100 + COALESCE(qe.TopAnswerScore,0)*3 + COALESCE(qe.Favorites,0)*5) DESC) AS HotRank
+FROM QuestionEnriched qe
+LEFT JOIN LATERAL (
+  SELECT
+    array_agg(t.Tag ORDER BY ts2.QuestionCount DESC, ts2.TotalViews DESC)[:5] AS TopTags,
+    array_to_string(array_agg(t.Tag ORDER BY ts2.QuestionCount DESC, ts2.TotalViews DESC)[:10], ',') AS TagList
+  FROM unnest(qe.TagArray) t(Tag)
+  LEFT JOIN TagStats ts2 ON lower(t.Tag) = ts2.Tag
+) ts ON true
+LEFT JOIN LATERAL (
+  SELECT
+    count(*) FILTER (WHERE rh.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') AS RecentEditsLast30Days,
+    max(rh.CreationDate) AS LastEditDate,
+    bool_or(rh.PostHistoryTypeId = 50) AS WasCommunityBump
+  FROM RecentHistory rh
+  WHERE rh.PostId = qe.Id
+) rh ON true
+LEFT JOIN LATERAL (
+  SELECT
+    count(*) FILTER (WHERE pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') AS RecentLinkCount,
+    count(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinkCount,
+    bool_or(pl.LinkTypeId = 1) AS HasOutboundLinks
+  FROM PostLinksRecent pl
+  WHERE pl.PostId = qe.Id OR pl.RelatedPostId = qe.Id
+) plinks ON true
+WHERE
+  array_length(qe.TagArray,1) IS NOT NULL
+  AND (qe.CurrAnswerCount >= 1 OR qe.ViewCount >= 1000 OR qe.TotalVotes >= 5)
+ORDER BY HotRank
+LIMIT 500;

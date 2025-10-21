@@ -1,0 +1,105 @@
+WITH 
+-- 1. Compute activity metrics for each user in the last 12 months
+user_metrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionScore,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswerScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT bh.Id) FILTER (WHERE bh.PostHistoryTypeId = 10) AS ClosedPosts,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 15) AS ReopenedPosts
+    FROM Users u
+    LEFT JOIN Posts p 
+        ON p.OwnerUserId = u.Id 
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    LEFT JOIN Comments c 
+        ON c.UserId = u.Id 
+        AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    LEFT JOIN Votes v 
+        ON v.UserId = u.Id 
+        AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    LEFT JOIN Badges b 
+        ON b.UserId = u.Id 
+        AND b.Date >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    LEFT JOIN PostHistory ph 
+        ON ph.UserId = u.Id 
+        AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    LEFT JOIN PostHistory bh 
+        ON bh.PostId = p.Id 
+        AND bh.PostHistoryTypeId = 10   -- Post Closed
+        AND bh.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2. Derive the most used tag per user (based on questions asked)
+user_top_tag AS (
+    SELECT 
+        um.UserId,
+        t.TagName,
+        cnt AS TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY um.UserId ORDER BY cnt DESC) AS rn
+    FROM user_metrics um
+    JOIN Posts p 
+        ON p.OwnerUserId = um.UserId 
+        AND p.PostTypeId = 1   -- Questions only
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+    ) AS taglist ON TRUE
+    JOIN Tags t 
+        ON t.TagName = taglist.tag
+    GROUP BY um.UserId, t.TagName
+),
+
+-- 3. Aggregate badge counts per class (Gold/Silver/Bronse)
+user_badge_breakdown AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+)
+
+SELECT 
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.CommentCount,
+    um.UpVoteCount,
+    um.DownVoteCount,
+    um.TotalQuestionScore,
+    um.TotalAnswerScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ut.TagName AS TopTag,
+    ut.TagUsage AS TopTagUsage,
+    um.BadgeCount,
+    um.ClosedPosts,
+    um.ReopenedPosts,
+    -- Calculate a composite activity score
+    (um.QuestionCount * 4 + um.AnswerCount * 6 + um.CommentCount * 2
+     + um.UpVoteCount * 1 - um.DownVoteCount * 2
+     + ub.GoldBadges * 10 + ub.SilverBadges * 5 + ub.BronzeBadges) 
+    AS ActivityScore
+FROM user_metrics um
+LEFT JOIN user_badge_breakdown ub ON ub.UserId = um.UserId
+LEFT JOIN (
+    SELECT UserId, TagName, TagUsage
+    FROM user_top_tag
+    WHERE rn = 1
+) ut ON ut.UserId = um.UserId
+WHERE um.Reputation > 1000
+ORDER BY ActivityScore DESC
+LIMIT 100;

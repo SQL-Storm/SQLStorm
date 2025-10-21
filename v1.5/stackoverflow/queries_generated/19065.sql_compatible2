@@ -1,0 +1,188 @@
+WITH EngagedUsersByPosts AS (
+    -- Identify users with significant post contributions within the last 2 years
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Unspecified Location') AS UserLocation,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        COUNT(DISTINCT P.Id) AS TotalUniquePosts,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        NULL AS TotalCommentsMade, -- Placeholder, will be populated by UNION ALL branch
+        NULL AS LastCommentActivity -- Placeholder
+    FROM Users U
+    INNER JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location
+    HAVING SUM(P.Score) > 50 OR COUNT(P.Id) > 10
+),
+EngagedUsersByComments AS (
+    -- Identify users with significant comment contributions within the last 2 years
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Unspecified Location') AS UserLocation,
+        NULL AS QuestionsAsked, -- Placeholder
+        NULL AS AnswersProvided, -- Placeholder
+        NULL AS TotalPostScore, -- Placeholder
+        NULL AS TotalPostViews, -- Placeholder
+        NULL AS TotalUniquePosts, -- Placeholder
+        NULL AS LastPostActivity, -- Placeholder
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM Users U
+    INNER JOIN Comments C ON U.Id = C.UserId
+    WHERE C.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location
+    HAVING COUNT(C.Id) > 15 OR SUM(C.Score) > 30
+),
+UserEngagementConsolidated AS (
+    -- Combine users from post and comment activity, consolidating metrics
+    SELECT
+        UserId,
+        MAX(DisplayName) AS DisplayName,
+        MAX(Reputation) AS Reputation,
+        MAX(CreationDate) AS CreationDate,
+        MAX(LastAccessDate) AS LastAccessDate,
+        MAX(UserLocation) AS UserLocation,
+        COALESCE(SUM(QuestionsAsked), 0) AS QuestionsAsked,
+        COALESCE(SUM(AnswersProvided), 0) AS AnswersProvided,
+        COALESCE(SUM(TotalPostScore), 0) AS TotalPostScore,
+        COALESCE(SUM(TotalPostViews), 0) AS TotalPostViews,
+        COALESCE(SUM(TotalUniquePosts), 0) AS TotalUniquePosts,
+        MAX(LastPostActivity) AS LastPostActivity,
+        COALESCE(SUM(TotalCommentsMade), 0) AS TotalCommentsMade,
+        MAX(LastCommentActivity) AS LastCommentActivity
+    FROM (
+        SELECT * FROM EngagedUsersByPosts
+        UNION ALL
+        SELECT * FROM EngagedUsersByComments
+    ) AS CombinedEngagement
+    GROUP BY UserId
+    HAVING COALESCE(SUM(QuestionsAsked), 0) + COALESCE(SUM(AnswersProvided), 0) + COALESCE(SUM(TotalCommentsMade), 0) > 0
+),
+PostHistoricalMetrics AS (
+    -- Calculate historical event counts for posts, specifically edits, closes, and reopens
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.FavoriteCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 1 ELSE 0 END) AS EditCount, -- Edits & Suggested Edits Applied
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 16 THEN PH.CreationDate ELSE NULL END) AS CommunityOwnedLatestDate
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.OwnerUserId IS NOT NULL -- Exclude community/deleted users from detailed historical analysis
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.FavoriteCount
+),
+BadgeSummary AS (
+    -- Summarize badge counts and last badge awarded per user
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardedDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PopularTagContributions AS (
+    -- Analyze user contributions to specific popular tags
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT TRIM(SUBSTRING(unnested_tag, 2, LENGTH(unnested_tag) - 2))) AS DistinctTagsContributed,
+        SUM(CASE WHEN TRIM(SUBSTRING(unnested_tag, 2, LENGTH(unnested_tag) - 2)) IN ('sql', 'postgresql', 'mysql', 'database', 'optimization', 'performance') THEN 1 ELSE 0 END) AS SqlRelatedTagCount,
+        SUM(CASE WHEN TRIM(SUBSTRING(unnested_tag, 2, LENGTH(unnested_tag) - 2)) IN ('python', 'java', 'c#', 'javascript', 'php', 'rust', 'go') THEN 1 ELSE 0 END) AS LangRelatedTagCount
+    FROM Posts P
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS unnested_tag
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    UEC.UserId,
+    UEC.DisplayName,
+    UEC.Reputation,
+    UEC.UserLocation,
+    UEC.QuestionsAsked,
+    UEC.AnswersProvided,
+    UEC.TotalPostScore,
+    UEC.TotalPostViews,
+    UEC.TotalCommentsMade,
+    COALESCE(BS.TotalBadges, 0) AS TotalBadges,
+    COALESCE(BS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(BS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(PTC.SqlRelatedTagCount, 0) AS SqlRelatedTagContributions,
+    COALESCE(PTC.LangRelatedTagCount, 0) AS LangRelatedTagContributions,
+    SUM(PHM.EditCount) AS TotalPostEditsByOwner,
+    SUM(PHM.CloseCount) AS TotalPostClosesByOwner,
+    SUM(PHM.ReopenCount) AS TotalPostReopensByOwner,
+    -- Conditional aggregation for high-performing questions
+    COUNT(DISTINCT PHM.PostId) FILTER (WHERE PHM.PostTypeId = 1 AND PHM.PostScore >= 50 AND PHM.PostViewCount >= 5000 AND PHM.AnswerCount >= 2) AS HighPerformingQuestions,
+    -- Average favorite count for questions
+    AVG(PHM.FavoriteCount) FILTER (WHERE PHM.PostTypeId = 1 AND PHM.FavoriteCount IS NOT NULL) AS AvgFavCountPerQuestion,
+    MAX(PHM.CommunityOwnedLatestDate) AS LatestCommunityOwnedPostDate,
+    -- Window function: Rank users within their account creation year by reputation and total post score
+    DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UEC.CreationDate) ORDER BY UEC.Reputation DESC, UEC.TotalPostScore DESC) AS RankWithinCreationYear,
+    -- Window function: Assign users to engagement quintiles based on a composite score
+    NTILE(5) OVER (ORDER BY (UEC.TotalPostScore * 0.4 + UEC.TotalPostViews * 0.01 + UEC.TotalCommentsMade * 5 + UEC.QuestionsAsked * 10 + UEC.AnswersProvided * 7 + COALESCE(BS.GoldBadges,0)*100) DESC) AS OverallEngagementQuintile,
+    -- Window function: Compare current user's reputation with the previous user in the same location
+    LAG(UEC.Reputation, 1, 0) OVER (PARTITION BY UEC.UserLocation ORDER BY UEC.Reputation DESC) AS PrevUserRepInLocation,
+    -- Correlated subquery: Calculate average comment score for comments made by this user on highly-edited, high-score posts by *other* users
+    (
+        SELECT AVG(C_sub.Score)
+        FROM Comments C_sub
+        WHERE C_sub.UserId = UEC.UserId
+          AND C_sub.PostId IN (
+              SELECT P_sub.Id
+              FROM Posts P_sub
+              WHERE P_sub.OwnerUserId IS NOT NULL
+                AND P_sub.OwnerUserId <> UEC.UserId -- Edited by others
+                AND P_sub.Score > 75
+                AND P_sub.CreationDate < UEC.LastAccessDate -- Post existed before user's last access
+                AND EXISTS ( -- Check if the post was edited by non-owner more than 3 times
+                    SELECT 1
+                    FROM PostHistory PH_sub
+                    WHERE PH_sub.PostId = P_sub.Id
+                      AND PH_sub.PostHistoryTypeId IN (4, 5, 6) -- Edit events
+                      AND PH_sub.UserId <> P_sub.OwnerUserId
+                    GROUP BY PH_sub.PostId
+                    HAVING COUNT(PH_sub.Id) >= 3
+                )
+          )
+    ) AS AvgCommentScoreOnHotEditedPosts,
+    -- Complex expression with NULL handling: total posts, excluding zero values
+    NULLIF(UEC.QuestionsAsked, 0) + NULLIF(UEC.AnswersProvided, 0) AS NonZeroPostCountSum,
+    -- String expression: Extract first 100 chars of AboutMe (if available) or a default string
+    COALESCE(SUBSTRING(U.AboutMe FROM 1 FOR 100), 'No "About Me" information provided.') AS AboutMeSnippet
+FROM UserEngagementConsolidated UEC
+LEFT JOIN Users U ON UEC.UserId = U.Id
+LEFT JOIN BadgeSummary BS ON UEC.UserId = BS.UserId
+LEFT JOIN PopularTagContributions PTC ON UEC.UserId = PTC.UserId
+LEFT JOIN PostHistoricalMetrics PHM ON UEC.UserId = PHM.OwnerUserId
+WHERE UEC.Reputation > 5000
+  AND UEC.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month'
+  AND (UEC.QuestionsAsked > 2 OR UEC.AnswersProvided > 5 OR UEC.TotalCommentsMade > 10)
+  AND (COALESCE(BS.GoldBadges, 0) > 0 OR COALESCE(BS.SilverBadges, 0) > 1 OR COALESCE(BS.BronzeBadges, 0) > 3)
+  AND UEC.UserLocation IS NOT NULL AND UEC.UserLocation <> 'Unspecified Location'
+GROUP BY
+    UEC.UserId, UEC.DisplayName, UEC.Reputation, UEC.UserLocation, UEC.QuestionsAsked, UEC.AnswersProvided,
+    UEC.TotalPostScore, UEC.TotalPostViews, UEC.TotalCommentsMade, BS.TotalBadges, BS.GoldBadges,
+    BS.SilverBadges, PTC.SqlRelatedTagCount, PTC.LangRelatedTagCount, UEC.CreationDate, UEC.LastAccessDate,
+    U.AboutMe, UEC.LastPostActivity
+HAVING SUM(PHM.EditCount) > 0 OR SUM(PHM.CloseCount) > 0 OR UEC.QuestionsAsked > 0 OR UEC.AnswersProvided > 0
+ORDER BY OverallEngagementQuintile ASC, RankWithinCreationYear ASC, UEC.Reputation DESC
+LIMIT 2500;

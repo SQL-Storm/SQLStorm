@@ -1,0 +1,172 @@
+-- {"query": "21059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1641} 
+
+WITH active_users AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+        AVG(COALESCE(p.Score, 0)) AS avg_post_score
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id 
+        AND p.DeletionDate IS NULL 
+        AND p.CreationDate > u.CreationDate
+    LEFT JOIN Votes v ON v.PostId = p.Id 
+        AND v.VoteTypeId IN (2, 3)  -- upvote/downvote
+        AND v.CreationDate BETWEEN p.CreationDate AND COALESCE(p.LastActivityDate, NOW())
+    WHERE u.Reputation > 1000 
+        AND u.CreationDate >= '2020-01-01'
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING question_count >= 5 OR answer_count >= 10
+),
+top_performers AS (
+    SELECT 
+        au.*,
+        RANK() OVER (PARTITION BY 
+            CASE 
+                WHEN au.question_count > au.answer_count THEN 'Questioner' 
+                ELSE 'Answerer' 
+            END 
+            ORDER BY au.upvote_count DESC, au.avg_post_score DESC) AS performance_rank,
+        LAG(au.Reputation) OVER (ORDER BY au.CreationDate) AS prev_user_reputation
+    FROM active_users au
+),
+recent_activity AS (
+    SELECT DISTINCT 
+        ph.PostId,
+        ph.CreationDate AS activity_date,
+        ph.PostHistoryTypeId,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'Close/Open'
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId = 2 THEN 'Initial Post'
+            ELSE ph.PostHistoryTypeId::TEXT
+        END AS activity_type,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS recency_rank
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= '2023-01-01'
+        AND ph.PostHistoryTypeId IN (2, 4, 5, 6, 10, 11, 50)  -- meaningful activity types
+),
+connected_posts AS (
+    SELECT 
+        p1.Id AS source_post_id,
+        p2.Id AS target_post_id,
+        pl.CreationDate AS link_date,
+        pl.LinkTypeId,
+        COALESCE(p1.Score, 0) + COALESCE(p2.Score, 0) AS combined_score,
+        LENGTH(COALESCE(p1.Tags, '')) + LENGTH(COALESCE(p2.Tags, '')) AS total_tag_length
+    FROM Posts p1
+    INNER JOIN PostLinks pl ON pl.PostId = p1.Id
+    INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE p1.PostTypeId = 1  -- Questions only
+        AND p2.PostTypeId IN (1, 2)  -- Questions and Answers
+        AND pl.LinkTypeId = 1  -- Linked posts
+        AND p1.CreationDate >= '2022-01-01'
+),
+complex_calculations AS (
+    SELECT 
+        tp.*,
+        ra.activity_type,
+        ra.activity_date,
+        cp.target_post_id,
+        (tp.Reputation * 0.1 + tp.upvote_count * 2 + tp.question_count * 5) AS engagement_score,
+        CASE 
+            WHEN tp.avg_post_score > 10 THEN 'High Quality'
+            WHEN tp.avg_post_score BETWEEN 1 AND 10 THEN 'Average'
+            ELSE 'Low Quality'
+        END AS quality_category,
+        CONCAT(
+            COALESCE(tp.DisplayName, 'Anonymous'),
+            ' (',
+            CASE WHEN tp.prev_user_reputation IS NULL THEN 'First' ELSE 'Established' END,
+            ')'
+        ) AS user_profile_summary,
+        NULLIF(tp.Reputation / NULLIF(tp.question_count, 0), 0) AS rep_per_question,
+        GREATEST(0, COALESCE(cp.combined_score, 0)) AS linked_post_impact
+    FROM top_performers tp
+    LEFT JOIN recent_activity ra ON ra.PostId = (
+        SELECT p.Id 
+        FROM Posts p 
+        WHERE p.OwnerUserId = tp.Id 
+        ORDER BY p.LastActivityDate DESC 
+        LIMIT 1
+    ) AND ra.recency_rank = 1
+    LEFT JOIN connected_posts cp ON cp.source_post_id = (
+        SELECT MIN(p.Id) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = tp.Id 
+            AND p.PostTypeId = 1
+            AND p.CreationDate >= '2022-01-01'
+    )
+    WHERE tp.performance_rank <= 50
+)
+SELECT 
+    cc.*,
+    b.Name AS recent_badge,
+    CASE 
+        WHEN cc.quality_category = 'High Quality' AND cc.engagement_score > 1000 THEN 'Elite'
+        WHEN cc.engagement_score > 500 THEN 'Strong'
+        ELSE 'Emerging'
+    END AS overall_tier,
+    COALESCE(b.Date, cc.activity_date) AS last_achievement_date,
+    (cc.rep_per_question * LOG(cc.upvote_count + 1)) AS weighted_reputation_metric,
+    CASE 
+        WHEN cc.prev_user_reputation IS NULL THEN true 
+        ELSE cc.Reputation > cc.prev_user_reputation 
+    END AS reputation_growth,
+    ROW_NUMBER() OVER (ORDER BY cc.engagement_score DESC, cc.last_achievement_date DESC) AS final_ranking
+FROM complex_calculations cc
+LEFT JOIN Badges b ON b.UserId = cc.Id 
+    AND b.Date >= COALESCE(cc.activity_date, '2023-01-01')
+    AND b.Class = 1  -- Gold badges only
+    AND b.Date = (
+        SELECT MAX(b2.Date) 
+        FROM Badges b2 
+        WHERE b2.UserId = cc.Id 
+            AND b2.Class = 1
+    )
+WHERE cc.activity_date IS NOT NULL 
+    OR cc.linked_post_impact > 0
+    OR EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.UserId = cc.Id 
+            AND c.CreationDate >= '2023-06-01'
+            AND LENGTH(c.Text) > 50
+            AND c.Score >= 1
+    )
+UNION ALL
+SELECT 
+    au.Id,
+    au.Reputation,
+    au.CreationDate,
+    au.question_count,
+    au.answer_count,
+    au.upvote_count,
+    au.avg_post_score,
+    NULL AS performance_rank,
+    NULL AS prev_user_reputation,
+    NULL AS activity_type,
+    NULL AS activity_date,
+    NULL AS target_post_id,
+    0 AS engagement_score,
+    'Legacy' AS quality_category,
+    'Historical User' AS user_profile_summary,
+    NULL AS rep_per_question,
+    0 AS linked_post_impact,
+    NULL AS recent_badge,
+    'Historical' AS overall_tier,
+    au.CreationDate AS last_achievement_date,
+    0 AS weighted_reputation_metric,
+    false AS reputation_growth,
+    9999 AS final_ranking
+FROM active_users au
+WHERE au.CreationDate < '2020-01-01'
+    AND NOT EXISTS (
+        SELECT 1 FROM complex_calculations cc2 
+        WHERE cc2.Id = au.Id
+    )
+ORDER BY final_ranking, engagement_score DESC
+LIMIT 100;

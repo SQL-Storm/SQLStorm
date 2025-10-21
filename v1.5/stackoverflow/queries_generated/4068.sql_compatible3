@@ -1,0 +1,147 @@
+with recursive TagHierarchy as (
+    select t.Id, t.TagName, t.Count, array[t.Id] as Ancestors
+    from Tags t
+    where not exists (
+        select 1 from Posts p
+        join PostLinks pl on pl.PostId = p.Id and pl.RelatedPostId = t.ExcerptPostId
+    )
+    union all
+    select t.Id, t.TagName, t.Count, h.Ancestors || t.Id
+    from Tags t
+    join TagHierarchy h on t.ExcerptPostId = any(h.Ancestors)
+    where not t.Id = any(h.Ancestors)
+),
+UserBadgesAgg as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Name end) as DistinctTagBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+LatestPostHistory as (
+    select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+           row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11, 12, 13, 14, 15)
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.OwnerUserId as QuestionOwner,
+        count(a.Id) as AnswerCount,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        max(a.Score) filter (where a.Score is not null) as MaxAnswerScore,
+        string_agg(distinct u.DisplayName || ' (Rep: ' || u.Reputation || ')',
+                   ', ' order by u.Reputation desc nulls last) as TopAnswerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId
+),
+PostAndVotes as (
+    select p.Id as PostId, p.PostTypeId,
+           p.Score, p.ViewCount,
+           v.VoteTypeId, v.UserId as VoterUserId,
+           case when v.VoteTypeId = 2 then 1
+                when v.VoteTypeId = 3 then -1 else 0 end as VoteValue
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+),
+UserVoteAgg as (
+    select
+        pv.VoterUserId as UserId,
+        pv.PostTypeId,
+        count(distinct pv.PostId) as VotedPostCount,
+        sum(pv.VoteValue) as VoteScoreSum
+    from PostAndVotes pv
+    where pv.VoterUserId is not null
+    group by pv.VoterUserId, pv.PostTypeId
+),
+ComplexFilteredPosts as (
+    select p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+           (length(coalesce(p.Body, '')) - length(replace(coalesce(p.Body, ''), '<code>', ''))) / 6 as ApproxCodeTags,
+           length(coalesce(p.Body, '')) as ContentLength,
+           case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+           min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as CloseDate,
+           max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as ReopenDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Body, p.ClosedDate
+),
+RankedQuestions as (
+    select *,
+        row_number() over (partition by OwnerUserId order by Score desc, ViewCount desc) as UserScoreRank,
+        rank() over (order by Score desc nulls last) as GlobalScoreRank
+    from ComplexFilteredPosts
+),
+DuplicatedQuestions as (
+    select pl.PostId as DuplicateId, pl.RelatedPostId as OriginalId, pl.CreationDate, pl.LinkTypeId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+DuplicatedQuestionsDetails as (
+    select dq.DuplicateId, dq.OriginalId, q.Title as OriginalTitle,
+           sq.Title as DuplicateTitle,
+           dq.CreationDate as DuplicationDate
+    from DuplicatedQuestions dq
+    join Posts q on q.Id = dq.OriginalId
+    join Posts sq on sq.Id = dq.DuplicateId
+),
+UserReputationWindow as (
+    select u.Id as UserId, u.DisplayName, u.Reputation,
+           sum(u.Reputation) over (order by u.Reputation desc rows between unbounded preceding and current row) as CumulativeReputation,
+           ntile(10) over (order by u.Reputation desc) as ReputationDecile
+    from Users u
+    where u.Reputation is not null
+)
+select
+    uq.GlobalScoreRank,
+    uq.UserScoreRank,
+    uq.Id as QuestionId,
+    uq.Title as QuestionTitle,
+    uq.Tags,
+    uq.Score,
+    uq.ViewCount,
+    uq.ApproxCodeTags,
+    uq.ContentLength,
+    uq.IsClosed,
+    uq.CloseDate,
+    uq.ReopenDate,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.TopAnswerers,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.DistinctTagBadges,
+    ura.Reputation,
+    ura.CumulativeReputation,
+    ura.ReputationDecile,
+    dq.DuplicateId,
+    dq.DuplicationDate,
+    dq.OriginalId,
+    dq.OriginalTitle,
+    dq.DuplicateTitle
+from RankedQuestions uq
+left join QuestionAnswerStats qas on qas.QuestionId = uq.Id
+left join UserBadgesAgg uba on uba.UserId = uq.OwnerUserId
+left join UserReputationWindow ura on ura.UserId = uq.OwnerUserId
+left join DuplicatedQuestionsDetails dq on dq.DuplicateId = uq.Id
+where uq.Score > coalesce(
+    (select avg(Score) * 1.5 from Posts p where p.PostTypeId = 1
+), 0)
+  and (uq.Tags ilike '%<sql>%' or uq.Tags ilike '%<database>%')
+  and uq.ApproxCodeTags >= 3
+  and uq.IsClosed = 0
+order by uq.GlobalScoreRank
+limit 50;

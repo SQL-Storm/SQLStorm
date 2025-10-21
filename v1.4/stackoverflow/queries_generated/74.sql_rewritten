@@ -1,0 +1,124 @@
+-- {"query": "74.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 953} 
+WITH RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    u.Reputation,
+    u.DisplayName AS OwnerName,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE p.PostTypeId = 1 -- only questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+  GROUP BY
+    p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.ViewCount, p.Score,
+    p.Tags, p.PostTypeId, p.LastActivityDate, p.AnswerCount, p.CommentCount,
+    u.Reputation, u.DisplayName
+),
+ExpandedTags AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.CreationDate,
+    r.ViewCount,
+    r.Score,
+    t.TagName AS Tag,
+    r.PostTypeId,
+    r.LastActivityDate,
+    r.AnswerCount,
+    r.CommentCount,
+    r.Reputation,
+    r.OwnerName,
+    r.UpVotes,
+    r.DownVotes,
+    ROW_NUMBER() OVER (PARTITION BY r.PostId ORDER BY t.TagName) AS TagRank
+  FROM RecentActive r
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(r.Tags, 2, length(r.Tags)-2), '><')) AS TagName
+  ) t
+),
+TopPosts AS (
+  SELECT
+    PostId,
+    Title,
+    OwnerUserId,
+    OwnerName,
+    CreationDate,
+    ViewCount,
+    Score,
+    LastActivityDate,
+    AnswerCount,
+    CommentCount,
+    Reputation,
+    UpVotes,
+    DownVotes
+  FROM (
+    SELECT
+      PostId, Title, OwnerUserId, OwnerName, CreationDate, ViewCount, Score,
+      LastActivityDate, AnswerCount, CommentCount, Reputation, UpVotes, DownVotes,
+      ROW_NUMBER() OVER (
+        PARTITION BY PostId
+        ORDER BY CreationDate DESC
+      ) AS rn
+    FROM ExpandedTags
+  ) x
+  WHERE rn = 1
+),
+PostLinksAgg AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS LinkCount,
+    SUM(CASE WHEN lt.Name ILIKE '%duplicate%' THEN 1 ELSE 0 END) AS DuplicateLinks
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+),
+BadgeInfluence AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1000 ELSE 100 END) AS InfluenceScore
+  FROM Badges b
+  GROUP BY b.UserId
+)
+SELECT
+  tp.PostId,
+  tp.Title,
+  tp.OwnerName AS Owner,
+  tp.CreationDate,
+  tp.ViewCount,
+  tp.Score,
+  tp.LastActivityDate,
+  tp.AnswerCount,
+  tp.CommentCount,
+  tp.Reputation AS OwnerReputation,
+  tp.UpVotes,
+  tp.DownVotes,
+  COALESCE(pla.LinkCount, 0) AS TotalLinks,
+  COALESCE(bi.InfluenceScore, 0) AS OwnerInfluence,
+  ARRAY_AGG(DISTINCT t.Tag) FILTER (WHERE t.Tag IS NOT NULL) AS Tags
+FROM TopPosts tp
+LEFT JOIN PostLinksAgg pla ON tp.PostId = pla.PostId
+LEFT JOIN BadgeInfluence bi ON tp.OwnerUserId = bi.UserId
+LEFT JOIN LATERAL (
+  SELECT DISTINCT TagName AS Tag
+  FROM ExpandedTags et
+  WHERE et.PostId = tp.PostId
+) t ON TRUE
+GROUP BY
+  tp.PostId, tp.Title, tp.OwnerName, tp.CreationDate, tp.ViewCount, tp.Score,
+  tp.LastActivityDate, tp.AnswerCount, tp.CommentCount, tp.Reputation,
+  tp.UpVotes, tp.DownVotes, pla.LinkCount, bi.InfluenceScore
+ORDER BY tp.LastActivityDate DESC
+LIMIT 100;

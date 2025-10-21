@@ -1,0 +1,131 @@
+-- {"query": "20035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1825} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.AboutMe,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400.0 AS AccountAgeDays,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswerScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViewCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1500 AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.AboutMe
+    HAVING COUNT(p.Id) > 10
+),
+RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.FavoriteCount DESC NULLS LAST) as PostRank,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.CreationDate) as PreviousPostScore,
+        (p.Score - AVG(p.Score) OVER(PARTITION BY p.OwnerUserId)) / NULLIF(STDDEV(p.Score) OVER(PARTITION BY p.OwnerUserId), 0) AS ZScore
+    FROM Posts p
+    WHERE p.CommunityOwnedDate IS NULL AND p.PostTypeId IN (1, 2)
+),
+UserContributionProfile AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.AccountAgeDays,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalAnswerScore,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        q.PostId AS TopQuestionId,
+        q.Title AS TopQuestionTitle,
+        q.Score AS TopQuestionScore,
+        q.Tags AS TopQuestionTags,
+        a.Score AS TopAnswerScore,
+        -- Complex user score calculation
+        (uas.Reputation * 0.1 + COALESCE(uas.TotalAnswerScore, 0) * 0.4 + uas.GoldBadges * 150 + uas.SilverBadges * 40) / (uas.AccountAgeDays + 1) AS InfluenceScore,
+        (
+            SELECT STRING_AGG(b.Name, ' | ')
+            FROM (
+                SELECT b_inner.Name
+                FROM Badges b_inner
+                WHERE b_inner.UserId = uas.UserId AND b_inner.TagBased = '1'
+                ORDER BY b_inner.Date DESC
+                LIMIT 5
+            ) b
+        ) AS RecentTagBadges
+    FROM UserActivitySummary uas
+    LEFT JOIN RankedUserPosts q ON uas.UserId = q.OwnerUserId AND q.PostRank = 1 AND q.PostTypeId = 1
+    LEFT JOIN RankedUserPosts a ON uas.UserId = a.OwnerUserId AND a.PostRank = 1 AND a.PostTypeId = 2
+    WHERE q.ClosedDate IS NULL AND uas.AnswerCount > uas.QuestionCount
+)
+SELECT
+    ucp.DisplayName,
+    ucp.Reputation,
+    ucp.InfluenceScore,
+    DENSE_RANK() OVER (ORDER BY ucp.InfluenceScore DESC) AS GlobalRank,
+    ucp.TopQuestionTitle,
+    ucp.TopQuestionScore,
+    ucp.RecentTagBadges,
+    -- String manipulation and conditional logic
+    'Primary Tags: ' || SUBSTRING(ucp.TopQuestionTags FROM 2 FOR POSITION('>' IN ucp.TopQuestionTags) - 2),
+    CASE
+        WHEN ucp.InfluenceScore > 100 THEN 'Community Pillar'
+        WHEN ucp.InfluenceScore > 20 AND ucp.GoldBadges > 0 THEN 'Valued Expert'
+        WHEN ucp.InfluenceScore > 5 THEN 'Consistent Contributor'
+        ELSE 'Active Member'
+    END AS UserTier,
+    (SELECT AVG(ans.Score) FROM Posts ans WHERE ans.ParentId = ucp.TopQuestionId) AS AvgAnswerScoreForTopQuestion,
+    'High A/Q Ratio User' AS UserClass
+FROM UserContributionProfile ucp
+WHERE EXISTS (
+    SELECT 1
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE p.OwnerUserId = ucp.UserId AND v.VoteTypeId = 8 -- BountyStart
+)
+
+UNION ALL
+
+-- Find users who specialize in reviving old, unanswered questions with high-quality answers
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    (SUM(p_ans.Score) * 0.7 + u.UpVotes * 0.3) / (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400.0) AS InfluenceScore,
+    DENSE_RANK() OVER (ORDER BY (SUM(p_ans.Score) * 0.7 + u.UpVotes * 0.3) / (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400.0) DESC) AS GlobalRank,
+    p_q.Title AS RespondedToQuestionTitle,
+    MAX(p_ans.Score) AS TopRevivalAnswerScore,
+    (SELECT t.TagName FROM Tags t WHERE t.Id = (SELECT pt.TagId FROM PostTags pt WHERE pt.PostId = p_q.Id LIMIT 1)) AS FirstTagOfQuestion, -- Assumes PostTags table for many-to-many
+    REVERSE(u.Location),
+    'Necromancer' AS UserTier,
+    EXTRACT(EPOCH FROM (MIN(p_ans.CreationDate) - p_q.CreationDate)) / 86400.0 AS DaysToFirstAnswer,
+    'Old Question Specialist' AS UserClass
+FROM Users u
+JOIN Posts p_ans ON u.Id = p_ans.OwnerUserId AND p_ans.PostTypeId = 2
+JOIN Posts p_q ON p_ans.ParentId = p_q.Id
+WHERE
+    p_q.AnswerCount = 1
+    AND p_q.AcceptedAnswerId = p_ans.Id
+    AND p_ans.CreationDate > p_q.CreationDate + INTERVAL '1 year'
+    AND p_q.Score > 10
+    AND u.Id NOT IN (SELECT UserId FROM UserContributionProfile)
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, p_q.Id, p_q.Title, p_q.CreationDate
+HAVING COUNT(p_ans.Id) >= 1
+
+ORDER BY InfluenceScore DESC NULLS LAST, Reputation DESC
+LIMIT 200;

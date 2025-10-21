@@ -1,0 +1,73 @@
+-- {"query": "28075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1368} 
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COALESCE(STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name), 'None') AS BadgeNames
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+), PostActivity AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+    GROUP BY p.OwnerUserId, p.PostTypeId
+), TagExplosion AS (
+    SELECT 
+        PostId,
+        UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(Tags, '<', ''), '>', ','), ',')) AS Tag
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    pa.TotalPosts,
+    te.Tag AS MostActiveTag,
+    (SELECT MAX(CreationDate) FROM Posts p2 WHERE p2.OwnerUserId = u.Id) AS LastPostDate,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+            AND ph.PostHistoryTypeId = 10 
+            AND ph.Comment::INT IN (SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%')
+        ) THEN 1 
+        ELSE 0 
+    END AS HasDuplicateClosures
+FROM Users u
+LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT JOIN PostActivity pa ON u.Id = pa.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        OwnerUserId, 
+        Tag, 
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM TagExplosion
+    GROUP BY OwnerUserId, Tag
+) te ON u.Id = te.OwnerUserId AND te.TagRank = 1
+LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8
+WHERE u.Reputation > 1000
+    AND (pa.AvgScore > 5 OR pa.AvgScore IS NULL)
+    AND u.Id IN (
+        SELECT UserId FROM Badges WHERE Class = 1
+        UNION
+        SELECT UserId FROM Votes WHERE VoteTypeId = 2
+    )
+GROUP BY u.Id, u.DisplayName, u.Reputation, ubs.TotalBadges, pa.TotalPosts, te.Tag
+HAVING COUNT(DISTINCT pa.PostTypeId) > 1 OR COUNT(DISTINCT v.Id) > 3
+ORDER BY TotalBounty DESC, u.Reputation DESC
+LIMIT 100;

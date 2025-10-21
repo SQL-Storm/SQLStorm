@@ -1,0 +1,161 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+    WHERE u.Reputation > 100 
+      AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+HighActivityPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Title,
+        CASE 
+            WHEN p.Tags LIKE '%sql%' OR p.Tags LIKE '%database%' THEN 'Database'
+            WHEN p.Tags LIKE '%python%' OR p.Tags LIKE '%java%' THEN 'Programming'
+            ELSE 'Other'
+        END AS TagCategory,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.ViewCount DESC, p.Score DESC
+        ) AS PostRank,
+        LAG(p.ViewCount) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate
+        ) AS PreviousPostViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1  -- Questions only
+      AND p.Score >= 0
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+      AND (p.AnswerCount > 0 OR p.ViewCount > 100)
+),
+UserEngagementMetrics AS (
+    SELECT 
+        au.UserId,
+        au.DisplayName,
+        au.TotalPosts,
+        au.AvgPostScore,
+        COALESCE(hap.PostId, 0) AS TopPostId,
+        hap.ViewCount AS TopPostViews,
+        hap.PostRank,
+        hap.AnswerCount,
+        hap.TagCategory,
+        CASE 
+            WHEN hap.ViewCount > au.PreviousPostViews * 1.5 THEN 'Growing'
+            WHEN hap.ViewCount < au.PreviousPostViews * 0.8 THEN 'Declining'
+            ELSE 'Stable'
+        END AS EngagementTrend,
+        LENGTH(hap.Title) AS TitleLength,
+        REGEXP_REPLACE(hap.Title, '[^a-zA-Z0-9\\s]', '', 'g') AS CleanTitle,
+        GREATEST(COALESCE(hap.AnswerCount, 0), 1) AS NormalizedAnswerCount,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01' AS DATE) - au.UserCreationDate)) / 86400 AS UserAgeDays
+    FROM ActiveUsers au
+    LEFT JOIN HighActivityPosts hap ON au.UserId = hap.OwnerUserId 
+        AND hap.PostRank = 1
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        AVG(EXTRACT(EPOCH FROM (b.Date - u.CreationDate)) / 86400) AS AvgDaysToBadge
+    FROM Badges b
+    INNER JOIN Users u ON b.UserId = u.Id
+    WHERE b.Date > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        COUNT(*) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        CASE 
+            WHEN COUNT(*) = 0 THEN 0
+            ELSE CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS float) / NULLIF(COUNT(*), 0)
+        END AS UpvoteRatio
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+      AND v.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY v.PostId, v.UserId
+    HAVING COUNT(*) > 5
+),
+CommentActivity AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        STRING_AGG(
+            SUBSTRING(c.Text, 1, 50), 
+            ' | '
+        ) AS SampleComments
+    FROM Comments c
+    WHERE c.CreationDate > cast('2024-10-01' as date) - INTERVAL '3 months'
+      AND LENGTH(c.Text) > 10
+    GROUP BY c.PostId, c.UserId
+)
+SELECT 
+    uem.DisplayName,
+    uem.TotalPosts,
+    uem.AvgPostScore,
+    uem.TopPostViews,
+    uem.PostRank,
+    uem.AnswerCount,
+    uem.TagCategory,
+    uem.EngagementTrend,
+    uem.TitleLength,
+    ba.TotalBadges,
+    ba.GoldBadges,
+    vp.Upvotes,
+    vp.Downvotes,
+    vp.UpvoteRatio,
+    ca.CommentCount,
+    ca.AvgCommentScore,
+    COALESCE(uem.TopPostViews, 0) * COALESCE(uem.AvgPostScore, 0) AS EngagementScore,
+    RANK() OVER (
+        ORDER BY COALESCE(uem.TopPostViews, 0) DESC, 
+                 COALESCE(ba.TotalBadges, 0) DESC
+    ) AS OverallRank,
+    CASE 
+        WHEN uem.EngagementTrend = 'Growing' AND ba.GoldBadges > 0 
+        THEN CONCAT('Rising Star: ', uem.DisplayName)
+        WHEN uem.TotalPosts > 50 AND vp.UpvoteRatio > 0.8
+        THEN CONCAT('Expert: ', uem.DisplayName)
+        ELSE uem.DisplayName
+    END AS UserStatus,
+    ROUND(uem.UserAgeDays / 30, 1) AS UserAgeMonths,
+    LENGTH(REGEXP_REPLACE(
+        COALESCE(uem.CleanTitle, ''), 
+        '\\s+', ' ', 'g'
+    )) AS CleanTitleWords
+FROM UserEngagementMetrics uem
+FULL OUTER JOIN BadgeAchievements ba ON uem.UserId = ba.UserId
+LEFT JOIN VotePatterns vp ON uem.TopPostId = vp.PostId 
+    AND (vp.UserId = uem.UserId OR vp.UserId IS NULL)
+LEFT JOIN CommentActivity ca ON uem.TopPostId = ca.PostId 
+    AND (ca.UserId = uem.UserId OR ca.UserId IS NULL)
+WHERE (uem.TotalPosts > 5 OR ba.TotalBadges > 10)
+  AND (uem.TagCategory = 'Database' OR uem.TagCategory = 'Programming')
+ORDER BY 
+    EngagementScore DESC NULLS LAST,
+    uem.PostRank ASC,
+    ba.LatestBadgeDate DESC NULLS FIRST
+LIMIT 100;

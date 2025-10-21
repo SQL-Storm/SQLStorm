@@ -1,0 +1,88 @@
+-- {"query": "22029.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1237} 
+WITH tag_array AS (
+  SELECT Id, unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), ''><'')) AS tag
+  FROM Posts
+  WHERE Tags IS NOT NULL AND substring(Tags, 2, length(Tags) - 2) IS NOT NULL
+),
+user_post_stats AS (
+  SELECT OwnerUserId, PostTypeId, COUNT(*) AS num_posts, AVG(Score) AS avg_score, SUM(ViewCount) AS total_views
+  FROM Posts
+  GROUP BY OwnerUserId, PostTypeId
+),
+vote_stats AS (
+  SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes, SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+  FROM Votes
+  GROUP BY PostId
+),
+comment_stats AS (
+  SELECT PostId, COUNT(*) AS num_comments, AVG(Score) AS avg_comment_score
+  FROM Comments
+  GROUP BY PostId
+),
+top_users AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+         COALESCE(q.num_posts, 0) AS questions, COALESCE(q.avg_score, 0) AS q_avg_score, COALESCE(q.total_views, 0) AS q_total_views,
+         COALESCE(a.num_posts, 0) AS answers, COALESCE(a.avg_score, 0) AS a_avg_score
+  FROM Users u
+  LEFT JOIN user_post_stats q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+  LEFT JOIN user_post_stats a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+  WHERE u.Reputation > 100 AND u.LastAccessDate > u.CreationDate + INTERVAL '1 year'
+),
+user_tag_count AS (
+  SELECT p.OwnerUserId, ta.tag, COUNT(*) AS tag_count, AVG(p.Score) AS avg_tag_score
+  FROM Posts p
+  JOIN tag_array ta ON p.Id = ta.Id
+  WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, ta.tag
+),
+ranked_tags AS (
+  SELECT OwnerUserId, tag, tag_count, avg_tag_score,
+         ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY tag_count DESC, avg_tag_score DESC) AS tag_rank
+  FROM user_tag_count
+),
+post_with_stats AS (
+  SELECT p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, COALESCE(v.upvotes, 0) AS upvotes, COALESCE(v.downvotes, 0) AS downvotes,
+         COALESCE(c.num_comments, 0) AS num_comments, COALESCE(c.avg_comment_score, 0) AS avg_comment_score,
+         (p.Score + COALESCE(v.upvotes, 0) - COALESCE(v.downvotes, 0)) * (1 + LOG(COALESCE(p.ViewCount, 1) + 1)) AS complex_score
+  FROM Posts p
+  LEFT JOIN vote_stats v ON p.Id = v.PostId
+  LEFT JOIN comment_stats c ON p.Id = c.PostId
+  WHERE p.PostTypeId = 1
+),
+ranked_posts AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY complex_score DESC, upvotes DESC) AS post_rank
+  FROM post_with_stats
+),
+user_activity AS (
+  SELECT OwnerUserId, DATE_TRUNC('month', CreationDate) AS activity_month, COUNT(*) AS posts_in_month
+  FROM Posts
+  WHERE PostTypeId IN (1, 2) AND CreationDate IS NOT NULL
+  GROUP BY OwnerUserId, activity_month
+),
+cumulative_activity AS (
+  SELECT OwnerUserId, activity_month, posts_in_month,
+         SUM(posts_in_month) OVER (PARTITION BY OwnerUserId ORDER BY activity_month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_posts
+  FROM user_activity
+),
+top_badge AS (
+  SELECT UserId, Name AS badge_name, Class AS badge_class,
+         ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class ASC, Date DESC) AS badge_rank
+  FROM Badges
+)
+SELECT tu.Id, tu.DisplayName, tu.Reputation, tu.CreationDate,
+       tu.questions, ROUND(tu.q_avg_score, 2) AS q_avg_score, tu.q_total_views,
+       tu.answers, ROUND(tu.a_avg_score, 2) AS a_avg_score,
+       rt.tag AS favorite_tag, rt.tag_count, ROUND(rt.avg_tag_score, 2) AS avg_fav_tag_score,
+       rp.Title AS top_post_title, rp.complex_score AS top_post_complex_score,
+       ca.activity_month AS latest_activity_month, ca.cumulative_posts AS total_cumulative_posts,
+       tb.badge_name AS top_badge, tb.badge_class,
+       CASE WHEN tu.questions > 0 THEN (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = tu.Id AND PostTypeId = 1) ELSE NULL END AS correlated_q_avg
+FROM top_users tu
+LEFT JOIN ranked_tags rt ON tu.Id = rt.OwnerUserId AND rt.tag_rank = 1
+LEFT JOIN ranked_posts rp ON tu.Id = rp.OwnerUserId AND rp.post_rank = 1
+LEFT JOIN (SELECT OwnerUserId, MAX(activity_month) AS activity_month, cumulative_posts FROM cumulative_activity GROUP BY OwnerUserId, cumulative_posts) ca ON tu.Id = ca.OwnerUserId
+LEFT JOIN top_badge tb ON tu.Id = tb.UserId AND tb.badge_rank = 1
+WHERE EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = tu.Id AND p.Score > 10)
+   OR tu.Reputation > 5000
+ORDER BY tu.Reputation DESC, tu.questions + tu.answers DESC
+LIMIT 100;

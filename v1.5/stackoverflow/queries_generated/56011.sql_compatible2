@@ -1,0 +1,67 @@
+WITH top_users AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, 
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes, 
+        COUNT(DISTINCT p.Id) AS PostCount
+    FROM 
+        Users AS u
+    JOIN 
+        Posts AS p ON u.Id = p.OwnerUserId
+    JOIN 
+        Votes AS v ON p.Id = v.PostId
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+top_posts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount, 
+        p.Tags, 
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes, 
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVotes
+    FROM 
+        Posts AS p
+    JOIN 
+        PostHistory AS ph ON p.Id = ph.PostId
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.Tags
+    HAVING 
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) > 5
+),
+badges AS (
+    SELECT 
+        b.UserId, 
+        b.Name, 
+        b.Class
+    FROM 
+        Badges AS b
+    WHERE 
+        b.Class = 1
+)
+SELECT 
+    tu.DisplayName, 
+    tu.UpVotes, 
+    tu.DownVotes, 
+    tu.PostCount, 
+    tp.Title, 
+    tp.Score, 
+    tp.ViewCount, 
+    tp.Tags, 
+    tp.CloseVotes, 
+    tp.ReopenVotes, 
+    b.Name AS BadgeName
+FROM 
+    top_users AS tu
+JOIN 
+    top_posts AS tp ON tu.Id = tp.Id
+JOIN 
+    badges AS b ON tu.Id = b.UserId
+ORDER BY 
+    tu.UpVotes DESC, 
+    tp.Score DESC;

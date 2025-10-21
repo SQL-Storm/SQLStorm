@@ -1,0 +1,77 @@
+-- {"query": "54054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1574} 
+
+WITH recent_questions AS (
+    SELECT p.Id AS qid,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           p.CreationDate,
+           STRING_AGG(t.TagName, ',') AS tag_list
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Tags t ON t.TagName = ANY(regexp_split_to_array(p.Tags, '<|>')) AND t.TagName <> ''
+    WHERE pt.Name = 'Question'
+      AND p.CreationDate >= NOW() - INTERVAL '30 day'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate
+),
+answer_counts AS (
+    SELECT ParentId AS qid, COUNT(*) AS answer_count
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+vote_totals AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1
+                    WHEN vt.Name = 'DownMod' THEN -1
+                    ELSE 0 END) AS net_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+badge_summary AS (
+    SELECT b.UserId,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+duplicate_links AS (
+    SELECT DISTINCT pl.ParentId AS qid, pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+tag_popularity AS (
+    SELECT t.TagName,
+           COUNT(DISTINCT pq.qid) AS usage_count
+    FROM Tags t
+    JOIN recent_questions pq
+      ON t.TagName = ANY(regexp_split_to_array(pq.tag_list, ','))
+    GROUP BY t.TagName
+    ORDER BY usage_count DESC
+    LIMIT 20
+)
+SELECT  rq.qid,
+        rq.OwnerUserId,
+        rq.Score,
+        rq.ViewCount,
+        rc.answer_count,
+        vt.net_votes,
+        bs.gold,
+        bs.silver,
+        bs.bronze,
+        tp.usage_count AS top_tag_usage
+FROM recent_questions rq
+LEFT JOIN answer_counts rc ON rc.qid = rq.qid
+LEFT JOIN vote_totals vt ON vt.PostId = rq.qid
+LEFT JOIN badge_summary bs ON bs.UserId = rq.OwnerUserId
+LEFT JOIN duplicate_links dl ON dl.qid = rq.qid
+LEFT JOIN LATERAL (
+    SELECT usage_count
+    FROM tag_popularity tp
+    WHERE tp.TagName = ANY(regexp_split_to_array(rq.tag_list, ','))
+    ORDER BY usage_count DESC
+    LIMIT 1
+) tp ON TRUE
+ORDER BY rq.ViewCount DESC, vt.net_votes DESC, rq.Score DESC, rq.CreationDate ASC;

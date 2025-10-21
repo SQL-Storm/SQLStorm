@@ -1,0 +1,95 @@
+-- {"query": "51097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 915} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS DownvoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id 
+        AND p.PostTypeId IN (1, 2) 
+        AND p.DeletedDate IS NULL
+    LEFT JOIN Votes v ON v.UserId = u.Id 
+        AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 100
+        AND u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TotalQuestions,
+        COUNT(DISTINCT SUBSTRING(p.Tags FROM '.*<' || t.TagName || '>.*')) AS ActiveUsers,
+        AVG(p.Score) AS AvgQuestionScore,
+        COUNT(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) * 100.0 / COUNT(*) AS AcceptanceRate
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+        AND p.ClosedDate IS NULL
+    WHERE t.Count > 50
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(*) > 10
+),
+HighImpactUsers AS (
+    SELECT 
+        ua.*,
+        RANK() OVER (ORDER BY ua.PostCount DESC, ua.Reputation DESC) AS OverallRank,
+        ROW_NUMBER() OVER (PARTITION BY 
+            CASE 
+                WHEN ua.QuestionCount > ua.AnswerCount THEN 'Questioner'
+                ELSE 'Answerer'
+            END 
+        ORDER BY ua.Reputation DESC) AS CategoryRank
+    FROM UserActivity ua
+    WHERE ua.PostCount >= 5
+)
+SELECT 
+    hiu.UserId,
+    hiu.DisplayName,
+    hiu.Reputation,
+    hiu.PostCount,
+    hiu.QuestionCount,
+    hiu.AnswerCount,
+    hiu.AvgPostScore,
+    hiu.BadgeCount,
+    hiu.OverallRank,
+    hiu.CategoryRank,
+    COALESCE(ts.ActiveUsers, 0) AS TagDiversityScore,
+    ts.AvgQuestionScore AS AvgTagQuestionScore,
+    CASE 
+        WHEN hiu.UpvoteCount > hiu.DownvoteCount * 2 THEN 'Positive'
+        WHEN hiu.UpvoteCount < hiu.DownvoteCount THEN 'Critical'
+        ELSE 'Balanced'
+    END AS VotingStyle,
+    (
+        SELECT STRING_AGG(DISTINCT pt.Name, ', ')
+        FROM Posts p2 
+        JOIN PostTypes pt ON p2.PostTypeId = pt.Id
+        WHERE p2.OwnerUserId = hiu.UserId
+            AND p2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months'
+        GROUP BY p2.OwnerUserId
+        LIMIT 3
+    ) AS RecentPostTypes
+FROM HighImpactUsers hiu
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT SUBSTRING(p.Tags FROM '<([^>]*)>')) AS ActiveUsers
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+    GROUP BY p.OwnerUserId
+) ts ON ts.OwnerUserId = hiu.UserId
+WHERE hiu.OverallRank <= 100
+ORDER BY 
+    hiu.OverallRank,
+    hiu.Reputation DESC,
+    hiu.PostCount DESC;

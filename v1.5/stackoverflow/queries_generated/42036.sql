@@ -1,0 +1,88 @@
+-- {"query": "42036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2057, "output_tokens": 670} 
+
+WITH RECURSIVE UserPostCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(P.Id) AS PostCount,
+        COUNT(DISTINCT T.TagName) AS TagCount,
+        SUM(P.Score) AS TotalScore,
+        SUM(P.ViewCount) AS TotalViews,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC) AS Rank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        LATERAL (SELECT UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'')) AS TagName) AS T ON TRUE
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        U.Id
+),
+TopUsers AS (
+    SELECT 
+        UserId, 
+        PostCount, 
+        TagCount, 
+        TotalScore, 
+        TotalViews
+    FROM 
+        UserPostCounts
+    WHERE 
+        Rank <= 100
+),
+UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT PH.PostId) AS EditCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(V.VoteTypeId = 2) AS UpvoteCount,
+        SUM(V.VoteTypeId = 3) AS DownvoteCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        PostHistory PH ON U.Id = PH.UserId AND PH.PostHistoryTypeId IN (5, 8, 24)
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    WHERE 
+        U.Id IN (SELECT UserId FROM TopUsers)
+    GROUP BY 
+        U.Id
+),
+UserBadges AS (
+    SELECT 
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges
+    FROM 
+        Badges B
+    WHERE 
+        B.UserId IN (SELECT UserId FROM TopUsers)
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    U.UserId,
+    U.PostCount,
+    U.TagCount,
+    U.TotalScore,
+    U.TotalViews,
+    A.EditCount,
+    A.CommentCount,
+    A.UpvoteCount,
+    A.DownvoteCount,
+    B.GoldBadges,
+    B.SilverBadges,
+    B.BronzeBadges
+FROM 
+    TopUsers U
+LEFT JOIN 
+    UserActivity A ON U.UserId = A.UserId
+LEFT JOIN 
+    UserBadges B ON U.UserId = B.UserId
+ORDER BY 
+    U.PostCount DESC, 
+    U.TotalScore DESC;

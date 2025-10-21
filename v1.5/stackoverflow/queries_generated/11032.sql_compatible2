@@ -1,0 +1,69 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount
+    FROM 
+        Posts p
+    WHERE 
+        p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        COUNT(DISTINCT p.Id) AS ActivePosts, 
+        SUM(p.Score) AS TotalScore, 
+        SUM(p.ViewCount) AS TotalViews
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    GROUP BY 
+        u.Id
+),
+BadgesCTE AS (
+    SELECT 
+        b.UserId, 
+        COUNT(b.Id) AS TotalBadges, 
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.AnswerCount, 
+    ua.ActivePosts, 
+    ua.TotalScore, 
+    ua.TotalViews, 
+    bc.TotalBadges, 
+    bc.GoldBadges, 
+    bc.SilverBadges, 
+    bc.BronzeBadges
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN 
+    BadgesCTE bc ON rp.OwnerUserId = bc.UserId
+WHERE 
+    rp.Score > 0
+    AND ua.ActivePosts > 5
+    AND bc.TotalBadges > 10
+ORDER BY 
+    rp.Score DESC, 
+    ua.TotalViews DESC, 
+    bc.TotalBadges DESC
+LIMIT 10;

@@ -1,0 +1,139 @@
+WITH
+QuestionStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        u.Reputation,
+        u.DisplayName AS OwnerDisplayName,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,8,9,16,36)) AS EditCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35,36)) AS CloseOrOpenCount,
+        (CAST(p.ViewCount AS DECIMAL) * 2 + CAST(p.Score AS DECIMAL) * 3) / NULLIF(DATEDIFF(day, p.CreationDate, CAST('2024-10-01' AS date)), 0) AS EngagementRate
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.DeletionDate IS NULL
+),
+Links AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName
+    FROM
+        PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE
+        lt.Name IN ('Linked', 'Duplicate')
+),
+Ranked AS (
+    SELECT
+        qs.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY qs.OwnerUserId
+            ORDER BY
+                qs.EngagementRate DESC,
+                qs.LastActivityDate DESC,
+                qs.Score DESC
+        ) AS rn
+    FROM
+        QuestionStats qs
+    WHERE
+        qs.EngagementRate > 0
+        AND qs.Reputation > 100
+),
+TopRelated AS (
+    SELECT
+        r.PostId,
+        r.RelatedPostId,
+        r.LinkTypeName,
+        (
+            SELECT MAX(v.BountyAmount)
+            FROM Votes v
+            WHERE v.PostId = r.RelatedPostId
+            AND v.VoteTypeId = 8
+        ) AS TopBounty,
+        (
+            SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = r.RelatedPostId
+        ) AS RelatedPostVotes
+    FROM
+        Links r
+),
+Final AS (
+    SELECT
+        ro.PostId,
+        ro.Title,
+        ro.OwnerDisplayName,
+        ro.Reputation,
+        ro.CreationDate,
+        ro.LastActivityDate,
+        ro.ViewCount,
+        ro.Score,
+        ro.AnswerCount,
+        ro.CommentCount,
+        ro.EditCount,
+        ro.CloseOrOpenCount,
+        ro.EngagementRate,
+        (
+            SELECT STRING_AGG(t.TagName, ',')
+            FROM (
+                SELECT DISTINCT t2.TagName
+                FROM (
+                    SELECT UNNEST(string_to_array(ro.Tags, ', ')) AS tg
+                ) AS a
+                JOIN Tags t2 ON t2.Id = CAST(regexp_replace(a.tg, E'[^0-9]+', '', 'g') AS BIGINT)
+            ) AS t
+        ) AS TagList,
+        fu.RelatedPostId AS ClusterRelatedPostId,
+        fu.LinkTypeName,
+        fu.TopBounty,
+        fu.RelatedPostVotes
+    FROM
+        Ranked ro
+        LEFT JOIN LATERAL (
+            SELECT
+                l.RelatedPostId,
+                l.LinkTypeName
+            FROM
+                TopRelated l
+            WHERE
+                l.PostId = ro.PostId
+            ORDER BY l.RelatedPostVotes DESC
+            LIMIT 1
+        ) fu ON TRUE
+        LEFT JOIN (
+            SELECT
+                t.Id
+            FROM
+                Tags t
+            WHERE
+                t.Id IN (
+                    SELECT CAST(SPLIT_PART(tg, '><', n.n) AS BIGINT)
+                    FROM (
+                        SELECT UNNEST(string_to_array(ro.Tags, ', ')) AS tg
+                    ) s
+                    CROSS JOIN LATERAL generate_series(1, 5) AS n(n)
+                    LIMIT 1
+                )
+        ) AS t ON TRUE
+    GROUP BY
+        ro.PostId, ro.Title, ro.OwnerDisplayName, ro.Reputation, ro.CreationDate, ro.LastActivityDate,
+        ro.ViewCount, ro.Score, ro.AnswerCount, ro.CommentCount, ro.EditCount, ro.CloseOrOpenCount,
+        ro.EngagementRate, fu.RelatedPostId, fu.LinkTypeName, fu.TopBounty, fu.RelatedPostVotes
+)
+SELECT
+    *
+FROM
+    Final
+ORDER BY
+    EngagementRate DESC
+LIMIT 100;

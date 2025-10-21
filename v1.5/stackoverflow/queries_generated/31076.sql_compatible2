@@ -1,0 +1,35 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounties,
+        AVG(CASE WHEN v.UserId IS NOT NULL THEN CAST(v.CreationDate AS TIMESTAMP) END) AS AvgVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        TotalBounties,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, TotalBounties DESC) AS Rank
+    FROM UserActivity
+)
+SELECT 
+    DisplayName,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    TotalBounties
+FROM TopUsers
+WHERE Rank <= 10
+ORDER BY TotalBounties DESC, PostCount DESC;

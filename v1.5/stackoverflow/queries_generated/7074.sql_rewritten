@@ -1,0 +1,174 @@
+-- {"query": "7074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1798} 
+with
+-- recent active questions with parsed tags and tag weights
+RecentQuestions as (
+  select p.id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         coalesce(p.answercount,0) as answercount,
+         coalesce(p.favoritecount,0) as favoritecount,
+         p.tags,
+         -- split tags like '<sql><performance>' into rows using regexp (works in many engines; adjust if needed)
+         regexp_split_to_table(substring(p.tags from 2 for char_length(p.tags)-2), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+),
+-- compute per-question aggregated vote breakdown and latest activity
+QuestionVotes as (
+  select q.id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         max(v.creationdate) as lastvotedate
+  from RecentQuestions q
+  left join votes v on v.postid = q.id
+  group by q.id
+),
+-- top answer per question using window function (score, then recent)
+TopAnswer as (
+  select a.*,
+         row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate desc) as rn
+  from posts a
+  where a.posttypeid = 2
+    and a.parentid in (select id from RecentQuestions)
+),
+TopAnswerBest as (
+  select * from TopAnswer where rn = 1
+),
+-- user stats with recency-weighted rep and activity windows
+UserActivity as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         u.location,
+         u.views,
+         coalesce(b.badge_count,0) as badge_count,
+         -- recency score: more recent access -> higher
+         greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400) as days_since_access,
+         -- a composite activity score: rep * log(1+views) / (1+days_since_access)
+         (case when u.lastaccessdate is null then 0
+               else (u.reputation::numeric * ln(1 + nullif(u.views,0)::numeric + 1) / (1 + greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400)))
+          end) as activity_score
+  from users u
+  left join (
+    select userId, count(*) as badge_count
+    from badges
+    group by userId
+  ) b on b.userId = u.id
+),
+-- per-tag aggregated metrics across recent questions
+TagAggregation as (
+  select rq.tag,
+         count(distinct rq.id) as question_count,
+         sum(rq.answercount) as total_answers,
+         avg(rq.score) as avg_q_score,
+         sum(case when qv.upvotes is null then 0 else qv.upvotes end) as total_upvotes,
+         sum(case when qv.downvotes is null then 0 else qv.downvotes end) as total_downvotes,
+         -- distinct active askers for this tag
+         count(distinct rq.owneruserid) filter (where rq.owneruserid is not null) as distinct_askers,
+         -- median of question viewcount using percentile_disc
+         percentile_disc(0.5) within group (order by rq.viewcount) as median_views
+  from RecentQuestions rq
+  left join QuestionVotes qv on qv.id = rq.id
+  group by rq.tag
+),
+-- identify suspicious or low-quality questions using correlated subqueries and JSON-ish checks
+QualitySignals as (
+  select q.id,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.tags,
+         qv.upvotes,
+         qv.downvotes,
+         qv.favorites,
+         ta.id as top_answer_id,
+         ta.owneruserid as top_answer_owner,
+         -- count of comments on question & top answer
+         (select count(*) from comments c where c.postid = q.id) as q_comment_count,
+         (select count(*) from comments c where c.postid = ta.id) as a_comment_count,
+         -- has code block heuristic: look for '<code>' in body of latest revision in posthistory
+         exists (
+           select 1 from posthistory ph
+           where ph.postid = q.id
+             and ph.posthistorytypeid in (2,5) -- initial or edit body
+             and ph.text ilike '%<code>%'
+           limit 1
+         ) as has_code,
+         -- duplicate link existence (posts linked as duplicate pointing to or from this question)
+         exists (
+           select 1 from postlinks pl
+           where (pl.postid = q.id or pl.relatedpostid = q.id)
+             and pl.linktypeid = 3
+           limit 1
+         ) as has_duplicate_link,
+         -- close vote history: correlated subquery looking for PostHistoryTypeId in close/reopen set
+         (select count(*) from posthistory ph where ph.postid = q.id and ph.posthistorytypeid in (10,11,35,36)) as close_events
+  from RecentQuestions q
+  left join QuestionVotes qv on qv.id = q.id
+  left join TopAnswerBest ta on ta.parentid = q.id
+),
+-- assemble final ranking with complex scoring expression and NULL-safe math
+FinalScore as (
+  select qs.*,
+         taagg.tag,
+         taagg.question_count,
+         taagg.total_upvotes,
+         ua.displayname as asker_name,
+         ua.activity_score as asker_activity,
+         -- score components
+         (coalesce(qs.upvotes,0) - coalesce(qs.downvotes,0)) as net_votes,
+         (coalesce(qs.viewcount,0) / nullif(greatest(1, taagg.question_count),1)) as views_per_tag_question,
+         -- penalize close events and duplicates and absence of code for certain tags
+         ( (coalesce(qs.score,0) * 2)
+           + (coalesce(qs.upvotes,0) * 1.5)
+           - (coalesce(qs.downvotes,0) * 2)
+           + (coalesce(qs.favoritecount,0) * 3)
+           + log(1 + greatest(0, coalesce(qs.viewcount,0)))
+           + (case when qs.has_code then 5 else 0 end)
+           - (case when qs.has_duplicate_link then 8 else 0 end)
+           - (qs.close_events * 10)
+           + (coalesce(ua.activity_score,0) / 100)
+         ) * (1 + ln(1 + nullif(taagg.question_count,0)))
+         as composite_score,
+         -- categorical flags
+         (case when qs.answercount = 0 and qs.viewcount < 100 and coalesce(qs.upvotes,0) = 0 then 1 else 0 end) as neglected_question_flag
+  from QualitySignals qs
+  left join TagAggregation taagg on taagg.tag = (select tag from regexp_split_to_table(substring(qs.tags from 2 for char_length(qs.tags)-2), '><') limit 1)
+  left join UserActivity ua on ua.id = qs.owneruserid
+)
+select f.id as question_id,
+       f.title,
+       f.tags,
+       f.tag,
+       f.question_count,
+       round(f.composite_score::numeric,2) as composite_score,
+       f.net_votes,
+       f.upvotes,
+       f.downvotes,
+       f.favoritecount,
+       f.viewcount,
+       f.answercount,
+       f.top_answer_id,
+       f.top_answer_owner,
+       f.q_comment_count,
+       f.a_comment_count,
+       f.has_code,
+       f.has_duplicate_link,
+       f.close_events,
+       f.asker_name,
+       round(f.asker_activity::numeric,2) as asker_activity,
+       f.neglected_question_flag
+from FinalScore f
+where f.composite_score is not null
+order by f.composite_score desc nulls last, f.viewcount desc
+limit 200;

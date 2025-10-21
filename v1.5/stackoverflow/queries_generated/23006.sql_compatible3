@@ -1,0 +1,109 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(p.Id) > 10
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(b.Date) AS LatestBadgeDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes
+    FROM Votes v
+    WHERE v.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+    GROUP BY v.PostId
+),
+ComplexSubquery AS (
+    SELECT 
+        ups.UserId,
+        ups.Reputation,
+        ups.DisplayName,
+        ups.Location,
+        ups.TotalPosts,
+        ups.AvgScore,
+        ups.TotalQuestionViews,
+        ups.AllTags,
+        bs.BadgeCount,
+        bs.LatestBadgeDate,
+        bs.GoldBadges,
+        (SELECT COUNT(c.Id) 
+         FROM Comments c 
+         WHERE c.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ups.UserId) 
+         AND c.Score > 5) AS HighScoreComments,
+        ROW_NUMBER() OVER (PARTITION BY ups.Location ORDER BY ups.Reputation DESC) AS RankInLocation,
+        LAG(ups.Reputation) OVER (ORDER BY ups.Reputation DESC) AS PrevReputation,
+        NULLIF(LEAD(ups.TotalPosts) OVER (ORDER BY ups.TotalPosts DESC), 0) AS NextTotalPosts
+    FROM UserPostStats ups
+    LEFT JOIN BadgeStats bs ON ups.UserId = bs.UserId
+    WHERE ups.Reputation > (SELECT AVG(Reputation) FROM Users) * 1.5
+      AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = ups.UserId) AND ph.PostHistoryTypeId IN (10, 11))
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Location,
+    cs.TotalPosts,
+    cs.AvgScore,
+    cs.TotalQuestionViews,
+    cs.AllTags,
+    cs.BadgeCount,
+    cs.GoldBadges,
+    cs.HighScoreComments,
+    cs.RankInLocation,
+    (cs.Reputation - COALESCE(cs.PrevReputation, 0)) AS ReputationDiff,
+    CASE 
+        WHEN cs.NextTotalPosts IS NULL THEN 'Top Poster'
+        ELSE CONCAT('Next has ', cs.NextTotalPosts, ' posts')
+    END AS NextPosterInfo,
+    va.VoteCount,
+    va.NetVotes
+FROM ComplexSubquery cs
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        SUM(va2.VoteCount) AS VoteCount,
+        SUM(va2.NetVotes) AS NetVotes
+    FROM Posts p
+    INNER JOIN VoteAnalysis va2 ON p.Id = va2.PostId
+    GROUP BY p.OwnerUserId
+) va ON cs.UserId = va.OwnerUserId
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    NULL AS Location,
+    COUNT(DISTINCT UserId) AS TotalPosts,
+    AVG(AvgScore) AS AvgScore,
+    SUM(TotalQuestionViews) AS TotalQuestionViews,
+    NULL AS AllTags,
+    SUM(BadgeCount) AS BadgeCount,
+    SUM(GoldBadges) AS GoldBadges,
+    SUM(HighScoreComments) AS HighScoreComments,
+    NULL AS RankInLocation,
+    NULL AS ReputationDiff,
+    NULL AS NextPosterInfo,
+    NULL AS VoteCount,
+    NULL AS NetVotes
+FROM ComplexSubquery
+ORDER BY Reputation DESC
+LIMIT 100;

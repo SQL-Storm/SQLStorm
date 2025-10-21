@@ -1,0 +1,175 @@
+-- {"query": "7079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2261} 
+with
+-- active users: created before 2020, at least 100 rep, and lurkers with many views
+active_users as (
+  select u.id, u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         nullif(u.location,'') as location,
+         coalesce(u.views,0) as views,
+         coalesce(u.upvotes,0) - coalesce(u.downvotes,0) as net_votes,
+         case when u.websiteurl is not null and u.websiteurl <> '' then 1 else 0 end has_website
+  from users u
+  where u.reputation >= 100
+    and u.creationdate < '2020-01-01'
+    and (coalesce(u.views,0) > 100 or coalesce(u.upvotes,0) > 10)
+),
+-- recent popular questions with parsed tag arrays and normalized score metrics
+questions as (
+  select p.id, p.owneruserid, p.title, p.tags,
+         p.creationdate,
+         p.score, p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         -- tag count: count of <> delimited tags stored like '<tag1><tag2>'
+         greatest(array_length(string_to_array(substring(coalesce(p.tags,''),2, char_length(coalesce(p.tags,'')) - 2), '><'),1),0) as tag_count,
+         -- normalized popularity: score weighted by views and favorites with null-safe math
+         (coalesce(p.score,0)::numeric * 0.6) + (coalesce(p.viewcount,0)::numeric / nullif(greatest((select avg(viewcount) from posts where posttypeid=1 and viewcount is not null),1),0) * 0.3)
+           + (coalesce(p.favoritecount,0)::numeric * 0.1) as popularity_index
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= '2015-01-01'
+),
+-- aggregate answers info per question with windowing and correlated existence checks
+answers as (
+  select a.id, a.parentid as questionid, a.owneruserid, a.creationdate, a.score,
+         row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as rn_best,
+         count(*) over (partition by a.parentid) as answers_total,
+         sum(case when a.score >= 0 then 1 else 0 end) over (partition by a.parentid) as non_negative_answers
+  from posts a
+  where a.posttypeid = 2
+),
+-- recent edits and close events per post with JSON parsing of PostHistory.Text where applicable
+post_events as (
+  select ph.postid,
+         max(ph.creationdate) as last_event_date,
+         bool_or(ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as has_moderation_votes,
+         count(*) filter (where ph.posthistorytypeid = 5) as body_edits,
+         count(*) filter (where ph.posthistorytypeid = 6) as tag_edits,
+         -- extract duplicate target id(s) for close duplicate events stored in comment field historically
+         array_agg(distinct nullif(regexp_replace(coalesce(ph.comment,''), '\D','','g'),'')::int) filter (where ph.posthistorytypeid = 10 or ph.posthistorytypeid = 35) as close_reason_ids,
+         -- preserve a sample of comments
+         string_agg(distinct substring(coalesce(ph.comment,''),1,80), ' | ' order by ph.creationdate desc) as recent_ph_comments
+  from posthistory ph
+  group by ph.postid
+),
+-- badge richness per user (weighted by class)
+user_badges as (
+  select b.userid,
+         count(*) as badge_count,
+         sum(case when b.class=1 then 5 when b.class=2 then 3 when b.class=3 then 1 else 0 end) as badge_score,
+         count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+-- votes heatmap per post (counts by type pivot)
+post_votes as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 8 then 1 else 0 end) as bounty_starts,
+         count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+-- tag exploded table for tag-level analytics
+question_tags as (
+  select q.id as questionid, trim(tag) as tag
+  from questions q,
+       unnest(string_to_array(substring(coalesce(q.tags,''),2, char_length(coalesce(q.tags,'')) - 2), '><')) as tag
+  where q.tags is not null and q.tags <> ''
+),
+-- top tags by average question popularity and volume
+tag_stats as (
+  select qt.tag,
+         count(*) as questions_with_tag,
+         avg(q.popularity_index) as avg_popularity,
+         percentile_cont(0.5) within group (order by q.popularity_index) as median_popularity
+  from question_tags qt
+  join questions q on q.id = qt.questionid
+  group by qt.tag
+  having count(*) >= 25
+  order by avg_popularity desc
+  limit 50
+),
+-- identify potentially asymmetrical link relationships (A links to B but not vice versa)
+asym_links as (
+  select pl.postid, pl.relatedpostid,
+         case when exists(select 1 from postlinks pl2 where pl2.postid = pl.relatedpostid and pl2.relatedpostid = pl.postid) then 0 else 1 end as is_one_way
+  from postlinks pl
+  where pl.creationdate >= '2016-01-01'
+),
+-- heavy query combining everything to stress planner: join questions to best answers, votes, events, badges, users and tags
+candidate_questions as (
+  select q.id as question_id,
+         q.title,
+         q.creationdate as q_created,
+         q.popularity_index,
+         q.tag_count,
+         coalesce(pv.upvotes,0) as q_upvotes,
+         coalesce(pv.downvotes,0) as q_downvotes,
+         coalesce(pe.last_event_date, q.creationdate) as last_activity_by_events,
+         coalesce(a.answers_total,0) as answers_total,
+         coalesce(a.rn_best, null) as best_answer_rank,
+         a.id as best_answer_id,
+         a.owneruserid as best_answer_owner,
+         bu.displayname as best_answer_owner_name,
+         ub.badge_score as best_answer_owner_badge_score,
+         au.displayname as question_owner_name,
+         ubq.badge_score as question_owner_badge_score,
+         ts.tag,
+         ts.avg_popularity as tag_avg_popularity,
+         ts.questions_with_tag,
+         al.is_one_way as link_is_one_way,
+         -- complex composite score combining many signals and null-safe operations
+         (
+           greatest(0, coalesce(q.popularity_index,0)) * power(greatest(1, coalesce(q.tag_count,1)), 0.2)
+           + ln(greatest(1, coalesce(pv.total_votes,1))) * 2
+           + (coalesce(ub.badge_score,0) * 0.5)
+           - (coalesce(pv.downvotes,0) * 0.3)
+           + case when coalesce(a.answers_total,0) = 0 then -5 else 3 end
+           + case when al.is_one_way = 1 then 1 else 0 end
+           - (date_part('epoch', cast('2024-10-01 12:34:56' as timestamp) - q.creationdate) / 86400) * 0.01
+         ) as composite_hotness
+  from questions q
+  left join post_votes pv on pv.postid = q.id
+  left join post_events pe on pe.postid = q.id
+  left join answers a on a.questionid = q.id and a.rn_best = 1
+  left join users au on au.id = q.owneruserid
+  left join user_badges ubq on ubq.userid = q.owneruserid
+  left join users bu on bu.id = a.owneruserid
+  left join user_badges ub on ub.userid = a.owneruserid
+  left join question_tags qt on qt.questionid = q.id
+  left join tag_stats ts on ts.tag = qt.tag
+  left join lateral (
+    select is_one_way from asym_links al where al.postid = q.id order by al.postid limit 1
+  ) al on true
+  where q.popularity_index is not null
+)
+select cq.*,
+       -- rank over composite_hotness, partitioned by tag to create bucketed leaderboards
+       rank() over (partition by coalesce(tag,'<none>') order by composite_hotness desc) as tag_rank,
+       dense_rank() over (order by composite_hotness desc) as global_rank,
+       -- correlated subquery: median response time for answers to this question (in hours)
+       (select percentile_cont(0.5) within group (order by extract(epoch from (a2.creationdate - q.creationdate))/3600)
+        from posts a2 where a2.parentid = cq.question_id and a2.posttypeid = 2 and a2.creationdate > cq.q_created
+       ) as median_response_hours,
+       -- existence correlated check for comments containing 'duplicate' or 'possible duplicate'
+       exists(
+         select 1 from comments c where c.postid = cq.question_id and (c.text ilike '%duplicate%' or c.text ilike '%possible duplicate%')
+       ) as has_duplicate_comment,
+       -- set operator example: union count of unique participants (asker, best answerer, commenters)
+       (
+         select count(distinct uid) from (
+           select cq.question_id as uid
+           union
+           select coalesce(c2.userid,-1) from comments c2 where c2.postid = cq.question_id
+           union
+           select coalesce(a2.owneruserid,-1) from posts a2 where a2.parentid = cq.question_id and a2.posttypeid = 2
+         ) t
+       ) as unique_participant_count
+from candidate_questions cq
+order by cq.composite_hotness desc
+limit 200;

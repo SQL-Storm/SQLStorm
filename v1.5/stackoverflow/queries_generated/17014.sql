@@ -1,0 +1,148 @@
+-- {"query": "17014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 35025, "output_tokens": 34508} 
+
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) as avg_post_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) as median_positive_score,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2), ', ' ORDER BY SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2)) 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) as primary_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_rankings AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) as gold_badges,
+        COUNT(*) FILTER (WHERE Class = 2) as silver_badges,
+        COUNT(*) FILTER (WHERE Class = 3) as bronze_badges,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) FILTER (WHERE Class = 1) DESC, COUNT(*) FILTER (WHERE Class = 2) DESC) as badge_rank,
+        ARRAY_AGG(DISTINCT Name ORDER BY Date DESC) FILTER (WHERE TagBased = B'1') as tag_badges
+    FROM Badges
+    GROUP BY UserId
+),
+recursive_comment_threads AS (
+    SELECT 
+        c1.PostId,
+        c1.Id as RootCommentId,
+        c1.Id as CommentId,
+        1 as depth,
+        c1.Score,
+        c1.UserId,
+        ARRAY[c1.Id] as path
+    FROM Comments c1
+    WHERE c1.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+        AND NOT EXISTS (
+            SELECT 1 FROM Comments c2 
+            WHERE c2.PostId = c1.PostId 
+                AND c2.Id < c1.Id 
+                AND c2.CreationDate < c1.CreationDate - INTERVAL '5 minutes'
+        )
+    
+    UNION ALL
+    
+    SELECT 
+        rct.PostId,
+        rct.RootCommentId,
+        c3.Id,
+        rct.depth + 1,
+        c3.Score,
+        c3.UserId,
+        rct.path || c3.Id
+    FROM recursive_comment_threads rct
+    JOIN Comments c3 ON c3.PostId = rct.PostId 
+        AND c3.Id > rct.CommentId
+        AND c3.CreationDate BETWEEN (SELECT CreationDate FROM Comments WHERE Id = rct.CommentId) 
+            AND (SELECT CreationDate FROM Comments WHERE Id = rct.CommentId) + INTERVAL '1 hour'
+        AND NOT (c3.Id = ANY(rct.path))
+    WHERE rct.depth < 5
+),
+post_evolution AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) as unique_editors,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 2 THEN LENGTH(ph.Text) END) as initial_length,
+        MAX(LENGTH(ph.Text)) FILTER (WHERE ph.PostHistoryTypeId = 5) as max_edit_length,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) as rollback_count,
+        FIRST_VALUE(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as first_activity,
+        LAST_VALUE(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as last_activity,
+        STRING_AGG(COALESCE(ph.Comment, ''), ' | ' ORDER BY ph.CreationDate) 
+            FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) as close_reasons
+    FROM PostHistory ph
+    GROUP BY ph.PostId, ph.CreationDate
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.post_count,
+    ROUND(uam.avg_post_score::numeric, 2) as avg_score,
+    COALESCE(uam.median_positive_score, 0) as median_score,
+    COALESCE(br.gold_badges, 0) as gold,
+    COALESCE(br.silver_badges, 0) as silver,
+    COALESCE(br.bronze_badges, 0) as bronze,
+    br.badge_rank,
+    CASE 
+        WHEN uam.Reputation > 10000 AND br.gold_badges >= 5 THEN 'Elite'
+        WHEN uam.Reputation > 5000 OR br.gold_badges >= 1 THEN 'Veteran'
+        WHEN uam.Reputation > 1000 THEN 'Active'
+        WHEN uam.Reputation > 100 THEN 'Contributor'
+        ELSE 'Newcomer'
+    END as user_tier,
+    COALESCE(SUBSTRING(uam.primary_tags FROM 1 FOR 100), 'No tags') as main_tags,
+    COUNT(DISTINCT rct.PostId) as commented_posts,
+    AVG(rct.depth) as avg_comment_depth,
+    SUM(CASE WHEN pe.rollback_count > 0 THEN 1 ELSE 0 END) as posts_with_rollbacks,
+    MAX(EXTRACT(EPOCH FROM (pe.last_activity - pe.first_activity))/3600)::int as max_edit_hours,
+    COALESCE(
+        (SELECT COUNT(DISTINCT v.PostId) 
+         FROM Votes v 
+         WHERE v.UserId = uam.Id 
+            AND v.VoteTypeId IN (2,3) 
+            AND v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'),
+        0
+    ) as recent_votes,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY p2.Score) FILTER (
+        WHERE p2.ParentId IN (SELECT Id FROM Posts WHERE OwnerUserId = uam.Id AND PostTypeId = 1)
+    ) as q75_answer_score_to_questions,
+    EXISTS (
+        SELECT 1 
+        FROM PostLinks pl 
+        WHERE pl.LinkTypeId = 3 
+            AND (pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uam.Id) 
+                OR pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uam.Id))
+    ) as has_duplicate_involvement,
+    COALESCE(NULLIF(TRIM(BOTH ' ' FROM 
+        REGEXP_REPLACE(
+            SUBSTRING(array_to_string(br.tag_badges, ', ') FROM 1 FOR 50),
+            '[^a-zA-Z0-9, -]',
+            '',
+            'g'
+        )), ''), 'None') as tag_badge_preview
+FROM user_activity_metrics uam
+LEFT JOIN badge_rankings br ON br.UserId = uam.Id
+LEFT JOIN recursive_comment_threads rct ON rct.UserId = uam.Id
+LEFT JOIN Posts p2 ON p2.PostTypeId = 2
+LEFT JOIN post_evolution pe ON pe.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uam.Id)
+WHERE uam.post_count > 0
+    OR br.gold_badges > 0
+    OR (uam.Reputation > 500 AND uam.DisplayName IS NOT NULL)
+GROUP BY 
+    uam.Id, uam.DisplayName, uam.Reputation, uam.post_count, 
+    uam.avg_post_score, uam.median_positive_score, uam.primary_tags,
+    br.gold_badges, br.silver_badges, br.bronze_badges, br.badge_rank, br.tag_badges
+HAVING COUNT(DISTINCT rct.PostId) > 0 
+    OR SUM(CASE WHEN pe.rollback_count > 0 THEN 1 ELSE 0 END) > 0
+    OR uam.post_count >= 5
+ORDER BY 
+    br.badge_rank ASC NULLS LAST,
+    uam.Reputation DESC,
+    uam.avg_post_score DESC NULLS LAST
+LIMIT 100;

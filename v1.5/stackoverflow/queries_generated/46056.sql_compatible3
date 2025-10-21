@@ -1,0 +1,120 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.Score) as avg_score,
+        SUM(p.ViewCount) as total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswererUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        COUNT(DISTINCT c.Id) as answer_comments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as answer_rank
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    GROUP BY a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate
+),
+TagEngagement AS (
+    SELECT 
+        t.Id as TagId,
+        t.TagName,
+        t.Count as tag_usage,
+        COUNT(DISTINCT b.UserId) as badge_holders,
+        AVG(p.Score) as avg_question_score
+    FROM Tags t
+    LEFT JOIN Badges b ON b.Name = t.TagName AND b.TagBased = 1
+    LEFT JOIN Posts p ON p.PostTypeId = 1 
+        AND p.Tags LIKE '%<' || t.TagName || '>%'
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    WHERE t.Count >= 100
+    GROUP BY t.Id, t.TagName, t.Count
+),
+UserReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) as total_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) as gold_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) as silver_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) as bronze_badges,
+        DATE_PART('day', DATE '2024-10-01' - u.CreationDate) as account_age_days
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation >= 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+)
+SELECT 
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    ur.DisplayName as AuthorName,
+    ur.Reputation as AuthorReputation,
+    ur.total_badges,
+    ur.gold_badges,
+    tqa.question_count as author_question_count,
+    tqa.avg_score as author_avg_score,
+    am.AnswerScore as best_answer_score,
+    am.answer_comments as best_answer_comments,
+    am.upvotes as best_answer_upvotes,
+    am.downvotes as best_answer_downvotes,
+    answerer.DisplayName as best_answerer_name,
+    answerer.Reputation as best_answerer_reputation,
+    te.TagName as primary_tag,
+    te.tag_usage,
+    te.badge_holders as tag_badge_holders,
+    te.avg_question_score as tag_avg_score,
+    COUNT(DISTINCT ph.Id) as edit_count,
+    COUNT(DISTINCT pl.Id) as related_link_count,
+    MAX(q.LastActivityDate) as last_activity,
+    DATE_PART('day', DATE '2024-10-01' - q.CreationDate) as question_age_days,
+    CASE 
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END as question_status
+FROM Posts q
+INNER JOIN TopQuestionAuthors tqa ON tqa.OwnerUserId = q.OwnerUserId
+INNER JOIN UserReputation ur ON ur.Id = q.OwnerUserId
+LEFT JOIN AnswerMetrics am ON am.QuestionId = q.Id AND am.answer_rank = 1
+LEFT JOIN UserReputation answerer ON answerer.Id = am.AnswererUserId
+LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+LEFT JOIN TagEngagement te ON q.Tags LIKE '%<' || te.TagName || '>%'
+WHERE q.PostTypeId = 1
+    AND q.CreationDate >= DATE '2024-10-01' - INTERVAL '18 months'
+    AND q.Score >= 5
+    AND q.ViewCount >= 100
+GROUP BY 
+    q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount,
+    q.FavoriteCount, q.AcceptedAnswerId, q.ClosedDate, q.CreationDate,
+    q.LastActivityDate, ur.DisplayName, ur.Reputation, ur.total_badges,
+    ur.gold_badges, tqa.question_count, tqa.avg_score, am.AnswerScore,
+    am.answer_comments, am.upvotes, am.downvotes, answerer.DisplayName,
+    answerer.Reputation, te.TagName, te.tag_usage, te.badge_holders,
+    te.avg_question_score
+HAVING COUNT(DISTINCT ph.Id) >= 2
+ORDER BY 
+    (q.ViewCount * 0.3) + (q.Score * 0.4) + (COALESCE(am.AnswerScore, 0) * 0.3) DESC,
+    q.CreationDate DESC
+LIMIT 1000;

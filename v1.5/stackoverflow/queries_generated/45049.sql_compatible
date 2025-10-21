@@ -1,0 +1,45 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY u.Id) AS TotalUserPosts
+    FROM Users AS u
+    JOIN Posts AS p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+),
+UserTagStats AS (
+    SELECT 
+        rp.UserId,
+        rp.DisplayName,
+        STRING_AGG(
+            (SELECT t.TagName FROM Tags t WHERE t.Id IN (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))
+            ) LIMIT 1),
+            ',' ORDER BY rp.PostRank
+        ) AS TopTags,
+        MAX(rp.Score) AS MaxQuestionScore,
+        AVG(rp.Score) AS AvgQuestionScore
+    FROM RankedUserPosts rp
+    WHERE rp.PostRank <= 5
+    GROUP BY rp.UserId, rp.DisplayName
+)
+SELECT 
+    uts.UserId,
+    uts.DisplayName,
+    uts.TopTags,
+    uts.MaxQuestionScore,
+    uts.AvgQuestionScore,
+    COUNT(v.Id) AS TotalVotes,
+    COUNT(DISTINCT b.Id) AS BadgeCount
+FROM UserTagStats uts
+LEFT JOIN Votes v ON v.UserId = uts.UserId
+LEFT JOIN Badges b ON b.UserId = uts.UserId
+WHERE uts.AvgQuestionScore > 2
+GROUP BY uts.UserId, uts.DisplayName, uts.TopTags, uts.MaxQuestionScore, uts.AvgQuestionScore
+ORDER BY TotalVotes DESC
+LIMIT 1000;

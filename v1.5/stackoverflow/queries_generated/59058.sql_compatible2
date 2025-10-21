@@ -1,0 +1,84 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Unanswered'
+    END AS PostStatus,
+    DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56')) AS DaysActive,
+    AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgScorePerUser,
+    RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS NewestPostRank,
+    LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+    LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+    NTILE(10) OVER (ORDER BY p.Score) AS ScoreQuartile,
+    PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(COUNT(DISTINCT c.Id), 0) AS CommentCountActual,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Date >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+    ) AS RecentBadgesCount,
+    (
+        SELECT STRING_AGG(b.Name, ', ')
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Date >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+    ) AS RecentBadges
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT Id, unnest(string_to_array(Tags, '<')) AS TagName
+    FROM Posts 
+    WHERE Tags IS NOT NULL AND Tags <> ''
+) t ON p.Id = t.Id
+WHERE p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '2 years')
+    AND p.PostTypeId IN (1, 2)
+    AND p.Score > 0
+    AND u.Reputation > 100
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    u.Reputation, 
+    p.PostTypeId, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    p.AnswerCount, 
+    p.LastActivityDate, 
+    p.FavoriteCount
+HAVING COUNT(DISTINCT c.Id) > 0
+    AND COUNT(DISTINCT v.Id) > 0
+    AND COUNT(DISTINCT ph.Id) > 0
+ORDER BY 
+    p.Score DESC, 
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 1000;

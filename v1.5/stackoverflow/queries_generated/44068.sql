@@ -1,0 +1,42 @@
+-- {"query": "44068.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 155992, "output_tokens": 53826} 
+Here is an elaborate SQL query for performance benchmarking:
+
+```sql
+WITH post_history_cte AS (
+  SELECT ph.PostId, ph.CreationDate, ph.PostHistoryTypeId, ph.UserId, ph.UserDisplayName, ph.Comment, ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (1, 4, 7, 10, 11, 12, 13, 14, 15, 19, 20)
+),
+user_badges_cte AS (
+  SELECT b.UserId, COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_votes_cte AS (
+  SELECT v.UserId, COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS up_votes,
+         COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS down_votes
+  FROM Votes v
+  GROUP BY v.UserId
+),
+post_stats_cte AS (
+  SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.LastEditorUserId, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate,
+         COALESCE(DATEDIFF(p.LastActivityDate, p.CreationDate), 0) AS days_active,
+         COALESCE(DATEDIFF(COALESCE(p.ClosedDate, p.CommunityOwnedDate), p.CreationDate), 0) AS days_to_close
+  FROM Posts p
+)
+SELECT u.Id AS user_id, u.Reputation, u.CreationDate AS user_creation_date, u.DisplayName, u.LastAccessDate, u.WebsiteUrl, u.Location, u.AboutMe, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl, u.EmailHash, u.AccountId,
+       ub.gold_badges, ub.silver_badges, ub.bronze_badges,
+       uv.up_votes, uv.down_votes,
+       ps.Id AS post_id, ps.PostTypeId, ps.AnswerCount, ps.CommentCount, ps.FavoriteCount, ps.days_active, ps.days_to_close,
+       ph.CreationDate AS post_history_date, ph.PostHistoryTypeId, ph.UserId AS post_history_user_id, ph.UserDisplayName AS post_history_user_name, ph.Comment AS post_history_comment, ph.Text AS post_history_text
+FROM Users u
+LEFT JOIN user_badges_cte ub ON u.Id = ub.UserId
+LEFT JOIN user_votes_cte uv ON u.Id = uv.UserId
+LEFT JOIN post_stats_cte ps ON u.Id = ps.OwnerUserId OR u.Id = ps.LastEditorUserId
+LEFT JOIN post_history_cte ph ON ps.Id = ph.PostId
+ORDER BY u.Id, ps.Id, ph.CreationDate;
+```
+
+This query combines data from multiple tables to provide a comprehensive view of user, post, and post history information for performance benchmarking purposes. It uses common table expressions (CTEs) to perform aggregations and calculations, and then joins the results together to generate the final output. The query covers a wide range of data points, including user reputation, badge counts, vote counts, post details, and post history events, allowing for in-depth analysis and performance testing.

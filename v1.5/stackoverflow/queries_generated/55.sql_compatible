@@ -1,0 +1,16 @@
+WITH RankedUsers AS (
+    SELECT Id, Reputation,
+           ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS Rank
+    FROM Users
+),
+TopUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM RankedUsers
+    WHERE Rank <= 100
+)
+SELECT u.DisplayName, u.Reputation, COUNT(p.Id) AS TotalPosts
+FROM TopUsers AS u
+LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1 OR p.PostTypeId IS NULL
+GROUP BY u.DisplayName, u.Reputation
+ORDER BY TotalPosts DESC;

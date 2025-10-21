@@ -1,0 +1,148 @@
+-- {"query": "51025.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1191} 
+
+WITH 
+top_tags AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS post_count
+    FROM 
+        Tags t
+    INNER JOIN 
+        Posts p ON position(t.TagName IN p.Tags) > 0
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        t.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 100
+    ORDER BY 
+        post_count DESC
+    LIMIT 50
+),
+active_users AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS question_count,
+        SUM(CASE WHEN p.Score >= 10 THEN 1 ELSE 0 END) AS high_score_questions
+    FROM 
+        Users u
+    INNER JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation >= 1000
+        AND u.LastAccessDate >= NOW() - INTERVAL '6 months'
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        u.Id, u.Reputation
+    HAVING 
+        COUNT(DISTINCT p.Id) >= 5
+),
+user_tag_interactions AS (
+    SELECT 
+        au.user_id,
+        tt.TagName,
+        COUNT(DISTINCT p.Id) AS interactions,
+        AVG(p.Score) AS avg_score,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes_received
+    FROM 
+        active_users au
+    INNER JOIN 
+        Posts p ON au.user_id = p.OwnerUserId AND p.PostTypeId = 1
+    INNER JOIN 
+        top_tags tt ON position(tt.TagName IN p.Tags) > 0
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2 AND v.CreationDate >= p.CreationDate
+    WHERE 
+        p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        au.user_id, tt.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) >= 2
+),
+monthly_trends AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        tt.TagName,
+        COUNT(DISTINCT p.Id) AS monthly_posts,
+        AVG(p.Score) AS avg_monthly_score,
+        COUNT(DISTINCT p.OwnerUserId) AS active_authors
+    FROM 
+        Posts p
+    INNER JOIN 
+        top_tags tt ON position(tt.TagName IN p.Tags) > 0
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate >= NOW() - INTERVAL '12 months'
+    GROUP BY 
+        DATE_TRUNC('month', p.CreationDate), tt.TagName
+),
+performance_metrics AS (
+    SELECT 
+        uti.TagName,
+        uti.user_id,
+        uti.interactions,
+        uti.avg_score,
+        uti.upvotes_received,
+        au.question_count,
+        au.high_score_questions,
+        ROW_NUMBER() OVER (PARTITION BY uti.TagName ORDER BY uti.upvotes_received DESC, uti.avg_score DESC) AS user_rank,
+        mt.monthly_posts,
+        mt.avg_monthly_score
+    FROM 
+        user_tag_interactions uti
+    INNER JOIN 
+        active_users au ON uti.user_id = au.user_id
+    INNER JOIN 
+        monthly_trends mt ON uti.TagName = mt.TagName 
+        AND DATE_TRUNC('month', NOW()) = mt.month  -- Most recent month data
+    WHERE 
+        uti.avg_score >= 2.0
+)
+SELECT 
+    pm.TagName,
+    u.DisplayName AS top_user,
+    u.Reputation AS user_reputation,
+    pm.interactions AS total_interactions,
+    pm.avg_score AS average_score,
+    pm.upvotes_received AS total_upvotes,
+    pm.question_count AS total_questions,
+    pm.monthly_posts AS current_month_activity,
+    pm.avg_monthly_score AS monthly_avg_score,
+    CASE 
+        WHEN pm.user_rank = 1 THEN '🏆 Leader'
+        WHEN pm.user_rank <= 3 THEN '🥈🥉 Top Performer'
+        ELSE 'Active Contributor'
+    END AS performance_tier,
+    CONCAT(
+        ROUND((pm.upvotes_received::float / NULLIF(pm.interactions, 0)) * 100, 2), 
+        '% upvote ratio'
+    ) AS engagement_ratio,
+    COUNT(DISTINCT c.Id) AS total_comments_on_posts
+FROM 
+    performance_metrics pm
+INNER JOIN 
+    Users u ON pm.user_id = u.Id
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId AND position(pm.TagName IN p.Tags) > 0 AND p.PostTypeId = 1
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+WHERE 
+    pm.user_rank <= 5  -- Only top 5 users per tag
+    AND pm.TagName IN (
+        SELECT TagName 
+        FROM top_tags 
+        ORDER BY post_count DESC 
+        LIMIT 10
+    )
+GROUP BY 
+    pm.TagName, u.DisplayName, u.Reputation, pm.interactions, 
+    pm.avg_score, pm.upvotes_received, pm.question_count,
+    pm.monthly_posts, pm.avg_monthly_score, pm.user_rank
+HAVING 
+    pm.upvotes_received >= 50  -- Only significant contributors
+ORDER BY 
+    pm.TagName, pm.upvotes_received DESC, pm.avg_score DESC
+LIMIT 100;

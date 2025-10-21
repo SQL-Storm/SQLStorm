@@ -1,0 +1,79 @@
+-- {"query": "3037.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 655} 
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id
+),
+ActiveQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+),
+QuestionAnswers AS (
+    SELECT
+        q.QuestionId,
+        COUNT(ans.Id) AS AnswerCount
+    FROM ActiveQuestions q
+    LEFT JOIN Posts ans ON ans.ParentId = q.QuestionId AND ans.PostTypeId = 2
+    GROUP BY q.QuestionId
+),
+PopularQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        qa.AnswerCount,
+        q.Score,
+        q.ViewCount
+    FROM ActiveQuestions q
+    JOIN QuestionAnswers qa ON qa.QuestionId = q.QuestionId
+    WHERE q.Score >= 10 AND q.ViewCount >= 1000
+),
+MostCommented AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CommentCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 OR p.PostTypeId = 2
+    ORDER BY p.CommentCount DESC
+    LIMIT 10
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    JSON_BUILD_OBJECT(
+        'userId', u.Id,
+        'questions', COALESCE(JSON_AGG(DISTINCT q.QuestionId), '[]'),
+        'popularQuestions', COALESCE(JSON_AGG(DISTINCT pq.QuestionId), '[]'),
+        'mostCommentedPosts', COALESCE(JSON_AGG(DISTINCT mc.PostId), '[]')
+    ) AS UserPerformanceSummary
+FROM Users u
+LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+LEFT JOIN ActiveQuestions q ON q.OwnerUserId = u.Id
+LEFT JOIN PopularQuestions pq ON pq.QuestionId IN (SELECT QuestionId FROM ActiveQuestions WHERE OwnerUserId = u.Id)
+LEFT JOIN MostCommented mc ON mc.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND (PostTypeId = 1 OR PostTypeId = 2)
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+ORDER BY u.Reputation DESC NULLS LAST;

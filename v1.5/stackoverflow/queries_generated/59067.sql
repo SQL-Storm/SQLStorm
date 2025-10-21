@@ -1,0 +1,108 @@
+-- {"query": "59067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 1372} 
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+    COALESCE(p.ParentId, 0) AS ParentId,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostTypeDescription,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer'
+        ELSE 'Not a Question'
+    END AS AnswerStatus,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.PostTypeId = 1 AND p.ClosedDate IS NULL THEN 'Open'
+        ELSE 'Not a Question'
+    END AS QuestionStatus,
+    COALESCE(ah.Id, 0) AS AcceptedAnswerHistoryId,
+    COALESCE(ah.Score, 0) AS AcceptedAnswerScore,
+    COALESCE(ah.CreationDate, '1900-01-01') AS AcceptedAnswerCreationDate,
+    COALESCE(au.DisplayName, 'Unknown') AS AcceptedAnswerOwnerDisplayName,
+    COALESCE(au.Reputation, 0) AS AcceptedAnswerOwnerReputation,
+    COALESCE(pv.Id, 0) AS PostVoteId,
+    COALESCE(vt.Name, 'Unknown Vote Type') AS VoteTypeName,
+    COALESCE(v.UserId, 0) AS VoterUserId,
+    COALESCE(vu.DisplayName, 'Unknown Voter') AS VoterDisplayName,
+    COALESCE(v.CreationDate, '1900-01-01') AS VoteCreationDate,
+    COALESCE(pv.BountyAmount, 0) AS BountyAmount,
+    COALESCE(cb.Id, 0) AS CommentId,
+    COALESCE(cb.Text, 'No Comment') AS CommentText,
+    COALESCE(cb.Score, 0) AS CommentScore,
+    COALESCE(cb.CreationDate, '1900-01-01') AS CommentCreationDate,
+    COALESCE(cu.DisplayName, 'Unknown Commenter') AS CommenterDisplayName,
+    COALESCE(ph.Id, 0) AS PostHistoryId,
+    COALESCE(pht.Name, 'Unknown History Type') AS HistoryTypeName,
+    COALESCE(ph.CreationDate, '1900-01-01') AS HistoryCreationDate,
+    COALESCE(ph.UserId, 0) AS HistoryUserId,
+    COALESCE(phu.DisplayName, 'Unknown History User') AS HistoryUserDisplayName,
+    COALESCE(ph.Comment, 'No Comment') AS HistoryComment,
+    COALESCE(b.Id, 0) AS BadgeId,
+    COALESCE(b.Name, 'No Badge') AS BadgeName,
+    COALESCE(b.Date, '1900-01-01') AS BadgeDate,
+    COALESCE(b.Class, 0) AS BadgeClass,
+    COALESCE(bg.Name, 'Unknown Badge Group') AS BadgeGroupName,
+    COALESCE(t.Id, 0) AS TagId,
+    COALESCE(t.TagName, 'No Tag') AS TagName,
+    COALESCE(t.Count, 0) AS TagCount,
+    COALESCE(t.ExcerptPostId, 0) AS ExcerptPostId,
+    COALESCE(t.WikiPostId, 0) AS WikiPostId,
+    COALESCE(t.IsModeratorOnly, 0) AS IsModeratorOnly,
+    COALESCE(t.IsRequired, 0) AS IsRequired,
+    COALESCE(pl.Id, 0) AS PostLinkId,
+    COALESCE(pl.CreationDate, '1900-01-01') AS LinkCreationDate,
+    COALESCE(pl.LinkTypeId, 0) AS LinkTypeId,
+    COALESCE(lt.Name, 'Unknown Link Type') AS LinkTypeName,
+    COALESCE(pl.RelatedPostId, 0) AS RelatedPostId
+FROM Posts p
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Posts ah ON p.AcceptedAnswerId = ah.Id
+LEFT JOIN Users au ON ah.OwnerUserId = au.Id
+LEFT JOIN Votes pv ON p.Id = pv.PostId
+LEFT JOIN VoteTypes vt ON pv.VoteTypeId = vt.Id
+LEFT JOIN Users v ON pv.UserId = v.Id
+LEFT JOIN Users vu ON v.Id = vu.Id
+LEFT JOIN Comments cb ON p.Id = cb.PostId
+LEFT JOIN Users cu ON cb.UserId = cu.Id
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Users phu ON ph.UserId = phu.Id
+LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+LEFT JOIN (
+    SELECT Id, Name FROM Badges GROUP BY Id, Name
+) bg ON b.Id = bg.Id
+LEFT JOIN (
+    SELECT TagName, Id, Count, ExcerptPostId, WikiPostId, IsModeratorOnly, IsRequired
+    FROM Tags
+) t ON EXISTS (
+    SELECT 1 FROM STRING_TO_ARRAY(p.Tags, '><') tag
+    WHERE tag = t.TagName
+)
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE p.Id > 0
+    AND p.Id <= 10000
+    AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+ORDER BY p.CreationDate DESC, p.Id ASC;

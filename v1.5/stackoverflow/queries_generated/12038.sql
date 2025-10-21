@@ -1,0 +1,122 @@
+-- {"query": "12038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 956} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS PostRank,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) OVER (PARTITION BY p.Id) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) OVER (PARTITION BY p.Id) AS DownVotes,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) OVER (PARTITION BY p.Id) AS LastEditDate
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE 
+        p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        Id, 
+        PostTypeId, 
+        Score, 
+        ViewCount, 
+        CreationDate, 
+        OwnerUserId, 
+        OwnerDisplayName, 
+        PostRank, 
+        UpVotes, 
+        DownVotes, 
+        CommentCount, 
+        LastEditDate
+    FROM 
+        RankedPosts
+    WHERE 
+        PostRank <= 10
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) AS PostsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        MAX(p.CreationDate) AS LastActivityDate
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.Id = ANY(string_to_array(p.Tags, '<', '>'))
+    GROUP BY 
+        t.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEdit,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate END) AS LastTagEdit
+    FROM 
+        PostHistory ph
+    GROUP BY 
+        ph.PostId
+)
+SELECT 
+    tp.Id,
+    tp.PostTypeId,
+    tp.Score,
+    tp.ViewCount,
+    tp.CreationDate,
+    tp.OwnerUserId,
+    tp.OwnerDisplayName,
+    tp.PostRank,
+    tp.UpVotes,
+    tp.DownVotes,
+    tp.CommentCount,
+    tp.LastEditDate,
+    ua.PostsCount,
+    ua.AnswersCount,
+    ua.QuestionsCount,
+    ua.LastActivityDate,
+    ts.TagName,
+    ts.PostCount,
+    ts.TotalScore,
+    ts.AvgScore,
+    phs.TotalEdits,
+    phs.LastBodyEdit,
+    phs.LastTagEdit
+FROM 
+    TopPosts tp
+JOIN 
+    UserActivity ua ON tp.OwnerUserId = ua.Id
+JOIN 
+    TagStats ts ON ts.TagName = ANY(string_to_array(tp.Tags, '<', '>'))
+LEFT JOIN 
+    PostHistorySummary phs ON tp.Id = phs.PostId
+ORDER BY 
+    tp.Score DESC, 
+    tp.CreationDate;

@@ -1,0 +1,179 @@
+-- {"query": "19092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3078} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates detailed engagement metrics for active users who own posts
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScoreOwned,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 2) AS AvgAnswerScoreOwned,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade
+    FROM Users AS U
+    JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId AND C.CreationDate >= (CURRENT_DATE - INTERVAL '2 year')
+    WHERE U.Reputation > 750
+      AND U.LastAccessDate >= (CURRENT_DATE - INTERVAL '1 year')
+      AND P.CreationDate >= (CURRENT_DATE - INTERVAL '3 year')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 10 AND SUM(P.Score) > 50
+),
+PostVersionHistory AS (
+    -- CTE 2: Traces post edit history, calculating time between edits and change types
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EditTimestamp,
+        PH.UserId AS EditorId,
+        PH.PostHistoryTypeId,
+        PH.Text AS RevisionText,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditTimestamp,
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600.0 AS HoursSincePrevEdit,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_history,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS rn_first_history
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 8, 9) -- Initial/Edit/Rollback Title, Body, Tags
+      AND PH.CreationDate >= (CURRENT_DATE - INTERVAL '4 year')
+),
+DuplicationImpact AS (
+    -- CTE 3: Analyzes posts involved in duplicate links, identifying source and target posts
+    SELECT
+        PL.PostId AS OriginalPostId,
+        P_Original.Title AS OriginalPostTitle,
+        P_Original.Score AS OriginalPostScore,
+        P_Original.ViewCount AS OriginalPostViewCount,
+        PL.RelatedPostId AS DuplicatePostId,
+        P_Duplicate.Title AS DuplicatePostTitle,
+        P_Duplicate.Score AS DuplicatePostScore,
+        P_Duplicate.ViewCount AS DuplicatePostViewCount,
+        (SELECT COUNT(*) FROM PostLinks WHERE RelatedPostId = PL.RelatedPostId AND LinkTypeId = 3) AS DuplicatedByCount -- Correlated subquery
+    FROM PostLinks AS PL
+    JOIN Posts AS P_Original ON PL.PostId = P_Original.Id
+    JOIN Posts AS P_Duplicate ON PL.RelatedPostId = P_Duplicate.Id
+    WHERE PL.LinkTypeId = 3 -- Duplicate link type
+      AND P_Original.PostTypeId = 1
+      AND P_Duplicate.PostTypeId = 1
+      AND P_Original.CreationDate >= (CURRENT_DATE - INTERVAL '5 year')
+),
+TagPerformance AS (
+    -- CTE 4: Calculates performance metrics per tag, handling NULL tags
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        COUNT(DISTINCT P.Id) AS TotalQuestionsWithTag,
+        SUM(P.ViewCount) AS TotalTagViewCount,
+        AVG(P.Score) AS AvgTagQuestionScore,
+        MAX(P.CreationDate) AS LatestQuestionWithTagDate
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')))
+    HAVING COUNT(DISTINCT P.Id) > 50
+)
+-- Main query: Retrieves a comprehensive view of posts, users, and associated metrics
+SELECT
+    UES.UserId,
+    UES.DisplayName AS UserName,
+    UES.Reputation,
+    UES.TotalPostsOwned,
+    UES.QuestionsOwned,
+    UES.AnswersOwned,
+    UES.AvgQuestionScoreOwned,
+    UES.AvgAnswerScoreOwned,
+    U.Views AS UserProfileViews,
+    COALESCE(U.Location, 'Unknown') AS UserLocation, -- NULL logic: provide default for unknown location
+    P.Id AS PostId,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount,
+    P.CommentCount,
+    P.FavoriteCount,
+    P.ClosedDate,
+    COALESCE(P.CommunityOwnedDate, '1900-01-01') AS CommunityOwnedDateOrDefault, -- NULL logic
+    EXTRACT(DAY FROM (CURRENT_DATE - P.CreationDate)) AS DaysSincePostCreation,
+    AcceptedAns.Title AS AcceptedAnswerTitle,
+    AcceptedAnsOwner.DisplayName AS AcceptedAnswerOwnerName,
+    PEH_First.EditTimestamp AS FirstEditDate,
+    PEH_Latest.EditTimestamp AS LastEditDate,
+    PEH_Latest.HoursSincePrevEdit AS HoursToLastEdit,
+    DATEDIFF('day', P.CreationDate, PEH_Latest.EditTimestamp) AS DaysToLastEdit, -- Specific date calculation
+    DP.OriginalPostTitle AS IsDuplicateOfTitle,
+    DP.DuplicatePostScore AS DuplicateOfScore,
+    TP.TotalQuestionsWithTag AS RelatedTagQuestions,
+    TP.AvgTagQuestionScore AS RelatedTagAvgScore,
+    B.GoldBadgeCount,
+    B.SilverBadgeCount,
+    B.BronzeBadgeCount,
+    (UES.UpVotes * 1.0 / NULLIF(UES.DownVotes, 0)) AS UpDownVoteRatio, -- Calculation, NULLIF for division by zero
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS TotalUpvotesOnPost, -- Window function
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS TotalDownvotesOnPost, -- Window function
+    RANK() OVER (PARTITION BY UES.UserId ORDER BY P.Score DESC, P.ViewCount DESC) AS PostRankByUser, -- Window function
+    NTILE(5) OVER (ORDER BY P.ViewCount DESC) AS PostViewCountQuintile, -- Window function
+    AVG(P.Score) OVER (ORDER BY P.CreationDate ROWS BETWEEN 7 PRECEDING AND CURRENT ROW) AS RollingAvgScoreLast7Posts, -- Window function
+    CASE
+        WHEN P.ViewCount > (SELECT AVG(ViewCount) * 2 FROM Posts WHERE PostTypeId = P.PostTypeId AND CreationDate BETWEEN P.CreationDate - INTERVAL '1 month' AND P.CreationDate + INTERVAL '1 month') THEN 'High Visibility'
+        WHEN P.Score > 50 AND P.AnswerCount > 0 THEN 'Popular & Answered'
+        WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Normal'
+    END AS PostPerformanceCategory, -- Complex conditional expression and correlated subquery
+    LOWER(SUBSTRING(P.Title FROM 1 FOR 1)) AS FirstCharOfTitle, -- String expression
+    UPPER(SUBSTRING(P.Tags FROM 2 FOR POSITION('>' IN P.Tags)-2)) AS MainTagCleaned, -- String expression
+    ARRAY_TO_STRING(ARRAY(SELECT TagName FROM Tags WHERE '%' || '<' || TagName || '>' || '%' LIKE P.Tags), ', ') AS AllTagsList, -- String expression with subquery
+    NULLIF(P.Body LIKE '%solution%' OR P.Body LIKE '%answer%', FALSE) AS ContainsSolutionKeyword, -- NULL logic: will be NULL if false, otherwise TRUE
+    EXISTS (SELECT 1 FROM Comments WHERE PostId = P.Id AND Text ILIKE '%bug report%') AS HasBugReportComment -- Correlated subquery
+FROM UserEngagementSummary AS UES
+JOIN Users AS U ON UES.UserId = U.Id
+JOIN Posts AS P ON UES.UserId = P.OwnerUserId
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN Posts AS AcceptedAns ON P.AcceptedAnswerId = AcceptedAns.Id
+LEFT JOIN Users AS AcceptedAnsOwner ON AcceptedAns.OwnerUserId = AcceptedAnsOwner.Id
+LEFT JOIN PostVersionHistory AS PEH_Latest ON P.Id = PEH_Latest.PostId AND PEH_Latest.rn_latest_history = 1 -- Get the latest history entry
+LEFT JOIN PostVersionHistory AS PEH_First ON P.Id = PEH_First.PostId AND PEH_First.rn_first_history = 1 -- Get the first history entry
+LEFT JOIN DuplicationImpact AS DP ON P.Id = DP.OriginalPostId
+LEFT JOIN (
+    -- Inline subquery for badge counts, demonstrating alternative to CTE
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM Badges
+    GROUP BY UserId
+) AS B ON UES.UserId = B.UserId
+LEFT JOIN TagPerformance AS TP ON P.Tags ILIKE '%' || '<' || TP.TagName || '>' || '%' -- Join to tag performance
+LEFT JOIN Votes AS V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3) -- Join for specific vote types
+
+WHERE
+    P.PostTypeId IN (1, 2) -- Filter for questions and answers
+    AND P.CreationDate >= (CURRENT_DATE - INTERVAL '2 year') -- Recent posts
+    AND P.Score >= 10 -- Only posts with a reasonable score
+    AND (
+        (P.ViewCount IS NOT NULL AND P.ViewCount > UES.AvgQuestionScoreOwned * 10) OR -- Complicated predicate
+        (P.CommentCount > 2 AND P.FavoriteCount > 1)
+    )
+    AND P.OwnerUserId IS NOT NULL -- Exclude community owned posts (where OwnerUserId is -1 or NULL if deleted)
+    AND NOT EXISTS (SELECT 1 FROM PostHistory WHERE PostId = P.Id AND PostHistoryTypeId = 12) -- Exclude deleted posts (correlated subquery)
+    AND (U.WebsiteUrl IS NOT NULL OR U.AboutMe IS NOT NULL) -- NULL logic: user has some additional info
+    AND P.Body ILIKE '%code%' OR P.Body ILIKE '%example%' -- String expression in body search
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.TotalPostsOwned, UES.QuestionsOwned, UES.AnswersOwned,
+    UES.AvgQuestionScoreOwned, UES.AvgAnswerScoreOwned, U.UpVotes, U.DownVotes, U.Views, U.Location,
+    P.Id, P.Title, PT.Name, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount,
+    P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, AcceptedAns.Title, AcceptedAnsOwner.DisplayName,
+    PEH_First.EditTimestamp, PEH_Latest.EditTimestamp, PEH_Latest.HoursSincePrevEdit,
+    DP.OriginalPostTitle, DP.DuplicatePostScore, TP.TotalQuestionsWithTag, TP.AvgTagQuestionScore,
+    B.GoldBadgeCount, B.SilverBadgeCount, B.BronzeBadgeCount, P.PostTypeId, P.Body, P.Tags
+HAVING
+    COUNT(DISTINCT V.Id) >= 3 -- Ensure at least 3 distinct up/down votes are recorded
+    AND (UES.Reputation > 10000 OR AVG(P.Score) > 20) -- Complex HAVING clause with aggregate and direct value
+ORDER BY
+    UES.Reputation DESC, P.CreationDate DESC, P.Score DESC
+LIMIT 500;

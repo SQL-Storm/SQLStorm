@@ -1,0 +1,287 @@
+-- {"query": "19090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4181} 
+
+WITH UserInteractionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COALESCE(U.Views, 0) AS ProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(GREATEST(
+            COALESCE(P.LastActivityDate, '1900-01-01'::timestamp),
+            COALESCE(C.CreationDate, '1900-01-01'::timestamp),
+            COALESCE(V.CreationDate, '1900-01-01'::timestamp),
+            COALESCE(B.Date, '1900-01-01'::timestamp)
+        )) AS LastUserActivity,
+        MIN(LEAST(
+            COALESCE(P.CreationDate, '2999-01-01'::timestamp),
+            COALESCE(C.CreationDate, '2999-01-01'::timestamp),
+            COALESCE(V.CreationDate, '2999-01-01'::timestamp),
+            COALESCE(B.Date, '2999-01-01'::timestamp)
+        )) AS FirstUserActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        COALESCE(P.ViewCount, 0) AS ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedViaHistory,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasDeletedViaHistory,
+        (SELECT MIN(A.CreationDate) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS FirstAnswerDate, -- Correlated subquery for first answer
+        (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS DuplicateLinkCount, -- Correlated subquery for duplicate links
+        (SELECT PHC.Comment::smallint FROM PostHistory PHC WHERE PHC.PostId = P.Id AND PHC.PostHistoryTypeId = 10 ORDER BY PHC.CreationDate DESC LIMIT 1) AS LastCloseReasonId -- Correlated subquery for last close reason ID
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.AcceptedAnswerId, P.ClosedDate, P.CommunityOwnedDate, P.Title, P.Body, P.Tags
+),
+TagEngagementStats AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS TagUseCount,
+        SUM(PQ.Score) AS TotalTagScore,
+        AVG(PQ.Score) AS AvgTagScore,
+        COUNT(DISTINCT PQ.OwnerUserId) AS UniqueUsersUsingTag,
+        AVG(LENGTH(PQ.Title)) AS AvgPostTitleLength,
+        AVG(LENGTH(PQ.Body)) AS AvgPostBodyLength,
+        SUM(CASE WHEN PQ.WasClosedViaHistory = 1 THEN 1 ELSE 0 END) AS ClosedPostsInTag,
+        SUM(CASE WHEN PQ.DuplicateLinkCount > 0 THEN 1 ELSE 0 END) AS DuplicateLinkedPostsInTag
+    FROM Tags T
+    JOIN PostQualityMetrics PQ ON PQ.PostTypeId = 1 AND LENGTH(COALESCE(PQ.Tags, '')) > 2 AND
+                                  (T.TagName = ANY(string_to_array(SUBSTRING(PQ.Tags, 2, LENGTH(PQ.Tags)-2), '><')))
+    GROUP BY T.Id, T.TagName, T.Count
+    HAVING COUNT(PQ.PostId) > 50 AND SUM(PQ.Score) IS NOT NULL
+),
+RankedPosts AS (
+    SELECT
+        PQ.PostId,
+        PQ.PostTypeId,
+        PQ.OwnerUserId,
+        PQ.PostCreationDate,
+        PQ.Score,
+        PQ.ViewCount,
+        PQ.AnswerCount,
+        PQ.FavoriteCount,
+        PQ.AcceptedAnswerId,
+        PQ.ClosedDate,
+        PQ.CommunityOwnedDate,
+        PQ.TotalHistoryEntries,
+        PQ.EditCount,
+        PQ.WasClosedViaHistory,
+        PQ.WasDeletedViaHistory,
+        PQ.DuplicateLinkCount,
+        PQ.LastCloseReasonId,
+        AGE(CURRENT_TIMESTAMP, PQ.PostCreationDate) AS PostAge,
+        CASE
+            WHEN PQ.PostTypeId = 1 AND PQ.FirstAnswerDate IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (PQ.FirstAnswerDate - PQ.PostCreationDate)) / 3600.0 -- Hours to first answer
+            ELSE NULL
+        END AS HoursToFirstAnswer,
+        ROW_NUMBER() OVER (PARTITION BY PQ.PostTypeId ORDER BY PQ.Score DESC, PQ.ViewCount DESC) AS PostRankByScoreViews,
+        RANK() OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.PostCreationDate) AS UserPostChronologicalRank,
+        LAG(PQ.PostCreationDate, 1) OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.PostCreationDate) AS PrevPostDateByUser,
+        LEAD(PQ.PostCreationDate, 1) OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.PostCreationDate) AS NextPostDateByUser,
+        AVG(PQ.Score) OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS AvgScoreLast3Posts
+    FROM PostQualityMetrics PQ
+),
+PotentiallyProblematicEntities AS (
+    SELECT
+        RP.PostId,
+        RP.PostTypeId,
+        RP.OwnerUserId,
+        RP.PostCreationDate,
+        RP.Score,
+        RP.ViewCount,
+        RP.AnswerCount,
+        RP.FavoriteCount,
+        RP.HoursToFirstAnswer,
+        RP.WasClosedViaHistory,
+        RP.WasDeletedViaHistory,
+        RP.DuplicateLinkCount,
+        RP.EditCount,
+        RP.LastCloseReasonId,
+        RP.PrevPostDateByUser,
+        RP.NextPostDateByUser,
+        RP.AvgScoreLast3Posts,
+        UIS.DisplayName AS OwnerDisplayName,
+        UIS.Reputation AS OwnerReputation,
+        UIS.UpVotes AS OwnerUpVotesReceived,
+        UIS.DownVotes AS OwnerDownVotesReceived,
+        COALESCE(CAST(UIS.UpVotes AS NUMERIC) / NULLIF(UIS.DownVotes, 0), 0) AS OwnerUpToDownVoteRatio,
+        P.Title,
+        P.Body,
+        P.Tags
+    FROM RankedPosts RP
+    JOIN Posts P ON RP.PostId = P.Id -- Join back to original Posts for Title, Body, Tags, etc.
+    LEFT JOIN UserInteractionSummary UIS ON RP.OwnerUserId = UIS.UserId
+    WHERE
+        RP.PostRankByScoreViews <= 5000 -- Limit for performance / interesting top posts overall
+        AND RP.PostCreationDate >= '2021-01-01' -- More recent data for relevance
+        AND (
+            RP.WasClosedViaHistory = 1
+            OR RP.WasDeletedViaHistory = 1
+            OR RP.DuplicateLinkCount > 0
+            OR RP.EditCount > 7
+            OR RP.Score < -2 -- Highly downvoted
+            OR (RP.PostTypeId = 1 AND RP.HoursToFirstAnswer IS NOT NULL AND RP.HoursToFirstAnswer > 72 AND RP.AnswerCount = 0) -- Questions with no answers for 3+ days
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM Badges B
+            WHERE B.UserId = RP.OwnerUserId AND B.Name = 'Teacher' AND B.Class = 1 -- Exclude users who are good teachers (Gold badge)
+        )
+)
+SELECT
+    'High-Edits-Low-Score-Post' AS Category,
+    PPE.PostId,
+    PPE.PostTypeId,
+    PPE.OwnerUserId,
+    PPE.OwnerDisplayName,
+    PPE.OwnerReputation,
+    PPE.PostCreationDate,
+    PPE.Score,
+    PPE.ViewCount,
+    PPE.EditCount,
+    PPE.DuplicateLinkCount,
+    PPE.WasClosedViaHistory,
+    PPE.WasDeletedViaHistory,
+    NULL::INT AS RelatedPostId,
+    NULL::VARCHAR(50) AS TagName,
+    REPLACE(LOWER(PPE.Title), 'sql', 'database') AS ModifiedTitle, -- String function: REPLACE, LOWER
+    SUBSTRING(PPE.Body, 1, 250) AS BodyExcerpt, -- String function: SUBSTRING
+    'Edits: ' || PPE.EditCount || ', Score: ' || PPE.Score || ', Ratio: ' || TO_CHAR(PPE.OwnerUpToDownVoteRatio, '999.99') AS ContextDetail -- String concatenation, TO_CHAR
+FROM PotentiallyProblematicEntities PPE
+WHERE PPE.EditCount > 10 AND PPE.Score < 10
+  AND PPE.OwnerUpToDownVoteRatio < 1.0
+  AND PPE.PostTypeId = 1 -- Only questions for this category
+
+UNION ALL
+
+SELECT
+    'Closed-Question-With-Many-Answers' AS Category,
+    PPE.PostId,
+    PPE.PostTypeId,
+    PPE.OwnerUserId,
+    PPE.OwnerDisplayName,
+    PPE.OwnerReputation,
+    PPE.PostCreationDate,
+    PPE.Score,
+    PPE.ViewCount,
+    PPE.EditCount,
+    PPE.DuplicateLinkCount,
+    PPE.WasClosedViaHistory,
+    PPE.WasDeletedViaHistory,
+    NULL::INT AS RelatedPostId,
+    NULL::VARCHAR(50) AS TagName,
+    REPLACE(LOWER(PPE.Title), 'python', 'programming') AS ModifiedTitle,
+    SUBSTRING(PPE.Body, 1, 250) AS BodyExcerpt,
+    'Answer Count: ' || PPE.AnswerCount || ', Closed Reason: ' || COALESCE(CR.Name, 'N/A') AS ContextDetail -- NULL logic, join to CloseReasonTypes
+FROM PotentiallyProblematicEntities PPE
+LEFT JOIN CloseReasonTypes CR ON PPE.LastCloseReasonId = CR.Id
+WHERE PPE.PostTypeId = 1 AND PPE.WasClosedViaHistory = 1 AND PPE.AnswerCount > 5
+  AND LENGTH(PPE.Title) > 50 -- String function: LENGTH
+
+UNION ALL
+
+SELECT
+    'Duplicate-Linked-Post-Activity' AS Category,
+    PPE.PostId,
+    PPE.PostTypeId,
+    PPE.OwnerUserId,
+    PPE.OwnerDisplayName,
+    PPE.OwnerReputation,
+    PPE.PostCreationDate,
+    PPE.Score,
+    PPE.ViewCount,
+    PPE.EditCount,
+    PPE.DuplicateLinkCount,
+    PPE.WasClosedViaHistory,
+    PPE.WasDeletedViaHistory,
+    PL.RelatedPostId,
+    T.TagName,
+    REPLACE(LOWER(PPE.Title), 'java', 'JVM') AS ModifiedTitle,
+    SUBSTRING(PPE.Body, 1, 250) AS BodyExcerpt,
+    'Linked Type: ' || LT.Name || ' to ' || COALESCE(P_RELATED.Title, 'Deleted Post') AS ContextDetail -- Join to posts for related post title, NULL logic
+FROM PotentiallyProblematicEntities PPE
+JOIN PostLinks PL ON PPE.PostId = PL.PostId AND PL.LinkTypeId = 3
+LEFT JOIN Tags T ON LENGTH(COALESCE(PPE.Tags, '')) > 2 AND T.TagName = ANY(string_to_array(SUBSTRING(PPE.Tags, 2, LENGTH(PPE.Tags)-2), '><'))
+LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+LEFT JOIN Posts P_RELATED ON PL.RelatedPostId = P_RELATED.Id
+WHERE PPE.DuplicateLinkCount > 0
+  AND T.TagName IS NOT NULL
+  AND PPE.PostCreationDate BETWEEN COALESCE(PPE.PrevPostDateByUser, '1900-01-01'::timestamp) - INTERVAL '1 month' AND COALESCE(PPE.NextPostDateByUser, '2999-01-01'::timestamp) + INTERVAL '1 month' -- Date calculation with interval, NULL logic explicitly handled
+  AND PPE.PostTypeId = 1 -- Only questions can be duplicates for link type 3
+
+UNION ALL
+
+SELECT
+    'Untagged-Or-Generic-Tag-Post' AS Category,
+    PPE.PostId,
+    PPE.PostTypeId,
+    PPE.OwnerUserId,
+    PPE.OwnerDisplayName,
+    PPE.OwnerReputation,
+    PPE.PostCreationDate,
+    PPE.Score,
+    PPE.ViewCount,
+    (SELECT COUNT(*) FROM PostHistory PH WHERE PH.PostId = PPE.PostId AND PH.PostHistoryTypeId IN (4,5,6)) AS EditCount_Subquery, -- Correlated subquery for scalar value
+    (SELECT COUNT(*) FROM PostLinks PL WHERE PL.PostId = PPE.PostId AND PL.LinkTypeId = 3) AS DuplicateLinkCount_Subquery, -- Correlated subquery for scalar value
+    (CASE WHEN PPE.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS WasClosed_Derived,
+    (CASE WHEN EXISTS (SELECT 1 FROM PostHistory PH_DEL WHERE PH_DEL.PostId = PPE.PostId AND PH_DEL.PostHistoryTypeId = 12) THEN 1 ELSE 0 END) AS WasDeleted_Derived,
+    NULL::INT AS RelatedPostId,
+    TES.TagName AS TagName,
+    REPLACE(LOWER(PPE.Title), 'web', 'internet') AS ModifiedTitle,
+    SUBSTRING(PPE.Body, 1, 250) AS BodyExcerpt,
+    'Tag Avg Score: ' || TO_CHAR(TES.AvgTagScore, '999.99') || ', Tag Use Count: ' || TES.TagUseCount || ', Last 3 Avg Score: ' || TO_CHAR(PPE.AvgScoreLast3Posts, '999.99') AS ContextDetail
+FROM PotentiallyProblematicEntities PPE
+LEFT JOIN TagEngagementStats TES ON LENGTH(COALESCE(PPE.Tags, '')) > 2 AND TES.TagName = ANY(string_to_array(SUBSTRING(PPE.Tags, 2, LENGTH(PPE.Tags)-2), '><'))
+WHERE PPE.PostTypeId = 1 -- Only questions have tags in a relevant way for this check
+  AND (
+        PPE.Tags IS NULL
+        OR LENGTH(TRIM(REPLACE(REPLACE(PPE.Tags, '<>', ''), '><', ''))) = 0 -- Effectively empty tags like '<>'
+        OR EXISTS (
+            SELECT 1 FROM Tags T_GENERIC
+            WHERE T_GENERIC.TagName IN ('discussion', 'general', 'question')
+              AND LENGTH(COALESCE(PPE.Tags, '')) > 2
+              AND T_GENERIC.TagName = ANY(string_to_array(SUBSTRING(PPE.Tags, 2, LENGTH(PPE.Tags)-2), '><'))
+        )
+    )
+  AND (TES.AvgTagScore < 0 OR TES.AvgTagScore IS NULL) -- NULL logic for tag stats
+  AND COALESCE(PPE.AvgScoreLast3Posts, 0) < 0 -- Window function result as predicate with NULL logic
+  AND NOT EXISTS (
+      SELECT 1 FROM Comments C WHERE C.PostId = PPE.PostId AND LENGTH(C.Text) < 10 AND C.UserId IS NOT NULL -- Correlated subquery with string expression and NULL logic
+  )
+
+ORDER BY PostCreationDate DESC, Score DESC, OwnerReputation DESC
+LIMIT 5000;

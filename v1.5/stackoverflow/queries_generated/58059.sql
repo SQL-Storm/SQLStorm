@@ -1,0 +1,69 @@
+-- {"query": "58059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1142} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(b.Id) AS GoldBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 100000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate BETWEEN '2022-01-01' AND '2023-01-01'
+    GROUP BY p.OwnerUserId, p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        pt.PostId,
+        t.TagName,
+        COUNT(*) OVER (PARTITION BY t.TagName) AS GlobalTagUsage
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS pt(TagName)
+    JOIN Tags t ON pt.TagName = t.TagName
+    WHERE t.IsModeratorOnly = FALSE
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    au.GoldBadges,
+    ps.PostId,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.Upvotes,
+    ta.TagName,
+    ta.GlobalTagUsage,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = au.Id AND PostTypeId = 1) AS AvgUserPostScore,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ps.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM ActiveUsers au
+JOIN PostStats ps ON au.Id = ps.OwnerUserId AND ps.PostRank <= 3
+JOIN TagAnalysis ta ON ps.PostId = ta.PostId
+WHERE EXISTS (
+    SELECT 1 
+    FROM Votes v 
+    WHERE v.PostId = ps.PostId 
+      AND v.VoteTypeId IN (2,8) 
+    HAVING COUNT(*) > 50
+)
+AND ta.TagName IN ('javascript', 'python', 'sql', 'java')
+ORDER BY 
+    au.Reputation DESC, 
+    ps.Score DESC, 
+    GlobalTagUsage DESC
+LIMIT 100;

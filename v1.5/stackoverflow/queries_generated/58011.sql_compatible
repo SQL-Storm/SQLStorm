@@ -1,0 +1,77 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2 AND p.Score > 10) AS HighScoreAnswers,
+        (SELECT AVG(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS AvgQuestionViews,
+        (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (2,5,8) AND ph.CreationDate >= cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') AS RecentEdits
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+VoteAnalysis AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE 0 END) AS TotalBountyGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) AS BookmarkedPosts
+    FROM Votes v
+    WHERE v.CreationDate >= cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY v.UserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Name LIKE '%Great%' THEN 1 END) AS GreatQuestionBadges
+    FROM Badges b
+    WHERE b.Date >= cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    GROUP BY b.UserId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.HighScoreAnswers,
+    ua.AvgQuestionViews,
+    ua.RecentEdits,
+    va.TotalUpvotes,
+    va.TotalBountyGiven,
+    va.BookmarkedPosts,
+    ba.GoldBadges,
+    ba.GreatQuestionBadges,
+    DENSE_RANK() OVER (ORDER BY (ua.QuestionCount * 0.3 + ua.HighScoreAnswers * 0.5 + va.TotalUpvotes * 0.2) DESC) AS EngagementScore,
+    (
+     SELECT STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.Count DESC)
+     FROM Posts p
+     JOIN unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag ON true
+     JOIN Tags t ON t.TagName = tag
+     WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+     LIMIT 5
+    ) AS TopTags
+FROM UserActivity ua
+JOIN VoteAnalysis va ON ua.UserId = va.UserId
+JOIN BadgeAchievements ba ON ua.UserId = ba.UserId
+WHERE ua.QuestionCount > 50
+  AND va.TotalUpvotes > 100
+  AND ba.GoldBadges >= 3
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.HighScoreAnswers,
+    ua.AvgQuestionViews,
+    ua.RecentEdits,
+    va.TotalUpvotes,
+    va.TotalBountyGiven,
+    va.BookmarkedPosts,
+    ba.GoldBadges,
+    ba.GreatQuestionBadges
+ORDER BY 
+    EngagementScore ASC,
+    ua.Reputation DESC,
+    va.TotalBountyGiven DESC
+LIMIT 100 OFFSET 0;

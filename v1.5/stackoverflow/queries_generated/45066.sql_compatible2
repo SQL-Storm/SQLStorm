@@ -1,0 +1,48 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY u.Id) AS TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgUserPostScore
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1,2)
+        AND u.Reputation > 1000
+),
+TagAnalytics AS (
+    SELECT 
+        PostId,
+        UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags) - 2), '><')) AS Tag,
+        Score,
+        PostRank,
+        TotalUserPosts
+    FROM 
+        RankedUserPosts
+)
+SELECT 
+    Tag,
+    COUNT(DISTINCT PostId) AS PostCount,
+    ROUND(AVG(Score), 2) AS AvgTagScore,
+    MAX(Score) AS MaxTagScore
+FROM 
+    TagAnalytics
+WHERE 
+    PostRank <= 10
+    AND TotalUserPosts > 5
+GROUP BY 
+    Tag
+HAVING 
+    COUNT(DISTINCT PostId) > 100
+ORDER BY 
+    AvgTagScore DESC, 
+    PostCount DESC
+LIMIT 50;

@@ -1,0 +1,218 @@
+-- {"query": "29065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1747} 
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreDenseRank,
+    NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreQuartile
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) as PostCount,
+    SUM(p.Score) as TotalScore,
+    AVG(p.Score) as AvgScore,
+    MAX(p.CreationDate) as LastPostDate,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.IsRequired,
+    t.IsModeratorOnly,
+    COALESCE(SUM(p.Score), 0) as TagTotalScore,
+    COALESCE(AVG(p.Score), 0) as TagAvgScore,
+    RANK() OVER (ORDER BY t.Count DESC) as TagRank,
+    CASE 
+      WHEN t.Count > 1000 THEN 'High'
+      WHEN t.Count > 100 THEN 'Medium'
+      WHEN t.Count > 10 THEN 'Low'
+      ELSE 'Very Low'
+    END as TagPopularityLevel
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE t.TagName IS NOT NULL
+  GROUP BY t.TagName, t.Count, t.IsRequired, t.IsModeratorOnly
+),
+ComplexPostAnalysis AS (
+  SELECT 
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.ScoreRank,
+    rp.ScoreDenseRank,
+    rp.ScoreQuartile,
+    CASE 
+      WHEN rp.Score > 100 THEN 'Highly Upvoted'
+      WHEN rp.Score > 50 THEN 'Upvoted'
+      WHEN rp.Score > 0 THEN 'Neutral'
+      WHEN rp.Score < 0 THEN 'Downvoted'
+      ELSE 'No Votes'
+    END as VoteStatus,
+    CASE 
+      WHEN rp.AnswerCount > 10 THEN 'Highly Active'
+      WHEN rp.AnswerCount > 5 THEN 'Active'
+      WHEN rp.AnswerCount > 0 THEN 'Slightly Active'
+      ELSE 'Inactive'
+    END as ActivityLevel,
+    DATEDIFF('DAY', rp.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+    COALESCE(rp.CommentCount, 0) as Comments,
+    COALESCE(rp.FavoriteCount, 0) as Favorites
+  FROM RankedPosts rp
+  WHERE rp.Score IS NOT NULL
+),
+ComprehensiveUserPostStats AS (
+  SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.TotalScore,
+    us.AvgScore,
+    us.LastPostDate,
+    us.QuestionCount,
+    us.AnswerCount,
+    CASE 
+      WHEN us.PostCount > 100 THEN 'Expert'
+      WHEN us.PostCount > 50 THEN 'Regular'
+      WHEN us.PostCount > 10 THEN 'Casual'
+      ELSE 'Beginner'
+    END as PostingLevel,
+    CASE 
+      WHEN us.TotalScore > 5000 THEN 'Veteran'
+      WHEN us.TotalScore > 1000 THEN 'Experienced'
+      WHEN us.TotalScore > 100 THEN 'Intermediate'
+      ELSE 'Novice'
+    END as ScoreLevel
+  FROM UserStats us
+  WHERE us.Reputation IS NOT NULL
+),
+FinalAnalysis AS (
+  SELECT 
+    cpa.Id,
+    cpa.PostTypeId,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.Title,
+    cpa.Tags,
+    cpa.OwnerUserId,
+    cpa.CreationDate,
+    cpa.ScoreRank,
+    cpa.ScoreDenseRank,
+    cpa.ScoreQuartile,
+    cpa.VoteStatus,
+    cpa.ActivityLevel,
+    cpa.DaysSinceCreation,
+    cpa.Comments,
+    cpa.Favorites,
+    cus.UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.PostCount,
+    cus.TotalScore,
+    cus.AvgScore,
+    cus.LastPostDate,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.PostingLevel,
+    cus.ScoreLevel,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.TagTotalScore,
+    ta.TagAvgScore,
+    ta.TagPopularityLevel,
+    CASE 
+      WHEN ta.TagName IS NOT NULL THEN 'Tagged'
+      ELSE 'Untagged'
+    END as TagStatus,
+    CASE 
+      WHEN cus.PostingLevel = 'Expert' AND ta.TagCount > 500 THEN 'High Impact Expert'
+      WHEN cus.PostingLevel = 'Expert' THEN 'Expert'
+      WHEN cus.ScoreLevel = 'Veteran' AND ta.TagCount > 250 THEN 'High Impact Veteran'
+      WHEN cus.ScoreLevel = 'Veteran' THEN 'Veteran'
+      ELSE 'Regular User'
+    END as UserTagImpactLevel
+  FROM ComplexPostAnalysis cpa
+  LEFT JOIN ComprehensiveUserPostStats cus ON cpa.OwnerUserId = cus.UserId
+  LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+    SELECT TRIM(UNNEST(STRING_TO_ARRAY(cpa.Tags, '<'))), 
+           TRIM(UNNEST(STRING_TO_ARRAY(cpa.Tags, '>')))
+  )
+  WHERE 
+    (ta.TagPopularityLevel IN ('High', 'Medium') OR ta.TagName IS NULL)
+    AND (cus.PostingLevel IN ('Expert', 'Regular') OR cus.UserId IS NULL)
+    AND cpa.ScoreQuartile IN (1, 2, 3)
+)
+SELECT 
+  fa.Id,
+  fa.PostTypeId,
+  fa.Score,
+  fa.ViewCount,
+  fa.Title,
+  fa.Tags,
+  fa.OwnerUserId,
+  fa.CreationDate,
+  fa.ScoreRank,
+  fa.ScoreDenseRank,
+  fa.ScoreQuartile,
+  fa.VoteStatus,
+  fa.ActivityLevel,
+  fa.DaysSinceCreation,
+  fa.Comments,
+  fa.Favorites,
+  fa.UserId,
+  fa.DisplayName,
+  fa.Reputation,
+  fa.PostCount,
+  fa.TotalScore,
+  fa.AvgScore,
+  fa.LastPostDate,
+  fa.QuestionCount,
+  fa.AnswerCount,
+  fa.PostingLevel,
+  fa.ScoreLevel,
+  fa.TagName,
+  fa.TagCount,
+  fa.TagTotalScore,
+  fa.TagAvgScore,
+  fa.TagPopularityLevel,
+  fa.TagStatus,
+  fa.UserTagImpactLevel,
+  LAG(fa.Score) OVER (ORDER BY fa.Score DESC) as PreviousScore,
+  LEAD(fa.Score) OVER (ORDER BY fa.Score DESC) as NextScore,
+  RANK() OVER (PARTITION BY fa.PostingLevel ORDER BY fa.Score DESC) as LevelScoreRank,
+  PERCENT_RANK() OVER (ORDER BY fa.Score) as PercentileRank
+FROM FinalAnalysis fa
+WHERE fa.Score IS NOT NULL
+  AND (fa.TagStatus = 'Tagged' OR fa.TagName IS NULL)
+  AND fa.DaysSinceCreation BETWEEN 30 AND 730
+ORDER BY fa.Score DESC, fa.Reputation DESC
+LIMIT 1000;

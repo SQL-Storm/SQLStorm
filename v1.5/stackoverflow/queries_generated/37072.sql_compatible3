@@ -1,0 +1,188 @@
+WITH
+RecentActiveUsers AS (
+  SELECT u.Id, u.Reputation, u.CreationDate,
+         GREATEST(u.LastAccessDate, u.CreationDate) AS LastSeen,
+         COALESCE(bad.BadgeScore,0) AS BadgeScore,
+         COALESCE(post_counts.QCount,0) AS QCount,
+         COALESCE(post_counts.ACount,0) AS ACount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class=1 THEN 50 WHEN Class=2 THEN 20 ELSE 5 END) AS BadgeScore
+    FROM Badges
+    GROUP BY UserId
+  ) bad ON bad.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId,
+           SUM(CASE WHEN PostTypeId=1 THEN 1 ELSE 0 END) AS QCount,
+           SUM(CASE WHEN PostTypeId=2 THEN 1 ELSE 0 END) AS ACount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) post_counts ON post_counts.OwnerUserId = u.Id
+  WHERE u.CreationDate <= TIMESTAMP '2024-10-01 12:34:56'
+),
+PopularRecentQuestions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.Tags,
+         COALESCE(array_remove(array(
+           SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')))
+         ), NULL), NULL) AS TagList
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+    AND p.Score >= 5
+),
+TagSnapshot AS (
+  SELECT t.TagName, t.Count AS GlobalCount,
+         COALESCE(recent.UsageInRecent,0) AS UsageInRecent
+  FROM Tags t
+  LEFT JOIN (
+    SELECT tag, COUNT(*) AS UsageInRecent FROM (
+      SELECT UNNEST(ARRAY_REMOVE(ARRAY(
+         SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')))
+      ), NULL)) AS tag
+      FROM Posts p
+      WHERE p.PostTypeId=1 AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+    ) s
+    GROUP BY tag
+  ) recent ON recent.tag = t.TagName
+),
+AnswererStats AS (
+  SELECT q.QuestionId,
+         a.OwnerUserId AS AnswererId,
+         COUNT(a.Id) OVER (PARTITION BY q.QuestionId, a.OwnerUserId) AS AnswersByUserForQuestion,
+         SUM(a.Score) OVER (PARTITION BY q.QuestionId, a.OwnerUserId) AS SumScoreByUserForQuestion,
+         MAX(a.Score) OVER (PARTITION BY q.QuestionId, a.OwnerUserId) AS MaxScoreByUserForQuestion,
+         MIN(a.CreationDate) OVER (PARTITION BY q.QuestionId, a.OwnerUserId) AS FirstAnswerDateByUser,
+         COUNT(*) FILTER (WHERE v.VoteTypeId=2) OVER (PARTITION BY q.QuestionId, a.OwnerUserId) AS UpVotesReceived
+  FROM PopularRecentQuestions q
+  JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+  LEFT JOIN Votes v ON v.PostId = a.Id
+  WHERE a.OwnerUserId IS NOT NULL
+),
+LinkNetwork AS (
+  SELECT q.QuestionId,
+         COUNT(DISTINCT pl.RelatedPostId) AS OutgoingLinks,
+         COUNT(DISTINCT pl2.PostId) AS IncomingLinks,
+         COUNT(DISTINCT CASE WHEN pl.LinkTypeId=3 THEN pl.RelatedPostId END) AS DuplicateTargets,
+         JSON_AGG(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.RelatedPostId IS NOT NULL) AS RelatedPosts
+  FROM PopularRecentQuestions q
+  LEFT JOIN PostLinks pl ON pl.PostId = q.QuestionId
+  LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = q.QuestionId
+  GROUP BY q.QuestionId
+),
+CloseReopenSignals AS (
+  SELECT ph.PostId AS QuestionId,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,35) THEN 1 ELSE 0 END) AS CloseEvents,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+         MAX(ph.CreationDate) AS LastHistoryEvent
+  FROM PostHistory ph
+  WHERE ph.PostId IS NOT NULL
+    AND ph.PostHistoryTypeId IN (10,11,35)
+  GROUP BY ph.PostId
+),
+TagAffinity AS (
+  SELECT q.QuestionId,
+         tmain AS MainTag,
+         tag_other AS CoTag,
+         COUNT(*) AS CoOccur
+  FROM PopularRecentQuestions q,
+       LATERAL (
+         SELECT UNNEST(ARRAY_REMOVE(ARRAY(
+           SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')))
+         ), NULL)) AS tmain
+       ) m,
+       LATERAL (
+         SELECT UNNEST(ARRAY_REMOVE(ARRAY(
+           SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')))
+         ), NULL)) AS tag_other
+       ) o
+  WHERE m.tmain IS NOT NULL AND o.tag_other IS NOT NULL AND m.tmain <> o.tag_other
+  GROUP BY q.QuestionId, tmain, tag_other
+),
+ScoredQuestions AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         ln.OutgoingLinks,
+         ln.IncomingLinks,
+         ln.DuplicateTargets,
+         cr.CloseEvents,
+         cr.ReopenEvents,
+         ts.TopTags,
+         COALESCE((SELECT COUNT(*) FROM AnswererStats a WHERE a.QuestionId = q.QuestionId),0) AS DistinctAnswerers,
+         COALESCE((SELECT MAX(SumScoreByUserForQuestion) FROM AnswererStats a WHERE a.QuestionId = q.QuestionId),0) AS TopAnswererScore,
+         (q.Score * 3
+           + q.ViewCount / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)),0) * 86400 * 0.1
+           + COALESCE(ln.OutgoingLinks,0) * 2
+           - COALESCE(cr.CloseEvents,0) * 5
+           + COALESCE(q.FavoriteCount,0) * 4
+           + GREATEST(0, q.AnswerCount - 1) * 2
+           + COALESCE((SELECT SUM(CASE WHEN v.VoteTypeId=2 THEN 1 WHEN v.VoteTypeId=3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = q.QuestionId),0) * 1.5
+         ) AS CompositeScore
+  FROM PopularRecentQuestions q
+  LEFT JOIN LinkNetwork ln ON ln.QuestionId = q.QuestionId
+  LEFT JOIN CloseReopenSignals cr ON cr.QuestionId = q.QuestionId
+  LEFT JOIN (
+    SELECT QuestionId, JSON_AGG(json_build_object('tag', TagName, 'global_count', GlobalCount, 'recent_usage', UsageInRecent) ORDER BY UsageInRecent DESC NULLS LAST) AS TopTags
+    FROM (
+      SELECT q.QuestionId, ts.TagName, ts.GlobalCount, ts.UsageInRecent
+      FROM PopularRecentQuestions q1
+      CROSS JOIN LATERAL UNNEST(q1.TagList) AS t(tagname)
+      JOIN TagSnapshot ts ON ts.TagName = t.tagname
+      WHERE q1.QuestionId = q1.QuestionId
+    ) s
+    GROUP BY QuestionId
+  ) ts ON ts.QuestionId = q.QuestionId
+)
+SELECT sq.QuestionId,
+       sq.Title,
+       sq.CreationDate,
+       sq.Score,
+       sq.ViewCount,
+       sq.AnswerCount,
+       sq.FavoriteCount,
+       sq.OutgoingLinks,
+       sq.IncomingLinks,
+       sq.DuplicateTargets,
+       sq.CloseEvents,
+       sq.ReopenEvents,
+       sq.DistinctAnswerers,
+       sq.TopAnswererScore,
+       sq.CompositeScore,
+       (SELECT json_agg(json_build_object('user_id', u.Id, 'display_name', u.DisplayName, 'rep', u.Reputation, 'answers', a_count.answers, 'avg_answer_score', a_stats.avg_score))
+        FROM (
+          SELECT a.OwnerUserId AS uid,
+                 COUNT(a.Id) AS answers
+          FROM Posts a
+          WHERE a.ParentId = sq.QuestionId AND a.PostTypeId = 2
+          GROUP BY a.OwnerUserId
+          ORDER BY answers DESC
+          LIMIT 5
+        ) a_count
+        JOIN Users u ON u.Id = a_count.uid
+        LEFT JOIN LATERAL (
+          SELECT AVG(a2.Score) AS avg_score
+          FROM Posts a2
+          WHERE a2.ParentId = sq.QuestionId AND a2.OwnerUserId = u.Id
+        ) a_stats ON true
+       ) AS TopAnswerers,
+       (SELECT json_agg(json_build_object('tag', ta.CoTag, 'cooccur', ta.CoOccur) ORDER BY ta.CoOccur DESC LIMIT 5)
+        FROM TagAffinity ta
+        WHERE ta.QuestionId = sq.QuestionId
+       ) AS TopCoTags,
+       sq.TopTags AS TagDetails
+FROM ScoredQuestions sq
+ORDER BY sq.CompositeScore DESC
+LIMIT 50;

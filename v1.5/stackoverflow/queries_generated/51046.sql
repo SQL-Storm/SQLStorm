@@ -1,0 +1,158 @@
+-- {"query": "51046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1458} 
+
+WITH 
+  popular_tags AS (
+    SELECT 
+      TagName,
+      COUNT AS tag_count
+    FROM Tags
+    WHERE COUNT > 1000
+  ),
+  top_users AS (
+    SELECT 
+      Id AS user_id,
+      Reputation,
+      ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rep_rank
+    FROM Users
+    WHERE Reputation >= 10000
+      AND Location IS NOT NULL
+      AND LENGTH(Location) > 5
+  ),
+  question_stats AS (
+    SELECT 
+      p.Id AS post_id,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.Title,
+      p.Tags,
+      u.Id AS owner_id,
+      u.Reputation AS owner_rep,
+      u.Location AS owner_location
+    FROM Posts p
+    JOIN top_users u ON p.OwnerUserId = u.user_id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '5 years'
+      AND p.Score >= 10
+      AND p.AnswerCount >= 3
+      AND p.ViewCount >= 10000
+  ),
+  tag_question_mapping AS (
+    SELECT 
+      qs.post_id,
+      pt.TagName,
+      qs.Title,
+      qs.CreationDate,
+      qs.Score,
+      qs.ViewCount,
+      qs.AnswerCount,
+      qs.owner_rep,
+      qs.owner_location
+    FROM question_stats qs
+    CROSS JOIN popular_tags pt
+    WHERE qs.Tags LIKE '%' || pt.TagName || '%'
+  ),
+  vote_activity AS (
+    SELECT 
+      v.PostId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+      COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS accepted_votes,
+      AVG(CASE WHEN v.VoteTypeId IN (2, 3) THEN v.BountyAmount END) AS avg_bounty
+    FROM Votes v
+    JOIN question_stats qs ON v.PostId = qs.post_id
+    WHERE v.VoteTypeId IN (1, 2, 3, 8, 9)
+    GROUP BY v.PostId
+    HAVING COUNT(*) >= 50
+  ),
+  comment_engagement AS (
+    SELECT 
+      c.PostId,
+      COUNT(*) AS comment_count,
+      AVG(c.Score) AS avg_comment_score,
+      MAX(c.CreationDate) AS last_comment_date,
+      STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate DESC LIMIT 5) AS recent_comments
+    FROM Comments c
+    JOIN question_stats qs ON c.PostId = qs.post_id
+    WHERE c.Score >= -5
+    GROUP BY c.PostId
+    HAVING COUNT(*) >= 10
+  ),
+  history_events AS (
+    SELECT 
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS total_edits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS close_votes,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS reopen_votes,
+      MAX(ph.CreationDate) AS last_event_date,
+      AVG(CASE WHEN ph.UserId IS NOT NULL THEN u.Reputation ELSE 0 END) AS avg_editor_rep
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    JOIN question_stats qs ON ph.PostId = qs.post_id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+    GROUP BY ph.PostId
+  ),
+  linked_posts AS (
+    SELECT 
+      pl.PostId,
+      COUNT(DISTINCT pl.RelatedPostId) AS linked_count,
+      AVG(p2.Score) AS avg_linked_score
+    FROM PostLinks pl
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    JOIN question_stats qs ON pl.PostId = qs.post_id
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+    HAVING COUNT(*) >= 3
+  ),
+  badge_analysis AS (
+    SELECT 
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+      STRING_AGG(DISTINCT b.Name, ', ') AS badge_names
+    FROM Badges b
+    JOIN top_users tu ON b.UserId = tu.user_id
+    GROUP BY b.UserId
+    HAVING COUNT(*) >= 20
+  )
+SELECT 
+  tqm.TagName,
+  tqm.Title,
+  tqm.CreationDate,
+  tqm.Score AS question_score,
+  tqm.ViewCount,
+  tqm.AnswerCount,
+  COALESCE(va.upvotes, 0) AS total_upvotes,
+  COALESCE(va.downvotes, 0) AS total_downvotes,
+  COALESCE(va.accepted_votes, 0) AS accepted_count,
+  tqm.owner_rep,
+  tqm.owner_location,
+  COALESCE(ce.avg_comment_score, 0) AS avg_comment_score,
+  COALESCE(ce.comment_count, 0) AS total_comments,
+  COALESCE(he.total_edits, 0) AS total_edits,
+  COALESCE(he.close_votes, 0) AS close_votes,
+  COALESCE(lp.linked_count, 0) AS linked_posts_count,
+  COALESCE(ba.gold_badges, 0) AS owner_gold_badges,
+  COALESCE(ba.silver_badges, 0) AS owner_silver_badges,
+  ROW_NUMBER() OVER (
+    PARTITION BY tqm.TagName 
+    ORDER BY tqm.ViewCount DESC, tqm.Score DESC
+  ) AS tag_rank,
+  NTILE(4) OVER (
+    ORDER BY tqm.ViewCount DESC
+  ) AS popularity_quartile
+FROM tag_question_mapping tqm
+LEFT JOIN vote_activity va ON tqm.post_id = va.PostId
+LEFT JOIN comment_engagement ce ON tqm.post_id = ce.PostId
+LEFT JOIN history_events he ON tqm.post_id = he.PostId
+LEFT JOIN linked_posts lp ON tqm.post_id = lp.PostId
+LEFT JOIN badge_analysis ba ON tqm.owner_id = ba.UserId
+WHERE tqm.ViewCount > 50000
+  AND tqm.owner_rep > 50000
+  AND tqm.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+ORDER BY tqm.ViewCount DESC, tqm.TagName, tqm.CreationDate DESC
+LIMIT 1000;

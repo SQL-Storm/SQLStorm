@@ -1,0 +1,336 @@
+-- {"query": "8065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2987} 
+with recent_questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select
+    a.QuestionId,
+    min(a.AnswerCreationDate) as FirstAnswerDate
+  from answers a
+  group by a.QuestionId
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyAmount
+  from Votes v
+  where v.CreationDate >= (select min(CreationDate) from recent_questions)
+  group by v.PostId
+),
+comment_signal as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(case when c.Score >= 5 then 1 else 0 end) as HighScoreComments,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  where c.CreationDate >= (select min(CreationDate) from recent_questions)
+  group by c.PostId
+),
+edits as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+    count(*) filter (where ph.PostHistoryTypeId = 24) as SuggestedEditApplied,
+    max(ph.CreationDate) as LastEditDate
+  from PostHistory ph
+  where ph.CreationDate >= (select min(CreationDate) from recent_questions)
+  group by ph.PostId
+),
+closures as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) as FirstClosedDate,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as ReopenedDate,
+    array_agg(distinct cast(ph.Comment as varchar)) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasonIds
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+dupes as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks,
+    max(pl.CreationDate) as LastLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+owner_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.DisplayName,
+    u.UpVotes as ProfileUpVotes,
+    u.DownVotes as ProfileDownVotes,
+    u.Views as ProfileViews
+  from Users u
+),
+owner_badges as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+tag_expansion as (
+  select
+    rq.QuestionId,
+    unnest(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) as tag
+  from recent_questions rq
+  where rq.Tags is not null and length(rq.Tags) > 2
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    count(*) as TagCount,
+    string_agg(te.tag, ',' order by te.tag) as TagList,
+    sum(t.Count) as GlobalTagPopularity
+  from tag_expansion te
+  left join Tags t on t.TagName = te.tag
+  group by te.QuestionId
+),
+accepted as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId
+  from Posts q
+  where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+question_activity as (
+  select
+    rq.QuestionId,
+    rq.CreationDate,
+    rq.OwnerUserId,
+    rq.Score as QuestionScore,
+    rq.ViewCount,
+    rq.Title,
+    rq.AnswerCount,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.Favorites,
+    vs.BountyAmount,
+    cs.CommentCount,
+    cs.HighScoreComments,
+    cs.LastCommentDate,
+    ed.EditCount,
+    ed.SuggestedEditApplied,
+    ed.LastEditDate,
+    cl.FirstClosedDate,
+    cl.ReopenedDate,
+    cl.CloseReasonIds,
+    dp.DuplicateLinks,
+    dp.LinkedLinks,
+    dp.LastLinkDate,
+    ts.TagCount,
+    ts.TagList,
+    ts.GlobalTagPopularity,
+    fa.FirstAnswerDate,
+    ac.AcceptedAnswerId
+  from recent_questions rq
+  left join votes_agg vs on vs.PostId = rq.QuestionId
+  left join comment_signal cs on cs.PostId = rq.QuestionId
+  left join edits ed on ed.PostId = rq.QuestionId
+  left join closures cl on cl.PostId = rq.QuestionId
+  left join dupes dp on dp.PostId = rq.QuestionId
+  left join tag_stats ts on ts.QuestionId = rq.QuestionId
+  left join first_answer fa on fa.QuestionId = rq.QuestionId
+  left join accepted ac on ac.QuestionId = rq.QuestionId
+),
+answerers as (
+  select
+    a.QuestionId,
+    count(*) as AnswererCount,
+    count(distinct a.AnswerOwnerId) as DistinctAnswerers,
+    avg(a.AnswerScore::numeric) as AvgAnswerScore,
+    max(a.AnswerScore) as MaxAnswerScore
+  from answers a
+  group by a.QuestionId
+),
+owner_enriched as (
+  select
+    qa.QuestionId,
+    os.UserId,
+    os.Reputation,
+    os.UserCreationDate,
+    os.DisplayName,
+    ob.BadgeCount,
+    ob.GoldBadges,
+    ob.SilverBadges,
+    ob.BronzeBadges,
+    ob.LastBadgeDate
+  from question_activity qa
+  left join owner_stats os on os.UserId = qa.OwnerUserId
+  left join owner_badges ob on ob.UserId = qa.OwnerUserId
+),
+scored as (
+  select
+    qa.*,
+    oe.Reputation,
+    oe.DisplayName,
+    oe.BadgeCount,
+    oe.GoldBadges,
+    oe.SilverBadges,
+    oe.BronzeBadges,
+    an.AnswererCount,
+    an.DistinctAnswerers,
+    an.AvgAnswerScore,
+    an.MaxAnswerScore,
+    extract(epoch from (coalesce(qa.FirstAnswerDate, qa.CreationDate) - qa.CreationDate))/60.0 as MinutesToFirstAnswer,
+    case
+      when qa.ViewCount is null or qa.ViewCount = 0 then null
+      else round((qa.QuestionScore::numeric / nullif(qa.ViewCount,0)) * 1000, 4)
+    end as ScorePer1000Views,
+    case when qa.DownVotes is null then 0 else qa.DownVotes end - coalesce(qa.UpVotes,0) as DownMinusUp,
+    (coalesce(qa.BountyAmount,0) + coalesce(qa.Favorites,0)*10) as EngagementPoints,
+    case when qa.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+    case
+      when qa.FirstClosedDate is null then 'open'
+      when qa.ReopenedDate is not null and qa.ReopenedDate > qa.FirstClosedDate then 'reopened'
+      else 'closed'
+    end as ClosureState
+  from question_activity qa
+  left join owner_enriched oe on oe.QuestionId = qa.QuestionId
+  left join answerers an on an.QuestionId = qa.QuestionId
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by coalesce(s.ViewCount,0) desc, coalesce(s.QuestionScore,0) desc, coalesce(s.EngagementPoints,0) desc) as rn_popular,
+    row_number() over (order by coalesce(s.ScorePer1000Views,0) desc nulls last) as rn_efficiency,
+    dense_rank() over (order by coalesce(s.GlobalTagPopularity,0) desc) as dr_tag_pop,
+    rank() over (partition by s.ClosureState order by coalesce(s.EditCount,0) desc) as rnk_by_closure_edits,
+    percent_rank() over (order by coalesce(s.MinutesToFirstAnswer,1e9)) as pr_time_to_answer
+  from scored s
+),
+thresholds as (
+  select
+    percentile_disc(0.5) within group (order by coalesce(ViewCount,0)) as p50_views,
+    percentile_disc(0.9) within group (order by coalesce(QuestionScore,0)) as p90_score,
+    percentile_disc(0.75) within group (order by coalesce(EngagementPoints,0)) as p75_engagement,
+    percentile_disc(0.25) within group (order by coalesce(MinutesToFirstAnswer,1e9)) as p25_tta
+  from scored
+),
+flagged as (
+  select
+    r.*,
+    t.p50_views,
+    t.p90_score,
+    t.p75_engagement,
+    t.p25_tta,
+    case
+      when coalesce(r.ViewCount,0) >= t.p50_views
+       and coalesce(r.QuestionScore,0) >= t.p90_score
+       and coalesce(r.EngagementPoints,0) >= t.p75_engagement
+       and coalesce(r.MinutesToFirstAnswer,1e9) <= t.p25_tta
+      then 1 else 0 end as IsOutlierStar
+  from ranked r
+  cross join thresholds t
+),
+stringy as (
+  select
+    f.QuestionId,
+    '[' || coalesce(cast(f.QuestionId as varchar), 'NULL') || '] ' ||
+    coalesce(substr(regexp_replace(f.Title, '\s+', ' ', 'g'), 1, 60), '(no title)') ||
+    case when f.TagList is not null then ' | tags: ' || f.TagList else '' end ||
+    case when f.CloseReasonIds is not null and array_length(f.CloseReasonIds,1) > 0
+         then ' | closed_reasons: ' || array_to_string(f.CloseReasonIds, ',')
+         else '' end as Headline,
+    coalesce(f.DisplayName, '(anon)') as OwnerName
+  from flagged f
+)
+select
+  f.QuestionId,
+  s.Headline,
+  s.OwnerName,
+  f.CreationDate,
+  f.ClosureState,
+  f.ViewCount,
+  f.QuestionScore,
+  coalesce(f.UpVotes,0) as UpVotes,
+  coalesce(f.DownVotes,0) as DownVotes,
+  f.DownMinusUp,
+  f.Favorites,
+  f.BountyAmount,
+  f.EngagementPoints,
+  f.AnswerCount,
+  f.HasAcceptedAnswer,
+  f.MinutesToFirstAnswer,
+  f.ScorePer1000Views,
+  f.TagCount,
+  f.TagList,
+  f.GlobalTagPopularity,
+  f.EditCount,
+  f.SuggestedEditApplied,
+  f.FirstClosedDate,
+  f.ReopenedDate,
+  f.LastEditDate,
+  f.LastCommentDate,
+  f.DuplicateLinks,
+  f.LinkedLinks,
+  f.LastLinkDate,
+  f.Reputation,
+  f.BadgeCount,
+  f.GoldBadges,
+  f.SilverBadges,
+  f.BronzeBadges,
+  f.AnswererCount,
+  f.DistinctAnswerers,
+  f.AvgAnswerScore,
+  f.MaxAnswerScore,
+  f.rn_popular,
+  f.rn_efficiency,
+  f.dr_tag_pop,
+  f.rnk_by_closure_edits,
+  round(f.pr_time_to_answer::numeric, 4) as pr_time_to_answer,
+  f.IsOutlierStar
+from flagged f
+join stringy s on s.QuestionId = f.QuestionId
+where (
+    f.IsOutlierStar = 1
+    or (f.rn_popular <= 100 and f.ScorePer1000Views is not null)
+    or (f.ClosureState = 'reopened' and coalesce(f.EditCount,0) > 0)
+    or (f.HasAcceptedAnswer = 1 and coalesce(f.MinutesToFirstAnswer,1e9) <= 30)
+  )
+  and (
+    f.TagCount is null
+    or f.TagCount between 1 and 5
+  )
+  and (
+    f.Reputation is null
+    or f.Reputation >= 1
+  )
+order by
+  f.IsOutlierStar desc,
+  f.rn_popular,
+  f.rn_efficiency
+limit 200;

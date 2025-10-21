@@ -1,0 +1,82 @@
+-- {"query": "57098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 670} 
+
+WITH ActiveUsers AS (
+    SELECT
+        Id AS UserId,
+        Reputation,
+        CreationDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.LastAccessDate >= NOW() - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.Id = ANY(string_to_array(substring(p.Tags, 2, LENGTH(p.Tags)-2), ''><''))
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+    ORDER BY
+        QuestionCount DESC
+    LIMIT 10
+),
+UserActivity AS (
+    SELECT
+        au.UserId,
+        au.Reputation,
+        au.CreationDate,
+        au.PostCount,
+        au.CommentCount,
+        au.VoteCount,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(p.ViewCount) AS TotalPostViews,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+        ActiveUsers au
+    LEFT JOIN
+        Posts p ON au.UserId = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON au.UserId = b.UserId
+    GROUP BY
+        au.UserId, au.Reputation, au.CreationDate, au.PostCount, au.CommentCount, au.VoteCount
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    ua.TotalPostScore,
+    ua.TotalPostViews,
+    ua.BadgeCount,
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.TotalViews
+FROM
+    UserActivity ua
+CROSS JOIN
+    TopTags tt
+ORDER BY
+    ua.Reputation DESC,
+    tt.QuestionCount DESC;

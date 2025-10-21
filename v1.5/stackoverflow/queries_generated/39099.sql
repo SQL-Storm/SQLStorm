@@ -1,0 +1,124 @@
+-- {"query": "39099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 1281} 
+
+WITH
+-- Recent activity per tag over the past month
+RecentActivity AS (
+    SELECT
+        p.Id         AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) 
+      AND p.CreationDate >= now() - interval '1 month'
+),
+
+-- Aggregate statistics per tag
+TagStats AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN PostId END)     AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN PostId END)     AS AnswerCount,
+        SUM(ViewCount)                                             AS TotalViews,
+        SUM(Score)                                                 AS TotalScore,
+        AVG(AnswerCount)                                           AS AvgAnswersPerQuestion
+    FROM RecentActivity
+    GROUP BY Tag
+),
+
+-- Top 3 answerers per tag in the past month
+TopAnswerers AS (
+    SELECT
+        RA.Tag,
+        a.OwnerUserId                                        AS UserId,
+        u.DisplayName                                        AS UserName,
+        COUNT(*)                                             AS AnswersGiven,
+        SUM(RA.Score)                                        AS ScoreSum,
+        RANK() OVER (PARTITION BY RA.Tag ORDER BY SUM(RA.Score) DESC) AS RankByScore
+    FROM RecentActivity RA
+    JOIN Posts a
+      ON RA.PostId = a.Id AND a.PostTypeId = 2 AND a.OwnerUserId > 0
+    JOIN Users u
+      ON a.OwnerUserId = u.Id
+    GROUP BY RA.Tag, a.OwnerUserId, u.DisplayName
+    HAVING COUNT(*) >= 5
+),
+
+-- Trending tags via recursive walk over daily question counts
+DailyCounts AS (
+    SELECT
+        Tag,
+        date_trunc('day', p.CreationDate) AS Day,
+        COUNT(*)                      AS QuestionsPerDay
+    FROM RecentActivity p
+    WHERE p.PostTypeId = 1
+    GROUP BY Tag, date_trunc('day', p.CreationDate)
+),
+TrendCalc AS (
+    SELECT
+        Tag,
+        Day,
+        QuestionsPerDay,
+        LAG(QuestionsPerDay) OVER (PARTITION BY Tag ORDER BY Day) AS PrevDayCount
+    FROM DailyCounts
+),
+TrendingTags AS (
+    SELECT DISTINCT
+        Tag
+    FROM TrendCalc
+    WHERE PrevDayCount > 0
+      AND (QuestionsPerDay::float / PrevDayCount) >= 1.5
+),
+
+-- Badge distribution among top answerers
+BadgeCounts AS (
+    SELECT
+        ta.Tag,
+        ta.UserId,
+        count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM TopAnswerers ta
+    LEFT JOIN Badges b
+      ON ta.UserId = b.UserId
+    GROUP BY ta.Tag, ta.UserId
+)
+
+-- Final result: per trending tag, show stats + top answerers + badge counts
+SELECT
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AnswerCount,
+    ts.TotalViews,
+    ts.TotalScore,
+    ts.AvgAnswersPerQuestion,
+    json_agg(
+        json_build_object(
+            'UserId', ta.UserId,
+            'UserName', ta.UserName,
+            'AnswersGiven', ta.AnswersGiven,
+            'ScoreSum', ta.ScoreSum,
+            'GoldBadges', bc.GoldBadges,
+            'SilverBadges', bc.SilverBadges,
+            'BronzeBadges', bc.BronzeBadges
+        ) ORDER BY ta.ScoreSum DESC
+    ) FILTER (WHERE ta.RankByScore <= 3) AS TopAnswerers
+FROM TagStats ts
+JOIN TrendingTags tr
+  ON ts.Tag = tr.Tag
+LEFT JOIN TopAnswerers ta
+  ON ts.Tag = ta.Tag AND ta.RankByScore <= 3
+LEFT JOIN BadgeCounts bc
+  ON ta.Tag = bc.Tag AND ta.UserId = bc.UserId
+GROUP BY
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AnswerCount,
+    ts.TotalViews,
+    ts.TotalScore,
+    ts.AvgAnswersPerQuestion
+ORDER BY ts.TotalScore DESC
+LIMIT 10;

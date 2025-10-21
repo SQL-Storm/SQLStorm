@@ -1,0 +1,139 @@
+WITH RankedAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT * FROM RankedAnswers WHERE AnswerRank <= 3
+),
+QuestionStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.CreationDate AS QuestionCreationDate,
+        u.DisplayName AS QuestionOwner,
+        u.Reputation AS QuestionOwnerReputation,
+        COALESCE(badge_counts.GoldBadges, 0) AS GoldBadges,
+        COALESCE(badge_counts.SilverBadges, 0) AS SilverBadges,
+        COALESCE(badge_counts.BronzeBadges, 0) AS BronzeBadges,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(vote_scores.Score) AS AvgVoteScore
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) badge_counts ON badge_counts.UserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN (
+        SELECT PostId, AVG(Score) AS Score FROM Votes GROUP BY PostId
+    ) vote_scores ON vote_scores.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount, q.CreationDate, u.DisplayName, u.Reputation,
+             badge_counts.GoldBadges, badge_counts.SilverBadges, badge_counts.BronzeBadges
+),
+AnswerDetails AS (
+    SELECT 
+        ta.AnswerId,
+        ta.QuestionId,
+        ta.OwnerUserId,
+        ta.Score AS AnswerScore,
+        ta.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwner,
+        u.Reputation AS AnswerOwnerReputation,
+        COALESCE(badge_counts.GoldBadges, 0) AS GoldBadges,
+        COALESCE(badge_counts.SilverBadges, 0) AS SilverBadges,
+        COALESCE(badge_counts.BronzeBadges, 0) AS BronzeBadges,
+        COUNT(DISTINCT c.Id) AS AnswerCommentCount,
+        COUNT(DISTINCT pl.Id) AS LinkedPostsCount
+    FROM TopAnswers ta
+    LEFT JOIN Users u ON ta.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) badge_counts ON badge_counts.UserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = ta.AnswerId
+    LEFT JOIN PostLinks pl ON pl.PostId = ta.AnswerId
+    GROUP BY ta.AnswerId, ta.QuestionId, ta.OwnerUserId, ta.Score, ta.CreationDate,
+             u.DisplayName, u.Reputation,
+             badge_counts.GoldBadges, badge_counts.SilverBadges, badge_counts.BronzeBadges
+),
+CloseReasonsCount AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseReasonVotes
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+TagExplode AS (
+    SELECT 
+        qs.QuestionId,
+        UNNEST(string_to_array(SUBSTRING(qs.Tags FROM 2 FOR CHAR_LENGTH(qs.Tags) - 2), '><')) AS Tag
+    FROM QuestionStats qs
+),
+TagUsage AS (
+    SELECT 
+        Tag,
+        COUNT(DISTINCT QuestionId) AS QuestionCount
+    FROM TagExplode
+    GROUP BY Tag
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionOwner,
+    qs.QuestionOwnerReputation,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.CommentCount,
+    qs.AvgVoteScore,
+    COALESCE(crc.CloseReason, 'Open') AS PostStatus,
+    COALESCE(crc.CloseReasonVotes, 0) AS CloseVotes,
+    array_agg(DISTINCT te.Tag) AS Tags,
+    tu.QuestionCount AS TagPopularity,
+    json_agg(
+        json_build_object(
+            'AnswerId', ad.AnswerId,
+            'AnswerScore', ad.AnswerScore,
+            'AnswerOwner', ad.AnswerOwner,
+            'AnswerOwnerReputation', ad.AnswerOwnerReputation,
+            'AnswerCommentCount', ad.AnswerCommentCount,
+            'LinkedPostsCount', ad.LinkedPostsCount,
+            'GoldBadges', ad.GoldBadges,
+            'SilverBadges', ad.SilverBadges,
+            'BronzeBadges', ad.BronzeBadges
+        ) ORDER BY ad.AnswerScore DESC
+    ) AS TopAnswersDetails
+FROM QuestionStats qs
+LEFT JOIN CloseReasonsCount crc ON qs.QuestionId = crc.PostId
+LEFT JOIN TagExplode te ON te.QuestionId = qs.QuestionId
+LEFT JOIN TagUsage tu ON tu.Tag = te.Tag
+LEFT JOIN AnswerDetails ad ON ad.QuestionId = qs.QuestionId
+GROUP BY 
+    qs.QuestionId, qs.Title, qs.QuestionOwner, qs.QuestionOwnerReputation, qs.QuestionScore, 
+    qs.ViewCount, qs.CommentCount, qs.AvgVoteScore, crc.CloseReason, crc.CloseReasonVotes, tu.QuestionCount
+ORDER BY qs.ViewCount DESC, qs.QuestionScore DESC
+LIMIT 100;

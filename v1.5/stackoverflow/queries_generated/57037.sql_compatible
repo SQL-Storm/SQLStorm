@@ -1,0 +1,107 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) AS TotalVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+),
+TagMetrics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS TotalPostsWithTag,
+        SUM(p.Score) AS TotalScoreForTag,
+        SUM(p.ViewCount) AS TotalViewCountForTag,
+        MAX(p.CreationDate) AS LastPostDateWithTag
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalBadges,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastVoteDate,
+    ua.LastBadgeDate,
+    pm.PostId,
+    pm.PostTypeId,
+    pm.CreationDate AS PostCreationDate,
+    pm.Score AS PostScore,
+    pm.ViewCount AS PostViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.TotalVotes AS PostVotes,
+    pm.TotalComments AS PostComments,
+    pm.TotalBountyAmount,
+    pm.LastVoteDate AS PostLastVoteDate,
+    pm.LastCommentDate AS PostLastCommentDate,
+    tm.TagId,
+    tm.TagName,
+    tm.TagCount,
+    tm.TotalPostsWithTag,
+    tm.TotalScoreForTag,
+    tm.TotalViewCountForTag,
+    tm.LastPostDateWithTag
+FROM
+    UserActivity ua
+LEFT JOIN
+    PostMetrics pm ON ua.UserId = pm.PostTypeId
+LEFT JOIN
+    TagMetrics tm ON tm.TagId = pm.PostId
+ORDER BY
+    ua.Reputation DESC,
+    pm.PostScore DESC,
+    tm.TotalScoreForTag DESC
+LIMIT 100;

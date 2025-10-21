@@ -1,0 +1,212 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from users)
+),
+question_posts as (
+  select p.id, p.owneruserid as user_id, p.creationdate, p.score, p.viewcount, p.answercount, p.tags
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id, p.parentid as question_id, p.owneruserid as user_id, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+),
+q_first_activity as (
+  select q.id as question_id,
+         q.user_id as asker_id,
+         q.creationdate as question_created,
+         coalesce(min(a.creationdate) filter (where a.user_id <> q.user_id), null) as first_answer_time,
+         count(a.id) as total_answers,
+         sum(case when a.score > 0 then 1 else 0 end) as positive_answers
+  from question_posts q
+  left join answer_posts a on a.question_id = q.id
+  group by q.id, q.user_id, q.creationdate
+),
+q_closure as (
+  select ph.postid as question_id,
+         min(ph.creationdate) as closed_at,
+         min(case when ph.posthistorytypeid = 10 then ph.comment end) as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10)
+  group by ph.postid
+),
+user_q_agg as (
+  select ru.user_id,
+         ru.displayname,
+         ru.reputation,
+         ru.cohort_month,
+         count(q.id) as questions_asked,
+         percentile_cont(0.5) within group (order by q.score) as q_score_p50,
+         avg(q.viewcount) as avg_q_views,
+         avg(nullif(q.answercount, 0)) as avg_answercount_nonzero,
+         sum(case when qc.closed_at is not null then 1 else 0 end) as closed_questions,
+         avg(extract(epoch from (qa.first_answer_time - q.creationdate)) / 3600.0) as avg_hours_to_first_answer
+  from recent_users ru
+  left join question_posts q on q.user_id = ru.user_id
+  left join q_first_activity qa on qa.question_id = q.id
+  left join q_closure qc on qc.question_id = q.id
+  group by ru.user_id, ru.displayname, ru.reputation, ru.cohort_month
+),
+user_a_agg as (
+  select ru.user_id,
+         count(a.id) as answers_posted,
+         percentile_cont(0.5) within group (order by a.score) as a_score_p50,
+         avg(a.score) as avg_a_score
+  from recent_users ru
+  left join answer_posts a on a.user_id = ru.user_id
+  group by ru.user_id
+),
+hotness as (
+  select q.id as question_id,
+         q.user_id as asker_id,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         0.5 * coalesce(q.score,0) + 0.3 * coalesce(q.viewcount,0) + 0.2 * coalesce(qa.total_answers,0) as hotness_score
+  from question_posts q
+  left join q_first_activity qa on qa.question_id = q.id
+),
+dupes as (
+  select pl.relatedpostid as master_id,
+         count(*) as dup_count,
+         array_agg(pl.postid) as duplicate_ids
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+tag_extract as (
+  select q.id as question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from question_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_stats as (
+  select te.tag,
+         count(*) as q_count,
+         avg(h.hotness_score) as avg_hotness,
+         percentile_cont(0.9) within group (order by h.hotness_score) as p90_hotness
+  from tag_extract te
+  join hotness h on h.question_id = te.question_id
+  group by te.tag
+),
+user_badges as (
+  select b.userid as user_id,
+         count(*) filter (where b.class = 1) as gold,
+         count(*) filter (where b.class = 2) as silver,
+         count(*) filter (where b.class = 3) as bronze,
+         count(*) as total_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+vote_summaries as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  group by v.postid
+),
+question_quality as (
+  select q.id as question_id,
+         q.user_id as asker_id,
+         coalesce(vs.upvotes,0) as upvotes,
+         coalesce(vs.downvotes,0) as downvotes,
+         coalesce(vs.favorites,0) as favorites,
+         (coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0)) as net_votes
+  from question_posts q
+  left join vote_summaries vs on vs.postid = q.id
+),
+user_engagement as (
+  select ru.user_id,
+         coalesce(sum(qq.favorites),0) as total_favorites_on_q,
+         coalesce(sum(qq.net_votes),0) as total_net_votes_on_q
+  from recent_users ru
+  left join question_posts q on q.user_id = ru.user_id
+  left join question_quality qq on qq.question_id = q.id
+  group by ru.user_id
+),
+cohort_activity as (
+  select uq.cohort_month,
+         count(*) as users_in_cohort,
+         avg(uq.questions_asked) as avg_questions_per_user,
+         avg(ua.answers_posted) as avg_answers_per_user,
+         avg(uq.avg_hours_to_first_answer) as avg_hours_to_first_answer,
+         percentile_cont(0.75) within group (order by coalesce(ua.answers_posted,0)) as p75_answers_per_user
+  from user_q_agg uq
+  left join user_a_agg ua on ua.user_id = uq.user_id
+  group by uq.cohort_month
+),
+ranked_users as (
+  select
+    uq.user_id,
+    uq.displayname,
+    uq.reputation,
+    uq.cohort_month,
+    uq.questions_asked,
+    coalesce(ua.answers_posted,0) as answers_posted,
+    uq.q_score_p50,
+    ua.a_score_p50,
+    uq.avg_q_views,
+    uq.closed_questions,
+    uq.avg_hours_to_first_answer,
+    ue.total_favorites_on_q,
+    ue.total_net_votes_on_q,
+    coalesce(ub.total_badges,0) as total_badges,
+    coalesce(ub.gold,0) as gold_badges,
+    coalesce(ub.silver,0) as silver_badges,
+    coalesce(ub.bronze,0) as bronze_badges,
+    row_number() over (order by
+      coalesce(ua.answers_posted,0) desc,
+      coalesce(uq.questions_asked,0) desc,
+      coalesce(ue.total_net_votes_on_q,0) desc,
+      coalesce(ub.total_badges,0) desc
+    ) as activity_rank
+  from user_q_agg uq
+  left join user_a_agg ua on ua.user_id = uq.user_id
+  left join user_engagement ue on ue.user_id = uq.user_id
+  left join user_badges ub on ub.user_id = uq.user_id
+)
+select
+  ru.activity_rank,
+  ru.user_id,
+  ru.displayname,
+  ru.reputation,
+  to_char(ru.cohort_month, 'YYYY-MM') as cohort_month,
+  ru.questions_asked,
+  ru.answers_posted,
+  round(ru.q_score_p50::numeric, 2) as q_score_p50,
+  round(ru.a_score_p50::numeric, 2) as a_score_p50,
+  round(ru.avg_q_views::numeric, 2) as avg_q_views,
+  ru.closed_questions,
+  round(ru.avg_hours_to_first_answer::numeric, 2) as avg_hours_to_first_answer,
+  ru.total_favorites_on_q,
+  ru.total_net_votes_on_q,
+  ru.total_badges,
+  ru.gold_badges,
+  ru.silver_badges,
+  ru.bronze_badges,
+  coalesce(d.dup_count,0) as duplicates_of_their_questions,
+  (select jsonb_object_agg(ts.tag, jsonb_build_object('q_count', ts.q_count, 'avg_hotness', round(ts.avg_hotness::numeric,2), 'p90_hotness', round(ts.p90_hotness::numeric,2)))
+   from tag_stats ts
+   where ts.q_count > 100) as global_tag_hotness_summary,
+  (select jsonb_build_object(
+      'users_in_cohort', ca.users_in_cohort,
+      'avg_questions_per_user', round(ca.avg_questions_per_user::numeric,2),
+      'avg_answers_per_user', round(ca.avg_answers_per_user::numeric,2),
+      'avg_hours_to_first_answer', round(ca.avg_hours_to_first_answer::numeric,2),
+      'p75_answers_per_user', ca.p75_answers_per_user
+    )
+   from cohort_activity ca
+   where ca.cohort_month = ru.cohort_month) as cohort_activity_summary
+from ranked_users ru
+left join (
+  select q.user_id, sum(coalesce(d.dup_count,0)) as dup_count
+  from question_posts q
+  left join dupes d on d.master_id = q.id
+  group by q.user_id
+) d on d.user_id = ru.user_id
+where ru.activity_rank <= 200
+order by ru.activity_rank;

@@ -1,0 +1,91 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        CASE 
+            WHEN p.Tags IS NULL THEN 'No Tags'
+            ELSE STRING_AGG(t.TagName, ', ') 
+        END AS TagList,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1  -- Questions
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.Title, p.Tags
+),
+CombinedStats AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.Location,
+        us.ReputationRank,
+        us.GoldBadges,
+        ps.PostId,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.TagList,
+        ps.PostRank,
+        COALESCE(
+            (SELECT MAX(v.CreationDate) 
+             FROM Votes v 
+             WHERE v.PostId = ps.PostId AND v.VoteTypeId IN (2, 3)), 
+            ps.CreationDate
+        ) AS LastVoteDate,
+        NULLIF(ps.Score * LOG(NULLIF(ps.ViewCount, 0) + 1), 0) AS WeightedScore
+    FROM UserStats us
+    LEFT OUTER JOIN PostStats ps ON us.UserId = ps.OwnerUserId AND ps.PostRank = 1
+    WHERE us.ReputationRank <= 100
+    UNION
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.Location,
+        us.ReputationRank,
+        us.GoldBadges,
+        NULL AS PostId,
+        0 AS Score,
+        0 AS ViewCount,
+        'No Top Post' AS Title,
+        'N/A' AS TagList,
+        0 AS PostRank,
+        NULL AS LastVoteDate,
+        0 AS WeightedScore
+    FROM UserStats us
+    WHERE NOT EXISTS (SELECT 1 FROM PostStats ps WHERE ps.OwnerUserId = us.UserId)
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Location,
+    cs.ReputationRank,
+    cs.GoldBadges,
+    cs.PostId,
+    cs.Title,
+    cs.TagList,
+    cs.WeightedScore,
+    CASE 
+        WHEN cs.LastVoteDate IS NULL THEN 'No Votes'
+        ELSE TO_CHAR(cs.LastVoteDate, 'YYYY-MM-DD') 
+    END AS FormattedLastVoteDate,
+    (SELECT COUNT(DISTINCT ph.PostHistoryTypeId) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = cs.PostId AND ph.CreationDate > cs.LastVoteDate) AS EditsAfterLastVote
+FROM CombinedStats cs
+WHERE cs.WeightedScore > 100 OR cs.GoldBadges > 0
+ORDER BY cs.ReputationRank, cs.WeightedScore DESC;

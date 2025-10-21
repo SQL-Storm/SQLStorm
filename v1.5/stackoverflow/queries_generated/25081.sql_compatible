@@ -1,0 +1,113 @@
+WITH recent_posts AS (
+    SELECT  p.Id,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.CreationDate,
+            p.Score,
+            p.Tags,
+            p.Title
+    FROM    Posts p
+    WHERE   p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+),
+user_badge_cnt AS (
+    SELECT  b.UserId,
+            COUNT(*) AS badge_cnt
+    FROM    Badges b
+    GROUP BY b.UserId
+),
+user_question_stats AS (
+    SELECT  p.OwnerUserId                AS uid,
+            COUNT(*)                     AS q_cnt,
+            AVG(p.Score)                 AS q_avg_score
+    FROM    Posts p
+    WHERE   p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+user_answer_stats AS (
+    SELECT  p.OwnerUserId                AS uid,
+            COUNT(*)                     AS a_cnt,
+            AVG(p.Score)                 AS a_avg_score
+    FROM    Posts p
+    WHERE   p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+user_vote_summary AS (
+    SELECT  p.OwnerUserId                                    AS uid,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM    Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+user_ranked AS (
+    SELECT  u.Id                                            AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(b.badge_cnt,0)                         AS badge_cnt,
+            COALESCE(q.q_cnt,0)                             AS question_cnt,
+            COALESCE(q.q_avg_score,0)                       AS question_avg_score,
+            COALESCE(a.a_cnt,0)                             AS answer_cnt,
+            COALESCE(a.a_avg_score,0)                       AS answer_avg_score,
+            COALESCE(v.up_votes,0)                          AS up_votes,
+            COALESCE(v.down_votes,0)                        AS down_votes,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM    Users u
+    LEFT JOIN user_badge_cnt b      ON b.UserId = u.Id
+    LEFT JOIN user_question_stats q ON q.uid    = u.Id
+    LEFT JOIN user_answer_stats a   ON a.uid    = u.Id
+    LEFT JOIN user_vote_summary v   ON v.uid    = u.Id
+),
+tag_use AS (
+    SELECT  t.TagName,
+            COUNT(*)                                   AS tag_use_cnt,
+            STRING_AGG(p.Title, '; ' ORDER BY p.CreationDate DESC) AS sample_titles
+    FROM    Tags t
+    JOIN    Posts p ON p.Tags LIKE '%'||'<'||t.TagName||'>'||'%'
+    GROUP BY t.TagName
+    HAVING  COUNT(*) > 100
+),
+user_recent_tag_match AS (
+    SELECT  ur.user_id,
+            COUNT(DISTINCT tg.TagName) AS matching_tag_cnt
+    FROM    user_ranked ur
+    LEFT JOIN recent_posts rp   ON rp.OwnerUserId = ur.user_id
+    LEFT JOIN Tags tg           ON rp.Tags LIKE '%'||'<'||tg.TagName||'>'||'%'
+    GROUP BY ur.user_id
+)
+SELECT  ur.user_id,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.badge_cnt,
+        ur.question_cnt,
+        ROUND(ur.question_avg_score,2)   AS question_avg_score,
+        ur.answer_cnt,
+        ROUND(ur.answer_avg_score,2)     AS answer_avg_score,
+        ur.up_votes,
+        ur.down_votes,
+        ur.rep_rank,
+        COALESCE(urt.matching_tag_cnt,0) AS recent_matching_tags
+FROM    user_ranked ur
+LEFT JOIN user_recent_tag_match urt ON urt.user_id = ur.user_id
+WHERE   ur.rep_rank <= 100
+ORDER BY ur.Reputation DESC
+UNION ALL
+SELECT  NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+EXCEPT
+SELECT  *
+FROM    (
+        SELECT  ur.user_id,
+                ur.DisplayName,
+                ur.Reputation,
+                ur.badge_cnt,
+                ur.question_cnt,
+                ur.question_avg_score,
+                ur.answer_cnt,
+                ur.answer_avg_score,
+                ur.up_votes,
+                ur.down_votes,
+                ur.rep_rank,
+                COALESCE(urt.matching_tag_cnt,0) AS recent_matching_tags
+        FROM    user_ranked ur
+        LEFT JOIN user_recent_tag_match urt ON urt.user_id = ur.user_id
+        WHERE   ur.rep_rank <= 100
+        ) AS final_set;

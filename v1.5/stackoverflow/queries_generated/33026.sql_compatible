@@ -1,0 +1,126 @@
+SELECT 
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    array_agg(t.TagName) AS Tags,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    u.CreationDate AS UserJoinDate,
+    uv.LastAccessDate AS UserLastAccess,
+    v_total.UpVotes,
+    v_total.DownVotes,
+    ph.EditCount,
+    ph.LastEditDate,
+    ch.CloseReason,
+    ch.CloseDate,
+    rev.RevisionCount,
+    vote_stats.VoteDistribution,
+    link_stats.LinkedPostsCount,
+    link_stats.DuplicatePostsCount
+FROM 
+    Posts p
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Users uv ON u.Id = uv.Id
+LEFT JOIN (
+    SELECT 
+        PostId, 
+        COUNT(*) AS EditCount,
+        MAX(CreationDate) AS LastEditDate
+    FROM 
+        PostHistory
+    WHERE 
+        PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,24,25,31,33,34,35,36,37,38,50,52,53,66)
+    GROUP BY 
+        PostId
+) ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT 
+        p2.PostId,
+        MAX(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        MAX(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM 
+        Votes v
+    JOIN 
+        Posts p2 ON v.PostId = p2.Id
+    GROUP BY 
+        p2.PostId
+) v_total ON p.Id = v_total.PostId
+LEFT JOIN (
+    SELECT 
+        ch.PostId,
+        array_agg(ct.Name) FILTER (WHERE ch.Comment LIKE '%Close%' AND ch.Comment LIKE '%Reason%') AS CloseReason
+    FROM 
+        PostHistory ch
+    LEFT JOIN 
+        CloseReasonTypes ct ON CAST(ch.Comment AS TEXT) ILIKE '%' || ct.Name || '%'
+    WHERE 
+        ch.PostHistoryTypeId = 10 AND ch.Comment IS NOT NULL
+    GROUP BY 
+        ch.PostId
+) ch ON p.Id = ch.PostId
+LEFT JOIN (
+    SELECT 
+        p3.ParentId AS PostId,
+        COUNT(*) AS RevisionCount
+    FROM 
+        PostHistory p3
+    WHERE 
+        p3.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,22,24,25,31,33,34,35,36,37,38,50,52,53,66)
+    GROUP BY 
+        p3.ParentId
+) rev ON p.Id = rev.PostId
+LEFT JOIN (
+    SELECT 
+        p4.Id AS PostId,
+        COUNT(DISTINCT v2.UserId) AS VoteCount,
+        JSON_AGG(DISTINCT v2.VoteTypeId) AS VoteDistribution
+    FROM 
+        Posts p4
+    LEFT JOIN 
+        Votes v2 ON p4.Id = v2.PostId
+    GROUP BY 
+        p4.Id
+) vote_stats ON p.Id = vote_stats.PostId
+LEFT JOIN (
+    SELECT 
+        p5.Id AS PostId,
+        COUNT(CASE WHEN l.LinkTypeId = 3 THEN 1 END) AS DuplicateLinks,
+        COUNT(CASE WHEN l.LinkTypeId = 1 THEN 1 END) AS LinkedPostLinks
+    FROM 
+        Posts p5
+    LEFT JOIN 
+        PostLinks l ON p5.Id = l.PostId
+    GROUP BY 
+        p5.Id
+) link_stats ON p.Id = link_stats.PostId
+LEFT JOIN (
+    SELECT 
+        p6.Id,
+        COUNT(CASE WHEN p6.PostTypeId = 1 THEN 1 END) AS QuestionsCount,
+        COUNT(CASE WHEN p6.PostTypeId = 2 THEN 1 END) AS AnswersCount
+    FROM 
+        Posts p6
+    GROUP BY 
+        p6.Id
+) post_counts ON p.Id = post_counts.Id
+LEFT JOIN 
+    Tags t ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+WHERE 
+    p.PostTypeId IN (1, 2)
+GROUP BY 
+    p.PostTypeId, pt.Name, p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Body, u.DisplayName, u.Reputation, u.CreationDate, uv.LastAccessDate, ph.EditCount, ph.LastEditDate, ch.CloseReason, ch.CloseDate, rev.RevisionCount, v_total.UpVotes, v_total.DownVotes, link_stats.LinkedPostsCount, link_stats.DuplicatePostsCount
+ORDER BY 
+    p.CreationDate DESC
+LIMIT 100;

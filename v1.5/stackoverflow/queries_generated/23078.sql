@@ -1,0 +1,126 @@
+-- {"query": "23078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 1076} 
+
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(COUNT(p.Id), 0) AS TotalPosts,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore,
+        STRING_AGG(COALESCE(p.Tags, ''), ', ') AS AllTags,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Location = u.Location) * 1.5
+      AND (p.CreationDate > '2020-01-01' OR p.CreationDate IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(p.Id) > 5 OR MAX(p.Score) > 10
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.Class IN (1, 2) AND b.TagBased = 1
+    GROUP BY b.UserId
+),
+TopVotedPosts AS (
+    SELECT 
+        v.PostId,
+        COUNT(v.Id) AS VoteCount
+    FROM Votes v
+    WHERE v.VoteTypeId = 2  -- Upvotes
+    GROUP BY v.PostId
+    HAVING COUNT(v.Id) > 100
+),
+CombinedStats AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.TotalScore,
+        ups.AvgScore,
+        ups.AllTags,
+        ups.RankInLocation,
+        COALESCE(bs.BadgeCount, 0) AS BadgeCount,
+        bs.LatestBadgeDate,
+        (SELECT COUNT(c.Id) 
+         FROM Comments c 
+         WHERE c.UserId = ups.UserId 
+           AND c.Score > (SELECT AVG(Score) FROM Comments WHERE PostId = c.PostId)
+           AND UPPER(c.Text) LIKE '%SQL%') AS SqlCommentsCount
+    FROM UserPostStats ups
+    FULL OUTER JOIN BadgeStats bs ON ups.UserId = bs.UserId
+    WHERE ups.RankInLocation <= 10
+      AND (ups.TotalScore + COALESCE(bs.BadgeCount * 10, 0) > 1000 OR ups.AvgScore IS NULL)
+),
+QuestionAskers AS (
+    SELECT UserId, TotalPosts AS QuestionsAsked
+    FROM CombinedStats
+    WHERE TotalPosts > 50
+),
+AnswerProviders AS (
+    SELECT ups.UserId, COUNT(p.Id) AS AnswersGiven
+    FROM UserPostStats ups
+    INNER JOIN Posts p ON ups.UserId = p.OwnerUserId AND p.PostTypeId = 2
+    GROUP BY ups.UserId
+    HAVING COUNT(p.Id) > 30
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.TotalPosts,
+    cs.TotalScore,
+    cs.AvgScore,
+    CASE 
+        WHEN cs.AllTags IS NULL THEN 'No Tags'
+        ELSE UPPER(REPLACE(cs.AllTags, '<', '['))
+    END AS ProcessedTags,
+    cs.RankInLocation,
+    cs.BadgeCount,
+    cs.LatestBadgeDate,
+    cs.SqlCommentsCount,
+    COALESCE(tvp.VoteCount, 0) AS TopVotes,
+    (cs.TotalScore * 1.1 + cs.BadgeCount * 5 - COALESCE(cs.SqlCommentsCount, 0)) AS CustomMetric
+FROM CombinedStats cs
+LEFT OUTER JOIN TopVotedPosts tvp ON EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = cs.UserId AND p.Id = tvp.PostId)
+WHERE cs.CustomMetric > 500
+UNION
+SELECT 
+    qa.UserId,
+    u.DisplayName,
+    u.Reputation,
+    qa.QuestionsAsked AS TotalPosts,
+    0 AS TotalScore,
+    0 AS AvgScore,
+    NULL AS ProcessedTags,
+    0 AS RankInLocation,
+    0 AS BadgeCount,
+    NULL AS LatestBadgeDate,
+    0 AS SqlCommentsCount,
+    0 AS TopVotes,
+    qa.QuestionsAsked * 2 AS CustomMetric
+FROM QuestionAskers qa
+INNER JOIN Users u ON qa.UserId = u.Id
+EXCEPT
+SELECT 
+    ap.UserId,
+    u.DisplayName,
+    u.Reputation,
+    ap.AnswersGiven AS TotalPosts,
+    0 AS TotalScore,
+    0 AS AvgScore,
+    NULL AS ProcessedTags,
+    0 AS RankInLocation,
+    0 AS BadgeCount,
+    NULL AS LatestBadgeDate,
+    0 AS SqlCommentsCount,
+    0 AS TopVotes,
+    ap.AnswersGiven * 3 AS CustomMetric
+FROM AnswerProviders ap
+INNER JOIN Users u ON ap.UserId = u.Id
+ORDER BY CustomMetric DESC, Reputation DESC;

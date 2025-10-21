@@ -1,0 +1,140 @@
+WITH
+    user_activity AS (
+        SELECT
+            u.Id AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            MAX(p.CreationDate)        AS LastPostDate,
+            MAX(c.CreationDate)        AS LastCommentDate,
+            MAX(v.CreationDate)        AS LastVoteDate,
+            COUNT(p.Id)                AS TotalPosts,
+            COUNT(c.Id)                AS TotalComments,
+            COUNT(v.Id)                AS TotalVotes
+        FROM Users AS u
+        LEFT JOIN Posts AS p      ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments AS c   ON c.UserId = u.Id
+        LEFT JOIN Votes AS v      ON v.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    badge_agg AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            STRING_AGG(DISTINCT b.Name, ', ')   AS BadgeList
+        FROM Badges AS b
+        GROUP BY b.UserId
+    ),
+
+    post_stats AS (
+        SELECT
+            p.OwnerUserId                                   AS UserId,
+            COUNT(*)                                        AS PostCount,
+            SUM(p.Score)                                    AS TotalScore,
+            AVG(p.Score)                                    AS AvgScore,
+            MAX(p.ViewCount)                                AS MaxViews,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.FavoriteCount ELSE 0 END) AS QuestionFavorites,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+            STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))), ', ') 
+                FILTER (WHERE p.PostTypeId = 1)            AS TagBag
+        FROM Posts AS p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    users_with_accepted AS (
+        SELECT DISTINCT
+            a.OwnerUserId AS UserId
+        FROM Posts AS a
+        WHERE a.PostTypeId = 2
+          AND EXISTS (
+                SELECT 1
+                FROM Posts AS q
+                WHERE q.Id = a.ParentId
+                  AND q.AcceptedAnswerId = a.Id
+          )
+    ),
+
+    combined AS (
+        SELECT
+            ua.UserId,
+            ua.DisplayName,
+            ua.Reputation,
+            COALESCE(ua.LastPostDate, DATE '1970-01-01')      AS LastPostDate,
+            COALESCE(ua.LastCommentDate, DATE '1970-01-01')   AS LastCommentDate,
+            COALESCE(ua.LastVoteDate, DATE '1970-01-01')      AS LastVoteDate,
+            ua.TotalPosts,
+            ua.TotalComments,
+            ua.TotalVotes,
+            COALESCE(ba.GoldBadges, 0)                    AS GoldBadges,
+            COALESCE(ba.SilverBadges, 0)                  AS SilverBadges,
+            COALESCE(ba.BronzeBadges, 0)                  AS BronzeBadges,
+            COALESCE(ba.BadgeList, '')                   AS BadgeList,
+            COALESCE(ps.PostCount, 0)                     AS PostCount,
+            COALESCE(ps.TotalScore, 0)                    AS TotalScore,
+            ROUND(COALESCE(ps.AvgScore, 0), 2)            AS AvgScore,
+            COALESCE(ps.MaxViews, 0)                      AS MaxViews,
+            COALESCE(ps.QuestionFavorites, 0)             AS QuestionFavorites,
+            ps.TagBag,
+            CASE WHEN uwa.UserId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+            ROUND(
+                (ua.Reputation * 0.6) +
+                (COALESCE(ba.GoldBadges,0) * 1000) +
+                (COALESCE(ba.SilverBadges,0) * 500) +
+                (COALESCE(ba.BronzeBadges,0) * 250) +
+                (ua.TotalPosts * 10) +
+                ( ua.TotalComments * 5) +
+                (ua.TotalVotes * 2) +
+                (COALESCE(ps.TotalScore,0) * 0.3),
+            0) AS CompositeScore
+        FROM user_activity ua
+        LEFT JOIN badge_agg ba      ON ba.UserId = ua.UserId
+        LEFT JOIN post_stats ps    ON ps.UserId = ua.UserId
+        LEFT JOIN users_with_accepted uwa ON uwa.UserId = ua.UserId
+    )
+
+SELECT *
+FROM (
+    SELECT
+        c.*,
+        ROW_NUMBER() OVER (ORDER BY c.CompositeScore DESC) AS RankByScore,
+        CASE 
+            WHEN c.LastPostDate < DATE '2024-10-01' - INTERVAL '2 years' THEN 'Inactive'
+            ELSE 'Active'
+        END AS ActivityStatus
+    FROM combined c
+) AS active_users
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    'Inactive Users Bucket' AS DisplayName,
+    NULL AS Reputation,
+    MIN(ua.LastPostDate) AS LastPostDate,
+    NULL AS LastCommentDate,
+    NULL AS LastVoteDate,
+    SUM(ua.TotalPosts) AS TotalPosts,
+    SUM(ua.TotalComments) AS TotalComments,
+    SUM(ua.TotalVotes) AS TotalVotes,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    '' AS BadgeList,
+    SUM(ps.PostCount) AS PostCount,
+    SUM(ps.TotalScore) AS TotalScore,
+    NULL AS AvgScore,
+    NULL AS MaxViews,
+    NULL AS QuestionFavorites,
+    NULL AS TagBag,
+    0 AS HasAcceptedAnswer,
+    NULL AS CompositeScore,
+    NULL AS RankByScore,
+    'Inactive' AS ActivityStatus
+FROM user_activity AS ua
+LEFT JOIN post_stats AS ps ON ps.UserId = ua.UserId
+WHERE ua.LastPostDate < DATE '2024-10-01' - INTERVAL '2 years'
+GROUP BY ActivityStatus
+ORDER BY CompositeScore DESC NULLS LAST;

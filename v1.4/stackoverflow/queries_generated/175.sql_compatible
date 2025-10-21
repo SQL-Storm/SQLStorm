@@ -1,0 +1,124 @@
+WITH
+RecentQuestions AS (
+    SELECT p.Id AS PostId,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.CreationDate,
+           p.OwnerUserId,
+           p.Tags,
+           p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= TIMESTAMPADD(DAY, -60, TIMESTAMP '2024-10-01 12:34:56')
+),
+UserInfo AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           u.Location,
+           u.Views,
+           u.UpVotes,
+           u.DownVotes,
+           u.ProfileImageUrl
+    FROM Users u
+),
+VoteAgg AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           COUNT(*) AS VoteCount,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+),
+TagInfo AS (
+    SELECT t.Id AS TagId,
+           t.TagName,
+           t.Count
+    FROM Tags t
+),
+Links AS (
+    SELECT pl.PostId,
+           pl.RelatedPostId,
+           lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+CommentCounts AS (
+    SELECT c.PostId,
+           COUNT(*) AS CommentCount
+    FROM Comments c
+    GROUP BY c.PostId
+),
+History AS (
+    SELECT ph.PostId,
+           MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+Composite AS (
+    SELECT rq.PostId,
+           rq.Title,
+           rq.ViewCount,
+           rq.Score,
+           rq.CreationDate,
+           rq.LastActivityDate,
+           ui.DisplayName AS OwnerName,
+           ui.Reputation,
+           COALESCE(va.UpVotes, 0) AS UpVotes,
+           COALESCE(va.DownVotes, 0) AS DownVotes,
+           COALESCE(cc.CommentCount, 0) AS CommentCount,
+           COALESCE(h.LastEditDate, rq.CreationDate) AS LastEditDate,
+           CASE
+               WHEN COALESCE(va.UpVotes, 0) - COALESCE(va.DownVotes, 0) >= 5 THEN 1
+               ELSE 0
+           END AS IsPromoted
+    FROM RecentQuestions rq
+    LEFT JOIN UserInfo ui ON rq.OwnerUserId = ui.Id
+    LEFT JOIN VoteAgg va ON rq.PostId = va.PostId
+    LEFT JOIN CommentCounts cc ON rq.PostId = cc.PostId
+    LEFT JOIN History h ON rq.PostId = h.PostId
+),
+Tagged AS (
+    SELECT c.PostId,
+           t.TagName AS PrimaryTag,
+           t.Count AS TagUsage
+    FROM Composite c
+    CROSS JOIN LATERAL (
+        SELECT t.TagName, t.Count
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT t2.Id
+            FROM Tags t2
+            WHERE POSITION(CONCAT('<', t2.TagName, '>') IN c.Tags) > 0
+            ORDER BY t2.Count DESC
+            LIMIT 1
+        )
+    ) AS t
+),
+Final AS (
+    SELECT  ROW_NUMBER() OVER (ORDER BY c.IsPromoted DESC, (COALESCE(c.UpVotes,0) - COALESCE(c.DownVotes,0)) DESC, c.LastEditDate DESC) AS rn,
+            c.PostId,
+            c.Title,
+            c.OwnerName,
+            c.Reputation,
+            c.Score,
+            c.ViewCount,
+            c.CreationDate,
+            c.LastActivityDate,
+            c.UpVotes,
+            c.DownVotes,
+            c.CommentCount,
+            c.LastEditDate,
+            c.IsPromoted,
+            COALESCE(tu.PrimaryTag, NULL) AS PrimaryTag,
+            COALESCE(tu.TagUsage, NULL) AS TagUsage
+    FROM Composite c
+    LEFT JOIN Tagged tu ON c.PostId = tu.PostId
+)
+SELECT *
+FROM Final
+WHERE rn <= 100;

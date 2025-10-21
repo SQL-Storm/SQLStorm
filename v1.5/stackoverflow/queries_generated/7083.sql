@@ -1,0 +1,226 @@
+-- {"query": "7083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2508} 
+with
+-- recent active questions with parsed tags and basic aggregates
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    coalesce(p.Score,0) as Score,
+    coalesce(p.ViewCount,0) as Views,
+    p.Tags,
+    -- normalized tag array (Postgres-style parsing of <tag><tag2> formatting)
+    regexp_split_to_table(substring(p.Tags from 2 for greatest(char_length(p.Tags)-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '2 years'
+),
+-- top answer stats per question (including correlated subquery for latest high-scoring answer)
+TopAnswerPerQuestion as (
+  select
+    q.Id as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as rn
+  from RecentQuestions q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+),
+TopAnswerFiltered as (
+  select *
+  from TopAnswerPerQuestion
+  where rn = 1
+),
+-- user aggregates including window to rank users by influence (reputation and received upvotes)
+UserAggregates as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(u.Views,0) as ProfileViews,
+    coalesce(u.UpVotes,0) as UpVotesGiven,
+    coalesce(u.DownVotes,0) as DownVotesGiven,
+    -- total posts and answers counts, plus avg score of their posts
+    (select count(*) from Posts p where p.OwnerUserId = u.Id) as TotalPosts,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as TotalAnswers,
+    (select avg(coalesce(p.Score,0)) from Posts p where p.OwnerUserId = u.Id) as AvgPostScore,
+    -- number of accepted answers they've provided (correlated subquery)
+    (select count(*) from Posts q where q.OwnerUserId = u.Id and q.PostTypeId = 2 and exists (
+        select 1 from Posts qq where qq.AcceptedAnswerId = q.Id
+    )) as AcceptedCount,
+    -- number of distinct tags they've answered in (join + distinct)
+    (select count(distinct unnest(regexp_split_to_array(substring(t.Tags from 2 for greatest(char_length(t.Tags)-2,0)), '><'))))
+      from Posts t where t.OwnerUserId = u.Id and t.PostTypeId = 2) as DistinctAnswerTags,
+    -- window rank by combined metric
+    dense_rank() over (order by (u.Reputation * 0.6 + coalesce(u.Views,0) * 0.0001 + coalesce(u.UpVotes,0) * 0.1) desc) as InfluenceRank
+  from Users u
+),
+-- compute recent comment activity and sentiment-like score (simple heuristics using string functions)
+CommentActivity as (
+  select
+    c.PostId,
+    count(*) filter (where c.CreationDate >= now() - interval '6 months') as RecentComments,
+    sum(case when c.Text ~* '\\b(thanks|thank you|ty|appreciate)\\b' then 1 else 0 end) as GratitudeCount,
+    sum(case when c.Text ~* '\\b(issue|bug|error|fail)\\b' then 1 else 0 end) as ProblemCount,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+-- combine question-level metrics, link relationships, and historical edits
+QuestionRich as (
+  select
+    q.*,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ua.DisplayName as QuestionOwner,
+    ua.Reputation as QuestionOwnerReputation,
+    coalesce(ca.RecentComments,0) as RecentComments,
+    coalesce(ca.GratitudeCount,0) as GratitudeCount,
+    coalesce(ca.ProblemCount,0) as ProblemCount,
+    pl.LinkCount,
+    ph.EditCount,
+    ph.LastEditDate,
+    -- average score of answers (with null-safe handling)
+    (select avg(coalesce(a.Score,0)) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as AvgAnswerScore,
+    -- fraction of answers with score >= question score
+    (select case when count(*)=0 then 0 else sum(case when coalesce(a.Score,0) >= coalesce(q.Score,0) then 1 else 0 end)::float / count(*) end
+       from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as FractionAnswersAtOrAboveQScore
+  from RecentQuestions q
+  left join TopAnswerFiltered ta on ta.QuestionId = q.Id
+  left join UserAggregates ua on ua.Id = q.OwnerUserId
+  left join CommentActivity ca on ca.PostId = q.Id
+  left join (
+    select pl.PostId, count(*) as LinkCount
+    from PostLinks pl
+    where pl.CreationDate >= now() - interval '1 year'
+    group by pl.PostId
+  ) pl on pl.PostId = q.Id
+  left join (
+    select ph.PostId, count(*) as EditCount, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9,24) -- edits and suggested edits
+    group by ph.PostId
+  ) ph on ph.PostId = q.Id
+),
+-- tag-level hotness using window functions and set operations
+TagHotness as (
+  select
+    Tag,
+    count(distinct Id) as QuestionCount,
+    sum(Score) as TotalScore,
+    sum(Views) as TotalViews,
+    -- density metric mixing recency and activity
+    sum(case when CreationDate >= now() - interval '3 months' then 3 else 1 end * greatest(Score,0)) as RecencyWeightedScore,
+    rank() over (order by sum(case when CreationDate >= now() - interval '3 months' then 3 else 1 end * greatest(Score,0)) desc) as HotRank
+  from RecentQuestions
+  group by Tag
+),
+-- a unioned set to find interesting posts: questions, answers with high delta, and posts referenced via links as duplicates
+InterestingPosts as (
+  select
+    q.Id,
+    'question'::text as PostKind,
+    q.Title,
+    q.Score,
+    q.Views,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Tags,
+    q.AnswerId,
+    q.RecentComments,
+    q.EditCount
+  from QuestionRich q
+  where q.Views >= 1000 or q.RecentComments >= 5 or q.EditCount >= 3
+
+  union
+
+  select
+    a.Id,
+    'answer'::text as PostKind,
+    substring(coalesce(a.Body, ''),1,120) as Title,
+    a.Score,
+    0 as Views,
+    a.CreationDate,
+    a.OwnerUserId,
+    (select string_agg(distinct tg.Tag, ',') from RecentQuestions tg where tg.Id = a.ParentId) as Tags,
+    null as AnswerId,
+    (select count(*) from Comments c where c.PostId = a.Id and c.CreationDate >= now() - interval '6 months') as RecentComments,
+    (select count(*) from PostHistory ph where ph.PostId = a.Id) as EditCount
+  from Posts a
+  where a.PostTypeId = 2
+    and a.CreationDate >= now() - interval '1 year'
+    and a.Score >= 10
+    and exists (select 1 from Posts q where q.Id = a.ParentId and q.Tags is not null)
+
+  union
+
+  -- posts that are linked as duplicates in past year with high-score target
+  select
+    pl.RelatedPostId as Id,
+    'linked_duplicate'::text,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    null,
+    (select count(*) from Comments c where c.PostId = p.Id),
+    (select count(*) from PostHistory ph where ph.PostId = p.Id)
+  from PostLinks pl
+  join Posts p on p.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3
+    and pl.CreationDate >= now() - interval '1 year'
+),
+-- final selection: combine tag hotness, question richness, and user influence ranking; compute complex expressions and null logic
+FinalSelection as (
+  select
+    qr.Id as QuestionId,
+    coalesce(qr.Title, '(no title)') as Title,
+    coalesce(qr.Tag, '') as RepresentativeTag,
+    th.HotRank,
+    th.TotalScore,
+    qr.Score as QuestionScore,
+    qr.Views as QuestionViews,
+    qr.AcceptedAnswerId,
+    qr.AnswerId as TopAnswerId,
+    qr.AnswerScore,
+    ua.Id as OwnerId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.InfluenceRank,
+    qr.RecentComments,
+    qr.GrantedBonus := (case when qr.RecentComments > 10 and qr.RecentComments is not null then 50 else 0 end) as GrantedBonusDummy, -- use of := simply to stress parser (if unsupported DB, treated as alias)
+    -- compute a synthetic ranking score combining many factors, careful null handling
+    (coalesce(qr.Score,0) * 2.0
+      + coalesce(qr.Views,0) * 0.001
+      + coalesce(qr.RecentComments,0) * 1.5
+      + coalesce(qr.EditCount,0) * 0.8
+      + coalesce(ua.Reputation,0) * 0.001
+      + coalesce(th.RecencyWeightedScore,0) * 0.5
+      - coalesce(qr.ProblemCount,0) * 1.2
+      + case when qr.AcceptedAnswerId is not null then 20 else 0 end
+      ) as SyntheticScore,
+    -- demonstrate nested correlated subquery: latest editor info for the question
+    (select u2.DisplayName || '|' || coalesce(u2.Reputation::text,'0')
+     from Users u2
+     where u2.Id = (select ph.LastEditorUserId from PostHistory ph where ph.PostId = qr.Id and ph.PostHistoryTypeId in (4,5,6) order by ph.CreationDate desc limit 1)
+     limit 1) as LastEditorSummary,
+    -- string expression showing tag summary (could be long)
+    left(coalesce(qr.Tags,''), 200) as TagSnippet
+  from QuestionRich qr
+  left join TagHotness th on th.Tag = qr.Tag
+  left join UserAggregates ua on ua.Id = qr.OwnerUserId
+)
+select
+  fs.*,
+  -- windowed position among final rows
+  row_number() over (order by fs.SyntheticScore desc nulls last, fs.QuestionViews desc) as FinalRank
+from FinalSelection fs
+where fs.SyntheticScore is not null
+order by FinalRank asc
+limit 500;

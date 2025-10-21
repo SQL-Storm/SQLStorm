@@ -1,0 +1,111 @@
+-- {"query": "46096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 220224, "output_tokens": 176701} 
+WITH high_reputation_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+question_metrics AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        COUNT(DISTINCT v.Id) as TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT pl.Id) as LinkedCount,
+        STRING_AGG(DISTINCT t.TagName, ', ') as PopularTags
+    FROM Posts p
+    INNER JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LATERAL (
+        SELECT TagName 
+        FROM Tags 
+        WHERE TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+        AND Count > 1000
+    ) t ON true
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND p.Score > 5
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate
+),
+answer_quality AS (
+    SELECT 
+        a.ParentId as QuestionId,
+        COUNT(a.Id) as QualityAnswerCount,
+        MAX(a.Score) as BestAnswerScore,
+        AVG(a.Score) as AvgAnswerScore,
+        COUNT(DISTINCT a.OwnerUserId) as UniqueAnswerers,
+        MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN a.Score END) as AcceptedAnswerScore
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 
+        AND a.Score >= 0
+    GROUP BY a.ParentId
+    HAVING COUNT(a.Id) >= 2
+),
+edit_history AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) as EditCount,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        MAX(ph.CreationDate) as LastEditDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) as MajorEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY ph.PostId
+)
+SELECT 
+    hru.DisplayName as UserName,
+    hru.Reputation,
+    hru.BadgeCount,
+    hru.GoldBadges,
+    hru.SilverBadges,
+    EXTRACT(DAYS FROM (cast('2024-10-01' as date) - hru.CreationDate::date)) as AccountAgeDays,
+    COUNT(DISTINCT qm.QuestionId) as TotalQuestions,
+    COALESCE(AVG(qm.Score), 0) as AvgQuestionScore,
+    COALESCE(AVG(qm.ViewCount), 0) as AvgViewCount,
+    COALESCE(SUM(qm.TotalVotes), 0) as TotalVotesReceived,
+    COALESCE(AVG(aq.QualityAnswerCount), 0) as AvgAnswersPerQuestion,
+    COALESCE(AVG(aq.BestAnswerScore), 0) as AvgBestAnswerScore,
+    COALESCE(AVG(eh.EditCount), 0) as AvgEditsPerPost,
+    COALESCE(SUM(qm.LinkedCount), 0) as TotalLinkedPosts,
+    STRING_AGG(DISTINCT qm.PopularTags, '; ') as TopTags,
+    RANK() OVER (ORDER BY hru.Reputation DESC) as ReputationRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qm.Score) as MedianQuestionScore,
+    MAX(qm.Score) as HighestScoredQuestion,
+    COUNT(CASE WHEN aq.AcceptedAnswerScore IS NOT NULL THEN 1 END) as QuestionsWithAcceptedAnswer,
+    ROUND(100.0 * COUNT(CASE WHEN aq.AcceptedAnswerScore IS NOT NULL THEN 1 END) / NULLIF(COUNT(DISTINCT qm.QuestionId), 0), 2) as AcceptanceRate
+FROM high_reputation_users hru
+LEFT JOIN question_metrics qm ON hru.Id = qm.OwnerUserId
+LEFT JOIN answer_quality aq ON qm.QuestionId = aq.QuestionId
+LEFT JOIN edit_history eh ON qm.QuestionId = eh.PostId
+GROUP BY 
+    hru.Id,
+    hru.DisplayName, 
+    hru.Reputation, 
+    hru.BadgeCount, 
+    hru.GoldBadges, 
+    hru.SilverBadges, 
+    hru.CreationDate
+HAVING COUNT(DISTINCT qm.QuestionId) > 0
+ORDER BY 
+    hru.Reputation DESC, 
+    TotalVotesReceived DESC,
+    AvgQuestionScore DESC
+LIMIT 100;

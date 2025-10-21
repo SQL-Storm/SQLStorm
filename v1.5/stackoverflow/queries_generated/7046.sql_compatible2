@@ -1,0 +1,193 @@
+WITH
+-- recent activity per post including synthetic score adjustments
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    COALESCE(p.ViewCount,0) AS Views,
+    COALESCE(p.AnswerCount,0) AS AnswerCount,
+    COALESCE(p.CommentCount,0) AS CommentCount,
+    -- tag list normalized to array-like by splitting on >< after trimming surrounding <>
+    CASE
+      WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::varchar[]
+      ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+    END AS TagArray
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- compute aggregated vote info with conditional weighting and null-safe math
+VoteAgg AS (
+  SELECT
+    v.PostId,
+    count(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    count(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    count(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+    sum(CASE WHEN v.VoteTypeId = 8 OR v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBounty,
+    -- recency-weighted votes: newer votes count more (linear decay over 365 days)
+    sum(
+      CASE
+        WHEN v.CreationDate IS NULL THEN 0
+        ELSE (
+          (1.0 - LEAST(365.0, EXTRACT(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - v.CreationDate))/86400.0) / 365.0)
+          * CASE WHEN v.VoteTypeId = 2 THEN 1.0 WHEN v.VoteTypeId = 3 THEN -1.5 ELSE 0 END
+        )
+      END
+    ) AS RecencyWeightedScore
+  FROM Votes v
+  GROUP BY v.PostId
+),
+-- compute user-level aggregates and a "reliability" metric using null-aware expressions
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COALESCE(u.Views,0) AS ProfileViews,
+    COALESCE(u.UpVotes,0) AS GivenUp,
+    COALESCE(u.DownVotes,0) AS GivenDown,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    -- reliability: reputation scaled by badge mix and inverse of account age in years (+1 to avoid div by zero)
+    (COALESCE(u.Reputation,0) * (1.0 + 0.5 * (COUNT(b.Id) FILTER (WHERE b.Class=1)) + 0.2 * (COUNT(b.Id) FILTER (WHERE b.Class=2))))
+      / (1.0 + EXTRACT(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/ (365.0*86400.0)) AS Reliability
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+-- posts enriched with votes and owner reliability and last editor influence
+PostEnriched AS (
+  SELECT
+    r.*,
+    COALESCE(va.UpVotes,0) AS UpVotes,
+    COALESCE(va.DownVotes,0) AS DownVotes,
+    COALESCE(va.Favorites,0) AS Favorites,
+    COALESCE(va.TotalBounty,0) AS TotalBounty,
+    COALESCE(va.RecencyWeightedScore,0) AS RecencyWeightedScore,
+    us.Reliability AS OwnerReliability,
+    le.Reliability AS LastEditorReliability,
+    -- tag count, null-safe
+    cardinality(TagArray) AS TagCount,
+    -- computed engagement metric with null handling and non-linear scaling
+    (COALESCE(p.Score,0) * 1.5
+     + LEAST(1000, COALESCE(p.ViewCount,0) / GREATEST(1, NULLIF(p.AnswerCount,0) ) )
+     + COALESCE(va.RecencyWeightedScore,0) * 10
+     + COALESCE(us.Reliability,0) * 0.001
+     + COALESCE(va.Favorites,0) * 2
+     - COALESCE(va.DownVotes,0) * 1.25
+    )::numeric AS EngagementRaw
+  FROM RecentActivity r
+  LEFT JOIN VoteAgg va ON va.PostId = r.PostId
+  LEFT JOIN UserStats us ON us.UserId = r.OwnerUserId
+  LEFT JOIN Users leuser ON leuser.Id = r.LastEditorUserId
+  LEFT JOIN UserStats le ON le.UserId = leuser.Id
+  LEFT JOIN Posts p ON p.Id = r.PostId
+),
+-- windowed ranking and moving averages for time-series style benchmarking
+PostWindow AS (
+  SELECT
+    pe.*,
+    ROW_NUMBER() OVER (PARTITION BY pe.PostTypeId ORDER BY pe.EngagementRaw DESC NULLS LAST) AS RankByType,
+    RANK() OVER (ORDER BY pe.EngagementRaw DESC NULLS LAST) AS GlobalRank,
+    AVG(pe.EngagementRaw) OVER (PARTITION BY pe.PostTypeId ORDER BY pe.LastActivityDate
+                                RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS MovingAvg30d,
+    -- exponentially decayed popularity using windowed sum with exponential factor applied via exp()
+    SUM(pe.EngagementRaw * EXP(-EXTRACT(epoch FROM cast('2024-10-01 12:34:56' as timestamp) - pe.LastActivityDate)/ (86400.0*30.0))) OVER () AS ExponentialPopularityGlobal
+  FROM PostEnriched pe
+),
+-- correlate posts with duplicates, links and comment sentiment proxies
+PostLinkComments AS (
+  SELECT
+    pw.*,
+    pl.LinkCount,
+    dup.DuplicateOf,
+    COALESCE(cmt.CommentLenAvg,0) AS AvgCommentLength,
+    COALESCE(cmt.CommentCount,0) AS TotalComments,
+    -- synthetic quality score blending multiple signals with NULL-aware coalesce
+    (
+      COALESCE(pw.EngagementRaw,0) * 0.6
+      + COALESCE(pw.MovingAvg30d, COALESCE(pw.EngagementRaw,0)) * 0.25
+      + GREATEST(0, COALESCE(pw.OwnerReliability,0)) * 0.0001
+      + GREATEST(0, COALESCE(pl.LinkCount,0)) * 0.5
+      - COALESCE(pw.DownVotes,0) * 0.8
+      + LEAST(50, COALESCE(pw.TagCount,0)) * 0.2
+      - COALESCE(pw.AnswerCount,0) * 0.1
+    )::numeric AS QualityScore
+  FROM PostWindow pw
+  LEFT JOIN (
+    SELECT PostId, count(*) AS LinkCount
+    FROM PostLinks
+    GROUP BY PostId
+  ) pl ON pl.PostId = pw.PostId
+  LEFT JOIN (
+    -- prefer latest duplicate target if multiple, via min Id heuristic
+    SELECT pl.PostId, MIN(pl.RelatedPostId) AS DuplicateOf
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+  ) dup ON dup.PostId = pw.PostId
+  LEFT JOIN (
+    SELECT c.PostId,
+           COUNT(*) AS CommentCount,
+           AVG(char_length(c.Text)) AS CommentLenAvg
+    FROM Comments c
+    GROUP BY c.PostId
+  ) cmt ON cmt.PostId = pw.PostId
+)
+SELECT
+  plc.PostId,
+  plc.PostTypeId,
+  plc.ParentId,
+  plc.OwnerUserId,
+  plc.CreationDate,
+  plc.LastActivityDate,
+  plc.Score,
+  plc.Views,
+  plc.AnswerCount,
+  plc.TagCount,
+  plc.UpVotes,
+  plc.DownVotes,
+  plc.Favorites,
+  plc.TotalBounty,
+  plc.RecencyWeightedScore,
+  plc.OwnerReliability,
+  plc.LastEditorReliability,
+  plc.MovingAvg30d,
+  plc.ExponentialPopularityGlobal,
+  plc.LinkCount,
+  plc.DuplicateOf,
+  plc.AvgCommentLength,
+  plc.TotalComments,
+  plc.QualityScore,
+  plc.RankByType,
+  plc.GlobalRank,
+  -- flag suspicious posts: high score but low owner reliability or many downvotes relative to upvotes
+  CASE
+    WHEN plc.QualityScore > 1000 AND (plc.OwnerReliability IS NULL OR plc.OwnerReliability < 100) THEN 'HighQuality_LowReliabilityOwner'
+    WHEN plc.DownVotes > plc.UpVotes * 1.5 AND plc.QualityScore < 0 THEN 'Controversial'
+    WHEN plc.DuplicateOf IS NOT NULL THEN 'Duplicate'
+    WHEN plc.TagCount = 0 THEN 'Untagged'
+    ELSE 'Normal'
+  END AS PostStatus,
+  -- create an illustrative signature string using complex string expressions and null logic
+  (COALESCE(NULLIF((SELECT DisplayName FROM Users u WHERE u.Id = plc.OwnerUserId LIMIT 1),''),'[deleted]')
+   || ' | ' ||
+   COALESCE((SELECT Name FROM PostTypes pt WHERE pt.Id = plc.PostTypeId),'UnknownType')
+   || ' | Q:' || COALESCE(plc.QualityScore::text,'0')
+   || ' | Rk:' || plc.GlobalRank::text
+  ) AS DiagnosticSignature
+FROM PostLinkComments plc
+-- pick a diverse sample: top by quality but include some randomization via set operator
+WHERE plc.PostId IN (
+  SELECT PostId FROM PostLinkComments WHERE GlobalRank <= 200
+  UNION
+  SELECT PostId FROM PostLinkComments WHERE (GlobalRank BETWEEN 201 AND 2000) AND (GlobalRank % 13 = 0)
+  UNION
+  SELECT PostId FROM PostLinkComments WHERE TagCount > 5 AND random() < 0.01
+)
+ORDER BY plc.QualityScore DESC NULLS LAST, plc.ExponentialPopularityGlobal DESC
+LIMIT 500;

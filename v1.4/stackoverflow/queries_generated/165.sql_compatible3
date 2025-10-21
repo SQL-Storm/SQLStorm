@@ -1,0 +1,126 @@
+WITH recent_activity AS (
+  SELECT
+    p.OwnerUserId,
+    MAX(p.CreationDate) AS last_post_date,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_last_30d,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_last_30d
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+  GROUP BY p.OwnerUserId
+),
+user_enriched AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS user_creation,
+    u.LastAccessDate,
+    u.Location,
+    COALESCE(u.AboutMe, '') AS about_me,
+    COALESCE(u.Views, 0) AS views,
+    COALESCE(u.UpVotes, 0) AS up_votes,
+    COALESCE(u.DownVotes, 0) AS down_votes,
+    u.ProfileImageUrl,
+    NULL AS EmailHash,
+    COALESCE(r.last_post_date, TIMESTAMP '1900-01-01') AS last_post_date,
+    COALESCE(r.questions_last_30d, 0) AS questions_last_30d,
+    COALESCE(r.answers_last_30d, 0) AS answers_last_30d
+  FROM Users u
+  LEFT JOIN recent_activity r ON r.OwnerUserId = u.Id
+),
+activity_score AS (
+  SELECT
+    ue.user_id,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.user_creation,
+    ue.last_post_date,
+    ue.questions_last_30d,
+    ue.answers_last_30d,
+    (COALESCE(ue.Reputation,0) * 2
+     + COALESCE(ue.questions_last_30d,0) * 5
+     + COALESCE(ue.answers_last_30d,0) * 3
+     + CASE WHEN ue.last_post_date > (CAST('2024-10-01' AS DATE) - INTERVAL '15 days') THEN 10 ELSE 0 END
+     ) AS activity_score
+  FROM user_enriched ue
+),
+top_users AS (
+  SELECT
+    a.user_id,
+    a.DisplayName,
+    a.Reputation,
+    a.user_creation,
+    a.last_post_date,
+    a.questions_last_30d,
+    a.answers_last_30d,
+    a.activity_score,
+    ROW_NUMBER() OVER (
+      ORDER BY a.activity_score DESC, a.Reputation DESC, a.last_post_date DESC NULLS LAST
+    ) AS rn
+  FROM activity_score a
+),
+post_links_summary AS (
+  SELECT
+    ul.user_id,
+    COUNT(DISTINCT pl.RelatedPostId) AS linked_post_count,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS duplicates_linked
+  FROM top_users ul
+  LEFT JOIN Posts p ON p.OwnerUserId = ul.user_id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  GROUP BY ul.user_id
+),
+badge_activity AS (
+  SELECT
+    u.Id AS user_id,
+    COUNT(*) AS badge_count,
+    STRING_AGG(b.Name, ',') AS badge_names
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+recent_comments AS (
+  SELECT
+    c.UserId,
+    COUNT(*) AS comment_count_last_30
+  FROM Comments c
+  WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+  GROUP BY c.UserId
+),
+final_select AS (
+  SELECT
+    t.user_id,
+    t.DisplayName,
+    t.Reputation,
+    t.user_creation,
+    t.last_post_date,
+    t.questions_last_30d,
+    t.answers_last_30d,
+    t.activity_score,
+    COALESCE(b.badge_count, 0) AS badge_count,
+    COALESCE(b.badge_names, '') AS badge_names,
+    COALESCE(pls.linked_post_count, 0) AS linked_post_count,
+    COALESCE(pls.duplicates_linked, 0) AS duplicates_linked,
+    COALESCE(rc.comment_count_last_30, 0) AS comment_count_last_30
+  FROM top_users t
+  LEFT JOIN badge_activity b ON b.user_id = t.user_id
+  LEFT JOIN post_links_summary pls ON pls.user_id = t.user_id
+  LEFT JOIN recent_comments rc ON rc.user_id = t.user_id
+)
+SELECT
+  user_id,
+  DisplayName,
+  Reputation,
+  user_creation,
+  last_post_date,
+  questions_last_30d,
+  answers_last_30d,
+  activity_score,
+  badge_count,
+  badge_names,
+  linked_post_count,
+  duplicates_linked,
+  comment_count_last_30
+FROM final_select
+WHERE rn <= 100
+ORDER BY activity_score DESC, Reputation DESC
+;

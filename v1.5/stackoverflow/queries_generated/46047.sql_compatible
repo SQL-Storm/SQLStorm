@@ -1,0 +1,135 @@
+WITH RECURSIVE UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        COUNT(DISTINCT a.Id) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalQuestionScore,
+        COALESCE(SUM(a.Score), 0) as TotalAnswerScore,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.CreationDate >= (DATE '2024-10-01') - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5 OR COUNT(DISTINCT a.Id) > 10
+),
+TagExpertise AS (
+    SELECT 
+        u.Id as UserId,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as PostsInTag,
+        AVG(p.Score) as AvgScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as AcceptedAnswers,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag_name
+    INNER JOIN Tags t ON t.TagName = tag_name
+    WHERE p.PostTypeId = 2
+        AND p.CreationDate >= (DATE '2024-10-01') - INTERVAL '2 years'
+    GROUP BY u.Id, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 3
+),
+QuestionQualityMetrics AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        COUNT(DISTINCT pl.RelatedPostId) as LinkedQuestions,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownVotes,
+        EXTRACT(EPOCH FROM (COALESCE(q.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - q.CreationDate)) / 3600 as HoursUntilClosed,
+        COUNT(DISTINCT ph.Id) as EditCount,
+        DENSE_RANK() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC) as UserQuestionRank
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id AND pl.LinkTypeId = 1
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= (DATE '2024-10-01') - INTERVAL '2 years'
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, 
+             q.FavoriteCount, q.CommentCount, q.AcceptedAnswerId, q.ClosedDate, q.CreationDate
+),
+AnswerPerformance AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.OwnerUserId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        q.Score as QuestionScore,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 60 as MinutesToAnswer,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) as AnswerPosition,
+        COUNT(DISTINCT c.Id) as AnswerCommentCount,
+        a.CommentCount as TotalComments
+    FROM Posts a
+    INNER JOIN Posts q ON q.Id = a.ParentId
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= (DATE '2024-10-01') - INTERVAL '2 years'
+        AND q.PostTypeId = 1
+    GROUP BY a.Id, a.OwnerUserId, a.ParentId, a.Score, q.Score, 
+             q.AcceptedAnswerId, a.CreationDate, q.CreationDate, a.CommentCount
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) as GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) as SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) as BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) as TagBasedBadges,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Name) FILTER (WHERE b.Class = 1) as GoldBadgeNames
+    FROM Badges b
+    WHERE b.Date >= (DATE '2024-10-01') - INTERVAL '3 years'
+    GROUP BY b.UserId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', uem.CreationDate)) as YearsActive,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.TotalQuestionScore,
+    uem.TotalAnswerScore,
+    ROUND(CAST(uem.TotalQuestionScore AS NUMERIC) / NULLIF(uem.QuestionCount, 0), 2) as AvgQuestionScore,
+    ROUND(CAST(uem.TotalAnswerScore AS NUMERIC) / NULLIF(uem.AnswerCount, 0), 2) as AvgAnswerScore,
+    te.TagName as TopTag,
+    te.PostsInTag as TopTagPosts,
+    ROUND(te.AvgScore, 2) as TopTagAvgScore,
+    bp.GoldBadges,
+    bp.SilverBadges,
+    bp.BronzeBadges,
+    bp.TagBasedBadges,
+    COALESCE(AVG(qqm.ViewCount), 0) as AvgQuestionViews,
+    COALESCE(AVG(qqm.AnswerCount), 0) as AvgAnswersReceived,
+    COALESCE(SUM(qqm.HasAcceptedAnswer), 0) as QuestionsWithAcceptedAnswers,
+    COALESCE(COUNT(DISTINCT ap.AnswerId) FILTER (WHERE ap.IsAccepted = 1), 0) as AcceptedAnswers,
+    COALESCE(AVG(ap.MinutesToAnswer) FILTER (WHERE ap.IsAccepted = 1), 0) as AvgMinutesToAcceptedAnswer,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ap.AnswerScore) as MedianAnswerScore,
+    uem.CommentCount,
+    uem.VotesCast,
+    ROUND(CAST(uem.Reputation AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM AGE(TIMESTAMP '2024-10-01 12:34:56', uem.CreationDate)) / 86400, 0), 2) as ReputationPerDay
+FROM UserEngagementMetrics uem
+LEFT JOIN TagExpertise te ON te.UserId = uem.Id AND te.TagRank = 1
+LEFT JOIN BadgeProgression bp ON bp.UserId = uem.Id
+LEFT JOIN QuestionQualityMetrics qqm ON qqm.OwnerUserId = uem.Id
+LEFT JOIN AnswerPerformance ap ON ap.OwnerUserId = uem.Id
+WHERE uem.Reputation > 1000
+GROUP BY uem.Id, uem.DisplayName, uem.Reputation, uem.CreationDate, uem.QuestionCount,
+         uem.AnswerCount, uem.TotalQuestionScore, uem.TotalAnswerScore,
+         te.TagName, te.PostsInTag, te.AvgScore, bp.GoldBadges, bp.SilverBadges,
+         bp.BronzeBadges, bp.TagBasedBadges, uem.CommentCount, uem.VotesCast
+HAVING COUNT(DISTINCT ap.AnswerId) > 5
+ORDER BY uem.Reputation DESC, uem.TotalAnswerScore DESC
+LIMIT 500;

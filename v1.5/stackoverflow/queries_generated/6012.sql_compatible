@@ -1,0 +1,49 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    MAX(p.CreationDate) AS LastQuestionDate,
+    SUM(v.BountyAmount) AS TotalBountyEarned,
+    STRING_AGG(DISTINCT t.Name, ',') AS TopTags,
+    AVG(NULLIF(v2.Score, 0)) OVER (PARTITION BY u.Id) AS AvgVoteScorePerPost,
+    CASE
+        WHEN u.Reputation >= 20000 THEN 'Legendary'
+        WHEN u.Reputation >= 10000 THEN 'Expert'
+        WHEN u.Reputation >= 1000 THEN 'Experienced'
+        ELSE 'Newbie'
+    END AS Tier,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+FROM
+    Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 2
+LEFT JOIN Votes v2 ON v2.UserId = u.Id
+LEFT JOIN (
+    SELECT
+        pt.OwnerUserId,
+        t1.TagName,
+        t2.Name
+    FROM
+        Posts pt
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(pt.Tags, 2, length(pt.Tags)-2), '><')) AS TagName
+    ) t1 ON true
+    JOIN Tags t2 ON t2.TagName = t1.TagName
+) t ON t.OwnerUserId = u.Id
+WHERE
+    u.AccountId IS NOT NULL
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+ORDER BY
+    Reputation DESC NULLS LAST,
+    LastQuestionDate DESC
+LIMIT 100;

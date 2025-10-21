@@ -1,0 +1,178 @@
+-- {"query": "9080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5071} 
+
+WITH TopQuestionViews AS (
+    SELECT 
+        p.Id      AS QuestionId, 
+        p.Title, 
+        p.ViewCount,
+        ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId, 
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionCommentStats AS (
+    SELECT 
+        c.PostId AS QuestionId,
+        COUNT(*) AS CommentsCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    JOIN Posts p 
+      ON c.PostId = p.Id 
+     AND p.PostTypeId = 1
+    GROUP BY c.PostId
+),
+AverageYearlyViews AS (
+    SELECT AVG(p.ViewCount) AS AvgView 
+    FROM Posts p 
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+PopularCleanQuestions AS (
+    SELECT Id 
+    FROM Posts 
+    WHERE PostTypeId = 1 
+      AND ViewCount > 10000
+    EXCEPT
+    SELECT Id 
+    FROM Posts 
+    WHERE Score < 0
+),
+AnswerOrUpvoteCounts AS (
+    SELECT 
+        COALESCE(a.ParentId, v.PostId) AS QuestionId,
+        COALESCE(a.AnswerCount,0) AS AnswerCount,
+        COALESCE(v.UpvoteCount,0) AS UpvoteCount
+    FROM (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a
+    FULL OUTER JOIN (
+        SELECT PostId, COUNT(*) AS UpvoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) v
+      ON a.ParentId = v.PostId
+),
+ResponseTimes AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        EXTRACT(EPOCH FROM AVG(p.CreationDate - q.CreationDate)) AS AvgResponseSecs
+    FROM Posts p
+    JOIN Posts q 
+      ON q.Id = p.ParentId
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+FilteredQuestions AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        COALESCE(q.ViewCount,0) AS Views,
+        COALESCE(q.Score,0)     AS Score,
+        COALESCE(qcounts.AnswerCount,0) AS Answers,
+        COALESCE(qcounts.UpvoteCount,0) AS Upvotes,
+        COALESCE(st.CommentsCount,0)    AS Comments,
+        COALESCE(ub.GoldBadges,0)        AS GoldBadges,
+        COALESCE(rt.AvgResponseSecs,-1)  AS AvgRespSecs,
+        q.Tags
+    FROM Posts q
+    LEFT JOIN QuestionCommentStats   st  ON q.Id = st.QuestionId
+    LEFT JOIN UserBadgeCounts        ub  ON q.OwnerUserId = ub.UserId
+    LEFT JOIN AnswerOrUpvoteCounts   qcounts ON q.Id = qcounts.QuestionId
+    LEFT JOIN ResponseTimes          rt  ON q.Id = rt.QuestionId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= NOW() - INTERVAL '1 year'
+      AND q.Id IN (SELECT QuestionId FROM TopQuestionViews WHERE ViewRank <= 500)
+      AND q.Id IN (SELECT Id FROM PopularCleanQuestions)
+      AND q.ViewCount > (SELECT AvgView FROM AverageYearlyViews)
+),
+ExplodedTags AS (
+    SELECT 
+        fq.Id      AS QuestionId,
+        LOWER(t.tag) AS TagName
+    FROM FilteredQuestions fq
+    CROSS JOIN LATERAL UNNEST(
+        string_to_array(
+            substring(fq.Tags, 2, length(fq.Tags)-2),
+            '><'
+        )
+    ) AS t(tag)
+),
+RankedAnswers AS (
+    SELECT
+        a.ParentId   AS QuestionId,
+        a.Id         AS AnswerId,
+        a.Score,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId 
+            ORDER BY a.Score DESC, a.CreationDate ASC
+        ) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+Final AS (
+    SELECT
+        fq.Id,
+        fq.Title,
+        fq.Views,
+        fq.Score,
+        fq.Answers,
+        fq.Upvotes,
+        fq.Comments,
+        fq.GoldBadges,
+        fq.AvgRespSecs,
+        tq.ViewRank,
+        ra.AnswerRank,
+        et.TagName,
+        CONCAT(
+            u.DisplayName,
+            '@',
+            COALESCE(
+                SUBSTRING(u.Location,1,20),
+                'Unknown'
+            )
+        ) AS UserLoc,
+        CASE 
+            WHEN fq.Views > 50000 THEN 'Epic'
+            WHEN fq.Views > 20000 THEN 'High'
+            ELSE 'Normal'
+        END AS Popularity,
+        LENGTH(fq.Title) - LENGTH(REPLACE(fq.Title,' ','')) AS DashCount
+    FROM FilteredQuestions fq
+    LEFT JOIN TopQuestionViews tq ON fq.Id = tq.QuestionId
+    LEFT JOIN RankedAnswers    ra ON fq.Id = ra.QuestionId AND ra.AnswerRank = 1
+    LEFT JOIN ExplodedTags     et ON fq.Id = et.QuestionId
+    LEFT JOIN Users u 
+      ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = fq.Id)
+)
+SELECT DISTINCT
+    F.Id,
+    F.Title,
+    F.Views,
+    F.Score,
+    F.Answers,
+    F.Upvotes,
+    F.Comments,
+    F.GoldBadges,
+    F.AvgRespSecs,
+    F.ViewRank,
+    F.AnswerRank,
+    F.TagName,
+    F.UserLoc,
+    F.Popularity,
+    F.DashCount
+FROM Final F
+ORDER BY F.Views DESC, F.Score DESC, F.AnswerRank ASC
+LIMIT 100;

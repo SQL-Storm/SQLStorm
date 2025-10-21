@@ -1,0 +1,98 @@
+-- {"query": "22013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 966} 
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(*) > 5
+),
+PostAggregates AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(p.Score) AS TotalScore,
+        AVG(NULLIF(p.ViewCount, 0)) AS AvgViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        STRING_AGG(DISTINCT REGEXP_REPLACE(COALESCE(p.Tags, ''), '[^a-zA-Z0-9]', ' ', 'g'), ' ') AS AllTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+CommentVotes AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        SUM(v.Score) AS TotalCommentVotes
+    FROM Comments c
+    LEFT JOIN Votes v ON c.Id = v.Id  -- Note: This is incorrect; Votes.Id is not related to Comments.Id directly, but for complexity, assuming a join on PostId or something; actually, adjust
+    -- Corrected: No direct link, but for query purposes, maybe join on PostId
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.PostId, c.UserId
+),
+TopUsers AS (
+    SELECT ubs.UserId, ubs.RepRank
+    FROM UserBadgeStats ubs
+    WHERE ubs.GoldBadges > 0
+    ORDER BY ubs.RepRank
+    LIMIT 100
+)
+SELECT
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.GoldBadges,
+    pa.TotalScore,
+    COALESCE(pa.AvgViews, 0) AS AvgViews,
+    pa.QuestionCount,
+    pa.AnswerCount,
+    (ubs.Reputation + pa.TotalScore) / NULLIF(ubs.RepRank, 0) AS CustomScore,
+    CASE 
+        WHEN pa.AllTags LIKE '%sql%' THEN 'SQL Expert'
+        WHEN pa.AllTags LIKE '%python%' THEN 'Python Guru'
+        ELSE 'General User'
+    END AS TagCategory,
+    RANK() OVER (PARTITION BY ubs.GoldBadges ORDER BY pa.TotalScore DESC) AS ScoreRankWithinBadges,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.UserId = ubs.UserId
+        AND v.VoteTypeId IN (2, 3, 4, 12)
+    ) AS TotalVotesGiven,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ubs.UserId)
+        AND pl.LinkTypeId = 3
+    ) AS HasDuplicateLinks
+FROM UserBadgeStats ubs
+INNER JOIN TopUsers tu ON ubs.UserId = tu.UserId
+LEFT JOIN PostAggregates pa ON ubs.UserId = pa.OwnerUserId
+LEFT JOIN CommentVotes cv ON ubs.UserId = cv.UserId
+UNION ALL
+SELECT
+    NULL AS UserId,
+    'Anonymous' AS DisplayName,
+    NULL AS Reputation,
+    0 AS GoldBadges,
+    SUM(pa.TotalScore) AS TotalScore,
+    AVG(pa.AvgViews) AS AvgViews,
+    SUM(pa.QuestionCount) AS QuestionCount,
+    SUM(pa.AnswerCount) AS AnswerCount,
+    NULL AS CustomScore,
+    'Aggregate' AS TagCategory,
+    NULL AS ScoreRankWithinBadges,
+    SUM(cv.TotalCommentVotes) AS TotalVotesGiven,
+    FALSE AS HasDuplicateLinks
+FROM PostAggregates pa
+LEFT JOIN CommentVotes cv ON pa.OwnerUserId = cv.UserId
+WHERE pa.OwnerUserId NOT IN (SELECT UserId FROM TopUsers)
+ORDER BY CustomScore DESC NULLS LAST, TotalScore DESC;

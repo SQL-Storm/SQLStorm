@@ -1,0 +1,135 @@
+-- {"query": "16067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 158780, "output_tokens": 146568} 
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) AS YearsActive,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY COALESCE(u.Views, 0)) AS ViewPercentile
+    FROM Users u
+    WHERE u.Reputation > 1000
+        AND u.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS HasAcceptedAnswer,
+        COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(p.Body, ' ', '')), 0) AS WordCount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(COALESCE(p.Tags, '')) - 2), '><') AS TagArray,
+        AVG(v.VoteTypeId) FILTER (WHERE v.VoteTypeId IN (2, 3)) OVER (PARTITION BY p.OwnerUserId) AS AvgVoteType,
+        COUNT(c.Id) AS CommentCountActual,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC NULLS LAST) AS PostRankInType
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '5 years'
+        AND p.PostTypeId IN (1, 2)
+        AND (p.ClosedDate IS NULL OR p.Score > 5)
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.AcceptedAnswerId, p.Body, p.Tags
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        NTILE(10) OVER (ORDER BY t.Count DESC) AS PopularityDecile,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count AS CountDiffFromNext
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Name END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(*), 0) AS TagBasedRatio
+    FROM Badges b
+    WHERE b.Date >= cast('2024-10-01' as date) - INTERVAL '3 years'
+    GROUP BY b.UserId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.ReputationRank,
+    ROUND(uem.ViewPercentile::NUMERIC, 4) AS ViewPercentile,
+    COALESCE(pp.PostCount, 0) AS TotalPosts,
+    COALESCE(ROUND(pp.AvgScore::NUMERIC, 2), 0) AS AvgPostScore,
+    COALESCE(pp.MaxViewCount, 0) AS MaxViewCount,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName) FILTER (WHERE tp.PopularityDecile <= 3) AS TopTierTags,
+    CASE 
+        WHEN uem.YearsActive >= 5 AND uem.Reputation >= 10000 THEN 'Veteran'
+        WHEN uem.YearsActive >= 3 AND uem.Reputation >= 5000 THEN 'Experienced'
+        WHEN uem.YearsActive >= 1 AND uem.Reputation >= 1000 THEN 'Intermediate'
+        ELSE 'Novice'
+    END AS UserCategory,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.UserId = uem.Id 
+         AND ph.PostHistoryTypeId IN (4, 5, 6)
+         AND ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year') AS EditContributions,
+    COALESCE(
+        (SELECT AVG(p2.Score) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = uem.Id 
+             AND p2.PostTypeId = 2 
+             AND p2.Id = p2.ParentId IS FALSE
+             AND p2.CreationDate >= cast('2024-10-01' as date) - INTERVAL '6 months'), 0
+    ) AS RecentAnswerAvgScore,
+    EXISTS(
+        SELECT 1 
+        FROM Posts p3
+        INNER JOIN PostLinks pl ON p3.Id = pl.PostId
+        WHERE p3.OwnerUserId = uem.Id 
+            AND pl.LinkTypeId = 3
+    ) AS HasDuplicatePost
+FROM UserEngagementMetrics uem
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) AS PostCount,
+        AVG(pp_inner.Score) AS AvgScore,
+        MAX(pp_inner.ViewCount) AS MaxViewCount,
+        SUM(pp_inner.HasAcceptedAnswer) AS AcceptedAnswerCount
+    FROM PostPerformance pp_inner
+    WHERE pp_inner.OwnerUserId = uem.Id
+        AND pp_inner.PostRankInType <= 100
+) pp ON true
+LEFT JOIN BadgeAchievements ba ON uem.Id = ba.UserId
+LEFT JOIN PostPerformance pp2 ON pp2.OwnerUserId = uem.Id AND pp2.PostTypeId = 1
+LEFT JOIN LATERAL UNNEST(pp2.TagArray) AS tag_elem ON true
+LEFT JOIN TagPopularity tp ON tp.TagName = tag_elem
+WHERE uem.ReputationRank <= 5000
+    AND (pp.PostCount IS NULL OR pp.PostCount >= 5)
+    AND uem.NetVotes > 0
+GROUP BY 
+    uem.Id,
+    uem.DisplayName, 
+    uem.Reputation, 
+    uem.ReputationRank, 
+    uem.ViewPercentile,
+    uem.YearsActive,
+    pp.PostCount,
+    pp.AvgScore,
+    pp.MaxViewCount,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.BronzeBadges
+HAVING COUNT(DISTINCT pp2.PostId) > 0
+ORDER BY 
+    WeightedBadgeScore DESC NULLS LAST,
+    uem.Reputation DESC,
+    AvgPostScore DESC
+LIMIT 500;

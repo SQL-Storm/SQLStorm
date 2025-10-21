@@ -1,0 +1,81 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.Score, 
+    p.ViewCount, 
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS ViewCountRank
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1
+),
+TopPosts AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.Score, 
+    p.ViewCount, 
+    p.Title
+  FROM 
+    RankedPosts p
+  WHERE 
+    p.ScoreRank <= 10 OR p.ViewCountRank <= 10
+),
+UserReputation AS (
+  SELECT 
+    u.Id, 
+    u.Reputation, 
+    COUNT(b.Id) AS BadgeCount
+  FROM 
+    Users u
+  LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id, u.Reputation
+),
+PostOwners AS (
+  SELECT 
+    p.Id, 
+    p.OwnerUserId, 
+    u.Reputation, 
+    u.DisplayName
+  FROM 
+    Posts p
+  LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+)
+SELECT 
+  p.Id, 
+  p.PostTypeId, 
+  p.Score, 
+  p.ViewCount, 
+  p.Title, 
+  po.OwnerUserId, 
+  po.Reputation, 
+  po.DisplayName, 
+  ur.BadgeCount, 
+  ph.Comment AS PostHistoryComment, 
+  ph.Text AS PostHistoryText, 
+  v.VoteTypeId, 
+  v.UserId AS VoteUserId
+FROM 
+  Posts p
+LEFT JOIN 
+  PostOwners po ON p.Id = po.Id
+LEFT JOIN 
+  UserReputation ur ON po.OwnerUserId = ur.Id
+LEFT JOIN 
+  PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+  Votes v ON p.Id = v.PostId
+WHERE 
+  p.Id IN (SELECT Id FROM TopPosts)
+  AND ph.PostHistoryTypeId = 10
+  AND v.VoteTypeId = 2
+  AND p.Score > 10
+  AND p.ViewCount > 100
+ORDER BY 
+  p.Score DESC, 
+  p.ViewCount DESC;

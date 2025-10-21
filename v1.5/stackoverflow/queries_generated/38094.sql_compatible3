@@ -1,0 +1,268 @@
+with recent_users as (
+  select u.id as user_id, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+active_questions as (
+  select p.id as question_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.owneruserid,
+         p.tags,
+         coalesce(p.answercount, 0) as answercount
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+  select a.id as answer_id, a.parentid as question_id, a.owneruserid as answer_user_id, a.score as answer_score, a.creationdate
+  from posts a
+  where a.posttypeid = 2
+),
+first_answer as (
+  select question_id,
+         min(creationdate) as first_answer_date
+  from answers
+  group by question_id
+),
+votes_agg as (
+  select v.postid,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 12) as spam_votes,
+         count(*) filter (where v.votetypeid = 10) as delete_votes
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+  group by c.postid
+),
+linked_clusters as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 1) as linked_count,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_mark_count
+  from postlinks pl
+  group by pl.postid
+),
+tag_expansion as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags from 2 for char_length(q.tags) - 2), '><')) as tag
+  from active_questions q
+  where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+  select tag,
+         count(*) as tag_q_count,
+         percentile_cont(0.5) within group (order by aq.score) as tag_median_score,
+         avg(aq.viewcount) as tag_avg_views
+  from tag_expansion te
+  join active_questions aq on aq.question_id = te.question_id
+  group by tag
+  order by tag_q_count desc
+  limit 50
+),
+owner_stats as (
+  select u.id as user_id,
+         u.reputation,
+         u.upvotes,
+         u.downvotes,
+         u.views as profile_views,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.reputation, u.upvotes, u.downvotes, u.views
+),
+q_edit_bursts as (
+  select ph.postid as question_id,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+         count(*) filter (where ph.posthistorytypeid = 24) as suggested_edits_applied,
+         max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  join posts p on p.id = ph.postid and p.posttypeid = 1
+  where ph.creationdate >= (select max(creationdate) - interval '365 days' from posthistory)
+  group by ph.postid
+),
+q_close_reasons as (
+  select ph.postid as question_id,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+         count(*) filter (where ph.posthistorytypeid in (35,36)) as migrations
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11,35,36)
+  group by ph.postid
+),
+answerers as (
+  select a.question_id,
+         count(distinct a.answer_user_id) as distinct_answerers,
+         avg(a.answer_score) as avg_answer_score,
+         min(a.creationdate) as first_answer_date
+  from answers a
+  group by a.question_id
+),
+question_owner as (
+  select p.id as question_id, p.owneruserid as owner_user_id
+  from posts p
+  where p.posttypeid = 1
+),
+owner_activity_window as (
+  select qa.question_id,
+         u.id as owner_user_id,
+         count(c.id) as owner_comment_count_last30d
+  from active_questions qa
+  join users u on u.id = (select owneruserid from posts where id = qa.question_id)
+  left join comments c
+    on c.userid = u.id
+   and c.creationdate >= (select max(creationdate) - interval '30 days' from comments)
+  group by qa.question_id, u.id
+),
+ranked_questions as (
+  select aq.question_id,
+         aq.creationdate,
+         aq.score,
+         aq.viewcount,
+         aq.answercount,
+         coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+         coalesce(va.spam_votes,0) as spam_votes,
+         coalesce(va.delete_votes,0) as delete_votes,
+         coalesce(ca.comment_count,0) as comment_count,
+         ca.last_comment_date,
+         coalesce(lc.linked_count,0) as linked_count,
+         coalesce(lc.duplicate_mark_count,0) as duplicate_mark_count,
+         coalesce(qeb.edit_count,0) as edit_count,
+         coalesce(qeb.suggested_edits_applied,0) as suggested_edits_applied,
+         qeb.last_edit_date,
+         coalesce(qcr.close_events,0) as close_events,
+         coalesce(qcr.reopen_events,0) as reopen_events,
+         coalesce(qcr.migrations,0) as migrations,
+         coalesce(ans.distinct_answerers,0) as distinct_answerers,
+         ans.avg_answer_score,
+         fa.first_answer_date,
+         oa.owner_user_id,
+         os.reputation as owner_reputation,
+         os.gold_badges,
+         os.silver_badges,
+         os.bronze_badges,
+         os.profile_views,
+         oaw.owner_comment_count_last30d,
+         extract(epoch from (coalesce(fa.first_answer_date, timestamp '2024-10-01 12:34:56') - aq.creationdate))/3600.0 as hrs_to_first_answer
+  from active_questions aq
+  left join votes_agg va on va.postid = aq.question_id
+  left join comment_activity ca on ca.postid = aq.question_id
+  left join linked_clusters lc on lc.question_id = aq.question_id
+  left join q_edit_bursts qeb on qeb.question_id = aq.question_id
+  left join q_close_reasons qcr on qcr.question_id = aq.question_id
+  left join answerers ans on ans.question_id = aq.question_id
+  left join first_answer fa on fa.question_id = aq.question_id
+  left join question_owner qo on qo.question_id = aq.question_id
+  left join owner_stats os on os.user_id = qo.owner_user_id
+  left join owner_activity_window oaw on oaw.question_id = aq.question_id
+),
+tag_enriched as (
+  select rq.*,
+         te.tag
+  from ranked_questions rq
+  left join tag_expansion te on te.question_id = rq.question_id
+),
+tag_scored as (
+  select te.*,
+         coalesce(tt.tag_q_count,0) as tag_q_count,
+         coalesce(tt.tag_median_score,0) as tag_median_score,
+         coalesce(tt.tag_avg_views,0) as tag_avg_views
+  from tag_enriched te
+  left join top_tags tt on tt.tag = te.tag
+),
+question_aggregated as (
+  select
+    question_id,
+    min(creationdate) as creationdate,
+    max(score) as score,
+    max(viewcount) as viewcount,
+    max(answercount) as answercount,
+    max(net_votes) as net_votes,
+    max(spam_votes) as spam_votes,
+    max(delete_votes) as delete_votes,
+    max(comment_count) as comment_count,
+    max(last_comment_date) as last_comment_date,
+    max(linked_count) as linked_count,
+    max(duplicate_mark_count) as duplicate_mark_count,
+    max(edit_count) as edit_count,
+    max(suggested_edits_applied) as suggested_edits_applied,
+    max(last_edit_date) as last_edit_date,
+    max(close_events) as close_events,
+    max(reopen_events) as reopen_events,
+    max(migrations) as migrations,
+    max(distinct_answerers) as distinct_answerers,
+    avg(avg_answer_score) as avg_answer_score,
+    max(first_answer_date) as first_answer_date,
+    max(owner_user_id) as owner_user_id,
+    max(owner_reputation) as owner_reputation,
+    max(gold_badges) as gold_badges,
+    max(silver_badges) as silver_badges,
+    max(bronze_badges) as bronze_badges,
+    max(profile_views) as profile_views,
+    max(owner_comment_count_last30d) as owner_comment_count_last30d,
+    max(hrs_to_first_answer) as hrs_to_first_answer,
+    array_agg(distinct tag) filter (where tag is not null) as tags,
+    sum(tag_q_count) as sum_tag_popularity,
+    avg(tag_median_score) as avg_tag_median_score,
+    avg(tag_avg_views) as avg_tag_avg_views
+  from tag_scored
+  group by question_id
+),
+scored as (
+  select qa.*,
+         (
+           0.30 * least(1.0, coalesce(viewcount,0) / 5000.0) +
+           0.25 * least(1.0, greatest(0, coalesce(score,0)) / 10.0) +
+           0.15 * least(1.0, coalesce(answercount,0) / 5.0) +
+           0.10 * least(1.0, coalesce(net_votes,0) / 15.0) +
+           0.05 * least(1.0, coalesce(linked_count,0) / 10.0) +
+           0.05 * (1.0 - least(1.0, coalesce(hrs_to_first_answer, 1e9) / 72.0)) +
+           0.05 * least(1.0, coalesce(sum_tag_popularity,0) / 200.0) +
+           0.03 * least(1.0, coalesce(avg_tag_median_score,0) / 5.0) +
+           0.02 * least(1.0, coalesce(owner_reputation,0) / 50000.0)
+         ) as hotness_score
+  from question_aggregated qa
+)
+select
+  s.question_id,
+  s.creationdate,
+  s.score,
+  s.viewcount,
+  s.answercount,
+  s.net_votes,
+  s.comment_count,
+  s.linked_count,
+  s.duplicate_mark_count,
+  s.edit_count,
+  s.close_events,
+  s.reopen_events,
+  s.distinct_answerers,
+  s.first_answer_date,
+  s.owner_user_id,
+  s.owner_reputation,
+  s.gold_badges,
+  s.silver_badges,
+  s.bronze_badges,
+  s.profile_views,
+  s.owner_comment_count_last30d,
+  s.hrs_to_first_answer,
+  s.tags,
+  s.sum_tag_popularity,
+  s.avg_tag_median_score,
+  s.avg_tag_avg_views,
+  s.hotness_score
+from scored s
+where coalesce(s.close_events,0) = 0
+order by s.hotness_score desc nulls last, s.viewcount desc nulls last, s.score desc nulls last
+limit 200;

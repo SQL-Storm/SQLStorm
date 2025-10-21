@@ -1,0 +1,157 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM Posts
+    WHERE Posts.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+),
+UserActivity AS (
+    SELECT 
+        Users.Id, 
+        Users.Reputation, 
+        Users.CreationDate, 
+        Users.DisplayName, 
+        Users.LastAccessDate, 
+        Users.WebsiteUrl, 
+        Users.Location, 
+        Users.AboutMe, 
+        Users.Views, 
+        Users.UpVotes, 
+        Users.DownVotes, 
+        Users.ProfileImageUrl, 
+        Users.EmailHash, 
+        Users.AccountId
+    FROM Users
+    WHERE Users.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '14' DAY
+),
+BadgeSummary AS (
+    SELECT 
+        Badges.UserId, 
+        COUNT(Badges.Id) AS TotalBadges, 
+        SUM(CASE WHEN Badges.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN Badges.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN Badges.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY Badges.UserId
+),
+PostVotes AS (
+    SELECT 
+        Votes.PostId, 
+        COUNT(Votes.Id) AS TotalVotes, 
+        SUM(CASE WHEN Votes.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, 
+        SUM(CASE WHEN Votes.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY Votes.PostId
+)
+SELECT 
+    RP.Id AS PostId, 
+    RP.PostTypeId, 
+    RP.AcceptedAnswerId, 
+    RP.ParentId, 
+    RP.CreationDate, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.Body, 
+    RP.OwnerUserId, 
+    RP.OwnerDisplayName, 
+    RP.LastEditorUserId, 
+    RP.LastEditorDisplayName, 
+    RP.LastEditDate, 
+    RP.LastActivityDate, 
+    RP.Title, 
+    RP.Tags, 
+    RP.AnswerCount, 
+    RP.CommentCount, 
+    RP.FavoriteCount, 
+    RP.ClosedDate, 
+    RP.CommunityOwnedDate, 
+    RP.ContentLicense, 
+    UA.Reputation, 
+    UA.CreationDate AS UserCreationDate, 
+    UA.DisplayName AS UserDisplayName, 
+    UA.LastAccessDate AS UserLastAccessDate, 
+    UA.WebsiteUrl AS UserWebsiteUrl, 
+    UA.Location AS UserLocation, 
+    UA.AboutMe AS UserAboutMe, 
+    UA.Views AS UserViews, 
+    UA.UpVotes AS UserUpVotes, 
+    UA.DownVotes AS UserDownVotes, 
+    UA.ProfileImageUrl AS UserProfileImageUrl, 
+    UA.EmailHash AS UserEmailHash, 
+    UA.AccountId AS UserId, 
+    BS.TotalBadges, 
+    BS.GoldBadges, 
+    BS.SilverBadges, 
+    BS.BronzeBadges, 
+    PV.TotalVotes AS PostTotalVotes, 
+    PV.UpVotes AS PostUpVotes, 
+    PV.DownVotes AS PostDownVotes
+FROM RecentPosts RP
+LEFT JOIN UserActivity UA ON RP.OwnerUserId = UA.Id
+LEFT JOIN BadgeSummary BS ON RP.OwnerUserId = BS.UserId
+LEFT JOIN PostVotes PV ON RP.Id = PV.PostId
+GROUP BY 
+    RP.Id,
+    RP.PostTypeId,
+    RP.AcceptedAnswerId,
+    RP.ParentId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.Body,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.LastEditorUserId,
+    RP.LastEditorDisplayName,
+    RP.LastEditDate,
+    RP.LastActivityDate,
+    RP.Title,
+    RP.Tags,
+    RP.AnswerCount,
+    RP.CommentCount,
+    RP.FavoriteCount,
+    RP.ClosedDate,
+    RP.CommunityOwnedDate,
+    RP.ContentLicense,
+    UA.Reputation,
+    UA.CreationDate,
+    UA.DisplayName,
+    UA.LastAccessDate,
+    UA.WebsiteUrl,
+    UA.Location,
+    UA.AboutMe,
+    UA.Views,
+    UA.UpVotes,
+    UA.DownVotes,
+    UA.ProfileImageUrl,
+    UA.EmailHash,
+    UA.AccountId,
+    BS.TotalBadges,
+    BS.GoldBadges,
+    BS.SilverBadges,
+    BS.BronzeBadges,
+    PV.TotalVotes,
+    PV.UpVotes,
+    PV.DownVotes
+ORDER BY RP.CreationDate DESC, RP.Score DESC
+LIMIT 100;

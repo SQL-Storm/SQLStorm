@@ -1,0 +1,69 @@
+WITH UserBadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate,
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS BadgeRank
+    FROM Badges
+    GROUP BY UserId
+),
+PostStats AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score * 1.0) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxViewCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents
+    FROM Posts p
+    LEFT JOIN PostHistory ph 
+        ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (10, 11)
+    WHERE p.PostTypeId = 1
+    GROUP BY OwnerUserId
+),
+CommentActivity AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalComments,
+        MAX(CreationDate) AS LastCommentDate,
+        STRING_AGG(CAST(SUBSTRING(Text, 1, 20) AS VARCHAR(100)), '; ' ORDER BY CreationDate DESC) AS RecentCommentPreviews
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoritesGiven,
+        CAST(PERCENT_RANK() OVER (ORDER BY COUNT(*) DESC) AS DECIMAL(10,3)) AS VotePercentile
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(ubs.GoldBadges, 0) + COALESCE(ubs.SilverBadges, 0) * 0.5 + COALESCE(ubs.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    ps.TotalPosts,
+    ps.AvgPostScore,
+    ps.MaxViewCount,
+    ps.CloseEvents,
+    ca.TotalComments,
+    CASE WHEN va.DownvotesGiven = 0 THEN NULL ELSE CAST(va.UpvotesGiven AS FLOAT) / CAST(va.DownvotesGiven AS FLOAT) END AS VoteRatio,
+    (u.UpVotes * 2) - (u.DownVotes * 0.5) + (ps.TotalPosts * 0.3) + (ca.TotalComments * 0.1) AS EngagementScore,
+    RANK() OVER (ORDER BY (u.Reputation * 0.3 + COALESCE(ps.AvgPostScore, 0) * 0.5 + COALESCE(va.VotePercentile, 0) * 0.2) DESC) AS GlobalRank,
+    DENSE_RANK() OVER (PARTITION BY CASE WHEN u.Reputation > 100000 THEN 'Top' ELSE 'Regular' END ORDER BY u.Reputation DESC) AS ReputationTier
+FROM Users u
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+LEFT JOIN CommentActivity ca ON u.Id = ca.UserId
+LEFT JOIN VoteAnalysis va ON u.Id = va.UserId
+WHERE u.Reputation > 100
+    AND (ps.CloseEvents < 5 OR ps.CloseEvents IS NULL)
+    AND (ubs.LastBadgeDate > (DATE '2024-10-01' - INTERVAL '1 year') OR ubs.LastBadgeDate IS NULL)
+ORDER BY EngagementScore DESC, GlobalRank ASC;

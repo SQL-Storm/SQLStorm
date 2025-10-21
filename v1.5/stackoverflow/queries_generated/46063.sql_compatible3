@@ -1,0 +1,108 @@
+WITH high_value_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+question_metrics AS (
+    SELECT 
+        p.Id as question_id,
+        p.OwnerUserId,
+        p.Score as question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        COALESCE(ans.Id, 0) as accepted_answer_id,
+        COALESCE(ans.Score, 0) as accepted_answer_score,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as downvotes,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) as linked_questions,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 5) as edit_count
+    FROM Posts p
+    LEFT JOIN Posts ans ON p.AcceptedAnswerId = ans.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+        AND p.Score > 5
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.FavoriteCount, p.CreationDate, ans.Id, ans.Score
+),
+tag_popularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.Score) as avg_question_score,
+        SUM(p.ViewCount) as total_views
+    FROM Tags t
+    INNER JOIN Posts p ON (string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><') && ARRAY[t.TagName])
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.TagName, t.Count
+),
+user_answer_quality AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(p.Id) as total_answers,
+        COUNT(CASE WHEN parent.AcceptedAnswerId = p.Id THEN 1 END) as accepted_answers,
+        AVG(p.Score) as avg_answer_score,
+        MAX(p.Score) as best_answer_score,
+        COUNT(DISTINCT p.ParentId) as questions_answered
+    FROM Posts p
+    INNER JOIN Posts parent ON p.ParentId = parent.Id
+    WHERE p.PostTypeId = 2
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) > 10
+)
+SELECT 
+    hvu.DisplayName,
+    hvu.Reputation,
+    hvu.badge_count,
+    hvu.gold_badges,
+    COALESCE(COUNT(DISTINCT qm.question_id), 0) as questions_asked,
+    COALESCE(AVG(qm.question_score), 0) as avg_question_score,
+    COALESCE(SUM(qm.ViewCount), 0) as total_question_views,
+    COALESCE(AVG(qm.AnswerCount), 0) as avg_answers_per_question,
+    COALESCE(uaq.total_answers, 0) as total_answers_given,
+    COALESCE(uaq.accepted_answers, 0) as accepted_answers,
+    COALESCE(uaq.avg_answer_score, 0) as avg_answer_score,
+    COALESCE(uaq.best_answer_score, 0) as best_answer_score,
+    ROUND(COALESCE(CAST(uaq.accepted_answers AS DECIMAL) / NULLIF(uaq.total_answers, 0) AS DECIMAL), 2) * 100 as acceptance_rate,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - hvu.CreationDate)) as account_age_days,
+    ROUND(CAST(hvu.Reputation AS DECIMAL) / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - hvu.CreationDate)), 0), 2) as reputation_per_day
+FROM high_value_users hvu
+LEFT JOIN question_metrics qm ON hvu.Id = qm.OwnerUserId
+LEFT JOIN user_answer_quality uaq ON hvu.Id = uaq.OwnerUserId
+WHERE (qm.question_id IS NOT NULL OR uaq.total_answers > 0)
+GROUP BY 
+    hvu.Id,
+    hvu.DisplayName, 
+    hvu.Reputation, 
+    hvu.badge_count, 
+    hvu.gold_badges,
+    hvu.CreationDate,
+    uaq.total_answers,
+    uaq.accepted_answers,
+    uaq.avg_answer_score,
+    uaq.best_answer_score
+HAVING COUNT(DISTINCT qm.question_id) + COALESCE(uaq.total_answers, 0) > 20
+ORDER BY 
+    (COALESCE(AVG(qm.question_score), 0) * 0.3 + 
+     COALESCE(uaq.avg_answer_score, 0) * 0.4 + 
+     COALESCE(uaq.accepted_answers, 0) * 0.3) DESC,
+    hvu.Reputation DESC
+LIMIT 100;

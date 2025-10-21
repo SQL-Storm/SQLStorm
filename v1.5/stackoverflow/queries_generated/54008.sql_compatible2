@@ -1,0 +1,79 @@
+WITH
+    /* Decompose each question into its constituent tags */
+    question_tags AS (
+        SELECT
+            p.Id                    AS post_id,
+            unnest(string_to_array(p.Tags, '><')) AS tag_name
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+
+    /* Aggregate question statistics per tag */
+    tag_stats AS (
+        SELECT
+            qt.tag_name                                    AS tag_name,
+            COUNT(*)                                         AS question_count,
+            SUM(p.Score)                                     AS total_score,
+            AVG(p.Score)                                     AS avg_score,
+            SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_answers,
+            SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END)        AS closed_questions
+        FROM question_tags qt
+        JOIN Posts p ON p.Id = qt.post_id
+        GROUP BY qt.tag_name
+    ),
+
+    /* Count duplicate links that reference a question containing the same tag */
+    duplicate_counts AS (
+        SELECT
+            t.TagName                                        AS tag_name,
+            COUNT(*)                                         AS duplicate_cnt
+        FROM Tags t
+        JOIN PostLinks l ON l.LinkTypeId = 3
+        JOIN Posts dup ON dup.Id = l.RelatedPostId
+        JOIN Posts owner ON owner.Id = l.PostId
+        WHERE EXISTS (
+            SELECT 1
+            FROM unnest(string_to_array(dup.Tags, '><')) AS dup_tag
+            WHERE dup_tag = t.TagName
+        )
+          AND EXISTS (
+            SELECT 1
+            FROM unnest(string_to_array(owner.Tags, '><')) AS owner_tag
+            WHERE owner_tag = t.TagName
+        )
+        GROUP BY t.TagName
+    ),
+
+    /* Top three users (by reputation) who posted questions with each tag */
+    top_users AS (
+        SELECT
+            qt.tag_name,
+            array_to_string(
+                array(
+                    SELECT DISTINCT u.DisplayName
+                    FROM Users u
+                    JOIN Posts p ON p.OwnerUserId = u.Id
+                    WHERE p.Id = qt.post_id
+                    ORDER BY u.Reputation DESC
+                    LIMIT 3
+                ),
+                ', '
+            ) AS top_users
+        FROM question_tags qt
+        GROUP BY qt.tag_name
+    )
+
+SELECT
+    ts.tag_name,
+    ts.question_count,
+    ts.total_score,
+    ts.avg_score,
+    ts.accepted_answers,
+    ts.closed_questions,
+    COALESCE(dc.duplicate_cnt, 0)           AS duplicate_cnt,
+    tu.top_users
+FROM tag_stats ts
+LEFT JOIN duplicate_counts dc ON dc.tag_name = ts.tag_name
+LEFT JOIN top_users tu ON tu.tag_name = ts.tag_name
+ORDER BY ts.question_count DESC
+LIMIT 25;

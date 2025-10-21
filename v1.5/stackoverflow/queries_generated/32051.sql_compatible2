@@ -1,0 +1,43 @@
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName, 
+    p.Id AS PostId, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    COALESCE(c.CommentCount, 0) AS CommentCount, 
+    COALESCE(v.VoteCount, 0) AS VoteCount, 
+    COALESCE(b.BadgeCount, 0) AS BadgeCount
+FROM 
+    Users AS u
+JOIN 
+    (
+        SELECT OwnerUserId, COUNT(Id) AS PostCount, SUM(Score) AS TotalScore 
+        FROM Posts 
+        WHERE PostTypeId = 1 
+        GROUP BY OwnerUserId
+    ) AS p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (
+        SELECT PostId, COUNT(Id) AS CommentCount 
+        FROM Comments 
+        GROUP BY PostId
+    ) AS c ON p.Id = c.PostId
+LEFT JOIN 
+    (
+        SELECT PostId, COUNT(Id) AS VoteCount 
+        FROM Votes 
+        WHERE VoteTypeId IN (2, 3) 
+        GROUP BY PostId
+    ) AS v ON p.Id = v.PostId
+LEFT JOIN 
+    (
+        SELECT UserId, COUNT(Id) AS BadgeCount 
+        FROM Badges 
+        GROUP BY UserId
+    ) AS b ON u.Id = b.UserId
+WHERE 
+    p.TotalScore > 100
+ORDER BY 
+    p.TotalScore DESC, p.PostCount DESC
+LIMIT 10;

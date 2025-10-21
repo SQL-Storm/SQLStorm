@@ -1,0 +1,48 @@
+-- {"query": "36029.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 500} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(DISTINCT v.Id) AS TotalVotes,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+  COUNT(DISTINCT c.Id) AS CommentCountTotal,
+  MAX(p.LastActivityDate) AS LastActivity,
+  ARRAY_AGG(DISTINCT t.Name) FILTER (WHERE pt.Id = 1) AS TagsUsed,
+  SUM(CASE WHEN (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 16) > 0 THEN 1 ELSE 0 END) AS ModeratorVotes,
+  (SELECT COUNT(*) FROM Posts AS q WHERE q.ParentId = p.Id AND q.PostTypeId = 2) AS AnswerCount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Tags t ON t.Id = (
+  CASE
+    WHEN p.PostTypeId = 1 THEN (SELECT CAST(SPLIT_PART(p.Tags, '><', generate_series(1, xml_count(p.Tags))) AS INT) FROM Posts t2 WHERE t2.Id = p.Id LIMIT 1)
+    ELSE NULL
+  END
+)
+LEFT JOIN Comments c ON c.PostId = p.Id
+WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+  AND p.PostTypeId IN (1, 2)
+  AND (p.Tags IS NULL OR LENGTH(p.Tags) = 0 OR p.Tags <> '')
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  p.OwnerUserId,
+  u.DisplayName
+HAVING COUNT(DISTINCT v.Id) > 0
+ORDER BY
+  p.Score DESC,
+  LastActivity DESC
+LIMIT 100;

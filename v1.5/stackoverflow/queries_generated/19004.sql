@@ -1,0 +1,277 @@
+-- {"query": "19004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4143} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Aggregate various user engagement metrics, including average post interval
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        -- Calculate the average time difference in days between consecutive posts by the user
+        AVG(EXTRACT(EPOCH FROM (current_post.CreationDate - prev_post.CreationDate)) / (60 * 60 * 24)) AS AvgPostIntervalDays,
+        -- Count recent post history edits by the user within the last 6 months of their last access
+        (SELECT COUNT(ph.Id)
+         FROM PostHistory ph
+         WHERE ph.UserId = U.Id
+           AND ph.CreationDate > (U.LastAccessDate - INTERVAL '6 months')) AS RecentHistoryEditsCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    -- Lateral join to calculate the difference between consecutive posts for each user
+    LEFT JOIN LATERAL (
+        SELECT
+            p_inner.CreationDate,
+            LAG(p_inner.CreationDate, 1) OVER (ORDER BY p_inner.CreationDate) AS prev_creation_date
+        FROM Posts p_inner
+        WHERE p_inner.OwnerUserId = U.Id
+        ORDER BY p_inner.CreationDate
+    ) AS current_post ON P.CreationDate = current_post.CreationDate
+    LEFT JOIN LATERAL (
+        SELECT p_prev.CreationDate
+        FROM Posts p_prev
+        WHERE p_prev.OwnerUserId = U.Id AND p_prev.CreationDate = current_post.prev_creation_date
+    ) AS prev_post ON prev_post.CreationDate IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    -- CTE 2: Extract detailed metrics for posts, including parsed tags and linked post statistics
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (CASE WHEN P.CommunityOwnedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS IsCommunityWiki,
+        -- Correlated subquery for average comment score
+        (SELECT AVG(COALESCE(C.Score, 0)) FROM Comments C WHERE C.PostId = P.Id) AS AvgCommentScore,
+        -- Parse tags into an array
+        ARRAY(SELECT TRIM(unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')))) AS ParsedTags,
+        -- Count linked posts (LinkTypeId = 1)
+        (SELECT COUNT(pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = P.Id AND pl.LinkTypeId = 1) AS LinkedPostCount,
+        -- Count duplicate posts (LinkTypeId = 3)
+        (SELECT COUNT(pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = P.Id AND pl.LinkTypeId = 3) AS DuplicatePostCount,
+        -- Average score of directly linked posts
+        (SELECT AVG(pr.Score)
+         FROM PostLinks pl_inner
+         JOIN Posts pr ON pl_inner.RelatedPostId = pr.Id
+         WHERE pl_inner.PostId = P.Id AND pl_inner.LinkTypeId = 1) AS AvgScoreOfLinkedPosts,
+        -- Date of the last significant edit (title, body, or tags)
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = P.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        -- Row number to pick top N recent posts per user
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS rn_latest_post_by_user
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+),
+TagPerformance AS (
+    -- CTE 3: Analyze performance and popularity of individual tags
+    SELECT
+        unnest_tag.Tag AS TagName,
+        COUNT(DISTINCT pd.PostId) AS TaggedPostCount,
+        SUM(pd.PostScore) AS TotalTagScore,
+        AVG(pd.PostScore) AS AvgTagPostScore,
+        AVG(pd.ViewCount) AS AvgTagPostViewCount,
+        COUNT(DISTINCT pd.OwnerUserId) AS UniqueTagOwners
+    FROM PostDetails pd
+    CROSS JOIN LATERAL unnest(pd.ParsedTags) AS unnest_tag(Tag)
+    WHERE unnest_tag.Tag IS NOT NULL AND unnest_tag.Tag != ''
+    GROUP BY unnest_tag.Tag
+    HAVING COUNT(DISTINCT pd.PostId) > 50 -- Filter for sufficiently used tags
+),
+TopTagsByInfluence AS (
+    -- CTE 4: Rank tags by a combined influence metric, for potential later join
+    SELECT
+        tp.TagName,
+        tp.TaggedPostCount,
+        tp.AvgTagPostScore,
+        RANK() OVER (ORDER BY (tp.AvgTagPostScore * tp.TaggedPostCount * COALESCE(tp.AvgTagPostViewCount,1) / 100.0) DESC) AS TagInfluenceRank
+    FROM TagPerformance tp
+),
+UserPostPerformance AS (
+    -- CTE 5: Combine user and post details, focusing on top-performing questions for each user
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalComments,
+        ue.TotalPostScore,
+        ue.TotalPostViews,
+        ue.TotalBadges,
+        ue.AvgPostIntervalDays,
+        ue.RecentHistoryEditsCount,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.PostCreationDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.FavoriteCount,
+        pd.BodyLength,
+        pd.TitleLength,
+        pd.HasAcceptedAnswer,
+        pd.IsCommunityWiki,
+        pd.AvgCommentScore,
+        pd.ParsedTags,
+        pd.LinkedPostCount,
+        pd.DuplicatePostCount,
+        COALESCE(pd.AvgScoreOfLinkedPosts, 0) AS AvgScoreOfLinkedPosts,
+        pd.LastEditDate,
+        -- Calculate an individual post's influence score
+        (pd.PostScore * 0.4 + COALESCE(pd.ViewCount, 0) * 0.01 + COALESCE(pd.FavoriteCount, 0) * 0.5 + COALESCE(pd.AnswerCount, 0) * 0.3 + COALESCE(pd.LinkedPostCount, 0) * 0.2 + COALESCE(pd.AvgCommentScore, 0) * 0.1) AS IndividualPostInfluenceScore,
+        -- Rank posts by influence for each user
+        RANK() OVER (PARTITION BY ue.UserId ORDER BY (pd.PostScore * 0.4 + COALESCE(pd.ViewCount, 0) * 0.01 + COALESCE(pd.FavoriteCount, 0) * 0.5 + COALESCE(pd.AnswerCount, 0) * 0.3 + COALESCE(pd.LinkedPostCount, 0) * 0.2 + COALESCE(pd.AvgCommentScore, 0) * 0.1) DESC) AS UserPostInfluenceRank
+    FROM UserEngagement ue
+    JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+    WHERE pd.rn_latest_post_by_user <= 10 -- Consider up to 10 most recent posts
+      AND pd.PostTypeId = 1 -- Focus only on questions for this performance metric
+      AND pd.CreationDate IS NOT NULL AND pd.LastEditDate IS NOT NULL -- Ensure valid dates
+),
+ConsolidatedUserMetrics AS (
+    -- CTE 6: Final aggregated user metrics for comprehensive ranking and filtering
+    SELECT
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        upp.UserCreationDate,
+        upp.LastAccessDate,
+        upp.TotalPosts,
+        upp.TotalQuestions,
+        upp.TotalAnswers,
+        upp.TotalComments,
+        upp.TotalPostScore,
+        upp.TotalPostViews,
+        upp.TotalBadges,
+        upp.AvgPostIntervalDays,
+        upp.RecentHistoryEditsCount,
+        AVG(upp.IndividualPostInfluenceScore) AS AvgUserTopQuestionsInfluenceScore,
+        SUM(CASE WHEN upp.HasAcceptedAnswer != -1 THEN 1 ELSE 0 END) AS AcceptedAnswerCountForUserQuestions, -- For their questions that have accepted answers
+        COUNT(DISTINCT unnest(upp.ParsedTags)) AS DistinctTagsUsedInTopQuestions,
+        -- Count of comments the user has received on their questions with score > 0
+        (SELECT COUNT(c.Id)
+         FROM Comments c
+         JOIN Posts p_q ON c.PostId = p_q.Id
+         WHERE p_q.OwnerUserId = upp.UserId AND p_q.PostTypeId = 1 AND c.Score > 0) AS PositiveCommentCountOnQuestions,
+        -- Average length of comments on the user's questions
+        (SELECT AVG(LENGTH(c.Text))
+         FROM Comments c
+         JOIN Posts p_q ON c.PostId = p_q.Id
+         WHERE p_q.OwnerUserId = upp.UserId AND p_q.PostTypeId = 1) AS AvgCommentLengthOnQuestions
+    FROM UserEngagement ue
+    JOIN UserPostPerformance upp ON ue.UserId = upp.UserId
+    GROUP BY
+        upp.UserId, upp.DisplayName, upp.Reputation, ue.UserCreationDate, ue.LastAccessDate,
+        upp.TotalPosts, upp.TotalQuestions, upp.TotalAnswers, upp.TotalComments, upp.TotalPostScore,
+        upp.TotalPostViews, upp.TotalBadges, upp.AvgPostIntervalDays, upp.RecentHistoryEditsCount
+)
+-- Main Query: Identify highly influential users based on a multi-faceted scoring model
+SELECT
+    cum.UserId,
+    cum.DisplayName,
+    cum.Reputation,
+    cum.UserCreationDate,
+    cum.LastAccessDate,
+    cum.TotalPosts,
+    cum.TotalQuestions,
+    cum.TotalAnswers,
+    cum.TotalComments,
+    cum.TotalPostScore,
+    cum.TotalPostViews,
+    cum.TotalBadges,
+    cum.AvgPostIntervalDays,
+    cum.RecentHistoryEditsCount,
+    cum.AvgUserTopQuestionsInfluenceScore,
+    cum.AcceptedAnswerCountForUserQuestions,
+    cum.DistinctTagsUsedInTopQuestions,
+    cum.PositiveCommentCountOnQuestions,
+    COALESCE(cum.AvgCommentLengthOnQuestions, 0) AS AvgCommentLengthOnQuestions,
+    -- Classify user based on their primary engagement type
+    CASE
+        WHEN cum.TotalQuestions > COALESCE(cum.TotalAnswers, 0) * 1.5 AND cum.TotalQuestions > 0 THEN 'Primary Questioner'
+        WHEN cum.TotalAnswers > COALESCE(cum.TotalQuestions, 0) * 1.5 AND cum.TotalAnswers > 0 THEN 'Primary Answerer'
+        WHEN cum.TotalComments > (COALESCE(cum.TotalQuestions, 0) + COALESCE(cum.TotalAnswers, 0)) * 0.75 AND cum.TotalComments > 0 THEN 'Active Commenter'
+        WHEN cum.TotalPosts > 0 THEN 'General Contributor'
+        ELSE 'Passive User'
+    END AS UserEngagementType,
+    -- Complex overall influence score for the user
+    (cum.Reputation * 0.15 +
+     cum.TotalPostScore * 0.2 +
+     COALESCE(cum.AvgUserTopQuestionsInfluenceScore, 0) * 0.25 +
+     cum.TotalBadges * 0.5 +
+     (COALESCE(cum.TotalQuestions, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)::numeric) * 100 * 0.05 + -- Question ratio
+     (COALESCE(cum.TotalAnswers, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)::numeric) * 100 * 0.05 + -- Answer ratio
+     (COALESCE(cum.TotalPostViews, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)::numeric) * 0.01 + -- Avg view per post
+     cum.RecentHistoryEditsCount * 0.1 +
+     COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.UserId = cum.UserId AND v.VoteTypeId = 8), 0) * 0.2 + -- Total Bounty given
+     cum.PositiveCommentCountOnQuestions * 0.05
+    ) AS UserOverallInfluenceScore,
+    -- Average body length of their most highly-rated questions (top 3 by score)
+    (SELECT AVG(pd_inner.BodyLength)
+     FROM PostDetails pd_inner
+     WHERE pd_inner.OwnerUserId = cum.UserId AND pd_inner.PostTypeId = 1
+     ORDER BY pd_inner.PostScore DESC
+     LIMIT 3) AS AvgTopRatedQuestionBodyLength,
+    -- Identify a user's most used and impactful tag
+    (SELECT t_user.TagName
+     FROM (
+         SELECT unnest_tag.Tag AS TagName, COUNT(pd_user.PostId) AS TagUsageCount
+         FROM PostDetails pd_user
+         CROSS JOIN LATERAL unnest(pd_user.ParsedTags) AS unnest_tag(Tag)
+         WHERE pd_user.OwnerUserId = cum.UserId AND unnest_tag.Tag IS NOT NULL
+         GROUP BY unnest_tag.Tag
+         ORDER BY TagUsageCount DESC, AVG(pd_user.PostScore) DESC
+         LIMIT 1
+     ) AS t_user
+    ) AS UsersMostImpactfulTag,
+    -- Global ranking of users by their comprehensive influence score
+    DENSE_RANK() OVER (ORDER BY (
+        cum.Reputation * 0.15 +
+        cum.TotalPostScore * 0.2 +
+        COALESCE(cum.AvgUserTopQuestionsInfluenceScore, 0) * 0.25 +
+        cum.TotalBadges * 0.5 +
+        (COALESCE(cum.TotalQuestions, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)::numeric) * 100 * 0.05 +
+        (COALESCE(cum.TotalAnswers, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)::numeric) * 100 * 0.05 +
+        (COALESCE(cum.TotalPostViews, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)::numeric) * 0.01 +
+        cum.RecentHistoryEditsCount * 0.1 +
+        COALESCE((SELECT SUM(v_inner.BountyAmount) FROM Votes v_inner WHERE v_inner.UserId = cum.UserId AND v_inner.VoteTypeId = 8), 0) * 0.2 +
+        cum.PositiveCommentCountOnQuestions * 0.05
+    ) DESC) AS OverallUserRank
+FROM ConsolidatedUserMetrics cum
+WHERE
+    cum.Reputation > 7500 -- Filter for high reputation users
+    AND cum.TotalPosts > 20 -- Minimum post count
+    AND cum.TotalBadges > 10 -- Minimum badge count
+    AND cum.LastAccessDate > (NOW() - INTERVAL '6 months') -- Recently active users
+    AND COALESCE(cum.AvgPostIntervalDays, 9999) < 90 -- Users who post relatively frequently
+    AND (
+        cum.DisplayName ILIKE '%engineer%' OR cum.DisplayName ILIKE '%architect%' OR -- Specific keywords in display name
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = cum.UserId AND b.Class = 1 AND b.Date > (NOW() - INTERVAL '2 year')) -- Has a Gold badge awarded in the last 2 years
+    )
+    AND cum.AvgUserTopQuestionsInfluenceScore IS NOT NULL -- Ensure they have contributing questions
+ORDER BY OverallUserRank ASC, cum.Reputation DESC, cum.UserOverallInfluenceScore DESC
+LIMIT 100;

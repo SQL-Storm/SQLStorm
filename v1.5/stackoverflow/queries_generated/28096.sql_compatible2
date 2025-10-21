@@ -1,0 +1,75 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+RankedUsers AS (
+    SELECT 
+        au.*,
+        RANK() OVER (PARTITION BY au.JoinYear ORDER BY au.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY au.GoldBadges DESC) AS BadgeRank
+    FROM ActiveUsers au
+),
+PostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        SUM(v.BountyAmount) AS TotalBounty,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpvotedPosts,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEvents
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,8)
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    GROUP BY p.OwnerUserId
+),
+TagAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(DISTINCT t.Id) AS UniqueTagsUsed,
+        SUM(CASE WHEN p.Tags IS NOT NULL THEN
+            (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))) / LENGTH('><') + 1
+        ELSE 0 END) AS TotalTagsCreated
+    FROM Posts p
+    JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY UserId
+)
+SELECT 
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.BadgeRank,
+    ps.AvgQuestionScore,
+    ps.TotalBounty,
+    COALESCE(ta.UniqueTagsUsed, 0) / NULLIF(LOG(ru.Reputation), 0) AS TagComplexityIndex,
+    (ru.QuestionCount * 3 + ru.AnswerCount * 2 + ru.CommentCount) * 
+        CASE WHEN ru.JoinYear < 2012 THEN 1.5 ELSE 1.0 END AS ActivityScore,
+    (ps.UpvotedPosts - ps.CloseEvents) * 1.0 / NULLIF(ru.QuestionCount, 0) AS QualityRatio,
+    COALESCESTRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 3), '|') AS TagPrefixes
+FROM RankedUsers ru
+LEFT JOIN PostStats ps ON ru.Id = ps.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ru.Id = ta.UserId
+LEFT JOIN Posts p ON ru.Id = p.OwnerUserId
+LEFT JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0
+WHERE ru.GoldBadges > 0
+    AND (ps.AvgQuestionScore > 5 OR ps.TotalBounty > 100)
+    AND (ru.JoinYear BETWEEN 2010 AND 2020)
+GROUP BY 
+    ru.DisplayName, ru.Reputation, ru.ReputationRank, ru.BadgeRank, 
+    ps.AvgQuestionScore, ps.TotalBounty, ta.UniqueTagsUsed, 
+    ru.QuestionCount, ru.AnswerCount, ru.CommentCount, 
+    ps.UpvotedPosts, ps.CloseEvents, ru.JoinYear
+HAVING COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    ReputationRank ASC, 
+    ActivityScore DESC, 
+    QualityRatio DESC NULLS LAST
+LIMIT 100;

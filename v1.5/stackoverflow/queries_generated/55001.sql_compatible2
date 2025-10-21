@@ -1,0 +1,104 @@
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30 days'
+      AND p.PostTypeId = 1   -- questions only
+),
+user_stats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreated,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+tag_agg AS (
+    SELECT
+        unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) AS TagName,
+        rp.OwnerUserId,
+        COUNT(*) AS TagUseCount,
+        SUM(rp.Score) AS TagScoreSum,
+        AVG(rp.ViewCount) AS TagViewAvg
+    FROM recent_posts rp
+    WHERE rp.rn = 1
+    GROUP BY TagName, rp.OwnerUserId
+),
+post_history_stats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS DistinctEditors
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30 days'
+    GROUP BY ph.PostId
+),
+link_stats AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30 days'
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.Id AS QuestionId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.UpVotesGiven,
+    u.DownVotesGiven,
+    ph.EditCount,
+    ph.LastEditDate,
+    ph.DistinctEditors,
+    ls.LinkedCount,
+    ls.DuplicateCount,
+    json_agg(
+        json_build_object(
+            'Tag', ta.TagName,
+            'UseCount', ta.TagUseCount,
+            'ScoreSum', ta.TagScoreSum,
+            'ViewAvg', ta.TagViewAvg
+        )
+    ) AS TagMetrics
+FROM recent_posts rp
+JOIN Users u ON u.Id = rp.OwnerUserId
+LEFT JOIN user_stats us ON us.UserId = u.Id
+LEFT JOIN post_history_stats ph ON ph.PostId = rp.Id
+LEFT JOIN link_stats ls ON ls.PostId = rp.Id
+LEFT JOIN tag_agg ta ON ta.OwnerUserId = rp.OwnerUserId
+WHERE rp.rn = 1
+GROUP BY
+    rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount,
+    rp.AnswerCount, rp.FavoriteCount,
+    u.Reputation, u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+    u.UpVotesGiven, u.DownVotesGiven,
+    ph.EditCount, ph.LastEditDate, ph.DistinctEditors,
+    ls.LinkedCount, ls.DuplicateCount
+ORDER BY rp.Score DESC, rp.ViewCount DESC
+LIMIT 100;

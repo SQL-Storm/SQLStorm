@@ -1,0 +1,154 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(p.AnswerCount) AS TotalAnswered,
+      AVG(p.Score) AS AvgQuestionScore,
+      MAX(p.CreationDate) AS LastQuestionDate
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  UserVoteStats AS (
+    SELECT
+      v.UserId,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCount,
+      MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes AS v
+    JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  COALESCE(upa.QuestionCount, 0) AS QuestionsAsked,
+  COALESCE(upa.TotalAnswered, 0) AS AnswersGiven,
+  COALESCE(upa.AvgQuestionScore, 0) AS AverageQuestionScore,
+  COALESCE(uca.CommentCount, 0) AS CommentsMade,
+  COALESCE(uca.AvgCommentScore, 0) AS AverageCommentScore,
+  COALESCE(uvs.UpVoteCount, 0) AS TotalUpvotes,
+  COALESCE(uvs.DownVoteCount, 0) AS TotalDownvotes,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 1
+  ) AS GoldBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 2
+  ) AS SilverBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 3
+  ) AS BronzeBadges,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteCategory,
+  COALESCE(rpe.EditDate, u.LastAccessDate) AS LastActivityIndicator,
+  COUNT(DISTINCT ph.Id) AS PostHistoryEventCount,
+  SUM(
+    CASE
+      WHEN ph.PostHistoryTypeId = 10 THEN 1
+      WHEN ph.PostHistoryTypeId = 12 THEN 1
+      WHEN ph.PostHistoryTypeId = 14 THEN 1
+      ELSE 0
+    END
+  ) AS ModerationEventCount,
+  STRING_AGG(DISTINCT pt.Name, ', ') WITHIN GROUP (
+    ORDER BY
+      pt.Name
+  ) AS PostTypesEdited,
+  COALESCE(
+    (
+      SELECT
+        COUNT(DISTINCT pl.Id)
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    ),
+    0
+  ) AS RelatedPostLinks
+FROM Users AS u
+LEFT JOIN UserPostActivity AS upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN UserCommentActivity AS uca
+  ON u.Id = uca.UserId
+LEFT JOIN UserVoteStats AS uvs
+  ON u.Id = uvs.UserId
+LEFT JOIN RankedPostEdits AS rpe
+  ON u.Id = rpe.UserId AND rpe.rn = 1
+LEFT JOIN Posts AS p
+  ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistory AS ph
+  ON p.Id = ph.PostId AND ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 10, 12, 14)
+LEFT JOIN PostHistoryTypes AS pht
+  ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+WHERE
+  u.Id BETWEEN 1000 AND 5000 AND u.Reputation > 1000 AND u.DisplayName NOT LIKE '%[^a-zA-Z0-9 ]%' AND (
+    u.Location IS NULL OR LENGTH(u.Location) < 50
+  )
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  upa.QuestionCount,
+  upa.TotalAnswered,
+  upa.AvgQuestionScore,
+  uca.CommentCount,
+  uca.AvgCommentScore,
+  uvs.UpVoteCount,
+  uvs.DownVoteCount,
+  u.WebsiteUrl,
+  u.LastAccessDate,
+  rpe.EditDate
+HAVING
+  COUNT(DISTINCT ph.Id) > 5 OR COUNT(DISTINCT p.Id) > 2
+ORDER BY
+  u.Reputation DESC,
+  LastActivityIndicator DESC
+LIMIT 100;

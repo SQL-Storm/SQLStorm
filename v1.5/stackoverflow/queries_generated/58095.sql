@@ -1,0 +1,37 @@
+-- {"query": "58095.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1263} 
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsAsked,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswersProvided,
+    (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND v.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT STRING_AGG(TagName, ', ') FROM Tags t WHERE t.Id IN (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1)) AS FrequentTags,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId = 5) AS EditBodyEvents,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Comments c ON u.Id = c.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    u.CreationDate >= '2015-01-01' 
+    AND p.PostTypeId IN (1, 2)
+    AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.CreationDate >= '2020-01-01')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10 
+    AND COUNT(DISTINCT c.Id) > 5
+ORDER BY 
+    (QuestionsAsked * 2 + AnswersProvided * 1.5 + GoldBadges * 10) DESC
+LIMIT 100;

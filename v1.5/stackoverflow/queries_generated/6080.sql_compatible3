@@ -1,0 +1,37 @@
+SELECT
+  u."DisplayName" AS "UserName",
+  u."Reputation",
+  COUNT(DISTINCT p."Id") AS "PostCount",
+  AVG(COALESCE(p."Score", 0)) AS "AvgPostScore",
+  SUM(COALESCE(p."ViewCount", 0)) AS "TotalViews",
+  MAX(p."LastActivityDate") AS "LastActivity",
+  STRING_AGG(DISTINCT t."Name", ',') FILTER (WHERE t."Name" IS NOT NULL) AS "PostTypesSeen",
+  COALESCE(SUM(CASE WHEN v."VoteTypeId" = 2 THEN 1 ELSE 0 END), 0) AS "UpVotesCast",
+  COALESCE(SUM(CASE WHEN v."VoteTypeId" = 3 THEN 1 ELSE 0 END), 0) AS "DownVotesCast",
+  COALESCE(SUM(CASE WHEN v."VoteTypeId" = 6 THEN 1 ELSE 0 END), 0) AS "CloseVotesCast",
+  CASE
+    WHEN u."AccountId" IS NULL THEN NULL
+    ELSE (
+      SELECT AVG((EXTRACT(EPOCH FROM (ph."CreationDate" - u."CreationDate")) / 86400.0))
+      FROM "PostHistory" ph
+      WHERE ph."UserId" = u."Id"
+        AND ph."PostId" IS NOT NULL
+    )
+  END AS "AvgTimeToFirstEditDays"
+FROM
+  "Users" u
+  LEFT JOIN "Posts" p ON p."OwnerUserId" = u."Id"
+  LEFT JOIN "PostTypes" t ON p."PostTypeId" = t."Id"
+  LEFT JOIN "Votes" v ON v."PostId" = p."Id"
+WHERE
+  u."Reputation" > 1000
+  AND u."CreationDate" < (DATE '2024-10-01' - INTERVAL '1 year')
+  AND (p."PostTypeId" = 1 OR p."PostTypeId" = 2)
+GROUP BY
+  u."Id", u."DisplayName", u."Reputation", u."AccountId"
+HAVING
+  COUNT(DISTINCT p."Id") > 5
+ORDER BY
+  AVG(COALESCE(p."Score", 0)) DESC
+LIMIT 100
+OFFSET 0;

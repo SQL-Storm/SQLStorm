@@ -1,0 +1,122 @@
+WITH RecursiveUserTree AS (
+    SELECT
+        Users.Id AS UserId,
+        Users.DisplayName,
+        Users.Reputation,
+        Users.CreationDate,
+        Users.LastAccessDate,
+        Users.Views,
+        Users.UpVotes,
+        Users.DownVotes,
+        CAST(NULL AS INT) AS ReferrerId
+    FROM
+        Users
+    WHERE
+        Users.Id = 1
+    UNION ALL
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        rut.UserId
+    FROM
+        Users u
+        INNER JOIN RecursiveUserTree rut ON u.AccountId = rut.UserId
+),
+RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Body,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2) AND
+        p.CreationDate > DATE_TRUNC('month', cast('2024-10-01 12:34:56' as timestamp)) - INTERVAL '1 year'
+),
+HighVoteUsers AS (
+    SELECT
+        v.UserId,
+        COUNT(v.PostId) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+        Votes v
+    WHERE
+        v.CreationDate > DATE_TRUNC('month', cast('2024-10-01 12:34:56' as timestamp)) - INTERVAL '6 months'
+    GROUP BY
+        v.UserId
+    HAVING
+        COUNT(v.PostId) > 100
+),
+HighActivityPosts AS (
+    SELECT
+        rp.PostId,
+        rp.PostTypeId,
+        rp.Title,
+        rp.OwnerUserId,
+        rp.Rank,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+        RankedPosts rp
+        LEFT JOIN Comments c ON rp.PostId = c.PostId
+        LEFT JOIN Votes v ON rp.PostId = v.PostId
+    GROUP BY
+        rp.PostId, rp.PostTypeId, rp.Title, rp.OwnerUserId, rp.Rank
+    HAVING
+        COUNT(c.Id) > 10 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 20
+)
+SELECT
+    hap.PostId,
+    hap.PostTypeId,
+    hap.Title,
+    hap.OwnerUserId,
+    hap.Rank,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    hap.CommentCount,
+    hap.UpVoteCount,
+    hap.DownVoteCount,
+    COALESCE(hvu.VoteCount, 0) AS UserVoteCount,
+    COALESCE(hvu.UpVoteCount, 0) AS UserUpVoteCount,
+    COALESCE(hvu.DownVoteCount, 0) AS UserDownVoteCount,
+    100.0 * (COALESCE(hvu.UpVoteCount, 0) / NULLIF(COALESCE(hvu.VoteCount, 0), 0)) AS UpVotePercentage,
+    CASE
+        WHEN pht.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'CAUTION/CLOSED ISSUE'
+        WHEN pht.PostHistoryTypeId IN (5) THEN 'MAJOR BODY EDIT'
+        WHEN EXISTS
+        ( SELECT 1 FROM Badges b WHERE b.UserId = rut.UserId AND b.Class = 1 )
+           THEN 'HIGH-HONORS'
+           ELSE 'REGULAR'
+    END AS BadgeClass
+FROM
+    HighActivityPosts hap
+    JOIN Users u ON hap.OwnerUserId = u.Id
+    JOIN RecursiveUserTree rut ON rut.UserId = u.UserId
+    LEFT JOIN HighVoteUsers hvu ON hap.OwnerUserId = hvu.UserId
+    LEFT JOIN PostHistory ph ON hap.PostId = ph.PostId
+    LEFT JOIN PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+WHERE
+    u.Reputation > 1000
+    AND ((hap.CommentCount > 100) OR (hap.UpVoteCount > 50 ))
+    AND u.AccountId NOT IN (select AccountId from Views where Views.Views > 10000)
+GROUP BY
+    hap.PostId, hap.PostTypeId, hap.Title, hap.OwnerUserId, hap.Rank,
+    hap.CommentCount, hap.UpVoteCount, hap.DownVoteCount,
+    u.DisplayName, u.Reputation, u.CreationDate, pht.PostHistoryTypeId, hvu.UpVoteCount, hvu.VoteCount;

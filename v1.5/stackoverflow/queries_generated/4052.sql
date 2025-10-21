@@ -1,0 +1,159 @@
+-- {"query": "4052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1632} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired,
+        array[t.Id] as AncestorPath
+    from Tags t
+    where t.Id is not null
+    union all
+    select
+        t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired,
+        r.AncestorPath || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.WikiPostId = r.Id
+    where not t.Id = any(r.AncestorPath)
+),
+AcceptedAnswerScores as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        coalesce(a.Score, 0) as AcceptedAnswerScore,
+        q.ViewCount,
+        q.Score as QuestionScore,
+        q.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation,
+        row_number() over (partition by u.Id order by q.CreationDate desc) as UserRecentQuestionRank
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on q.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+UserBadgeAgg as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+LatestPostHistory as (
+    select ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11, 12, 13) -- closed, reopened, deleted, undeleted
+),
+TopAnswersWithCommentStats as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        u.DisplayName as AnswerOwner,
+        a.Score as AnswerScore,
+        count(distinct c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        sum(case when c.Score <= 0 then 1 else 0 end) as NonPositiveComments
+    from Posts a
+    left join Comments c on c.PostId = a.Id
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2 -- answers only
+    group by a.Id, a.ParentId, u.DisplayName, a.Score
+    having a.Score > (
+        select avg(score) from Posts where PostTypeId = 2 and ParentId = a.ParentId
+    )
+),
+UserPostActivityRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        p.PostTypeId,
+        count(p.Id) as PostCount,
+        sum(case when p.PostTypeId = 1 then coalesce(p.ViewCount,0) else 0 end) as QuestionViews,
+        rank() over (partition by p.PostTypeId order by count(p.Id) desc) as PostCountRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, p.PostTypeId
+),
+CombinedPostsAndVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        v.VoteTypeId,
+        count(v.Id) as VoteCount
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, v.VoteTypeId
+),
+DuplicatePostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+ComplexUserSummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        coalesce(uba.GoldBadges,0) as GoldBadges,
+        coalesce(uba.SilverBadges,0) as SilverBadges,
+        coalesce(uba.BronzeBadges,0) as BronzeBadges,
+        ua.PostCount,
+        ua.QuestionViews,
+        ua.PostCountRank,
+        case 
+            when u.Reputation > 10000 and coalesce(uba.GoldBadges,0) > 5 then 'Veteran'
+            when u.Reputation > 1000 and coalesce(uba.SilverBadges,0) > 10 then 'Experienced'
+            else 'Newbie'
+        end as UserTier,
+        string_agg(distinct t.TagName, ', ' order by t.Count desc) as TopTags
+    from Users u
+    left join UserBadgeAgg uba on uba.UserId = u.Id
+    left join UserPostActivityRanks ua on ua.Id = u.Id and ua.PostTypeId = 1
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join RecursiveTagHierarchy rth on p.Tags like '%' || rth.TagName || '%'
+    left join Tags t on t.Id = rth.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate, uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges, ua.PostCount, ua.QuestionViews, ua.PostCountRank
+)
+select 
+    cqs.QuestionId,
+    cqs.Title,
+    cqs.AcceptedAnswerScore,
+    cqs.ViewCount as QuestionViewCount,
+    cqs.QuestionScore,
+    cqs.OwnerName as QuestionOwner,
+    cqs.Reputation as OwnerReputation,
+    coalesce(uba.GoldBadges,0) as OwnerGoldBadges,
+    topa.AnswerId,
+    topa.AnswerOwner,
+    topa.AnswerScore,
+    topa.CommentCount,
+    topa.PositiveComments,
+    topa.NonPositiveComments,
+    upa.PostCount as OwnerTotalPosts,
+    upa.QuestionViews as OwnerQuestionViews,
+    upa.PostCountRank as OwnerPostRank,
+    dpl.RelatedPostId as DuplicateOfPost,
+    lph.PostHistoryTypeId as LastStatusChangeType,
+    lph.CreationDate as LastStatusChangeDate,
+    cus.UserTier,
+    cus.TopTags
+from AcceptedAnswerScores cqs
+left join UserBadgeAgg uba on uba.UserId = (select OwnerUserId from Posts where Id = cqs.QuestionId)
+left join TopAnswersWithCommentStats topa on topa.QuestionId = cqs.QuestionId
+left join UserPostActivityRanks upa on upa.Id = (select OwnerUserId from Posts where Id = cqs.QuestionId) and upa.PostTypeId = 1
+left join DuplicatePostLinks dpl on dpl.PostId = cqs.QuestionId
+left join LatestPostHistory lph on lph.PostId = cqs.QuestionId and lph.rn = 1
+left join ComplexUserSummary cus on cus.Id = (select OwnerUserId from Posts where Id = cqs.QuestionId)
+where cqs.ViewCount > 10000
+ and cqs.AcceptedAnswerScore is not null
+order by cqs.ViewCount desc, topa.AnswerScore desc
+limit 50;

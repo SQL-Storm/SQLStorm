@@ -1,0 +1,166 @@
+-- {"query": "49008.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2595} 
+
+WITH UserPostAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT p.AcceptedAnswerId) FILTER (WHERE p.PostTypeId = 1) AS AcceptedAnswersGivenCount -- Number of questions for which this user accepted an answer
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= '2023-01-01'
+    GROUP BY p.OwnerUserId
+),
+UserCommentAggregates AS (
+    SELECT
+        c.UserId AS UserId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+      AND c.CreationDate >= '2023-01-01'
+    GROUP BY c.UserId
+),
+UserVoteCastingAggregates AS (
+    SELECT
+        v.UserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        COUNT(DISTINCT v.PostId) FILTER (WHERE v.VoteTypeId = 5) AS FavoritePostsMarkedCount
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+      AND v.CreationDate >= '2023-01-01'
+    GROUP BY v.UserId
+),
+UserReceivedVoteAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersReceivedCount -- Number of accepted answers received for this user's posts
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND v.CreationDate >= '2023-01-01'
+    GROUP BY p.OwnerUserId
+),
+UserBadgeAggregates AS (
+    SELECT
+        b.UserId AS UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Date >= '2023-01-01'
+    GROUP BY b.UserId
+),
+UserPostHistoryAggregates AS (
+    SELECT
+        ph.UserId AS UserId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS PostEditsMade, -- Edit Title, Body, Tags
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS PostsClosedByVotesMade, -- User participated in closing a post
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS PostsReopenedByVotesMade, -- User participated in reopening a post
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS UniquePostsModeratedByVotes
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.CreationDate >= '2023-01-01'
+    GROUP BY ph.UserId
+),
+TopTagsPerUser AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName AS MostFrequentQuestionTag,
+        COUNT(t.TagName) AS TagFrequency,
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY COUNT(t.TagName) DESC, t.TagName) as rn
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+    AND p.CreationDate >= '2023-01-01'
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tags_unnested(TagName)
+    JOIN Tags t ON tags_unnested.TagName = t.TagName
+    GROUP BY u.Id, t.TagName
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserRegistrationDate,
+    u.LastAccessDate,
+    COALESCE(upa.TotalPosts, 0) AS TotalPostsOwned,
+    COALESCE(upa.QuestionsCount, 0) AS QuestionsAsked,
+    COALESCE(upa.AnswersCount, 0) AS AnswersProvided,
+    COALESCE(upa.TotalPostScore, 0) AS TotalPostScoreReceived,
+    COALESCE(upa.AvgPostScore, 0.0) AS AvgPostScoreReceived,
+    COALESCE(upa.AcceptedAnswersGivenCount, 0) AS AcceptedAnswersGivenByMe,
+    COALESCE(uca.TotalComments, 0) AS TotalCommentsMade,
+    COALESCE(uca.TotalCommentScore, 0) AS TotalCommentScoreReceived,
+    COALESCE(uvca.UpVotesCast, 0) AS UpVotesGiven,
+    COALESCE(uvca.DownVotesCast, 0) AS DownVotesGiven,
+    COALESCE(uvca.FavoritePostsMarkedCount, 0) AS FavoritePostsMarked,
+    COALESCE(urva.UpVotesReceived, 0) AS UpVotesOnPostsReceived,
+    COALESCE(urva.DownVotesReceived, 0) AS DownVotesOnPostsReceived,
+    COALESCE(urva.AcceptedAnswersReceivedCount, 0) AS AcceptedAnswersReceivedOnMyPosts,
+    COALESCE(uba.TotalBadges, 0) AS TotalBadgesEarned,
+    COALESCE(uba.GoldBadges, 0) AS GoldBadgesEarned,
+    COALESCE(uba.SilverBadges, 0) AS SilverBadgesEarned,
+    COALESCE(uba.BronzeBadges, 0) AS BronzeBadgesEarned,
+    COALESCE(upha.TotalHistoryEntries, 0) AS TotalPostHistoryEvents,
+    COALESCE(upha.PostEditsMade, 0) AS OwnPostEditsMade,
+    COALESCE(upha.PostsClosedByVotesMade, 0) AS CloseVotesCast,
+    COALESCE(upha.PostsReopenedByVotesMade, 0) AS ReopenVotesCast,
+    COALESCE(upha.UniquePostsModeratedByVotes, 0) AS UniquePostsVotedOnForModeration,
+    COALESCE(tpt.MostFrequentQuestionTag, 'N/A') AS DominantQuestionTag,
+    COALESCE(tpt.TagFrequency, 0) AS DominantTagFrequencyCount,
+    -- Calculate a comprehensive user activity and impact score
+    (u.Reputation * 0.1
+    + COALESCE(upa.TotalPostScore, 0) * 0.5
+    + COALESCE(uca.TotalCommentScore, 0) * 0.2
+    + COALESCE(urva.UpVotesReceived, 0) * 0.8
+    - COALESCE(urva.DownVotesReceived, 0) * 1.0
+    + COALESCE(uba.GoldBadges, 0) * 100
+    + COALESCE(uba.SilverBadges, 0) * 30
+    + COALESCE(uba.BronzeBadges, 0) * 10
+    + COALESCE(upa.QuestionsCount, 0) * 5
+    + COALESCE(upa.AnswersCount, 0) * 3
+    + COALESCE(uca.TotalComments, 0) * 1
+    + COALESCE(upha.PostEditsMade, 0) * 0.5
+    + COALESCE(upa.AcceptedAnswersGivenByMe, 0) * 20
+    + COALESCE(urva.AcceptedAnswersReceivedOnMyPosts, 0) * 25
+    + COALESCE(upha.UniquePostsVotedOnForModeration, 0) * 15
+    ) AS CompositeImpactScore,
+    -- Calculate days since last significant activity (post, comment, badge, or user access)
+    EXTRACT(DAY FROM (
+        NOW() - GREATEST(
+            COALESCE(upa.LastPostDate, '1900-01-01'::timestamp),
+            COALESCE(uca.LastCommentDate, '1900-01-01'::timestamp),
+            COALESCE(uba.LastBadgeDate, '1900-01-01'::timestamp),
+            u.LastAccessDate
+        )
+    )) AS DaysSinceLastActivity
+FROM Users u
+LEFT JOIN UserPostAggregates upa ON u.Id = upa.UserId
+LEFT JOIN UserCommentAggregates uca ON u.Id = uca.UserId
+LEFT JOIN UserVoteCastingAggregates uvca ON u.Id = uvca.UserId
+LEFT JOIN UserReceivedVoteAggregates urva ON u.Id = urva.UserId
+LEFT JOIN UserBadgeAggregates uba ON u.Id = uba.UserId
+LEFT JOIN UserPostHistoryAggregates upha ON u.Id = upha.UserId
+LEFT JOIN (SELECT UserId, MostFrequentQuestionTag, TagFrequency FROM TopTagsPerUser WHERE rn = 1) tpt ON u.Id = tpt.UserId
+WHERE u.LastAccessDate >= '2023-01-01'
+  AND (
+        COALESCE(upa.TotalPosts, 0) > 0 OR
+        COALESCE(uca.TotalComments, 0) > 0 OR
+        COALESCE(uba.TotalBadges, 0) > 0 OR
+        COALESCE(upha.TotalHistoryEntries, 0) > 0 OR
+        COALESCE(uvca.UpVotesCast, 0) > 0 OR
+        COALESCE(uvca.DownVotesCast, 0) > 0
+      )
+ORDER BY CompositeImpactScore DESC, u.Reputation DESC
+LIMIT 500;

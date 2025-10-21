@@ -1,0 +1,240 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeCategory,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank
+    FROM Posts p
+    WHERE p.Score > 100 AND p.CreationDate >= DATE '2015-01-01'
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT CAST(p.PostTypeId AS VARCHAR(10)), ',') AS PostTypes,
+        STRING_AGG(DISTINCT CASE WHEN p.Title IS NOT NULL THEN SUBSTRING(p.Title, 1, 50) ELSE 'No Title' END, ' | ') AS SampleTitles,
+        MAX(p.CreationDate) AS LastActivityDate
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATE '2018-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS RankByCount,
+        NTH_VALUE(t.TagName, 1) OVER (ORDER BY t.Count DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS HighestCountTag,
+        NTH_VALUE(t.TagName, 100) OVER (ORDER BY t.Count DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS HundredthCountTag
+    FROM Tags t
+),
+RecentVotes AS (
+    SELECT 
+        v.Id,
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE 
+            WHEN v.VoteTypeId = 2 THEN 'Upvote'
+            WHEN v.VoteTypeId = 3 THEN 'Downvote'
+            WHEN v.VoteTypeId = 8 THEN 'Bounty Start'
+            WHEN v.VoteTypeId = 9 THEN 'Bounty Close'
+            ELSE 'Other'
+        END AS VoteType,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteSequence,
+        LAG(v.CreationDate) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS PreviousVoteDate,
+        TIMESTAMPDIFF(MINUTE, LAG(v.CreationDate) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate), v.CreationDate) AS MinutesBetweenVotes
+    FROM Votes v
+    WHERE v.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.TotalScore,
+    uas.LastPostDate,
+    uas.PostRank,
+    uas.AvgPostScore,
+    uas.ReputationPercentile,
+    COALESCE(ups.PostCount, 0) AS UserPostCount,
+    COALESCE(ups.TotalScore, 0) AS UserTotalScore,
+    COALESCE(ups.AvgScore, 0) AS UserAvgScore,
+    CASE 
+        WHEN ups.PostCount IS NULL THEN 'No activity in 2018+'
+        WHEN ups.PostCount > 500 THEN 'Highly active'
+        WHEN ups.PostCount > 100 THEN 'Active'
+        WHEN ups.PostCount > 10 THEN 'Regular'
+        ELSE 'Occasional'
+    END AS ActivityLevel,
+    CASE 
+        WHEN tp.PostId IS NOT NULL THEN 'Has Top Posts'
+        ELSE 'No Top Posts'
+    END AS HasTopPosts,
+    STRING_AGG(DISTINCT CASE 
+        WHEN tp.PostId IS NOT NULL AND tp.PostTypeCategory = 'Question' THEN 'Q-' || tp.PostId
+        WHEN tp.PostId IS NOT NULL AND tp.PostTypeCategory = 'Answer' THEN 'A-' || tp.PostId
+        ELSE NULL
+    END, ', ') AS TopPostsList,
+    STRING_AGG(DISTINCT ta.TagName, ', ') AS AssociatedTags,
+    COALESCE(SUM(rv.BountyAmount) FILTER (WHERE rv.VoteTypeId = 8), 0) AS TotalBounties,
+    COALESCE(SUM(CASE WHEN rv.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN uas.LastPostDate >= DATE '2023-01-01' THEN uas.UserId END) AS RecentContributors,
+    COUNT(*) OVER () AS TotalUsersAnalyzed
+FROM UserActivityStats uas
+LEFT JOIN UserPostStats ups ON uas.UserId = ups.UserId
+LEFT JOIN TopPosts tp ON uas.UserId = tp.OwnerUserId
+LEFT JOIN Posts p ON uas.UserId = p.OwnerUserId
+LEFT JOIN Tags t ON p.Tags IS NOT NULL AND p.Tags <> ''
+LEFT JOIN TagAnalysis ta ON t.TagName = ta.TagName
+LEFT JOIN RecentVotes rv ON uas.UserId = rv.UserId
+WHERE uas.Reputation > 1000 
+    AND (uas.Questions > 5 OR uas.Answers > 10 OR uas.Comments > 100)
+    AND (tp.PostId IS NOT NULL OR ups.UserId IS NOT NULL OR rv.Id IS NOT NULL)
+GROUP BY 
+    uas.UserId, 
+    uas.DisplayName, 
+    uas.Reputation, 
+    uas.TotalPosts, 
+    uas.Questions, 
+    uas.Answers, 
+    uas.Comments, 
+    uas.TotalScore, 
+    uas.LastPostDate, 
+    uas.PostRank, 
+    uas.AvgPostScore, 
+    uas.ReputationPercentile,
+    ups.PostCount,
+    ups.TotalScore,
+    ups.AvgScore
+HAVING 
+    COUNT(DISTINCT tp.PostId) > 0 
+    OR COUNT(DISTINCT ups.UserId) > 0 
+    OR COUNT(DISTINCT rv.Id) > 0
+ORDER BY 
+    uas.Reputation DESC,
+    uas.TotalPosts DESC,
+    uas.LastPostDate DESC
+LIMIT 1000
+EXCEPT
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.TotalScore,
+    uas.LastPostDate,
+    uas.PostRank,
+    uas.AvgPostScore,
+    uas.ReputationPercentile,
+    COALESCE(ups.PostCount, 0) AS UserPostCount,
+    COALESCE(ups.TotalScore, 0) AS UserTotalScore,
+    COALESCE(ups.AvgScore, 0) AS UserAvgScore,
+    CASE 
+        WHEN ups.PostCount IS NULL THEN 'No activity in 2018+'
+        WHEN ups.PostCount > 500 THEN 'Highly active'
+        WHEN ups.PostCount > 100 THEN 'Active'
+        WHEN ups.PostCount > 10 THEN 'Regular'
+        ELSE 'Occasional'
+    END AS ActivityLevel,
+    CASE 
+        WHEN tp.PostId IS NOT NULL THEN 'Has Top Posts'
+        ELSE 'No Top Posts'
+    END AS HasTopPosts,
+    STRING_AGG(DISTINCT CASE 
+        WHEN tp.PostId IS NOT NULL AND tp.PostTypeCategory = 'Question' THEN 'Q-' || tp.PostId
+        WHEN tp.PostId IS NOT NULL AND tp.PostTypeCategory = 'Answer' THEN 'A-' || tp.PostId
+        ELSE NULL
+    END, ', ') AS TopPostsList,
+    STRING_AGG(DISTINCT ta.TagName, ', ') AS AssociatedTags,
+    COALESCE(SUM(rv.BountyAmount) FILTER (WHERE rv.VoteTypeId = 8), 0) AS TotalBounties,
+    COALESCE(SUM(CASE WHEN rv.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN uas.LastPostDate >= DATE '2023-01-01' THEN uas.UserId END) AS RecentContributors,
+    COUNT(*) OVER () AS TotalUsersAnalyzed
+FROM UserActivityStats uas
+LEFT JOIN UserPostStats ups ON uas.UserId = ups.UserId
+LEFT JOIN TopPosts tp ON uas.UserId = tp.OwnerUserId
+LEFT JOIN Posts p ON uas.UserId = p.OwnerUserId
+LEFT JOIN Tags t ON p.Tags IS NOT NULL AND p.Tags <> ''
+LEFT JOIN TagAnalysis ta ON t.TagName = ta.TagName
+LEFT JOIN RecentVotes rv ON uas.UserId = rv.UserId
+WHERE uas.Reputation BETWEEN 1000 AND 5000 
+    AND (uas.Questions > 20 OR uas.Answers > 100 OR uas.Comments > 500)
+GROUP BY 
+    uas.UserId, 
+    uas.DisplayName, 
+    uas.Reputation, 
+    uas.TotalPosts, 
+    uas.Questions, 
+    uas.Answers, 
+    uas.Comments, 
+    uas.TotalScore, 
+    uas.LastPostDate, 
+    uas.PostRank, 
+    uas.AvgPostScore, 
+    uas.ReputationPercentile,
+    ups.PostCount,
+    ups.TotalScore,
+    ups.AvgScore
+HAVING 
+    COUNT(DISTINCT tp.PostId) > 0 
+    OR COUNT(DISTINCT ups.UserId) > 0 
+    OR COUNT(DISTINCT rv.Id) > 0
+ORDER BY 
+    uas.Reputation DESC,
+    uas.TotalPosts DESC,
+    uas.LastPostDate DESC
+LIMIT 1000;

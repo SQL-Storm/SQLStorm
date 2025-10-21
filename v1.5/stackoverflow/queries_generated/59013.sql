@@ -1,0 +1,59 @@
+-- {"query": "59013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 1010} 
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerDisplayName,
+    u.Reputation,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountActual,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) as VoteCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 3) as BronzeBadges,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) as AvgBounty,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) as CloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 12) as DeleteCount,
+    (SELECT TOP 1 ph.Comment FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 ORDER BY ph.CreationDate DESC) as LastCloseReason,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (
+        SELECT TRIM('"' FROM unnest(string_to_array(p.Tags, '>'))) as TagName
+        WHERE p.Tags IS NOT NULL AND p.Tags != ''
+    ) t) as ExtractedTags,
+    DATEDIFF(day, p.CreationDate, GETDATE()) as AgeInDays,
+    CASE 
+        WHEN p.Score >= 100 THEN 'High'
+        WHEN p.Score >= 50 THEN 'Medium'
+        WHEN p.Score >= 10 THEN 'Low'
+        ELSE 'Very Low'
+    END as ScoreCategory,
+    (SELECT COUNT(*) FROM Posts ap WHERE ap.ParentId = p.Id AND ap.PostTypeId = 2) as AnswerCountWithDeleted,
+    (SELECT COUNT(*) FROM Posts ap WHERE ap.ParentId = p.Id AND ap.PostTypeId = 2 AND ap.DeletedDate IS NULL) as AnswerCountWithoutDeleted,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id) as LinkedPostCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.UserId = p.OwnerUserId) as OwnerEdits,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) as LastEditDate,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 2, 3)) as InitialRevisionCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) as EditRevisionCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (7, 8, 9)) as RollbackRevisionCount,
+    (SELECT TOP 1 ph.PostHistoryTypeId FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 16, 17) ORDER BY ph.CreationDate DESC) as LatestSpecialAction,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (6, 7, 10, 11)) as SpecialVoteCount
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= '2023-01-01'
+    AND p.CreationDate < '2024-01-01'
+    AND p.Score >= 0
+    AND p.ViewCount >= 10
+    AND u.Reputation >= 1000
+    AND p.Tags IS NOT NULL
+    AND p.Tags != ''
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > '2023-06-01')
+    AND p.DeletedDate IS NULL
+    AND u.AccountId IS NOT NULL
+    AND u.DisplayName IS NOT NULL
+    AND u.DisplayName != ''
+ORDER BY p.CreationDate DESC, p.Score DESC, p.ViewCount DESC

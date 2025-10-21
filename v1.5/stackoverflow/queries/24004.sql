@@ -1,0 +1,96 @@
+WITH
+    tokenized AS (
+        SELECT
+            p.Id          AS post_id,
+            unnest(string_to_array(p.Tags, '><')) AS tag_name,
+            p.OwnerUserId
+        FROM posts p
+        WHERE p.PostTypeId = 1
+    ),
+
+    tag_stats AS (
+        SELECT
+            t.tag_name,
+            COUNT(DISTINCT t.post_id)          AS question_count,
+            AVG(u.Reputation)                 AS avg_reputation
+        FROM tokenized t
+        LEFT JOIN users u ON u.Id = t.OwnerUserId
+        GROUP BY t.tag_name
+    ),
+
+    high_rep_tags AS (
+        SELECT tag_name, question_count, avg_reputation
+        FROM tag_stats
+        WHERE avg_reputation > 2000
+    ),
+
+    low_rep_tags AS (
+        SELECT tag_name, question_count, avg_reputation
+        FROM tag_stats
+        WHERE avg_reputation <= 2000
+          AND question_count > 500
+    ),
+
+    all_tags AS (
+        SELECT * FROM high_rep_tags
+        UNION ALL
+        SELECT * FROM low_rep_tags
+    ),
+
+    ranked_tags AS (
+        SELECT
+            tag_name,
+            question_count,
+            avg_reputation,
+            ROW_NUMBER() OVER (
+                ORDER BY question_count DESC,
+                         avg_reputation DESC
+            ) AS rnk
+        FROM all_tags
+    ),
+
+    duplicate_posts AS (
+        SELECT
+            pl.PostId       AS dup_post_id,
+            pl.RelatedPostId
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+    ),
+
+    top_tag_sel AS (
+        SELECT
+            r.tag_name,
+            r.question_count,
+            r.avg_reputation,
+            r.rnk,
+            p.Id          AS related_post_id,
+            u.Reputation  AS dup_owner_rep,
+            p.Score       AS post_score
+        FROM ranked_tags r
+        JOIN duplicate_posts dp ON dp.dup_post_id = (
+            SELECT p2.Id
+            FROM posts p2
+            WHERE p2.Tags LIKE '%' || r.tag_name || '%'
+              AND p2.PostTypeId = 1
+            ORDER BY p2.Score DESC
+            LIMIT 1
+        )
+        LEFT JOIN posts p ON p.Id = dp.RelatedPostId
+        LEFT JOIN users u ON u.Id = p.OwnerUserId
+        WHERE r.rnk <= 10
+    )
+
+SELECT
+    t.tag_name,
+    t.question_count,
+    t.avg_reputation,
+    t.rnk,
+    t.related_post_id,
+    COALESCE(t.dup_owner_rep, 0)   AS dup_owner_rep,
+    CASE
+        WHEN t.avg_reputation > 3000 AND t.post_score >= 20 THEN 'Elite'
+        WHEN t.avg_reputation < 1000              THEN 'Rookie'
+        ELSE 'Regular'
+    END                             AS tag_category
+FROM top_tag_sel t
+ORDER BY t.rnk;

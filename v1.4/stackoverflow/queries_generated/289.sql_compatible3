@@ -1,0 +1,65 @@
+WITH
+base AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerName,
+         COALESCE(u.Reputation, 0) AS Reputation,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         p.LastActivityDate,
+         p.LastEditorDisplayName,
+         p.OwnerUserId,
+         (EXISTS (SELECT 1 FROM Badges bb WHERE bb.UserId = p.OwnerUserId AND bb.Class = 1)) AS HasGoldBadge
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+expanded AS (
+  SELECT b.PostId, b.Title, b.OwnerName, b.Reputation, b.CreationDate, b.Score, b.ViewCount, b.Tags,
+         COALESCE(
+           (SELECT LISTAGG(a.TagName, ',')
+            WITHIN GROUP (ORDER BY a.TagName)
+            FROM (SELECT TRIM(value) AS TagName
+                  FROM UNNEST(string_to_array(substring(b.Tags, 2, length(b.Tags) - 2), '><')) AS a(value)
+                 ) AS a
+           ),
+           ''
+         ) AS TagList,
+         b.LastActivityDate, b.LastEditorDisplayName, b.OwnerUserId, b.HasGoldBadge
+  FROM base b
+),
+metrics AS (
+  SELECT e.PostId, e.Title, e.OwnerName, e.Reputation, e.CreationDate, e.Score, e.ViewCount, e.TagList,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = e.PostId AND v.VoteTypeId = 2) AS Upvotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = e.PostId AND v.VoteTypeId = 3) AS Downvotes,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = e.PostId) AS CommentCount,
+         e.LastActivityDate, e.LastEditorDisplayName, e.OwnerUserId, e.HasGoldBadge,
+         (SELECT COUNT(*) FROM Badges bb WHERE bb.UserId = e.OwnerUserId AND bb.Class = 1) AS OwnerBadgeCount
+  FROM expanded e\n),
+q1 AS (
+  SELECT p.PostId, p.Title, p.OwnerName, p.Reputation, p.CreationDate, p.Score, p.ViewCount, p.TagList,
+         p.Upvotes, p.Downvotes, p.CommentCount, p.LastActivityDate, p.LastEditorDisplayName, p.OwnerBadgeCount, p.HasGoldBadge,
+         (p.Title || ' by ' || COALESCE(p.OwnerName, 'Unknown') || ' ' ||
+          CAST(to_char(p.CreationDate, 'YYYY-MM-DD HH24:MI') AS VARCHAR)) AS Summary,
+         (p.Upvotes * 2 - p.Downvotes + p.CommentCount) AS EngagementScore,
+         ROW_NUMBER() OVER (ORDER BY (p.Upvotes * 2 - p.Downvotes + p.CommentCount) DESC, p.LastActivityDate DESC) AS RankWithinSet
+  FROM metrics p
+  WHERE p.Upvotes > 50 AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+),
+q2 AS (
+  SELECT p.PostId, p.Title, p.OwnerName, p.Reputation, p.CreationDate, p.Score, p.ViewCount, p.TagList,
+         p.Upvotes, p.Downvotes, p.CommentCount, p.LastActivityDate, p.LastEditorDisplayName, p.OwnerBadgeCount, p.HasGoldBadge,
+         (p.Title || ' by ' || COALESCE(p.OwnerName, 'Unknown') || ' ' ||
+          CAST(to_char(p.CreationDate, 'YYYY-MM-DD HH24:MI') AS VARCHAR)) AS Summary,
+         (p.Upvotes * 2 - p.Downvotes + p.CommentCount) AS EngagementScore,
+         ROW_NUMBER() OVER (ORDER BY (p.Upvotes * 2 - p.Downvotes + p.CommentCount) DESC, p.LastActivityDate DESC) AS RankWithinSet
+  FROM metrics p
+  WHERE p.Upvotes <= 50 AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+)
+SELECT * FROM q1
+UNION ALL
+SELECT * FROM q2
+ORDER BY EngagementScore DESC, RankWithinSet
+FETCH FIRST 100 ROWS ONLY;

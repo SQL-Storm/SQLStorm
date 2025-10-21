@@ -1,0 +1,126 @@
+-- {"query": "21035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1301} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > CURRENT_TIMESTAMP - INTERVAL '1 year'
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.Title, p.Tags) AS PostTitleOrTags,
+        LAG(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostTitle,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate 
+                            ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS RollingAvgScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1  -- Questions only
+      AND p.Score > 5
+      AND (p.ViewCount > 1000 OR p.AnswerCount > 2)
+),
+DetailedPostStats AS (
+    SELECT 
+        hp.PostId,
+        hp.OwnerUserId,
+        hp.Score,
+        hp.ViewCount,
+        hp.AnswerCount,
+        hp.PostTitleOrTags,
+        hp.RollingAvgScore,
+        au.RepRank,
+        au.Reputation AS UserRep,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        STRING_AGG(
+            CASE 
+                WHEN b.Name IS NOT NULL THEN b.Name 
+                ELSE COALESCE(c.Text, 'No Comment') 
+            END, 
+            ' | '
+        ) AS ConcatenatedCommentsAndBadges,
+        CASE 
+            WHEN hp.AnswerCount > 5 AND au.RepRank <= 10 THEN 'Elite Q&A'
+            WHEN hp.ViewCount > 10000 THEN 'Viral'
+            WHEN hp.Score < 0 THEN 'Controversial'
+            ELSE 'Standard'
+        END AS PostCategory,
+        COALESCE(
+            (SELECT ph.Text 
+             FROM PostHistory ph 
+             WHERE ph.PostId = hp.PostId 
+               AND ph.PostHistoryTypeId = 4  -- Edit Title
+             ORDER BY ph.CreationDate DESC 
+             LIMIT 1), 
+            hp.PostTitleOrTags
+        ) AS LatestTitle
+    FROM HighImpactPosts hp
+    INNER JOIN ActiveUsers au ON hp.OwnerUserId = au.UserId
+    LEFT JOIN Votes v ON hp.PostId = v.PostId AND v.VoteTypeId IN (2, 3)  -- UpMod, DownMod
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Comments c ON hp.PostId = c.PostId 
+        AND c.CreationDate > (hp.CreationDate - INTERVAL '7 days')  -- Recent comments
+        AND c.Score > 0  -- Positive score comments
+    LEFT JOIN Badges b ON au.UserId = b.UserId 
+        AND b.Class = 1  -- Gold badges only
+        AND b.Date > (au.CreationDate - INTERVAL '6 months')  -- Recent badges
+    WHERE hp.RollingAvgScore > 3
+      AND (hp.PostTitleOrTags ILIKE '%sql%' OR hp.PostTitleOrTags ILIKE '%database%')
+    GROUP BY 
+        hp.PostId, hp.OwnerUserId, hp.Score, hp.ViewCount, hp.AnswerCount,
+        hp.PostTitleOrTags, hp.RollingAvgScore, au.RepRank, au.Reputation, hp.PrevPostTitle, hp.LatestTitle
+    HAVING COUNT(DISTINCT c.Id) > 1 OR SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) > 10
+)
+SELECT 
+    dps.PostCategory,
+    COUNT(*) AS PostCount,
+    AVG(dps.UserRep) AS AvgUserRep,
+    AVG(dps.RollingAvgScore) AS AvgRollingScore,
+    SUM(dps.UpVotes) AS TotalUpVotes,
+    MAX(dps.ConcatenatedCommentsAndBadges) AS SampleCommentsBadges,
+    SUM(CASE WHEN dps.LatestTitle IS NULL THEN 1 ELSE 0 END) AS NullTitleCount,
+    (SELECT STRING_AGG(t.TagName, ', ') 
+     FROM Tags t 
+     WHERE t.Count > 100 
+       AND t.ExcerptPostId IS NOT NULL) AS TopTagsOverview,
+    CASE 
+        WHEN dps.PostCount > 1 THEN 
+            dps.PostTitleOrTags || ' (Series: ' || dps.PrevPostTitle || ')'
+        ELSE dps.LatestTitle
+    END AS EnhancedTitleSample
+FROM DetailedPostStats dps
+WHERE dps.AvgCommentLength > 50
+   OR (dps.VoteCount > 20 AND dps.PostCategory = 'Elite Q&A')
+UNION ALL
+SELECT 
+    'Summary Stats' AS PostCategory,
+    COUNT(*) AS PostCount,
+    AVG(dps2.UserRep) AS AvgUserRep,
+    NULL AS AvgRollingScore,  -- Intentional NULL for union compatibility
+    SUM(dps2.DownVotes) AS TotalUpVotes,  -- Reusing column for downvotes in summary
+    'Overall Analysis Complete' AS SampleCommentsBadges,
+    0 AS NullTitleCount,
+    NULL AS TopTagsOverview,
+    'Benchmark Query End' AS EnhancedTitleSample
+FROM DetailedPostStats dps2
+WHERE dps2.RepRank <= 5  -- Top users only for summary
+GROUP BY dps2.PostCategory
+ORDER BY 
+    CASE PostCategory 
+        WHEN 'Elite Q&A' THEN 1 
+        WHEN 'Viral' THEN 2 
+        WHEN 'Controversial' THEN 3 
+        WHEN 'Standard' THEN 4 
+        ELSE 5 
+    END,
+    PostCount DESC;

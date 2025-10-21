@@ -1,0 +1,115 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      Score,
+      AnswerCount,
+      FavoriteCount,
+      CreationDate,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          CreationDate DESC
+      ) AS rn
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+  ),
+  QuestionEngagement AS (
+    SELECT
+      q.Id AS QuestionId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount
+    FROM RecentQuestions q
+    LEFT JOIN Comments c
+      ON q.Id = c.PostId
+    LEFT JOIN Votes v
+      ON q.Id = v.PostId
+    WHERE
+      q.rn <= 1000
+    GROUP BY
+      q.Id
+  ),
+  UserReputation AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(b.Id) AS BadgeCount,
+      MAX(CASE WHEN b.Name LIKE '%gold%' THEN 1 ELSE 0 END) AS HasGoldBadge
+    FROM Users u
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCount,
+      AVG(p.Score) AS AvgAnswerScore,
+      SUM(CASE WHEN p.Id = pst.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts p
+    JOIN Posts pst
+      ON p.Id = pst.AcceptedAnswerId
+    WHERE
+      p.PostTypeId = 2 AND pst.PostTypeId = 1
+    GROUP BY
+      p.ParentId
+  )
+SELECT
+  rq.Id AS QuestionId,
+  rq.Title AS QuestionTitle,
+  rq.Tags,
+  rq.Score AS QuestionScore,
+  rq.FavoriteCount AS QuestionFavoriteCount,
+  rq.AnswerCount AS UndeletedAnswerCount,
+  COALESCE(qe.CommentCount, 0) AS TotalComments,
+  COALESCE(qe.UpVoteCount, 0) AS TotalUpvotes,
+  COALESCE(qe.DownVoteCount, 0) AS TotalDownvotes,
+  COALESCE(qe.FavoriteVoteCount, 0) AS TotalFavoriteVotes,
+  ur.DisplayName AS OwnerDisplayName,
+  ur.Reputation AS OwnerReputation,
+  ur.BadgeCount AS OwnerBadgeCount,
+  CASE
+    WHEN ur.HasGoldBadge = 1 THEN 'Yes'
+    ELSE 'No'
+  END AS OwnerHasGoldBadge,
+  COALESCE(ad.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(ad.AvgAnswerScore, 0.0) AS AverageAnswerScore,
+  COALESCE(ad.AcceptedAnswerCount, 0) AS NumberOfAcceptedAnswers,
+  DATEDIFF(day, rq.CreationDate, TIMESTAMP '2024-10-01 12:34:56') AS DaysSinceCreation,
+  UPPER(SUBSTRING(rq.Title FROM 1 FOR 1)) || LOWER(SUBSTRING(rq.Title FROM 2 FOR CHARACTER_LENGTH(rq.Title))) AS FormattedTitle,
+  CASE
+    WHEN rq.Score > 100 THEN 'High'
+    WHEN rq.Score > 10 THEN 'Medium'
+    ELSE 'Low'
+  END AS ScoreCategory,
+  CASE
+    WHEN rq.Tags LIKE '%<sql>%' THEN 'SQL Related'
+    WHEN rq.Tags LIKE '%<python>%' THEN 'Python Related'
+    ELSE 'Other'
+  END AS PrimaryTagCategory
+FROM RecentQuestions rq
+LEFT JOIN QuestionEngagement qe
+  ON rq.Id = qe.QuestionId
+LEFT JOIN UserReputation ur
+  ON rq.OwnerUserId = ur.UserId
+LEFT JOIN AnswerDetails ad
+  ON rq.Id = ad.QuestionId
+WHERE
+  rq.rn <= 500
+  AND (
+    qe.UpVoteCount + qe.DownVoteCount > 5 OR rq.AnswerCount > 3
+  )
+ORDER BY
+  rq.Score DESC,
+  rq.FavoriteCount DESC;

@@ -1,0 +1,146 @@
+WITH RECURSIVE user_reputation_tiers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        NTILE(10) OVER (ORDER BY Reputation DESC) as rep_decile,
+        CASE 
+            WHEN Reputation >= 25000 THEN 'Elite'
+            WHEN Reputation >= 10000 THEN 'Expert'
+            WHEN Reputation >= 3000 THEN 'Advanced'
+            WHEN Reputation >= 500 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as tier,
+        LAG(Reputation, 1) OVER (PARTITION BY EXTRACT(YEAR FROM CreationDate) ORDER BY Reputation) as prev_rep,
+        LEAD(Reputation, 1) OVER (PARTITION BY EXTRACT(YEAR FROM CreationDate) ORDER BY Reputation) as next_rep
+    FROM Users
+    WHERE Reputation > 0
+),
+post_engagement_metrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+        LENGTH(p.Body) as body_length,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END as has_accepted_answer,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400.0 as activity_days,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as user_post_rank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as user_total_posts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as rolling_avg_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= DATE '2020-01-01'
+),
+tag_correlations AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_usage_count,
+        COUNT(DISTINCT p.OwnerUserId) as unique_contributors,
+        AVG(p.Score) as avg_post_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) as answer_rate,
+        STRING_AGG(DISTINCT SUBSTRING(u.Location, 1, 20), '; ') FILTER (WHERE u.Location IS NOT NULL) as top_locations
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT OUTER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(*) > 50
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) as favorites,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) as bounty_starts,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) as total_bounty,
+        MAX(v.CreationDate) as last_vote_date,
+        COUNT(DISTINCT v.UserId) as unique_voters
+    FROM Votes v
+    WHERE v.CreationDate >= DATE '2019-01-01'
+    GROUP BY v.PostId
+),
+complex_badge_analysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) as gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) as silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) as bronze_badges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) as tag_based_badges,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Name) FILTER (WHERE b.Class = 1) as gold_badge_names,
+        MAX(b.Date) - MIN(b.Date) as badge_earning_span
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    urt.DisplayName,
+    urt.tier as reputation_tier,
+    urt.Reputation,
+    urt.rep_decile,
+    COALESCE(urt.Reputation - urt.prev_rep, 0) as rep_gap_below,
+    pem.user_total_posts,
+    pem.rolling_avg_score,
+    ROUND(AVG(pem.Score)::numeric, 2) as avg_question_score,
+    ROUND(AVG(CASE WHEN pem.PostTypeId = 2 THEN pem.Score END)::numeric, 2) as avg_answer_score,
+    MAX(pem.ViewCount) as max_views,
+    SUM(vp.upvotes) as total_upvotes,
+    SUM(vp.downvotes) as total_downvotes,
+    ROUND(SUM(vp.upvotes)::numeric / NULLIF(SUM(vp.upvotes) + SUM(vp.downvotes), 0), 3) as upvote_ratio,
+    cba.gold_badges,
+    cba.silver_badges,
+    cba.bronze_badges,
+    COALESCE(cba.gold_badges * 50 + cba.silver_badges * 10 + cba.bronze_badges * 1, 0) as badge_score,
+    STRING_AGG(DISTINCT tc.TagName, ', ' ORDER BY tc.TagName) FILTER (WHERE tc.avg_post_score > 5) as high_performing_tags,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) as edit_count,
+    COUNT(DISTINCT c.Id) as total_comments,
+    ROUND(AVG(pem.activity_days)::numeric, 1) as avg_activity_duration_days,
+    MAX(CASE 
+        WHEN pem.has_accepted_answer = 1 AND pem.PostTypeId = 1 
+        THEN CONCAT(SUBSTRING(p.Title, 1, 50), '...') 
+    END) as top_answered_question,
+    ROUND((SUM(COALESCE(vp.total_bounty, 0)) * 1.0 / NULLIF(COUNT(DISTINCT pem.Id), 0))::numeric, 2) as avg_bounty_per_post,
+    CASE 
+        WHEN SUM(vp.favorites) > 20 THEN 'Highly Favorited'
+        WHEN SUM(vp.favorites) > 5 THEN 'Moderately Favorited'
+        ELSE 'Low Favorites'
+    END as favorite_status
+FROM user_reputation_tiers urt
+INNER JOIN post_engagement_metrics pem ON urt.Id = pem.OwnerUserId
+LEFT OUTER JOIN vote_patterns vp ON pem.Id = vp.PostId
+LEFT OUTER JOIN complex_badge_analysis cba ON urt.Id = cba.UserId
+LEFT OUTER JOIN Posts p ON pem.Id = p.Id
+LEFT OUTER JOIN PostHistory ph ON p.Id = ph.PostId AND ph.UserId = urt.Id
+LEFT OUTER JOIN Comments c ON p.Id = c.PostId AND c.UserId = urt.Id
+LEFT OUTER JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+LEFT OUTER JOIN tag_correlations tc ON t.TagName = tc.TagName
+WHERE urt.tier IN ('Expert', 'Elite')
+    AND pem.user_post_rank <= 10
+    AND (vp.upvotes IS NULL OR vp.upvotes > 0)
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts sub_p 
+        WHERE sub_p.OwnerUserId = urt.Id 
+            AND sub_p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = sub_p.PostTypeId)
+    )
+GROUP BY 
+    urt.Id, urt.DisplayName, urt.tier, urt.Reputation, urt.rep_decile, 
+    urt.prev_rep, pem.user_total_posts, pem.rolling_avg_score,
+    cba.gold_badges, cba.silver_badges, cba.bronze_badges
+HAVING COUNT(DISTINCT pem.Id) >= 5
+    AND SUM(vp.upvotes) > 100
+    AND AVG(pem.Score) > 2
+ORDER BY 
+    badge_score DESC,
+    urt.Reputation DESC,
+    total_upvotes DESC
+LIMIT 500;

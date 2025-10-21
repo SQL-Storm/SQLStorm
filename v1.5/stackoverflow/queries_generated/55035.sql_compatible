@@ -1,0 +1,79 @@
+WITH user_stats AS (
+    SELECT 
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id)                       FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(p.Id)                       FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        COALESCE(SUM(p.Score), 0)                     AS total_post_score,
+        COUNT(v.Id)                       FILTER (WHERE v.VoteTypeId = 2) AS upvotes_given,
+        COUNT(v.Id)                       FILTER (WHERE v.VoteTypeId = 3) AS downvotes_given,
+        COUNT(b.Id)                                 AS badge_cnt,
+        JSONB_AGG(
+            DISTINCT jsonb_build_object('name', b.Name, 'class', b.Class)
+        ) FILTER (WHERE b.Id IS NOT NULL)          AS badges
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v      ON v.UserId = u.Id
+    LEFT JOIN Badges b     ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    ORDER BY t.Count DESC
+    LIMIT 50
+),
+recent_hot_questions AS (
+    SELECT 
+        p.Id                                 AS post_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName                        AS owner_name,
+        ARRAY_AGG(DISTINCT pt.tag_name)      AS tags,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS hot_rank
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name
+    ) pt ON true
+    WHERE p.PostTypeId = 1                                   -- only questions
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName
+    HAVING COUNT(pt.tag_name) > 0
+    ORDER BY p.Score DESC, p.ViewCount DESC
+    LIMIT 100
+)
+SELECT 
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    us.total_post_score,
+    us.upvotes_given,
+    us.downvotes_given,
+    us.badge_cnt,
+    us.badges,
+    tt.TagName,
+    tt.Count           AS tag_usage,
+    rhq.post_id,
+    rhq.Title,
+    rhq.Score,
+    rhq.ViewCount,
+    rhq.CreationDate,
+    rhq.owner_name,
+    rhq.tags
+FROM user_stats us
+LEFT JOIN top_tags tt   ON tt.tag_rank = (us.user_id % 50) + 1
+LEFT JOIN recent_hot_questions rhq ON rhq.hot_rank = (us.user_id % 100) + 1
+WHERE us.Reputation > 1000
+ORDER BY us.total_post_score DESC, us.badge_cnt DESC
+LIMIT 200;

@@ -1,0 +1,145 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT SUBSTRING(b.Name, 1, 20), ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS GlobalPostRank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND p.Score > 0
+    LEFT OUTER JOIN Votes v ON u.Id = v.UserId 
+        AND v.VoteTypeId IN (2, 3, 8)
+    LEFT OUTER JOIN Comments c ON u.Id = c.UserId 
+        AND LENGTH(COALESCE(c.Text, '')) > 50
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+        AND u.CreationDate IS NOT NULL
+        AND (u.LastAccessDate >= TIMESTAMP '2019-01-01' OR u.Views > 10)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 5
+),
+QuestionAnswerPairs AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerUserId,
+        CASE 
+            WHEN q.AcceptedAnswerId = a.Id THEN 'Accepted'
+            WHEN a.Score >= 10 THEN 'Highly Rated'
+            WHEN a.Score < 0 THEN 'Downvoted'
+            ELSE 'Standard'
+        END AS AnswerCategory,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAnswer,
+        LAG(a.Score) OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS PreviousAnswerScore,
+        LEAD(a.CreationDate) OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS NextAnswerTime,
+        COUNT(*) OVER (PARTITION BY q.Id) AS TotalAnswersForQuestion
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1
+        AND a.PostTypeId = 2
+        AND q.ClosedDate IS NULL
+        AND q.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2023-12-31'
+        AND (q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<python>%' OR q.Tags LIKE '%<javascript>%')
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        AVG(p.Score) AS AvgQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS AcceptanceRate,
+        MAX(p.Score) AS MaxScore,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.Tags LIKE '%<' || t.TagName || '>%' 
+           AND p2.PostTypeId = 1
+           AND p2.Score < 0) AS NegativeScoreQuestions
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE t.Count > 100
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING AVG(p.Score) IS NOT NULL
+)
+SELECT 
+    uem.DisplayName,
+    COALESCE(uem.Location, 'Not Specified') AS UserLocation,
+    uem.Reputation,
+    uem.PostCount,
+    uem.VoteCount,
+    ROUND(CAST(uem.AvgAnswerScore AS NUMERIC), 2) AS AvgAnswerScore,
+    uem.GoldBadges,
+    uem.LocationRank,
+    qap.Title AS BestQuestionTitle,
+    qap.QuestionScore,
+    qap.AnswerCategory,
+    ROUND(CAST(qap.HoursToAnswer AS NUMERIC), 2) AS HoursToAnswer,
+    COALESCE(qap.AnswerScore, 0) AS AnswerScore,
+    qap.TotalAnswersForQuestion,
+    tp.TagName AS PrimaryTag,
+    ROUND(CAST(tp.AvgQuestionScore AS NUMERIC), 2) AS TagAvgScore,
+    ROUND(CAST(tp.AcceptanceRate AS NUMERIC), 2) AS TagAcceptanceRate,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.UserId = uem.UserId 
+       AND ph.PostHistoryTypeId IN (4, 5, 6)
+       AND ph.CreationDate >= TIMESTAMP '2020-01-01') AS UserEditCount,
+    (SELECT STRING_AGG(DISTINCT vt.Name, ', ')
+     FROM Votes v2
+     INNER JOIN VoteTypes vt ON v2.VoteTypeId = vt.Id
+     WHERE v2.UserId = uem.UserId
+       AND v2.VoteTypeId IN (8, 14)
+     LIMIT 5) AS SpecialVoteTypes,
+    CASE 
+        WHEN uem.Reputation > 10000 THEN 'Elite'
+        WHEN uem.Reputation > 1000 THEN 'Advanced'
+        WHEN uem.Reputation > 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    EXTRACT(YEAR FROM cast('2024-10-01 12:34:56' as timestamp)) - EXTRACT(YEAR FROM (SELECT u2.CreationDate FROM Users u2 WHERE u2.Id = uem.UserId)) AS YearsActive
+FROM UserEngagementMetrics uem
+LEFT OUTER JOIN QuestionAnswerPairs qap ON uem.UserId = qap.AnswerUserId
+    AND qap.AnswerScore = (
+        SELECT MAX(qap2.AnswerScore)
+        FROM QuestionAnswerPairs qap2
+        WHERE qap2.AnswerUserId = uem.UserId
+    )
+LEFT OUTER JOIN TagPerformance tp ON tp.TagName IN (
+    SELECT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    FROM Posts p
+    WHERE p.OwnerUserId = uem.UserId
+        AND p.PostTypeId = 1
+    LIMIT 1
+)
+WHERE uem.PostCount >= 3
+    AND (qap.QuestionScore IS NULL OR qap.QuestionScore >= -5)
+    AND (tp.TagUsageCount IS NULL OR tp.TagUsageCount > 0)
+    AND uem.LocationRank <= 100
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Votes v3
+        WHERE v3.UserId = uem.UserId
+            AND v3.VoteTypeId = 12
+            AND v3.CreationDate >= TIMESTAMP '2022-01-01'
+    )
+ORDER BY 
+    COALESCE(uem.AvgAnswerScore * uem.PostCount, 0) DESC,
+    uem.Reputation DESC,
+    qap.HoursToAnswer ASC NULLS LAST
+LIMIT 500;

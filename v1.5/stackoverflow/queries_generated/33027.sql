@@ -1,0 +1,36 @@
+-- {"query": "33027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 358} 
+SELECT
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    COALESCE(q.AnswerCount, 0) AS AnswerCount,
+    COALESCE(c.CommentCount, 0) AS CommentCount,
+    COUNT(DISTINCT v.UserId) AS UniqueVoters,
+    COUNT(DISTINCT bl.RelatedPostId) AS LinkedPostsCount,
+    AVG(votes.Count) OVER (PARTITION BY p.Id) AS AverageVoteCountPerPost,
+    jsonb_object_agg(tv.Name, COUNT(*) ) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesPerTag,
+    jsonb_object_agg(tv.Name, COUNT(*) ) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesPerTag,
+    array_agg(DISTINCT bl.RelatedPostId) AS RelatedPostIds
+FROM
+    Posts p
+LEFT JOIN
+    Posts q ON p.Id = q.ParentId
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    VoteTypes tv ON v.VoteTypeId = tv.Id
+LEFT JOIN
+    PostLinks bl ON bl.PostId = p.Id AND bl.LinkTypeId = 1
+WHERE
+    p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '1 year'
+GROUP BY
+    p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, q.AnswerCount, c.CommentCount
+ORDER BY
+    p.CreationDate DESC
+LIMIT 100;

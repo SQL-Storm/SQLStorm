@@ -1,0 +1,143 @@
+WITH RECURSIVE
+RecentActivity AS (
+  SELECT
+    p.id AS post_id,
+    p.posttypeid,
+    COALESCE(p.title, SUBSTRING(p.body FOR 120)) AS headline,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.tags,
+    NULLIF(REGEXP_REPLACE(COALESCE(p.tags, ''), '^<([^>]+)>(?:.*)$', '\\1'), '') AS first_tag,
+    LOWER(MD5(COALESCE(p.title, '') || '|' || COALESCE(p.tags, ''))) AS signature,
+    ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.lastactivitydate DESC NULLS LAST, p.score DESC) AS rn_user_post
+  FROM posts p
+),
+UserAgg AS (
+  SELECT
+    u.id AS user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate AS user_created,
+    u.lastaccessdate,
+    COUNT(DISTINCT b.id) FILTER (WHERE b.class = 1) AS gold_badges,
+    COUNT(DISTINCT b.id) FILTER (WHERE b.class = 2) AS silver_badges,
+    COUNT(DISTINCT b.id) FILTER (WHERE b.class = 3) AS bronze_badges,
+    SUM(COALESCE(p.score, 0) * EXP(-GREATEST(0, EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - COALESCE(p.lastactivitydate, p.creationdate))) / (60*60*24*180)))) AS recency_weighted_score,
+    NULLIF(u.upvotes, 0) AS upvotes_nonzero,
+    u.downvotes,
+    CASE WHEN u.views > 0 THEN ROUND(((u.upvotes::NUMERIC - u.downvotes)::NUMERIC) / GREATEST(1, u.views)::NUMERIC, 6) ELSE NULL END AS vote_per_view
+  FROM users u
+  LEFT JOIN badges b ON b.userid = u.id
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  GROUP BY u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.upvotes, u.downvotes, u.views
+),
+QAs AS (
+  SELECT
+    q.id AS question_id,
+    q.acceptedanswerid,
+    q.answercount,
+    q.score AS q_score,
+    a.id AS answer_id,
+    a.score AS a_score,
+    a.owneruserid AS a_owner,
+    a.creationdate AS a_created,
+    (SELECT COUNT(*) FROM comments c WHERE c.postid = a.id AND c.creationdate > q.creationdate) AS recent_comments_on_answer,
+    (
+      SELECT STRING_AGG(vw.voter_summary, ';' ORDER BY vw.vote_count DESC NULLS LAST)
+      FROM (
+        SELECT (vt.name || ':' || COUNT(*) || '@' || TO_CHAR(MIN(v.creationdate), 'YYYY-MM-DD')) AS voter_summary,
+               COUNT(*) AS vote_count
+        FROM votes v
+        JOIN votetypes vt ON vt.id = v.votetypeid
+        WHERE v.postid = a.id
+        GROUP BY vt.name
+        ORDER BY vote_count DESC
+        LIMIT 3
+      ) vw
+    ) AS top_vote_summary
+  FROM posts q
+  LEFT JOIN posts a ON a.parentid = q.id AND a.posttypeid = 2
+  WHERE q.posttypeid = 1
+),
+RecursiveLinks AS (
+  SELECT pl.postid, pl.relatedpostid, pl.linktypeid, 1 AS depth, ARRAY[pl.postid, pl.relatedpostid] AS path
+  FROM postlinks pl
+  WHERE pl.postid IS NOT NULL
+  UNION ALL
+  SELECT r.postid, pl.relatedpostid, pl.linktypeid, r.depth + 1, r.path || pl.relatedpostid
+  FROM RecursiveLinks r
+  JOIN postlinks pl ON pl.postid = r.relatedpostid
+  WHERE NOT pl.relatedpostid = ANY(r.path) AND r.depth < 6
+),
+QuestionComplexScore AS (
+  SELECT
+    p.id AS question_id,
+    p.title,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    (p.score
+     + COALESCE(LN(GREATEST(p.viewcount, 1)), 0) * SIGN(p.score + 0.00001)
+     + COALESCE((SELECT 5 * COUNT(*) FROM badges b WHERE b.userid = p.owneruserid AND b.class = 1), 0)
+     - COALESCE((SELECT COUNT(*) FROM posthistory ph WHERE ph.postid = p.id AND ph.posthistorytypeid IN (10, 12)), 0) * 0.5
+    ) AS ext_score,
+    (SELECT COUNT(DISTINCT rl.path[1]) FROM RecursiveLinks rl WHERE rl.postid = p.id AND rl.linktypeid = 3) AS duplicate_chains,
+    CASE WHEN p.tags ILIKE '%<sql>%'
+         THEN 1
+         ELSE 0
+    END AS has_sql_tag,
+    (
+      SELECT STRING_AGG(DISTINCT tag, ',' ORDER BY tag)
+      FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(p.tags, ''), 2, GREATEST(LENGTH(COALESCE(p.tags, '')) - 2, 0)), '><')) AS tag
+    ) AS tag_fingerprint
+  FROM posts p
+  WHERE p.posttypeid = 1
+),
+FinalPick AS (
+  SELECT
+    ra.post_id,
+    ra.posttypeid,
+    ra.headline,
+    ra.owneruserid,
+    ra.signature,
+    ua.displayname,
+    ua.reputation,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    qs.ext_score,
+    qs.duplicate_chains,
+    qs.has_sql_tag,
+    qa.answer_id,
+    qa.a_score,
+    qa.recent_comments_on_answer,
+    qa.top_vote_summary,
+    RANK() OVER (PARTITION BY COALESCE(ua.reputation::TEXT, '0') ORDER BY qs.ext_score DESC NULLS LAST, ra.lastactivitydate DESC NULLS LAST) AS composite_rank
+  FROM RecentActivity ra
+  LEFT JOIN UserAgg ua ON ua.user_id = ra.owneruserid
+  LEFT JOIN QuestionComplexScore qs ON qs.question_id = ra.post_id
+  LEFT JOIN QAs qa ON qa.question_id = ra.post_id
+  WHERE ra.rn_user_post <= 5
+)
+SELECT
+  fp.*,
+  EXISTS (SELECT 1 FROM posts p WHERE p.parentid = fp.post_id AND p.owneruserid = fp.owneruserid) AS owner_self_answered,
+  EXTRACT(EPOCH FROM (COALESCE(fp.lastactivitydate, fp.creationdate) - COALESCE(u.lastaccessdate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)))) / 86400.0 AS days_since_user_last_access,
+  CASE WHEN fp.post_id IN (
+       SELECT question_id FROM QuestionComplexScore qcs
+       EXCEPT
+       SELECT post_id FROM RecentActivity WHERE signature = fp.signature
+    )
+    THEN 'IN_TOP_SCORE_BUT_NOT_IN_RECENT'
+    ELSE 'OK'
+  END AS score_recency_diff
+FROM FinalPick fp
+LEFT JOIN users u ON u.id = fp.owneruserid
+WHERE (fp.ext_score IS NOT NULL AND fp.ext_score > 1)
+  OR (fp.has_sql_tag = 1)
+ORDER BY fp.composite_rank ASC, fp.ext_score DESC NULLS LAST
+LIMIT 200;

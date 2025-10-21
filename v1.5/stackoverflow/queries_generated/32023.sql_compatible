@@ -1,0 +1,55 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(COALESCE(v.Score, 0)) AS TotalScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        u.CreationDate BETWEEN TIMESTAMP '2022-01-01' AND TIMESTAMP '2023-01-01'
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        COUNT(p.Id) > 10 AND SUM(COALESCE(v.Score, 0)) > 50
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        CONCAT('#', STRING_AGG(DISTINCT t.TagName, ', #')) AS TagsUsed
+    FROM 
+        Posts p
+    LEFT JOIN 
+        (SELECT TRIM(value) AS elem FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ',')) tarr ON TRUE
+    LEFT JOIN 
+        Tags t ON t.TagName = tarr.elem
+    WHERE 
+        p.CreationDate >= (SELECT MIN(CreationDate) FROM ActiveUsers)
+    GROUP BY 
+        p.Id, p.Title, p.PostTypeId, p.ViewCount
+    HAVING 
+        p.ViewCount > 1000
+)
+SELECT 
+    u.DisplayName,
+    SUM(ap.ViewCount) AS TotalViews,
+    STRING_AGG(ap.Title, '; ') AS PopularPosts
+FROM 
+    ActiveUsers u
+JOIN 
+    PostActivity ap ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = ap.PostId)
+GROUP BY 
+    u.DisplayName
+ORDER BY 
+    TotalViews DESC;

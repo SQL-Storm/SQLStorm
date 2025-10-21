@@ -1,0 +1,109 @@
+WITH
+UsersBase AS (
+  SELECT u.Id AS UserId,
+         COALESCE(u.DisplayName, 'Unknown') AS DisplayName,
+         u.Reputation,
+         COALESCE(u.Location, '') AS Location,
+         COALESCE(u.Views, 0) AS Views
+  FROM Users u
+),
+PostStats AS (
+  SELECT OwnerUserId AS UserId,
+         COUNT(*) AS PostCount,
+         SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         MAX(LastActivityDate) AS LastActivityDate
+  FROM Posts
+  GROUP BY OwnerUserId
+),
+VoteEngagement AS (
+  SELECT P.OwnerUserId AS UserId,
+         SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Posts P
+  LEFT JOIN Votes V ON V.PostId = P.Id
+  GROUP BY P.OwnerUserId
+),
+Engagement AS (
+  SELECT UB.UserId,
+         UB.DisplayName,
+         UB.Reputation,
+         COALESCE(PS.PostCount, 0) AS PostCount,
+         COALESCE(PS.QuestionCount, 0) AS QuestionCount,
+         COALESCE(PS.AnswerCount, 0) AS AnswerCount,
+         PS.LastActivityDate,
+         COALESCE(VE.UpVotes, 0) AS UpVotes,
+         COALESCE(VE.DownVotes, 0) AS DownVotes,
+         (COALESCE(UB.Reputation, 0) * 1.6
+          + COALESCE(PS.PostCount, 0) * 2.4
+          + COALESCE(VE.UpVotes, 0) * 3.0
+          - COALESCE(VE.DownVotes, 0) * 1.5) AS EngagementScore
+  FROM UsersBase UB
+  LEFT JOIN PostStats PS ON PS.UserId = UB.UserId
+  LEFT JOIN VoteEngagement VE ON VE.UserId = UB.UserId
+),
+Q1 AS (
+  SELECT
+     E.UserId,
+     E.DisplayName,
+     E.Reputation,
+     E.PostCount,
+     E.QuestionCount,
+     E.AnswerCount,
+     E.LastActivityDate,
+     (SELECT MAX(CreationDate) FROM Comments c WHERE c.UserId = E.UserId) AS LastCommentDate,
+     E.EngagementScore,
+     'HighRep' AS Source,
+     ROW_NUMBER() OVER (PARTITION BY (CASE WHEN E.Reputation > 10000 THEN 1 ELSE 0 END) ORDER BY E.EngagementScore DESC) AS Seq,
+     CONCAT(E.DisplayName, ' - ', COALESCE(TO_CHAR_DATE(E.LastActivityDate), 'N/A')) AS ProfileSummary
+  FROM Engagement E
+  WHERE E.Reputation > 10000
+),
+Q2 AS (
+  SELECT
+     E.UserId,
+     E.DisplayName,
+     E.Reputation,
+     E.PostCount,
+     E.QuestionCount,
+     E.AnswerCount,
+     E.LastActivityDate,
+     (SELECT MAX(CreationDate) FROM Comments c WHERE c.UserId = E.UserId) AS LastCommentDate,
+     E.EngagementScore,
+     'Active' AS Source,
+     ROW_NUMBER() OVER (PARTITION BY (CASE WHEN E.PostCount > 100 THEN 1 ELSE 0 END) ORDER BY E.EngagementScore DESC) AS Seq,
+     CONCAT(E.DisplayName, ' - ', COALESCE(TO_CHAR_DATE(E.LastActivityDate), 'N/A')) AS ProfileSummary
+  FROM Engagement E
+  WHERE E.PostCount > 100
+)
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  PostCount,
+  QuestionCount,
+  AnswerCount,
+  LastActivityDate,
+  LastCommentDate,
+  EngagementScore,
+  Source,
+  Seq,
+  ProfileSummary
+FROM Q1
+UNION ALL
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  PostCount,
+  QuestionCount,
+  AnswerCount,
+  LastActivityDate,
+  LastCommentDate,
+  EngagementScore,
+  Source,
+  Seq,
+  ProfileSummary
+FROM Q2
+ORDER BY Source, EngagementScore DESC
+LIMIT 200;

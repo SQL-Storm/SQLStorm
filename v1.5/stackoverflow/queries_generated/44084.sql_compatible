@@ -1,0 +1,51 @@
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, u.Id AS UserId, u.Reputation, u.CreationDate AS UserCreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, b.Id AS BadgeId, b.Name AS BadgeName, b.Date AS BadgeDate, b.Class AS BadgeClass, b.TagBased AS BadgeTagBased, c.Id AS CommentId, c.Score AS CommentScore, c.CreationDate AS CommentCreationDate, v.Id AS VoteId, v.VoteTypeId, v.CreationDate AS VoteCreationDate, v.BountyAmount, pl.Id AS PostLinkId, pl.LinkTypeId, pl.CreationDate AS PostLinkCreationDate, pt.Name AS PostTypeName, ct.Name AS CloseReasonName, lt.Name AS LinkTypeName, vt.Name AS VoteTypeName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN CloseReasonTypes ct ON p.ClosedDate IS NOT NULL AND EXTRACT(EPOCH FROM p.ClosedDate) = EXTRACT(EPOCH FROM (SELECT Id FROM CloseReasonTypes ct2 WHERE ct2.Id = ct.Id)) -- simplified compatibility
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+)
+SELECT
+  COUNT(*) AS TotalPosts,
+  COUNT(DISTINCT UserId) AS UniqueUserCount,
+  COUNT(DISTINCT BadgeId) AS UniqueBadgeCount,
+  COUNT(DISTINCT CommentId) AS UniqueCommentCount,
+  COUNT(DISTINCT VoteId) AS UniqueVoteCount,
+  COUNT(DISTINCT PostLinkId) AS UniquePostLinkCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'Question' THEN p.Id END) AS QuestionCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'Answer' THEN p.Id END) AS AnswerCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'Wiki' THEN p.Id END) AS WikiCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'TagWikiExcerpt' THEN p.Id END) AS TagWikiExcerptCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'TagWiki' THEN p.Id END) AS TagWikiCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'ModeratorNomination' THEN p.Id END) AS ModeratorNominationCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'WikiPlaceholder' THEN p.Id END) AS WikiPlaceholderCount,
+  COUNT(DISTINCT CASE WHEN PostTypeName = 'PrivilegeWiki' THEN p.Id END) AS PrivilegeWikiCount,
+  COUNT(DISTINCT CASE WHEN ClosedDate IS NOT NULL THEN p.Id END) AS ClosedPostCount,
+  COUNT(DISTINCT CASE WHEN CommunityOwnedDate IS NOT NULL THEN p.Id END) AS CommunityOwnedPostCount,
+  AVG(Score) AS AvgPostScore,
+  AVG(ViewCount) AS AvgPostViewCount,
+  AVG(AnswerCount) AS AvgPostAnswerCount,
+  AVG(CommentCount) AS AvgPostCommentCount,
+  AVG(FavoriteCount) AS AvgPostFavoriteCount,
+  AVG(Reputation) AS AvgUserReputation,
+  AVG(Views) AS AvgUserViews,
+  AVG(UpVotes) AS AvgUserUpVotes,
+  AVG(DownVotes) AS AvgUserDownVotes,
+  AVG(CASE WHEN BadgeClass IS NULL THEN 0 ELSE BadgeClass END) AS AvgBadgeClass,
+  AVG(CommentScore) AS AvgCommentScore,
+  AVG(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteRatio,
+  AVG(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteRatio,
+  AVG(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteRatio,
+  AVG(CASE WHEN VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVoteRatio,
+  AVG(CASE WHEN VoteTypeId = 7 THEN 1 ELSE 0 END) AS ReopenVoteRatio,
+  AVG(BountyAmount) AS AvgBountyAmount,
+  COUNT(DISTINCT CASE WHEN LinkTypeName = 'Linked' THEN pl.Id END) AS LinkedPostLinkCount,
+  COUNT(DISTINCT CASE WHEN LinkTypeName = 'Duplicate' THEN pl.Id END) AS DuplicatePostLinkCount
+FROM cte p
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63

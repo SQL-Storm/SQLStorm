@@ -1,0 +1,354 @@
+-- {"query": "29087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3072} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3_rows,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.Title, 'No Title') as title_or_placeholder,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag)
+            ELSE 0 
+        END as tag_count
+    FROM Posts p
+    WHERE p.CreationDate >= '2019-01-01'::timestamp
+),
+UserStats AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount as user_views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as total_question_views,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) as total_answer_views,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags_used,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = u.Id 
+         AND b.Date >= '2020-01-01'::timestamp 
+         AND b.Class = 1) as gold_badges_count
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2018-01-01'::timestamp
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+HighScorePosts AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.avg_score_3_rows,
+        rp.post_category,
+        rp.tag_count,
+        CASE 
+            WHEN rp.Score > 100 THEN 'High'
+            WHEN rp.Score > 50 THEN 'Medium'
+            WHEN rp.Score > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as score_level,
+        (rp.Score - rp.prev_score) as score_change,
+        DENSE_RANK() OVER (ORDER BY rp.Score DESC) as score_rank,
+        ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC) as user_score_rank
+    FROM RankedPosts rp
+    WHERE rp.rn = 1
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as change_count,
+        COUNT(DISTINCT ph.PostHistoryTypeId) as unique_changes,
+        MAX(ph.CreationDate) as last_change_date,
+        STRING_AGG(ph.Comment, ' | ') as change_comments,
+        STRING_AGG(CAST(ph.PostHistoryTypeId AS VARCHAR), ', ') as change_types
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= '2020-01-01'::timestamp
+    GROUP BY ph.PostId
+    HAVING COUNT(*) > 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Rare'
+        END as tag_popularity,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%') as post_count_with_tag
+    FROM Tags t
+    WHERE t.Count > 50
+),
+CombinedResults AS (
+    SELECT 
+        hsp.Id as post_id,
+        hsp.OwnerUserId,
+        hsp.Score,
+        hsp.ViewCount,
+        hsp.Title,
+        hsp.Tags,
+        hsp.avg_score_3_rows,
+        hsp.post_category,
+        hsp.tag_count,
+        hsp.score_level,
+        hsp.score_change,
+        hsp.score_rank,
+        us.DisplayName as owner_name,
+        us.Reputation as owner_reputation,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.total_score,
+        us.avg_score,
+        us.total_question_views,
+        us.total_answer_views,
+        us.all_tags_used,
+        us.gold_badges_count,
+        ps.change_count,
+        ps.unique_changes,
+        ps.last_change_date,
+        ps.change_comments,
+        ps.change_types,
+        ta.tag_popularity,
+        ta.post_count_with_tag,
+        CASE WHEN hsp.Score > us.avg_score THEN 'Above Avg' ELSE 'Below Avg' END as score_vs_user_avg,
+        CASE WHEN hsp.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Site Avg' ELSE 'Below Site Avg' END as score_vs_site_avg,
+        CASE 
+            WHEN hsp.PostTypeId = 1 AND hsp.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) 
+                 FROM Posts p 
+                 WHERE p.ParentId = hsp.Id AND p.PostTypeId = 2) 
+            ELSE 0 
+        END as actual_answers_count,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = hsp.Id 
+             AND c.CreationDate >= '2020-01-01'::timestamp), 0
+        ) as recent_comments_count,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = hsp.Id 
+             AND v.VoteTypeId IN (2, 3) 
+             AND v.CreationDate >= '2020-01-01'::timestamp), 0
+        ) as recent_votes_count,
+        -- Complex NULL handling and conditional calculations
+        CASE 
+            WHEN hsp.Score > 0 AND hsp.ViewCount > 0 THEN 
+                ROUND((hsp.Score::DECIMAL / hsp.ViewCount) * 100, 2)
+            ELSE 0 
+        END as score_to_view_ratio,
+        -- Multiple conditional aggregations
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = hsp.OwnerUserId 
+         AND b.Class = 1) as total_gold_badges,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = hsp.OwnerUserId 
+         AND b.Class = 2) as total_silver_badges,
+        -- Complex string operations and null handling
+        COALESCE(
+            TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        hsp.Title, 
+                        '[^a-zA-Z0-9\s\-_]', 
+                        '', 
+                        'g'
+                    ), 
+                    '\s+', 
+                    ' ', 
+                    'g'
+                )
+            ), 
+            'No Title'
+        ) as cleaned_title,
+        -- Calculated fields with multiple conditions
+        ROUND(
+            CASE 
+                WHEN hsp.ViewCount > 0 THEN hsp.Score::DECIMAL / hsp.ViewCount 
+                ELSE 0 
+            END, 
+            4
+        ) as view_score_ratio,
+        -- Window function combined with conditions
+        (SELECT MAX(p.Score) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = hsp.OwnerUserId 
+         AND p.PostTypeId = 1) as max_question_score,
+        -- Complex join with multiple conditions and correlated subqueries
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = hsp.OwnerUserId 
+         AND p2.Score > hsp.Score 
+         AND p2.PostTypeId = 1) as higher_questions_count,
+        -- String expression and concat functions
+        CASE 
+            WHEN hsp.Tags IS NOT NULL AND hsp.Tags != '' THEN 
+                UPPER(SUBSTRING(hsp.Tags, 2, 20)) || '... (' || hsp.tag_count || ' tags)'
+            ELSE 'No Tags'
+        END as tags_summary,
+        -- Conditional date operations
+        CASE 
+            WHEN hsp.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Recent'
+            WHEN hsp.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 'Older'
+            ELSE 'Very Old'
+        END as post_recency,
+        -- Set operator logic using EXISTS
+        EXISTS(
+            SELECT 1 
+            FROM PostLinks pl 
+            WHERE pl.PostId = hsp.Id 
+            AND pl.LinkTypeId = 3
+        ) as is_duplicate,
+        -- Complex nested subqueries with joins
+        (SELECT AVG(p3.Score) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = hsp.OwnerUserId 
+         AND p3.CreationDate >= '2020-01-01'::timestamp 
+         AND p3.PostTypeId = 1) as recent_avg_question_score,
+        -- Multiple set operators
+        CASE 
+            WHEN EXISTS(
+                SELECT 1 
+                FROM PostHistory ph2 
+                WHERE ph2.PostId = hsp.Id 
+                AND ph2.PostHistoryTypeId = 10
+            ) AND EXISTS(
+                SELECT 1 
+                FROM PostHistory ph3 
+                WHERE ph3.PostId = hsp.Id 
+                AND ph3.PostHistoryTypeId = 11
+            ) THEN 'Closed & Reopened'
+            WHEN EXISTS(
+                SELECT 1 
+                FROM PostHistory ph4 
+                WHERE ph4.PostId = hsp.Id 
+                AND ph4.PostHistoryTypeId = 10
+            ) THEN 'Closed'
+            WHEN EXISTS(
+                SELECT 1 
+                FROM PostHistory ph5 
+                WHERE ph5.PostId = hsp.Id 
+                AND ph5.PostHistoryTypeId = 11
+            ) THEN 'Reopened'
+            ELSE 'No Status Change'
+        END as status_history
+    FROM HighScorePosts hsp
+    INNER JOIN UserStats us ON hsp.OwnerUserId = us.user_id
+    LEFT JOIN PostHistorySummary ps ON hsp.Id = ps.PostId
+    LEFT JOIN TagAnalysis ta ON hsp.Tags IS NOT NULL 
+        AND hsp.Tags != '' 
+        AND ta.TagName IN (
+            SELECT unnest(string_to_array(substring(hsp.Tags, 2, length(hsp.Tags)-2), '><'))
+        )
+    WHERE hsp.Score > 0 
+    AND us.total_posts > 0
+    AND COALESCE(hsp.Score, 0) > COALESCE(us.avg_score, 0)
+)
+
+-- Final SELECT with multiple complex expressions and logic
+SELECT 
+    cr.post_id,
+    cr.owner_name,
+    cr.Score,
+    cr.ViewCount,
+    cr.Title,
+    cr.Tags,
+    cr.avg_score_3_rows,
+    cr.post_category,
+    cr.tag_count,
+    cr.score_level,
+    cr.score_change,
+    cr.score_rank,
+    cr.owner_reputation,
+    cr.total_posts,
+    cr.question_count,
+    cr.answer_count,
+    cr.total_score,
+    cr.avg_score,
+    cr.total_question_views,
+    cr.total_answer_views,
+    cr.change_count,
+    cr.unique_changes,
+    cr.last_change_date,
+    cr.tag_popularity,
+    cr.post_count_with_tag,
+    cr.score_vs_user_avg,
+    cr.score_vs_site_avg,
+    cr.actual_answers_count,
+    cr.recent_comments_count,
+    cr.recent_votes_count,
+    cr.cleaned_title,
+    cr.view_score_ratio,
+    cr.max_question_score,
+    cr.higher_questions_count,
+    cr.tags_summary,
+    cr.post_recency,
+    cr.is_duplicate,
+    cr.recent_avg_question_score,
+    cr.status_history,
+    -- Complex final calculations
+    CASE 
+        WHEN cr.score_rank <= 100 AND cr.score > 1000 THEN 'Top Performer'
+        WHEN cr.score_rank <= 500 AND cr.score > 500 THEN 'High Performer'
+        WHEN cr.score_rank <= 1000 AND cr.score > 100 THEN 'Moderate Performer'
+        ELSE 'Standard Performer'
+    END as performance_category,
+    -- Mathematical operations and NULL handling
+    ROUND(
+        (cr.total_score::DECIMAL / NULLIF(cr.total_posts, 0)) * 
+        (NULLIF(cr.total_question_views, 0) / NULLIF(cr.total_answer_views + 1, 0)), 
+        2
+    ) as composite_performance_metric,
+    -- Final set operation logic
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = cr.OwnerUserId 
+     AND p.Score > cr.Score
+     AND p.CreationDate >= '2020-01-01'::timestamp
+    ) as newer_higher_score_count,
+    -- Complex filtering and ordering
+    CASE 
+        WHEN cr.recent_votes_count > 10 AND cr.ViewCount > 100 THEN 'High Activity'
+        WHEN cr.recent_votes_count > 5 AND cr.ViewCount > 50 THEN 'Moderate Activity'
+        ELSE 'Low Activity'
+    END as activity_level
+FROM CombinedResults cr
+WHERE cr.is_duplicate IS NOT NULL 
+AND (cr.post_id IS NOT NULL OR cr.owner_name IS NOT NULL)
+ORDER BY cr.score_rank ASC, cr.total_score DESC
+LIMIT 1000;

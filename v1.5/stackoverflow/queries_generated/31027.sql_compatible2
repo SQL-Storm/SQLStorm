@@ -1,0 +1,73 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        p.CreationDate,
+        p.Score,
+        p.AcceptedAnswerId,
+        COALESCE(a.OwnerDisplayName, 'No Accepted Answer') AS AcceptedAnswerOwner,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE 
+        p.PostTypeId = 1
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.PostId) AS VotedPosts
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+PostsWithStats AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Score,
+        rp.AcceptedAnswerOwner,
+        us.DisplayName AS OwnerDisplayName,
+        us.Reputation,
+        us.BadgeCount,
+        us.VotedPosts
+    FROM 
+        RankedPosts rp
+    LEFT JOIN 
+        UserStats us ON rp.OwnerUserId = us.UserId
+    WHERE 
+        rp.PostRank = 1
+)
+SELECT 
+    pws.PostId,
+    pws.Title,
+    pws.ViewCount,
+    pws.CreationDate,
+    pws.Score,
+    pws.AcceptedAnswerOwner,
+    pws.OwnerDisplayName,
+    pws.Reputation,
+    pws.BadgeCount,
+    pws.VotedPosts,
+    pt.Name AS PostType
+FROM 
+    PostsWithStats pws
+JOIN 
+    PostTypes pt ON pt.Id = (
+        SELECT PostTypeId FROM Posts AS pp WHERE pp.Id = pws.PostId
+    )
+ORDER BY 
+    pws.Score DESC, pws.ViewCount DESC
+LIMIT 100;

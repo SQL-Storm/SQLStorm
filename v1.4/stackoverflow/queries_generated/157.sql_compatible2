@@ -1,0 +1,144 @@
+WITH
+RecentEdits AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate AS EditDate,
+    ph.UserId AS EditorId,
+    ph.Text,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 16, 24, 33, 34)
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COALESCE(u.WebsiteUrl, '') AS WebsiteUrl,
+    COALESCE(u.AboutMe, '') AS AboutMe,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.AboutMe
+),
+EditsPerUser AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ua.Location,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.WebsiteUrl,
+    ua.AboutMe,
+    ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY re.EditDate DESC) AS rn,
+    MAX(pa.EditDate) OVER (PARTITION BY ua.UserId) AS LastEditDate,
+    re.EditDate AS MostRecentEdit
+  FROM UserActivity ua
+  LEFT JOIN RecentEdits re ON re.EditorId = ua.UserId
+  LEFT JOIN Posts p ON p.Id = re.PostId
+  LEFT JOIN (
+    SELECT
+      ph.PostId,
+      ph.CreationDate AS EditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10)
+  ) pa ON pa.PostId = p.Id
+),
+TagUsage AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagMentionCount
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+  GROUP BY t.TagName
+),
+ActiveQuestionTags AS (
+  SELECT
+    t.TagName,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCountWithTag
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT
+      TRIM(x.value) AS TagName
+    FROM (
+      SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS value
+    ) AS x
+  ) AS t ON TRUE
+  GROUP BY t.TagName
+),
+Combined AS (
+  SELECT
+    epu.UserId,
+    epu.DisplayName,
+    epu.Reputation,
+    epu.LastEditDate,
+    epu.MostRecentEdit,
+    epu.Location,
+    epu.Views,
+    epu.UpVotes,
+    epu.DownVotes,
+    epu.WebsiteUrl,
+    epu.AboutMe,
+    COALESCE(uc.QuestionCount, 0) AS QuestionCount,
+    COALESCE(uc.AnswerCount, 0) AS AnswerCount,
+    COALESCE(ta.TagMentionCount, 0) AS TopTagEngagement
+  FROM EditsPerUser epu
+  LEFT JOIN (
+    SELECT
+      p.OwnerUserId,
+      COUNT(*) AS QuestionCount,
+      COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ) uc ON uc.OwnerUserId = epu.UserId
+  LEFT JOIN (
+    SELECT
+      tu.TagName,
+      SUM(ut.TagMentionCount) AS TagMentionCount
+    FROM ActiveQuestionTags au
+    JOIN TagUsage tu ON tu.TagName = au.TagName
+    GROUP BY tu.TagName
+  ) ta ON ta.TagName = (SELECT TagName FROM (
+      SELECT t.TagName
+      FROM Tags t
+      WHERE t.IsModeratorOnly = FALSE
+      LIMIT 1
+  ) AS sub)
+)
+SELECT
+  c.UserId,
+  c.DisplayName,
+  c.Reputation,
+  c.LastEditDate,
+  CASE WHEN c.MostRecentEdit IS NULL THEN NULL ELSE c.MostRecentEdit END AS MostRecentEditDate,
+  c.Location,
+  c.Views,
+  c.UpVotes,
+  c.DownVotes,
+  c.WebsiteUrl,
+  c.AboutMe,
+  c.QuestionCount,
+  c.AnswerCount,
+  c.TopTagEngagement,
+  CASE
+    WHEN c.Location IS NULL THEN '(unknown)'
+    ELSE c.Location
+  END AS LocationSafe,
+  CONCAT_WS(' | ', c.DisplayName, COALESCE(NULLIF(c.Location, ''), '(no location)')) AS DisplayWithLocation
+FROM Combined c
+ORDER BY c.Reputation DESC NULLS LAST, c.LastEditDate DESC NULLS LAST
+LIMIT 100;

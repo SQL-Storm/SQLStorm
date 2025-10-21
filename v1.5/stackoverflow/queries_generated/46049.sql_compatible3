@@ -1,0 +1,97 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND p.Score > 5
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY a.ParentId, a.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 ELSE NULL END) AS TagBasedBadges
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2019-01-01'
+    GROUP BY b.UserId
+),
+InteractionGraph AS (
+    SELECT 
+        p.OwnerUserId AS QuestionOwnerId,
+        a.OwnerUserId AS AnswererId,
+        COUNT(DISTINCT p.Id) AS InteractionCount,
+        AVG(a.Score) AS AvgInteractionScore,
+        SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedCount
+    FROM Posts p
+    INNER JOIN Posts a ON p.Id = a.ParentId
+    WHERE p.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND p.OwnerUserId IS NOT NULL
+        AND a.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.OwnerUserId, a.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 3
+)
+SELECT 
+    tqa.DisplayName AS AuthorName,
+    tqa.QuestionCount,
+    tqa.AvgScore AS AvgQuestionScore,
+    tqa.TotalViews,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COUNT(DISTINCT am.AnswererId) AS UniqueAnswerers,
+    AVG(am.AvgAnswerScore) AS AvgAnswerScoreOnQuestions,
+    SUM(am.HasAcceptedAnswer) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT ig.AnswererId) AS RecurringAnswerers,
+    AVG(ig.AvgInteractionScore) AS AvgRecurringAnswererScore,
+    SUM(ig.AcceptedCount) AS RecurringAcceptedAnswers,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBountiesOffered,
+    COUNT(DISTINCT c.Id) AS TotalCommentsReceived,
+    AVG(c.Score) AS AvgCommentScore
+FROM TopQuestionAuthors tqa
+LEFT JOIN AnswerMetrics am ON am.QuestionId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = tqa.OwnerUserId AND PostTypeId = 1
+)
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = tqa.OwnerUserId
+LEFT JOIN InteractionGraph ig ON ig.QuestionOwnerId = tqa.OwnerUserId
+LEFT JOIN Posts p ON p.OwnerUserId = tqa.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 8
+LEFT JOIN Comments c ON c.PostId = p.Id
+GROUP BY 
+    tqa.OwnerUserId,
+    tqa.DisplayName,
+    tqa.QuestionCount,
+    tqa.AvgScore,
+    tqa.TotalViews,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges
+HAVING COUNT(DISTINCT am.AnswererId) >= 5
+ORDER BY 
+    (tqa.QuestionCount * 0.3 + 
+     COALESCE(ubs.GoldBadges, 0) * 10 + 
+     COUNT(DISTINCT ig.AnswererId) * 0.5) DESC
+LIMIT 100;

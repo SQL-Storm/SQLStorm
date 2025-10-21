@@ -1,0 +1,176 @@
+with
+-- top users by adjusted reputation (penalize for many downvotes and reward recent activity)
+user_scores as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    greatest(0, u.reputation
+      + coalesce((select sum(case when v.votetypeid=2 then 5 when v.votetypeid=3 then -8 else 0 end) from votes v where v.userid = u.id),0)
+      - coalesce((select count(*)*2 from posts p where p.owneruserid = u.id and p.score < 0),0)
+    ) as adjusted_reputation,
+    -- recency boost: more recent last access increases score
+    round(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400) as days_since_last_access
+  from users u
+),
+-- question and answer aggregates with complex tag parsing and string ops
+post_aggs as (
+  select
+    p.id as postid,
+    p.posttypeid,
+    p.owneruserid,
+    p.title,
+    p.tags,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    -- count distinct commenters excluding owner using correlated subquery
+    (select count(distinct coalesce(c.userid, -1))
+     from comments c
+     where c.postid = p.id
+       and coalesce(c.userid, -1) <> coalesce(p.owneruserid, -1)
+    ) as distinct_commenters,
+    -- extract first tag (Tags stored like '<sql><performance>')
+    case
+      when p.tags is null then null
+      when position('><' in p.tags) = 0 then trim(both '<>' from p.tags)
+      else cast(split_part(trim(both '<>' from p.tags), '><', 1) as text)
+    end as first_tag,
+    -- number of tags
+    case when p.tags is null then 0 else array_length(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><'),1) end as tag_count,
+    -- heuristic text complexity: length of body plus number of code fences (``` or <code>)
+    (coalesce(length(p.body),0)
+      + (case when p.body ~ '<code' then (length(regexp_matches(p.body,'<code','g')))::int else 0 end)
+      + (case when p.body ~ '```' then (length(regexp_matches(p.body,'```','g')))::int else 0 end)
+    ) as textual_complexity
+  from posts p
+  where p.posttypeid in (1,2) -- questions and answers
+),
+-- link neighborhood: find duplicates and linked posts, aggregate depth via recursive CTE
+recursive_links as (
+  select pl.postid, pl.relatedpostid, pl.linktypeid, 1 as depth, array[pl.postid, pl.relatedpostid] as path
+  from postlinks pl
+  union all
+  select rl.postid, pl.relatedpostid, pl.linktypeid, rl.depth+1, rl.path || pl.relatedpostid
+  from recursive_links rl
+  join postlinks pl on pl.postid = rl.relatedpostid
+  where rl.depth < 5 and not pl.relatedpostid = any(rl.path)
+),
+link_stats as (
+  select
+    rl.postid,
+    count(distinct rl.relatedpostid) as linked_count,
+    max(case when rl.linktypeid = 3 then 1 else 0 end) as has_duplicate_relation,
+    min(rl.depth) filter (where rl.relatedpostid = rl.postid) over () as dummy
+  from recursive_links rl
+  group by rl.postid
+),
+-- compute moving averages and percentiles with window functions per tag
+tag_metrics as (
+  select
+    pa.first_tag,
+    pa.postid,
+    pa.posttypeid,
+    pa.creationdate,
+    pa.score,
+    pa.viewcount,
+    pa.textual_complexity,
+    pa.tag_count,
+    pa.distinct_commenters,
+    rank() over (partition by pa.first_tag order by pa.score desc nulls last) as score_rank_in_tag,
+    avg(pa.score) over (partition by pa.first_tag order by pa.creationdate rows between 30 preceding and current row) as avg_score_30d,
+    percentile_cont(0.5) within group (order by pa.viewcount) over (partition by pa.first_tag) as median_views_in_tag,
+    ntile(10) over (partition by pa.first_tag order by pa.textual_complexity desc) as complexity_decile
+  from post_aggs pa
+),
+-- consolidated join of posts, users, votes, badges and link stats
+consolidated as (
+  select
+    pa.postid,
+    pa.posttypeid,
+    pa.title,
+    pa.owneruserid,
+    u.displayname as owner_name,
+    us.adjusted_reputation,
+    pa.first_tag,
+    pa.tag_count,
+    pa.score,
+    pa.viewcount,
+    pa.answercount,
+    pa.commentcount,
+    pa.distinct_commenters,
+    lm.linked_count,
+    lm.has_duplicate_relation,
+    tm.avg_score_30d,
+    tm.median_views_in_tag,
+    tm.complexity_decile,
+    -- correlate to find accepted answer age if question has accepted answer
+    case when pa.posttypeid = 1 and posts_accepted.created is not null then extract(epoch from (posts_accepted.created - pa.creationdate))/3600 else null end as hours_to_accept,
+    -- badges summary: top 3 most recent badge names for owner (string aggregation)
+    (select string_agg(b.name || ' (' || to_char(b.date,'YYYY-MM-DD') || ')', '; ' order by b.date desc)
+     from badges b where b.userid = pa.owneruserid limit 3
+    ) as recent_badges,
+    -- votes breakdown for the post
+    (select sum(case when v.votetypeid = 2 then 1 else 0 end) from votes v where v.postid = pa.postid) as upvotes,
+    (select sum(case when v.votetypeid = 3 then 1 else 0 end) from votes v where v.postid = pa.postid) as downvotes,
+    -- complicated score factor combining many inputs with null-safe logic
+    (coalesce(pa.score,0) * nullif(coalesce(tm.avg_score_30d,0),0) * (1 + coalesce(lm.linked_count,0)/10.0) / greatest(1, 1 + coalesce(pa.tag_count,0)/3)
+      + coalesce((select count(*) from comments c where c.postid = pa.postid),0) * 0.5
+      - coalesce((select sum(case when v.votetypeid=3 then 1 else 0 end) from votes v where v.postid = pa.postid),0) * 0.75
+    ) as composite_score
+  from post_aggs pa
+  left join users u on u.id = pa.owneruserid
+  left join user_scores us on us.id = pa.owneruserid
+  left join link_stats lm on lm.postid = pa.postid
+  left join tag_metrics tm on tm.postid = pa.postid and tm.first_tag = pa.first_tag
+  left join lateral (
+    select p.creationdate as created from posts p where p.id = pa.acceptedanswerid limit 1
+  ) posts_accepted on true
+),
+-- final ranking CTE with UNION of interesting sets and windowed relative ranks
+final_rank as (
+  select
+    c.*,
+    dense_rank() over (order by coalesce(c.composite_score,0) desc) as overall_rank,
+    row_number() over (partition by c.first_tag order by c.composite_score desc nulls last) as rank_within_tag
+  from consolidated c
+)
+select
+  fr.overall_rank,
+  fr.rank_within_tag,
+  fr.postid,
+  fr.posttypeid,
+  fr.title,
+  coalesce(fr.owner_name, 'unknown') as owner_name,
+  fr.adjusted_reputation,
+  fr.first_tag,
+  fr.tag_count,
+  fr.score,
+  fr.viewcount,
+  fr.answercount,
+  fr.commentcount,
+  fr.distinct_commenters,
+  fr.linked_count,
+  fr.has_duplicate_relation,
+  round(coalesce(fr.avg_score_30d,0),2) as avg_score_30d,
+  round(coalesce(fr.median_views_in_tag,0)) as median_views_in_tag,
+  fr.complexity_decile,
+  round(coalesce(fr.hours_to_accept,0),2) as hours_to_accept,
+  coalesce(fr.recent_badges, '') as recent_badges,
+  coalesce(fr.upvotes,0) as upvotes,
+  coalesce(fr.downvotes,0) as downvotes,
+  round(coalesce(fr.composite_score,0),4) as composite_score
+from final_rank fr
+where
+  (
+    fr.composite_score > 100
+    or fr.linked_count >= 5
+    or fr.tag_count >= 5
+  )
+  and fr.owner_name is not null
+order by fr.composite_score desc nulls last, fr.viewcount desc
+limit 200;

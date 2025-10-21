@@ -1,0 +1,111 @@
+WITH RecentEdits AS (
+    SELECT ph.PostId,
+           MAX(ph.CreationDate)                                  AS LastEditDate,
+           COUNT(*)                                             AS TotalEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+),
+QuestionAnswers AS (
+    SELECT p.ParentId                                       AS QuestionId,
+           COUNT(*)                                        AS AnswerCount,
+           AVG(p.Score)                                    AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+HighViewQuestions AS (
+    SELECT Id                                               AS QuestionId,
+           ViewCount
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND ViewCount > 10000
+),
+PopularQuestions AS (
+    SELECT qa.QuestionId
+    FROM QuestionAnswers qa
+    WHERE qa.AnswerCount >= 5
+    INTERSECT
+    SELECT hv.QuestionId
+    FROM HighViewQuestions hv
+),
+OrderedUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           RANK() OVER (ORDER BY u.Reputation DESC)        AS RepRank,
+           DATEDIFF(day, u.CreationDate, u.LastAccessDate) AS DaysActive
+    FROM Users u
+),
+SumBadges AS (
+    SELECT b.UserId,
+           SUM(CASE
+                 WHEN b.Class = 1 THEN 3
+                 WHEN b.Class = 2 THEN 2
+                 ELSE 1
+               END)                                         AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CombinedQuestions AS (
+    SELECT pq.QuestionId
+    FROM PopularQuestions pq
+    UNION
+    SELECT hv.QuestionId
+    FROM HighViewQuestions hv
+),
+DistinctContent AS (
+    SELECT q.Id                                            AS QuestionId,
+           (LEN(ISNULL(q.Tags, '')) 
+            - LEN(REPLACE(ISNULL(q.Tags, ''), '<', '')))     AS TagCount,
+           CASE
+             WHEN q.ClosedDate IS NULL THEN 'Open'
+             ELSE 'Closed'
+           END                                            AS Status
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT cq.QuestionId,
+       q.Title,
+       ou.DisplayName                                    AS Author,
+       qa.AnswerCount,
+       CAST(qa.AvgAnswerScore AS DECIMAL(5,2))          AS AvgAnswerScore,
+       ou.RepRank,
+       ou.DaysActive,
+       re.TotalEdits,
+       sb.BadgeScore,
+       dc.TagCount,
+       dc.Status,
+       DATEDIFF(minute,
+                q.CreationDate,
+                IFNULL(re.LastEditDate, q.CreationDate)) AS MinutesToLastEdit,
+       -- correlated subquery for first non-negative comment
+       (SELECT MIN(c.CreationDate)
+        FROM Comments c
+        WHERE c.PostId = q.Id
+          AND c.Score >= 0)                              AS FirstCommentDate,
+       -- string expression for a short body preview
+       LEFT(q.Body,
+            CASE WHEN LEN(q.Body) > 100 THEN 100 ELSE LEN(q.Body) END
+       ) || '...'                                         AS BodyPreview,
+       -- NULL logic combining score and answer count
+       COALESCE(q.Score, 0) + COALESCE(qa.AnswerCount, 0) AS ScoreAnswerSum
+FROM CombinedQuestions cq
+LEFT JOIN Posts q               ON cq.QuestionId = q.Id
+LEFT JOIN QuestionAnswers qa    ON qa.QuestionId = cq.QuestionId
+LEFT JOIN RecentEdits re        ON re.PostId = cq.QuestionId
+LEFT JOIN OrderedUsers ou       ON ou.Id = q.OwnerUserId
+LEFT JOIN SumBadges sb          ON sb.UserId = ou.Id
+FULL OUTER JOIN DistinctContent dc ON dc.QuestionId = cq.QuestionId
+WHERE EXISTS (
+    SELECT 1
+    FROM Tags t
+    WHERE t.TagName IN (
+        SELECT value
+        FROM STRING_SPLIT(ISNULL(q.Tags, ''), '><')
+    )
+      AND t.Count > (SELECT AVG("Count") FROM Tags)
+)
+ORDER BY ou.RepRank,
+         qa.AnswerCount DESC,
+         dc.TagCount DESC
+OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY;

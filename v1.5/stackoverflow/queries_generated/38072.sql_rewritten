@@ -1,0 +1,187 @@
+-- {"query": "38072.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1922} 
+with params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '1 month' as end_month
+),
+months as (
+  select generate_series(start_month, end_month, interval '1 month')::date as month_start
+  from params
+),
+q as (
+  select p.Id, p.OwnerUserId, p.CreationDate::date as created_on, p.Score, p.ViewCount, p.Title, p.Tags
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select start_month from params)
+    and p.CreationDate <  (select end_month from params) + interval '1 month'
+),
+a as (
+  select p.ParentId as QuestionId, p.Id as AnswerId, p.OwnerUserId as AnswererId, p.Score as AnswerScore, p.CreationDate
+  from Posts p
+  where p.PostTypeId = 2
+),
+qa as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId as AskerId,
+    date_trunc('month', q.CreationDate)::date as question_month,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    count(a.AnswerId) as AnswerCount,
+    max(a.AnswerScore) as MaxAnswerScore,
+    min(a.CreationDate) filter (where a.CreationDate >= q.created_on) as FirstAnswerAt,
+    q.Tags,
+    q.Title
+  from q
+  left join a on a.QuestionId = q.Id
+  group by q.Id, q.OwnerUserId, date_trunc('month', q.CreationDate), q.Score, q.ViewCount, q.Tags, q.Title
+),
+first_answer_latency as (
+  select
+    QuestionId,
+    extract(epoch from (FirstAnswerAt - (select created_on from q where q.Id = QuestionId limit 1))) / 3600.0 as hours_to_first_answer
+  from qa
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded
+  from Votes v
+  group by v.PostId
+),
+comments_agg as (
+  select c.PostId,
+         count(*) as CommentCount,
+         sum(case when c.Score >= 5 then 1 else 0 end) as HighScoreComments,
+         max(c.Score) as MaxCommentScore,
+         max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    percentile_cont(0.5) within group (order by u.Reputation) over () as GlobalMedianRep,
+    u.Reputation,
+    u.CreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+  from Users u
+),
+tag_expanded as (
+  select
+    qa.QuestionId,
+    unnest(string_to_array(substring(qa.Tags, 2, length(qa.Tags)-2), '><')) as tag
+  from qa
+  where qa.Tags is not null and qa.Tags like '<%>'
+),
+tag_stats as (
+  select
+    date_trunc('month', q.CreationDate)::date as month_start,
+    te.tag,
+    count(distinct te.QuestionId) as QuestionsWithTag,
+    avg(q.Score) as AvgQuestionScoreForTag,
+    avg(qa.AnswerCount) as AvgAnswersForTag,
+    percentile_cont(0.5) within group (order by coalesce(fal.hours_to_first_answer, 24*30)) as P50_HoursToFirstAnswer
+  from tag_expanded te
+  join Posts q on q.Id = te.QuestionId
+  join qa on qa.QuestionId = q.Id
+  left join first_answer_latency fal on fal.QuestionId = q.Id
+  group by 1,2
+),
+question_quality as (
+  select
+    qa.QuestionId,
+    qa.question_month,
+    qa.AskerId,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    coalesce(v.Favorites,0) as Favorites,
+    coalesce(v.BountyAwarded,0) as BountyAwarded,
+    coalesce(c.CommentCount,0) as CommentCount,
+    coalesce(c.HighScoreComments,0) as HighScoreComments,
+    qa.QuestionScore,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.QuestionViews,
+    coalesce(fal.hours_to_first_answer, null) as HoursToFirstAnswer,
+    case
+      when qa.AnswerCount >= 3 and qa.QuestionScore >= 5 and coalesce(fal.hours_to_first_answer, 1e9) <= 24 then 'Excellent'
+      when qa.AnswerCount >= 1 and qa.QuestionScore >= 0 then 'Good'
+      else 'NeedsWork'
+    end as QualityBucket
+  from qa
+  left join votes_agg v on v.PostId = qa.QuestionId
+  left join comments_agg c on c.PostId = qa.QuestionId
+  left join first_answer_latency fal on fal.QuestionId = qa.QuestionId
+),
+per_user_month as (
+  select
+    date_trunc('month', q.CreationDate)::date as month_start,
+    q.OwnerUserId as UserId,
+    count(*) as QuestionsAsked,
+    avg(q.Score) as AvgQuestionScore,
+    avg(q.ViewCount) as AvgQuestionViews,
+    avg(qa.AnswerCount) as AvgAnswersReceived,
+    avg(coalesce(fal.hours_to_first_answer, 24*30)) as AvgHoursToFirstAnswer,
+    sum(case when qq.QualityBucket = 'Excellent' then 1 else 0 end) as ExcellentQuestions
+  from q
+  join qa on qa.QuestionId = q.Id
+  left join first_answer_latency fal on fal.QuestionId = q.Id
+  left join question_quality qq on qq.QuestionId = q.Id
+  group by 1,2
+),
+ranked_users as (
+  select
+    pum.month_start,
+    pum.UserId,
+    pum.QuestionsAsked,
+    pum.ExcellentQuestions,
+    pum.AvgQuestionScore,
+    row_number() over (partition by pum.month_start order by pum.ExcellentQuestions desc, pum.AvgQuestionScore desc, pum.QuestionsAsked desc) as rn
+  from per_user_month pum
+),
+top_users as (
+  select ru.month_start, ru.UserId, ru.QuestionsAsked, ru.ExcellentQuestions, ru.AvgQuestionScore
+  from ranked_users ru
+  where ru.rn <= 50
+),
+final as (
+  select
+    m.month_start,
+    count(distinct q.Id) as TotalQuestions,
+    avg(qq.QuestionScore) as AvgQuestionScore,
+    avg(qq.AnswerCount) as AvgAnswers,
+    avg(qq.QuestionViews) as AvgViews,
+    percentile_cont(0.5) within group (order by coalesce(qq.HoursToFirstAnswer, 24*30)) as P50_HoursToFirstAnswer,
+    sum(case when qq.QualityBucket = 'Excellent' then 1 else 0 end) as ExcellentQuestions,
+    sum(case when qq.QualityBucket = 'NeedsWork' then 1 else 0 end) as NeedsWorkQuestions
+  from months m
+  left join q on date_trunc('month', q.CreationDate) = m.month_start
+  left join question_quality qq on qq.QuestionId = q.Id
+  group by m.month_start
+)
+select
+  f.month_start,
+  f.TotalQuestions,
+  f.AvgQuestionScore,
+  f.AvgAnswers,
+  f.AvgViews,
+  f.P50_HoursToFirstAnswer,
+  f.ExcellentQuestions,
+  f.NeedsWorkQuestions,
+  tu.UserId as TopUserId,
+  tu.QuestionsAsked as TopUserQuestions,
+  tu.ExcellentQuestions as TopUserExcellent,
+  tu.AvgQuestionScore as TopUserAvgScore,
+  us.Reputation as TopUserReputation,
+  us.GlobalMedianRep as GlobalMedianReputation
+from final f
+left join top_users tu on tu.month_start = f.month_start
+left join user_stats us on us.UserId = tu.UserId
+order by f.month_start asc, tu.ExcellentQuestions desc nulls last, tu.AvgQuestionScore desc nulls last, tu.QuestionsAsked desc nulls last;

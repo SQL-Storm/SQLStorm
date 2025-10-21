@@ -1,0 +1,165 @@
+with
+post_snapshot as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.acceptedanswerid,
+    p.creationdate,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    p.title,
+    coalesce(p.tags,'') as raw_tags,
+    regexp_split_to_array(regexp_replace(coalesce(p.tags,''), '^<|>$',''), '><') as tag_array,
+    p.owneruserid,
+    u.reputation as owner_reputation,
+    u.creationdate as owner_created,
+    u.displayname as owner_name,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.lastactivitydate
+  from posts p
+  left join users u on p.owneruserid = u.id
+  where p.posttypeid in (1,2)
+),
+user_agg as (
+  select
+    coalesce(owneruserid,-1) as userid,
+    count(*) filter (where posttypeid=1) as questions_posted,
+    count(*) filter (where posttypeid=2) as answers_posted,
+    sum(score) as total_score,
+    avg(score) as avg_score,
+    max(score) as max_score,
+    min(score) as min_score,
+    count(distinct id) as posts_count,
+    max(lastactivitydate) as last_activity
+  from post_snapshot
+  group by coalesce(owneruserid,-1)
+),
+latest_comment as (
+  select distinct on (c.postid)
+    c.postid,
+    c.id as comment_id,
+    c.creationdate as comment_date,
+    c.text as comment_text,
+    c.userid as commenter_id
+  from comments c
+  order by c.postid, c.creationdate desc, c.id desc
+),
+post_links_agg as (
+  select
+    pl.postid,
+    count(*) filter (where lt.id is not null) as total_links,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+    count(distinct pl.relatedpostid) as distinct_related_posts,
+    max(pl.creationdate) as last_linked
+  from postlinks pl
+  left join linktypes lt on pl.linktypeid = lt.id
+  group by pl.postid
+),
+tag_usage as (
+  select
+    lower(tn) as tag,
+    count(*) as posts_with_tag,
+    sum(coalesce(p.viewcount,0)) as views_for_tag,
+    avg(coalesce(p.score,0)) as avg_score_for_tag,
+    max(p.score) as top_score
+  from posts p
+  cross join lateral (
+    select unnest(regexp_split_to_array(regexp_replace(coalesce(p.tags,''), '^<|>$',''), '><')) as tn
+  ) tags_split
+  where p.posttypeid = 1
+  group by lower(tn)
+),
+question_ranks as (
+  select
+    ps.*,
+    ua.questions_posted,
+    ua.answers_posted,
+    ua.total_score as owner_total_score,
+    lc.comment_id is not null as has_recent_comment,
+    lc.comment_date,
+    pl.total_links,
+    pl.duplicate_links,
+    (select t.tag from (
+       select lower(tn) as tag, row_number() over (partition by ps.id order by tag_usage.posts_with_tag desc nulls last) rn
+       from regexp_split_to_table(coalesce(ps.raw_tags,''), '><') as tn
+       left join tag_usage on lower(tn) = tag_usage.tag
+     ) t where rn = 1) as top_tag,
+    (coalesce(ps.score,0) * 3
+     + ln(coalesce(ps.viewcount,1)) * 2
+     + coalesce(ua.total_score,0) / nullif(coalesce(ua.posts_count,1),0)
+     - 5 * coalesce(pl.duplicate_links,0)
+     + coalesce(u.reputation,0) / greatest(coalesce(u.reputation,1),100) * 10
+     + case when ps.posttypeid = 1 then coalesce(ps.answercount,0) else 0 end
+    ) as composite_score
+  from post_snapshot ps
+  left join user_agg ua on ua.userid = ps.owneruserid
+  left join latest_comment lc on lc.postid = ps.id
+  left join post_links_agg pl on pl.postid = ps.id
+  left join users u on u.id = ps.owneruserid
+  where ps.posttypeid = 1
+),
+ranked_questions as (
+  select
+    qr.*,
+    row_number() over (order by composite_score desc nulls last, score desc nulls last, viewcount desc nulls last) as global_rank,
+    rank() over (partition by coalesce(top_tag,'<no_tag>') order by composite_score desc nulls last) as tag_rank,
+    dense_rank() over (order by coalesce(top_tag,'<no_tag>')) as tag_group_id
+  from question_ranks qr
+),
+qa_pairs as (
+  select
+    q.id as question_id,
+    q.title,
+    q.top_tag,
+    q.composite_score,
+    q.global_rank,
+    q.tag_rank,
+    q.owneruserid,
+    q.owner_name,
+    q.owner_reputation,
+    q.creationdate as question_created,
+    q.answercount,
+    a.id as accepted_answer_id,
+    a.creationdate as accepted_answer_created,
+    a.score as accepted_answer_score,
+    a.owneruserid as accepted_ownerid,
+    a.ownerreputation as accepted_owner_reputation,
+    (select count(*) from posts p2 where p2.parentid = q.id and p2.posttypeid = 2 and p2.creationdate >= (q.creationdate - interval '30 days')) as answers_in_last_30d,
+    (select avg(coalesce(p3.score,0)) from posts p3 where p3.parentid = q.id and p3.posttypeid = 2) as avg_answer_score,
+    (select string_agg(distinct t, ',') from (
+       select lower(tn) as t from regexp_split_to_table(coalesce(q.raw_tags,''),'><') tn
+       union
+       select lower(tn) as t from posts pa cross join regexp_split_to_table(coalesce(pa.tags,''),'><') tn where pa.id = (
+         select a2.id from posts a2 where a2.parentid = q.id and a2.score = (select max(coalesce(p4.score,0)) from posts p4 where p4.parentid = q.id) limit 1
+       )
+    ) sx) as combined_tags
+  from ranked_questions q
+  left join posts a on a.id = q.acceptedanswerid
+  where q.global_rank <= 250
+)
+select
+  qp.*,
+  avg(qp.composite_score) over () as avg_composite_top250,
+  percentile_cont(0.5) within group (order by qp.composite_score) over () as median_composite_top250,
+  sum(qp.answercount) over () as total_answers_top250,
+  case
+    when qp.owner_name is null then '<anonymous>'
+    when length(trim(qp.owner_name)) = 0 then '<blank>'
+    when qp.owner_reputation > 10000 then qp.owner_name || ' (⭐ high-rep)'
+    else qp.owner_name end as owner_display,
+  coalesce(qp.answers_in_last_30d,0) as answers_last_30d_safe,
+  coalesce(qp.avg_answer_score,0) as avg_answer_score_safe,
+  (select coalesce(stddev_samp(coalesce(p.score,0)) ,0) from posts p where p.parentid = qp.question_id and p.posttypeid = 2) as answer_score_stddev,
+  tu.posts_with_tag,
+  tu.views_for_tag,
+  case
+    when qp.composite_score > (select avg(composite_score) from ranked_questions) and coalesce(tu.posts_with_tag,0) > 100 then 'HOT_AND_WELL_TAGGED'
+    when qp.composite_score > (select avg(composite_score) from ranked_questions) then 'HOT'
+    when coalesce(tu.posts_with_tag,0) > 100 then 'POPULAR_TAG'
+    else 'NORMAL' end as quality_bucket
+from qa_pairs qp
+left join tag_usage tu on qp.top_tag = tu.tag
+order by qp.global_rank;

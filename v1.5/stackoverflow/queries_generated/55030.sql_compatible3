@@ -1,0 +1,77 @@
+WITH TagPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        UNNEST(REGEXP_SPLIT_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+      AND p.Tags IS NOT NULL
+),
+Answers AS (
+    SELECT
+        a.Id,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        tp.TagName
+    FROM Posts a
+    JOIN TagPosts tp ON a.ParentId = tp.Id
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+),
+UserStats AS (
+    SELECT
+        a.TagName,
+        a.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        CAST(AVG(a.Score) AS DECIMAL(10, 2)) AS AvgScore,
+        MAX(u.Reputation) AS UserReputation
+    FROM Answers a
+    JOIN Users u ON u.Id = a.OwnerUserId
+    GROUP BY a.TagName, a.OwnerUserId
+),
+BadgesAgg AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+Ranked AS (
+    SELECT
+        us.TagName,
+        us.OwnerUserId,
+        us.AnswerCount,
+        us.AvgScore,
+        us.UserReputation,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ROW_NUMBER() OVER (
+            PARTITION BY us.TagName
+            ORDER BY us.AnswerCount DESC, us.AvgScore DESC
+        ) AS rn
+    FROM UserStats us
+    LEFT JOIN BadgesAgg ba ON ba.UserId = us.OwnerUserId
+)
+SELECT
+    r.TagName,
+    t.Count AS TagTotalCount,
+    r.OwnerUserId,
+    u.DisplayName,
+    r.AnswerCount,
+    r.AvgScore,
+    r.UserReputation,
+    COALESCE(r.GoldBadges, 0) AS GoldBadges,
+    COALESCE(r.SilverBadges, 0) AS SilverBadges,
+    COALESCE(r.BronzeBadges, 0) AS BronzeBadges
+FROM Ranked r
+JOIN Tags t ON t.TagName = r.TagName
+JOIN Users u ON u.Id = r.OwnerUserId
+WHERE r.rn <= 5
+ORDER BY r.TagName, r.rn;

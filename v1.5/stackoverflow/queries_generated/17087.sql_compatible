@@ -1,0 +1,159 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_given,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) as avg_post_score,
+        SUM(COALESCE(p.ViewCount, 0)) as total_views,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) as median_score,
+        MAX(p.CreationDate) as last_post_date,
+        MIN(p.CreationDate) as first_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) as tag_name,
+        COUNT(*) as tag_post_count,
+        SUM(p.Score) as tag_total_score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, tag_name
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) as edited_posts,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as edit_actions,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) as rollback_actions,
+        STRING_AGG(DISTINCT pht.Name, ', ' ORDER BY pht.Name) as edit_types_used,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))/3600.0) as avg_hours_to_first_edit
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId BETWEEN 2 AND 9
+    GROUP BY ph.UserId
+),
+voting_behavior AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) as upvotes_cast,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) as downvotes_cast,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) as favorites_marked,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) as bounties_started,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) as total_bounty_offered,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE v.VoteTypeId = 3) = 0 THEN NULL
+            ELSE CAST(COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS FLOAT) / 
+                 NULLIF(COUNT(*) FILTER (WHERE v.VoteTypeId = 3), 0)
+        END as upvote_downvote_ratio
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) as gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) as silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) as bronze_badges,
+        COUNT(DISTINCT b.Name) as unique_badges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY b.Date DESC) as gold_badge_names,
+        MAX(b.Date) as last_badge_date
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.DisplayName, 'Anonymous User #' || CAST(uam.Id AS VARCHAR)) as display_name_fallback,
+    uam.Reputation,
+    uam.total_posts,
+    uam.questions_asked,
+    uam.answers_given,
+    ROUND(CAST(uam.avg_post_score AS NUMERIC), 2) as avg_post_score,
+    uam.median_score,
+    uam.total_views,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uam.first_post_date)) as days_since_first_post,
+    CASE 
+        WHEN uam.total_posts > 0 
+        THEN ROUND(uam.total_views::numeric / NULLIF(uam.total_posts, 0), 1)
+        ELSE 0 
+    END as avg_views_per_post,
+    COALESCE(te.tag_name, 'No Primary Tag') as primary_expertise_tag,
+    COALESCE(te.tag_total_score, 0) as primary_tag_score,
+    COALESCE(ep.edited_posts, 0) as posts_edited,
+    COALESCE(ep.edit_actions, 0) as total_edits,
+    COALESCE(ep.rollback_actions, 0) as total_rollbacks,
+    ROUND(COALESCE(ep.avg_hours_to_first_edit, 0)::numeric, 2) as avg_hours_to_edit,
+    SUBSTRING(COALESCE(ep.edit_types_used, 'No edits'), 1, 100) as edit_types_summary,
+    COALESCE(vb.upvotes_cast, 0) as upvotes_given,
+    COALESCE(vb.downvotes_cast, 0) as downvotes_given,
+    ROUND(COALESCE(vb.upvote_downvote_ratio, 0)::numeric, 2) as vote_ratio,
+    COALESCE(vb.bounties_started, 0) as bounties_offered,
+    COALESCE(vb.total_bounty_offered, 0) as total_bounty_amount,
+    COALESCE(ba.gold_badges, 0) as gold_count,
+    COALESCE(ba.silver_badges, 0) as silver_count,
+    COALESCE(ba.bronze_badges, 0) as bronze_count,
+    COALESCE(ba.unique_badges, 0) as unique_badge_count,
+    SUBSTRING(COALESCE(ba.gold_badge_names, 'None'), 1, 200) as gold_badges_earned,
+    CASE 
+        WHEN uam.last_post_date IS NULL THEN 'Never Posted'
+        WHEN EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uam.last_post_date)) > 365 THEN 'Inactive'
+        WHEN EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uam.last_post_date)) > 90 THEN 'Low Activity'
+        WHEN EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uam.last_post_date)) > 30 THEN 'Moderate Activity'
+        ELSE 'Active'
+    END as activity_status,
+    RANK() OVER (ORDER BY uam.Reputation DESC) as reputation_rank,
+    DENSE_RANK() OVER (ORDER BY COALESCE(te.tag_total_score, 0) DESC) as expertise_rank,
+    ROW_NUMBER() OVER (PARTITION BY 
+        CASE 
+            WHEN uam.Reputation >= 10000 THEN 'Expert'
+            WHEN uam.Reputation >= 1000 THEN 'Advanced'
+            WHEN uam.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END 
+        ORDER BY uam.total_views DESC NULLS LAST) as views_rank_in_tier,
+    LAG(uam.Reputation, 1) OVER (ORDER BY uam.Reputation DESC) - uam.Reputation as reputation_gap_to_next,
+    FIRST_VALUE(uam.DisplayName) OVER (
+        PARTITION BY EXTRACT(YEAR FROM uam.first_post_date) 
+        ORDER BY uam.Reputation DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) as top_user_in_cohort_year
+FROM user_activity_metrics uam
+LEFT OUTER JOIN tag_expertise te ON uam.Id = te.OwnerUserId AND te.tag_rank = 1
+LEFT OUTER JOIN edit_patterns ep ON uam.Id = ep.UserId
+LEFT OUTER JOIN voting_behavior vb ON uam.Id = vb.UserId
+LEFT OUTER JOIN badge_achievements ba ON uam.Id = ba.UserId
+WHERE uam.total_posts > 0
+    OR EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.UserId = uam.Id
+            AND LENGTH(c.Text) > 50
+    )
+    OR uam.Id IN (
+        SELECT DISTINCT ph.UserId 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+            AND ph.UserId IS NOT NULL
+        INTERSECT
+        SELECT DISTINCT v.UserId
+        FROM Votes v
+        WHERE v.VoteTypeId IN (8, 9)
+            AND v.UserId IS NOT NULL
+    )
+ORDER BY 
+    uam.Reputation DESC,
+    COALESCE(te.tag_total_score, 0) DESC,
+    uam.total_views DESC NULLS LAST
+LIMIT 100;

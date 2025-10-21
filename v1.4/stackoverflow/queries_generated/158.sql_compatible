@@ -1,0 +1,97 @@
+WITH PostBase AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastEditDate,
+    p.Tags,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(p.ParentId, 0) AS ParentId,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+    COALESCE(p.LastEditorUserId, 0) AS LastEditorUserId,
+    COALESCE(p.LastEditorDisplayName, '') AS LastEditorDisplayName,
+    COALESCE(p.Title, '') AS TitleSafe
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+Tagged AS (
+  SELECT
+    pb.*,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pb.PostId) AS CommentCountFromComments,
+    (SELECT MAX(v.CreationDate)
+       FROM Votes v
+       WHERE v.PostId = pb.PostId AND v.VoteTypeId IN (2, 6, 10, 11, 12, 14, 15, 16)) AS LastVoteDate,
+    (SELECT STRING_AGG(COALESCE(lt.Name, ''), ',')
+       FROM PostLinks pl
+       LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+       WHERE pl.PostId = pb.PostId) AS LinkTypesForPost
+  FROM PostBase pb
+),
+Windowed AS (
+  SELECT
+    t.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY t.PostTypeId
+      ORDER BY
+        t.Score DESC NULLS LAST,
+        t.ViewCount DESC NULLS LAST,
+        t.CreationDate DESC
+    ) AS rn,
+    (SELECT MAX(ph.CreationDate)
+       FROM PostHistory ph
+       WHERE ph.PostId = t.PostId
+         AND ph.PostHistoryTypeId = 10) AS LastCloseVoteDate,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = t.PostId) AS LinkCount
+  FROM Tagged t
+),
+Aggregated AS (
+  SELECT
+    w.*,
+    u.Id AS UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.Location AS UserLocation,
+    (SELECT SUM(b.Class) FROM Badges b WHERE b.UserId = u.Id) AS BadgeSum
+  FROM Windowed w
+  LEFT JOIN Users u ON w.OwnerUserId = u.Id
+  GROUP BY
+    w.PostId, w.PostTypeId, w.TitleSafe, w.CreationDate, w.Score, w.ViewCount,
+    w.OwnerUserId, w.LastEditDate, w.Tags, w.CommentCountFromComments, w.AnswerCount,
+    w.FavoriteCount, w.ContentLicense, w.ParentId, w.AcceptedAnswerId,
+    w.LastEditorUserId, w.LastEditorDisplayName, w.LinkTypesForPost, w.rn,
+    w.LastCloseVoteDate, w.LinkCount, u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+    u.Location
+)
+SELECT
+  a.PostId,
+  a.PostTypeId,
+  a.TitleSafe AS Title,
+  a.CreationDate,
+  a.Score,
+  a.ViewCount,
+  a.OwnerUserId AS OwnerId,
+  a.UserDisplayName AS OwnerDisplayName,
+  a.Reputation AS OwnerReputation,
+  a.LastEditDate,
+  a.Tags,
+  a.CommentCountFromComments AS CommentCount,
+  a.AnswerCount,
+  a.LinkTypesForPost AS RelatedLinkTypes,
+  a.LastVoteDate,
+  a.LastCloseVoteDate,
+  a.LinkCount,
+  a.UserLocation,
+  a.BadgeSum
+FROM Aggregated a
+WHERE a.rn <= 50
+  AND COALESCE(a.LastVoteDate, TIMESTAMP '1900-01-01') > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+ORDER BY a.PostTypeId, a.Score DESC NULLS LAST, a.ViewCount DESC NULLS LAST
+LIMIT 200;

@@ -1,0 +1,42 @@
+-- {"query": "36089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 388} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  p.Tags,
+  pc.CommentCount,
+  -- Engagement: recent activity score
+  (SELECT SUM(v2.Score) 
+     FROM Votes v2 
+     WHERE v2.PostId = p.Id
+       AND v2.CreationDate > NOW() - INTERVAL '30 days') AS RecentVoteScore30d,
+  -- Popularity via tag-based depth: count of related posts linked to this post (duplicates/linked)
+  (SELECT COUNT(*) 
+     FROM PostLinks pl
+     WHERE pl.PostId = p.Id) AS LinkedCount,
+  -- Time-based signal: activity slope over last 7 and 30 days
+  (EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / 3600.0) *
+  (CASE
+     WHEN p.ViewCount > 0 THEN 1.0
+     ELSE 0.0
+   END) AS VelocityApprox,
+  -- Diversity of editors: number of distinct users who edited within last 90 days
+  (SELECT COUNT(DISTINCT hu.UserId)
+     FROM PostHistory hu
+     WHERE hu.PostId = p.Id
+       AND hu.CreationDate > NOW() - INTERVAL '90 days') AS UniqueEditors90d
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId = 1 -- questions
+  AND p.CreationDate < NOW() - INTERVAL '1 hour'
+ORDER BY
+  RecentVoteScore30d DESC NULLS LAST,
+  p.ViewCount DESC NULLS LAST
+LIMIT 100;

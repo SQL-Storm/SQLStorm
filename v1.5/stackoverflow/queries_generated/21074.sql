@@ -1,0 +1,119 @@
+-- {"query": "21074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1247} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rep_rank
+    FROM Users u
+    WHERE u.Reputation >= 100
+      AND u.LastAccessDate > CURRENT_DATE - INTERVAL '1 year'
+      AND u.Location IS NOT NULL
+      AND LENGTH(TRIM(u.Location)) > 0
+),
+QuestionStats AS (
+    SELECT p.Id AS question_id,
+           p.OwnerUserId,
+           p.CreationDate AS q_creation,
+           p.Score AS q_score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           COALESCE(p.FavoriteCount, 0) AS favorites,
+           AVG(v.BountyAmount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate
+                                     ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS avg_recent_bounty,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_q_score,
+           CASE 
+               WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+               WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+               ELSE 'Active'
+           END AS post_status,
+           UPPER(SUBSTRING(p.Title FROM 1 FOR 1)) || LOWER(SUBSTRING(p.Title FROM 2)) AS title_case
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId 
+                       AND v.VoteTypeId = 8  -- BountyStart
+                       AND v.BountyAmount > 0
+    WHERE p.PostTypeId = 1
+      AND p.DeletionDate IS NULL
+      AND p.CreationDate > CURRENT_DATE - INTERVAL '2 years'
+),
+TopContributors AS (
+    SELECT au.Id,
+           au.Reputation,
+           au.rep_rank,
+           COUNT(qs.question_id) AS question_count,
+           SUM(qs.q_score) AS total_score,
+           MAX(qs.avg_recent_bounty) AS max_bounty_contrib,
+           STRING_AGG(DISTINCT qs.title_case, ' | ' ORDER BY qs.q_creation DESC) AS top_titles
+    FROM ActiveUsers au
+    JOIN QuestionStats qs ON au.Id = qs.OwnerUserId
+    GROUP BY au.Id, au.Reputation, au.rep_rank
+    HAVING COUNT(qs.question_id) >= 3
+       OR SUM(qs.q_score) > 1000
+),
+BadgeAchievers AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+           COUNT(*) FILTER (WHERE b.TagBased = TRUE) AS tag_badges,
+           AVG(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - b.Date))/86400) AS avg_days_to_badge
+    FROM Badges b
+    WHERE b.Date > CURRENT_DATE - INTERVAL '1 year'
+      AND b.Name NOT LIKE '%Critic%'
+    GROUP BY b.UserId
+),
+LinkedPosts AS (
+    SELECT pl.PostId,
+           COUNT(DISTINCT pl.RelatedPostId) AS link_count,
+           STRING_AGG(DISTINCT t.TagName, ',') AS linked_tags
+    FROM PostLinks pl
+    JOIN Posts related ON pl.RelatedPostId = related.Id
+    JOIN Tags t ON POSITION(',' || t.TagName || ',' IN ',' || related.Tags || ',') > 0
+    WHERE pl.LinkTypeId = 3  -- Duplicate links
+      AND pl.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY pl.PostId
+)
+SELECT DISTINCT ON (tc.Id)
+       tc.Id AS user_id,
+       tc.Reputation,
+       tc.rep_rank,
+       tc.question_count,
+       tc.total_score,
+       tc.max_bounty_contrib,
+       tc.top_titles,
+       COALESCE(ba.gold_badges, 0) AS gold_badges,
+       COALESCE(ba.silver_badges, 0) AS silver_badges,
+       COALESCE(ba.tag_badges, 0) AS tag_badges,
+       COALESCE(ba.avg_days_to_badge, 999) AS avg_badge_days,
+       COALESCE(lp.link_count, 0) AS duplicate_links,
+       CASE 
+           WHEN tc.question_count >= 10 AND tc.total_score > 5000 THEN 'Power User'
+           WHEN tc.rep_rank <= 100 THEN 'Elite'
+           WHEN lp.link_count > 5 THEN 'Link Master'
+           ELSE 'Active'
+       END AS user_category,
+       (tc.total_score * 1.0 / NULLIF(tc.question_count, 0)) AS score_per_question,
+       GREATEST(tc.rep_rank, COALESCE(ba.gold_badges * 10, 0)) AS composite_rank,
+       SUBSTRING(tc.top_titles FROM 1 FOR 100) || 
+       CASE WHEN LENGTH(tc.top_titles) > 100 THEN '...' ELSE '' END AS truncated_titles
+FROM TopContributors tc
+LEFT JOIN BadgeAchievers ba ON tc.Id = ba.UserId
+LEFT JOIN LinkedPosts lp ON tc.Id = (
+    SELECT qs.question_id 
+    FROM QuestionStats qs 
+    WHERE qs.OwnerUserId = tc.Id 
+    ORDER BY qs.q_creation DESC 
+    LIMIT 1
+)
+LEFT JOIN Comments c ON (
+    SELECT p.Id 
+    FROM QuestionStats qs2 
+    JOIN Posts p ON p.Id = qs2.question_id 
+    WHERE qs2.OwnerUserId = tc.Id 
+      AND p.Id = c.PostId
+) IS NOT NULL
+   AND c.Score > 5
+   AND c.UserId != tc.Id  -- Comments from others
+WHERE tc.rep_rank <= 50
+   OR (tc.total_score > 2000 AND ba.gold_badges > 0)
+   OR lp.link_count >= 3
+ORDER BY tc.rep_rank ASC, tc.total_score DESC NULLS LAST
+LIMIT 25;

@@ -1,0 +1,137 @@
+WITH RECURSIVE UserHierarchy AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    0 AS Level
+  FROM Users u
+  WHERE u.Reputation > 10000
+  AND u.UpVotes > 1000
+  LIMIT 100
+),
+QuestionMetrics AS (
+  SELECT 
+    p.Id AS QuestionId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    AVG(EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate))/3600.0) AS AvgTimeToAnswerHours,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+  FROM Posts p
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS tag
+  ) tag_split ON true
+  LEFT JOIN Tags t ON t.TagName = tag_split.tag
+  WHERE p.PostTypeId = 1
+  AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+  AND p.Score >= 5
+  GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+),
+AnswerQuality AS (
+  SELECT 
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId,
+    a.Score AS AnswerScore,
+    a.CreationDate,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+    COUNT(DISTINCT ph.Id) AS EditCount,
+    COUNT(DISTINCT c.Id) AS AnswerComments,
+    RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+  FROM Posts a
+  INNER JOIN Posts q ON a.ParentId = q.Id
+  LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId IN (5, 8)
+  LEFT JOIN Comments c ON a.Id = c.PostId
+  WHERE a.PostTypeId = 2
+  AND a.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+  GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.AcceptedAnswerId
+),
+UserEngagement AS (
+  SELECT 
+    uh.Id AS UserId,
+    uh.DisplayName,
+    uh.Reputation,
+    COUNT(DISTINCT qm.QuestionId) AS QuestionsAsked,
+    AVG(qm.Score) AS AvgQuestionScore,
+    COUNT(DISTINCT aq.AnswerId) AS AnswersGiven,
+    AVG(aq.AnswerScore) AS AvgAnswerScore,
+    SUM(aq.IsAccepted) AS AcceptedAnswers,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+    SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) AS TotalBountyAmount
+  FROM UserHierarchy uh
+  LEFT JOIN QuestionMetrics qm ON uh.Id = qm.OwnerUserId
+  LEFT JOIN AnswerQuality aq ON uh.Id = aq.OwnerUserId
+  LEFT JOIN Badges b ON uh.Id = b.UserId
+  LEFT JOIN Votes v ON uh.Id = v.UserId
+  GROUP BY uh.Id, uh.DisplayName, uh.Reputation
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count AS TagUsageCount,
+    COUNT(DISTINCT qm.QuestionId) AS RecentQuestions,
+    AVG(qm.Score) AS AvgScore,
+    AVG(qm.ViewCount) AS AvgViews,
+    AVG(qm.AnswerCount) AS AvgAnswers,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qm.Score) AS MedianScore
+  FROM Tags t
+  INNER JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS tag, p.Id
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+  ) post_tags ON t.TagName = post_tags.tag
+  INNER JOIN QuestionMetrics qm ON qm.QuestionId = post_tags.Id
+  WHERE t.Count > 100
+  GROUP BY t.TagName, t.Count
+  HAVING COUNT(DISTINCT qm.QuestionId) > 10
+)
+SELECT 
+  ue.UserId,
+  ue.DisplayName,
+  ue.Reputation,
+  ue.QuestionsAsked,
+  ROUND(ue.AvgQuestionScore, 2) AS AvgQuestionScore,
+  ue.AnswersGiven,
+  ROUND(ue.AvgAnswerScore, 2) AS AvgAnswerScore,
+  ue.AcceptedAnswers,
+  ROUND(100.0 * ue.AcceptedAnswers / NULLIF(ue.AnswersGiven, 0), 2) AS AcceptanceRate,
+  ue.GoldBadges,
+  ue.SilverBadges,
+  ue.BronzeBadges,
+  ue.TotalBadges,
+  COALESCE(ue.BountiesStarted, 0) AS BountiesStarted,
+  COALESCE(ue.TotalBountyAmount, 0) AS TotalBountyAmount,
+  ta.TagName AS MostActiveTag,
+  ta.RecentQuestions AS TagQuestions,
+  ROUND(ta.AvgScore, 2) AS TagAvgScore,
+  DENSE_RANK() OVER (ORDER BY ue.Reputation DESC) AS ReputationRank,
+  DENSE_RANK() OVER (ORDER BY ue.AnswersGiven DESC) AS AnswersRank,
+  DENSE_RANK() OVER (ORDER BY ue.TotalBadges DESC) AS BadgesRank
+FROM UserEngagement ue
+CROSS JOIN LATERAL (
+  SELECT ta.*
+  FROM TagAnalysis ta
+  ORDER BY ta.RecentQuestions DESC
+  LIMIT 1
+) ta
+WHERE ue.QuestionsAsked > 0 OR ue.AnswersGiven > 0
+ORDER BY 
+  (ue.Reputation * 0.3 + 
+   COALESCE(ue.AnswersGiven, 0) * 10 * 0.3 + 
+   COALESCE(ue.AcceptedAnswers, 0) * 15 * 0.2 + 
+   ue.TotalBadges * 5 * 0.2) DESC
+LIMIT 50;

@@ -1,0 +1,111 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        AVG(NULLIF(p.ViewCount, 0)) AS AvgViewCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(COALESCE(p.Tags, ''), '|' ORDER BY p.CreationDate DESC) AS AllTags
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetUpvotes,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+),
+CombinedStats AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalScore,
+        us.AvgViewCount,
+        us.LastPostDate,
+        us.AllTags,
+        COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+        bs.LatestBadgeDate,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = us.UserId AND c.Score > 5) AS HighScoreComments,
+        (SELECT MAX(va.NetUpvotes) 
+         FROM Posts p 
+         INNER JOIN VoteAnalysis va ON p.Id = va.PostId 
+         WHERE p.OwnerUserId = us.UserId AND va.VoteRank = 1) AS MaxNetUpvotes
+    FROM UserStats us
+    LEFT OUTER JOIN BadgeStats bs ON us.UserId = bs.UserId
+    WHERE us.LastPostDate > DATE '2020-01-01'
+),
+RankedUsers AS (
+    SELECT 
+        cs.*,
+        DENSE_RANK() OVER (ORDER BY cs.Reputation DESC, cs.TotalScore DESC, cs.GoldBadges DESC) AS OverallRank,
+        CASE 
+            WHEN cs.AllTags LIKE '%sql%' THEN 'SQL Expert'
+            WHEN cs.AllTags LIKE '%python%' THEN 'Python Expert'
+            ELSE 'Generalist'
+        END AS ExpertiseCategory,
+        COALESCE(UPPER(SUBSTRING(cs.AllTags, 1, 10)), 'NO TAGS') AS TagPrefix
+    FROM CombinedStats cs
+    WHERE cs.MaxNetUpvotes > 50 OR cs.HighScoreComments > 10
+)
+SELECT 
+    ru.UserId,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.TotalScore,
+    ru.AvgViewCount,
+    ru.LastPostDate,
+    ru.AllTags,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.LatestBadgeDate,
+    ru.HighScoreComments,
+    ru.MaxNetUpvotes,
+    ru.OverallRank,
+    ru.ExpertiseCategory,
+    ru.TagPrefix,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ru.UserId) AND ph.PostHistoryTypeId = 10) AS ClosedPosts
+FROM RankedUsers ru
+WHERE ru.OverallRank <= 100
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    AVG(ru.Reputation) AS Reputation,
+    AVG(ru.TotalPosts) AS TotalPosts,
+    AVG(ru.TotalScore) AS TotalScore,
+    AVG(ru.AvgViewCount) AS AvgViewCount,
+    MAX(ru.LastPostDate) AS LastPostDate,
+    NULL AS AllTags,
+    AVG(ru.GoldBadges) AS GoldBadges,
+    AVG(ru.SilverBadges) AS SilverBadges,
+    AVG(ru.BronzeBadges) AS BronzeBadges,
+    MAX(ru.LatestBadgeDate) AS LatestBadgeDate,
+    AVG(ru.HighScoreComments) AS HighScoreComments,
+    AVG(ru.MaxNetUpvotes) AS MaxNetUpvotes,
+    NULL AS OverallRank,
+    NULL AS ExpertiseCategory,
+    NULL AS TagPrefix,
+    NULL AS ClosedPosts
+FROM RankedUsers ru
+ORDER BY OverallRank ASC NULLS LAST;

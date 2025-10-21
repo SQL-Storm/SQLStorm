@@ -1,0 +1,129 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.CreationDate) AS GlobalRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId IN (1, 2) AND p.Score > 0 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(Score) AS TotalScore,
+        AVG(Score) AS AvgScore,
+        MAX(ViewCount) AS MaxViewCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 1
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+    WHERE 
+        p.PostTypeId = 1 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY 
+        t.TagName
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastHistoryDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY 
+        ph.PostId
+),
+PostComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM 
+        Comments c
+    WHERE 
+        c.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY 
+        c.PostId
+)
+SELECT 
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    tu.PostCount,
+    tu.TotalScore,
+    tu.AvgScore,
+    tu.MaxViewCount,
+    ts.TagName,
+    ts.PostCount AS TagPostCount,
+    ts.AvgScore AS TagAvgScore,
+    ts.MaxViewCount AS TagMaxViewCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    phs.HistoryCount,
+    phs.LastHistoryDate,
+    pc.CommentCount,
+    pc.AvgCommentScore
+FROM 
+    RankedPosts rp
+JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.OwnerUserId
+JOIN 
+    TagStats ts ON ts.TagName IN (
+        SELECT unnest(string_to_array((SELECT rp.Tags), '<'))
+    )
+LEFT JOIN 
+    UserBadgeCounts ub ON rp.OwnerUserId = ub.Id
+LEFT JOIN 
+    PostHistorySummary phs ON rp.Id = phs.PostId
+LEFT JOIN 
+    PostComments pc ON rp.Id = pc.PostId
+WHERE 
+    rp.GlobalRank <= 100
+ORDER BY 
+    rp.Score DESC, 
+    rp.CreationDate;

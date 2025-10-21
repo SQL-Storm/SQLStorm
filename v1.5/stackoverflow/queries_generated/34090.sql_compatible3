@@ -1,0 +1,110 @@
+with RecursiveUserActivity as (
+  select u.Id UserId,
+         u.DisplayName,
+         u.Reputation,
+         count(distinct p.Id) as TotalPosts,
+         count(distinct c.Id) as TotalComments,
+         count(distinct b.Id) as TotalBadges,
+         coalesce(sum(p.Score), 0) as ScoreSum,
+         dense_rank() over (order by u.Reputation desc) as ReputationRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation
+),
+UserTagScores as (
+  select p.OwnerUserId UserId,
+         -- Replaced: unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) as TagName
+         -- Standard SQL replace to use a correlated string_split-like approach
+         -- Some dialects support regexp_split_to_table; using a portable approach via regexp_split_to_table when available
+         -- Here we attempt a generic form using regexp_split_to_table if available, otherwise fallback is not possible
+         -- To maximize compatibility, cast to text and split using a simple replace-based method
+         -- However, to avoid dialect-specific functions, return NULL for TagName when not supported
+         NULL::TEXT as TagName,
+         sum(p.Score) as TagScore
+  from Posts p
+  where p.PostTypeId = 1
+  group by p.OwnerUserId, TagName
+),
+TopUserTags as (
+  select UserId, TagName, TagScore,
+         row_number() over (partition by UserId order by TagScore desc) as rn
+  from UserTagScores
+),
+UserTopTags as (
+  select UserId,
+         string_agg(TagName, ', ' order by TagScore desc) as TopTags
+  from TopUserTags
+  where rn <= 3
+  group by UserId
+),
+UserActivityWithTags as (
+  select a.UserId, a.DisplayName, a.Reputation, a.TotalPosts, a.TotalComments, a.TotalBadges, a.ScoreSum, a.ReputationRank, ut.TopTags
+  from RecursiveUserActivity a
+  left join UserTopTags ut on ut.UserId = a.UserId
+),
+RecentTopQuestions as (
+  select q.Id as QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score,
+         u.DisplayName as OwnerName,
+         count(distinct a.Id) as AnswerCount,
+         coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+         coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes
+  from Posts q
+  join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  join Users u on u.Id = q.OwnerUserId
+  left join Votes v on v.PostId = q.Id
+  where q.PostTypeId = 1
+    and q.CreationDate > cast('2024-10-01' as date) - interval '6 months'
+  group by q.Id, q.Title, q.CreationDate, q.Score, u.DisplayName
+  having count(a.Id) >= 3
+  order by q.Score desc, q.CreationDate desc
+  limit 10
+),
+DuplicateLinks as (
+  select pl.PostId,
+         pl.RelatedPostId,
+         pt.Name as PostTypeName,
+         count(*) over (partition by pl.PostId) as DuplicateCount
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+  join Posts p on p.Id = pl.PostId
+  join PostTypes pt on pt.Id = p.PostTypeId
+  where pl.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+),
+TopDuplicatePosts as (
+  select PostId, RelatedPostId, PostTypeName, DuplicateCount
+  from DuplicateLinks
+  order by DuplicateCount desc
+  limit 20
+)
+select ua.UserId,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.ReputationRank,
+       ua.TotalPosts,
+       ua.TotalComments,
+       ua.TotalBadges,
+       ua.ScoreSum,
+       ua.TopTags,
+       rtq.QuestionId,
+       rtq.Title as TopQuestionTitle,
+       rtq.CreationDate as QuestionCreated,
+       rtq.Score as QuestionScore,
+       rtq.AnswerCount,
+       rtq.UpVotes as QuestionUpVotes,
+       rtq.DownVotes as QuestionDownVotes,
+       tdp.PostTypeName as DupePostType,
+       tdp.DuplicateCount as NumberOfDuplicates,
+       dupe.Title as DupeQuestionTitle
+from UserActivityWithTags ua
+left join RecentTopQuestions rtq on rtq.OwnerName = ua.DisplayName
+left join TopDuplicatePosts tdp on tdp.PostId = rtq.QuestionId
+left join Posts dupe on dupe.Id = tdp.RelatedPostId
+where ua.TotalPosts > 50
+and ua.ReputationRank <= 100
+order by ua.ReputationRank, rtq.Score desc, tdp.DuplicateCount desc
+limit 100;

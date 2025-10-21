@@ -1,0 +1,124 @@
+WITH QuestionTags AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL THEN unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><'))
+            ELSE NULL
+        END AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        (p.Score + COALESCE(p.ViewCount, 0) / 1000.0 + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 2) AS CustomScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY (p.Score + COALESCE(p.ViewCount, 0) / 1000.0 + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 2) DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+        AND p.OwnerUserId IS NOT NULL
+),
+TopBadges AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Class, b.Date DESC) AS BadgeList,
+        COUNT(*) AS BadgeCount,
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS BadgeRank
+    FROM Badges b
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 10
+),
+ActiveUsers AS (
+    SELECT u.Id,
+           u.Reputation,
+           u.CreationDate,
+           COALESCE(u.Location, 'Unknown') AS Location,
+           UPPER(SUBSTR(u.DisplayName, 1, 1)) || LOWER(SUBSTR(u.DisplayName, 2)) AS FormattedName,
+           (CAST('2024-10-01' AS DATE) - CAST(u.LastAccessDate AS DATE)) AS DaysSinceLastAccess,
+           CASE 
+               WHEN u.Reputation > 10000 THEN 'Legendary'
+               WHEN u.Reputation > 1000 THEN 'Trusted'
+               ELSE 'Regular'
+           END AS UserLevel
+    FROM Users u
+    LEFT JOIN (SELECT DISTINCT OwnerUserId FROM Posts WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months') p ON u.Id = p.OwnerUserId
+    WHERE p.OwnerUserId IS NOT NULL
+),
+Combined AS (
+    SELECT DISTINCT
+        au.Id AS UserId,
+        au.FormattedName,
+        au.Location,
+        au.UserLevel,
+        au.DaysSinceLastAccess,
+        tb.BadgeList,
+        tb.BadgeCount,
+        ps.CustomScore AS MaxScore,
+        ps.ScoreRank,
+        CASE 
+            WHEN ps.ScoreRank IS NOT NULL THEN 'ActivePoster'
+            ELSE 'Casual'
+        END AS PosterType
+    FROM ActiveUsers au
+    LEFT JOIN PostStats ps ON au.Id = ps.OwnerUserId AND ps.ScoreRank = 1
+    LEFT JOIN TopBadges tb ON au.Id = tb.UserId
+    WHERE au.Reputation > 100
+        AND (tb.BadgeCount IS NULL OR tb.BadgeCount > 0)
+        AND EXISTS (
+            SELECT 1 
+            FROM Votes v 
+            WHERE v.UserId = au.Id 
+                AND v.VoteTypeId IN (2, 3, 8) 
+                AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+        )
+        AND au.Id NOT IN (
+            SELECT v.UserId 
+            FROM Votes v 
+            WHERE v.VoteTypeId IN (4, 12) 
+                AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months'
+        )
+)
+SELECT 
+    c.UserId,
+    c.FormattedName,
+    c.Location,
+    c.UserLevel,
+    c.PosterType,
+    c.BadgeList,
+    c.BadgeCount,
+    c.MaxScore,
+    DENSE_RANK() OVER (ORDER BY COALESCE(c.MaxScore, 0) DESC, c.BadgeCount DESC) AS OverallRank,
+    CASE 
+        WHEN c.DaysSinceLastAccess < 30 THEN 'Very Active'
+        WHEN c.DaysSinceLastAccess < 90 THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus
+FROM Combined c
+WHERE c.UserLevel IN ('Trusted', 'Legendary')
+    AND (c.BadgeList LIKE '%Guru%' OR c.MaxScore > 500)
+ORDER BY OverallRank, c.UserId
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS FormattedName,
+    'N/A' AS Location,
+    'N/A' AS UserLevel,
+    'N/A' AS PosterType,
+    NULL AS BadgeList,
+    COUNT(*) AS BadgeCount,
+    AVG(COALESCE(c.MaxScore, 0)) AS MaxScore,
+    NULL AS OverallRank,
+    NULL AS ActivityStatus
+FROM Combined c
+WHERE c.MaxScore IS NOT NULL;

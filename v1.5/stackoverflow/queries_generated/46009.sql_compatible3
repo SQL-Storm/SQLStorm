@@ -1,0 +1,118 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        AVG(p.Score) as AvgScore,
+        SUM(p.ViewCount) as TotalViews
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '2 years')
+        AND p.Score >= 5
+    GROUP BY p.OwnerUserId, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerEngagement AS (
+    SELECT 
+        a.ParentId as QuestionId,
+        COUNT(DISTINCT a.Id) as AnswerCount,
+        COUNT(DISTINCT a.OwnerUserId) as UniqueAnswerers,
+        AVG(a.Score) as AvgAnswerScore,
+        MAX(a.Score) as BestAnswerScore,
+        COUNT(DISTINCT c.Id) as AnswerCommentCount
+    FROM Posts a
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+TagPerformance AS (
+    SELECT 
+        UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) as TagName,
+        COUNT(DISTINCT p.Id) as TagQuestionCount,
+        AVG(p.Score) as TagAvgScore,
+        AVG(ae.AnswerCount) as TagAvgAnswers,
+        SUM(p.ViewCount) as TagTotalViews
+    FROM Posts p
+    LEFT JOIN AnswerEngagement ae ON p.Id = ae.QuestionId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '18 months')
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT p.Id) >= 50
+),
+UserBadgeMetrics AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) as TagBasedBadges
+    FROM Badges b
+    WHERE b.Date >= (DATE '2024-10-01' - INTERVAL '3 years')
+    GROUP BY b.UserId
+),
+QuestionEvolution AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as EditCount,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        MIN(ph.CreationDate) as FirstEdit,
+        MAX(ph.CreationDate) as LastEdit,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) as CloseAttempts,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.Id END) as SuggestedEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11,24)
+    GROUP BY ph.PostId
+)
+SELECT 
+    tqa.DisplayName,
+    tqa.Reputation,
+    tqa.QuestionCount,
+    ROUND(tqa.AvgScore, 2) as AvgQuestionScore,
+    tqa.TotalViews,
+    COALESCE(ubm.GoldBadges, 0) as GoldBadges,
+    COALESCE(ubm.SilverBadges, 0) as SilverBadges,
+    COALESCE(ubm.BronzeBadges, 0) as BronzeBadges,
+    tp.TagName as MostUsedTag,
+    tp.TagQuestionCount,
+    ROUND(tp.TagAvgScore, 2) as TagAvgScore,
+    ROUND(AVG(ae.AnswerCount), 2) as AvgAnswersPerQuestion,
+    ROUND(AVG(ae.AvgAnswerScore), 2) as AvgAnswerScoreReceived,
+    ROUND(AVG(qe.EditCount), 2) as AvgEditsPerQuestion,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as TotalFavorites,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) as BountiesOffered,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as TotalBountyAmount,
+    COUNT(DISTINCT pl.Id) as LinkedQuestions,
+    ROUND(AVG(p.CommentCount), 2) as AvgCommentsPerQuestion
+FROM TopQuestionAuthors tqa
+INNER JOIN Posts p ON tqa.OwnerUserId = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN AnswerEngagement ae ON p.Id = ae.QuestionId
+LEFT JOIN QuestionEvolution qe ON p.Id = qe.PostId
+LEFT JOIN UserBadgeMetrics ubm ON tqa.OwnerUserId = ubm.UserId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+CROSS JOIN LATERAL (
+    SELECT TagName, TagQuestionCount, TagAvgScore
+    FROM TagPerformance tp_inner
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p_inner
+        WHERE p_inner.OwnerUserId = tqa.OwnerUserId
+            AND p_inner.PostTypeId = 1
+            AND p_inner.Tags LIKE '%' || '<' || tp_inner.TagName || '>%' 
+    )
+    ORDER BY TagQuestionCount DESC
+    LIMIT 1
+) tp(TagName, TagQuestionCount, TagAvgScore)
+WHERE p.CreationDate >= (DATE '2024-10-01' - INTERVAL '2 years')
+GROUP BY 
+    tqa.DisplayName, tqa.Reputation, tqa.QuestionCount, tqa.AvgScore, 
+    tqa.TotalViews, ubm.GoldBadges, ubm.SilverBadges, ubm.BronzeBadges,
+    tp.TagName, tp.TagQuestionCount, tp.TagAvgScore
+HAVING COUNT(DISTINCT p.Id) >= 10
+    AND AVG(ae.AnswerCount) >= 2
+ORDER BY 
+    tqa.Reputation DESC,
+    tqa.TotalViews DESC,
+    tqa.QuestionCount DESC
+LIMIT 100;

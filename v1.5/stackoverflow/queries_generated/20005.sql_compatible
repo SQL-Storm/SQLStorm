@@ -1,0 +1,110 @@
+WITH UserActivitySummary AS (
+  SELECT
+    OwnerUserId,
+    MIN(CreationDate) AS FirstPostDate,
+    MAX(CreationDate) AS LastPostDate,
+    COUNT(*) AS TotalPosts,
+    SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(ViewCount) AS TotalViewCount,
+    AVG(Score) AS AvgPostScore
+  FROM Posts
+  WHERE OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+  HAVING COUNT(*) > 10
+),
+RankedUserAnswers AS (
+  SELECT
+    p.Id AS AnswerId,
+    p.OwnerUserId,
+    p.ParentId AS QuestionId,
+    p.Score,
+    p.CreationDate,
+    p.Body,
+    LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextAnswerDate,
+    DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS AnswerRank
+  FROM Posts p
+  WHERE
+    p.PostTypeId = 2 AND p.OwnerUserId IN (SELECT OwnerUserId FROM UserActivitySummary)
+),
+TopTierContributors AS (
+  SELECT
+    'Top Answerer' AS ContributorType,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    uas.TotalPosts,
+    EXTRACT(EPOCH FROM (uas.LastPostDate - uas.FirstPostDate)) / 86400.0 AS ActiveDays,
+    q.Title AS QuestionTitle,
+    ra.Score AS AnswerScore,
+    COALESCE(q.FavoriteCount, 0) AS QuestionFavorites,
+    (
+      SELECT crt.Name
+      FROM PostHistory ph
+      JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+      WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+      ORDER BY ph.CreationDate DESC
+      LIMIT 1
+    ) AS CloseReason,
+    ra.AnswerId,
+    LENGTH(ra.Body) AS AnswerBodyLength,
+    EXTRACT(EPOCH FROM (ra.NextAnswerDate - ra.CreationDate)) / 3600.0 AS HoursUntilNextAnswer,
+    (
+      SELECT STRING_AGG(c.Text, ' || ')
+      FROM Comments c
+      WHERE c.PostId = ra.AnswerId AND c.Score > 5
+    ) AS HighQualityComments
+  FROM RankedUserAnswers ra
+  JOIN Users u ON ra.OwnerUserId = u.Id
+  JOIN Posts q ON ra.QuestionId = q.Id
+  LEFT JOIN UserActivitySummary uas ON u.Id = uas.OwnerUserId
+  WHERE
+    ra.AnswerRank <= 5
+    AND u.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000)
+    AND q.ClosedDate IS NULL
+    AND EXISTS (
+      SELECT 1 FROM Badges b
+      WHERE b.UserId = u.Id AND b.Class = 1
+    )
+),
+UnansweredGems AS (
+  SELECT
+    'Niche Questioner' AS ContributorType,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    uas.TotalPosts,
+    EXTRACT(EPOCH FROM (uas.LastPostDate - uas.FirstPostDate)) / 86400.0 AS ActiveDays,
+    p.Title AS QuestionTitle,
+    NULL AS AnswerScore,
+    p.FavoriteCount AS QuestionFavorites,
+    NULL AS CloseReason,
+    NULL AS AnswerId,
+    LENGTH(p.Body) AS AnswerBodyLength,
+    NULL AS HoursUntilNextAnswer,
+    (
+      SELECT STRING_AGG(t.TagName, ', ')
+      FROM UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS t(TagName)
+    ) AS TagsList
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN UserActivitySummary uas ON u.Id = uas.OwnerUserId
+  WHERE
+    p.PostTypeId = 1
+    AND p.AnswerCount = 0
+    AND p.FavoriteCount > 50
+    AND p.ClosedDate IS NULL
+    AND uas.AnswerCount < 5
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year')
+)
+SELECT * FROM TopTierContributors
+UNION ALL
+SELECT * FROM UnansweredGems
+ORDER BY
+  ContributorType,
+  Reputation DESC,
+  ActiveDays DESC NULLS LAST,
+  UserId,
+  COALESCE(AnswerScore, 0) DESC NULLS LAST;

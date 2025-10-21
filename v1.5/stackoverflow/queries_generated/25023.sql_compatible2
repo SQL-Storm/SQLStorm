@@ -1,0 +1,121 @@
+WITH
+UserPosts AS (
+    SELECT
+        p.OwnerUserId      AS UserId,
+        p.Id               AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId END AS AcceptedAnswerId
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserTagStats AS (
+    SELECT
+        up.UserId,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM up.Tags), '><'))          AS Tag,
+        COUNT(*) OVER (PARTITION BY up.UserId, UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM up.Tags), '><'))) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY up.UserId ORDER BY 
+            COUNT(*) OVER (PARTITION BY up.UserId, UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM up.Tags), '><'))) DESC) AS TagRank
+    FROM UserPosts up
+    WHERE up.PostTypeId = 1                                                   -- only questions have tags
+),
+TopUserTags AS (
+    SELECT
+        UserId,
+        Tag,
+        TagCount
+    FROM UserTagStats
+    WHERE TagRank <= 3
+),
+UserReputationGrowth AS (
+    SELECT
+        u.Id                                           AS UserId,
+        COALESCE(SUM(CASE 
+            WHEN p.CreationDate >= DATE_TRUNC('month', CAST('2024-10-01' AS DATE) - INTERVAL '1 month')
+                 AND p.CreationDate <  DATE_TRUNC('month', CAST('2024-10-01' AS DATE))
+            THEN p.Score ELSE 0 END),0)                AS RevGrowthLastMonth
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+BadgePoints AS (
+    SELECT
+        b.UserId,
+        SUM(CASE 
+            WHEN b.Class = 1 THEN 100
+            WHEN b.Class = 2 THEN 50
+            WHEN b.Class = 3 THEN 10
+            ELSE 0 END)                               AS TotalBadgePoints
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id                                          AS UserId,
+        CASE WHEN MAX(v.CreationDate) >= CAST('2024-10-01' AS DATE) - INTERVAL '7 day' THEN 1 ELSE 0 END AS HasRecentVote,
+        CASE WHEN MAX(p.CreationDate) >= CAST('2024-10-01' AS DATE) - INTERVAL '7 day' THEN 1 ELSE 0 END AS HasRecentPost
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    u.Id                                        AS UserId,
+    COALESCE(u.DisplayName,'anonymous')         AS DisplayName,
+    u.Reputation,
+    ur.RevGrowthLastMonth,
+    COUNT(DISTINCT CASE WHEN up.PostTypeId = 1 THEN up.PostId END)      AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN up.PostTypeId = 2 THEN up.PostId END)      AS AnswerCount,
+    AVG(CASE WHEN up.PostTypeId = 1 THEN up.Score END)                AS AvgQuestionScore,
+    SUM(CASE WHEN up.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)   AS AcceptedAnswerCount,
+    bp.TotalBadgePoints,
+    ra.HasRecentVote,
+    ra.HasRecentPost,
+    STRING_AGG(DISTINCT t.Tag||':'||t.TagCount, ', ') 
+        FILTER (WHERE t.Tag IS NOT NULL)                                 AS TopTags,
+    CASE
+        WHEN u.Views > 1000               THEN 'HighViewer'
+        WHEN u.Views BETWEEN 100 AND 1000 THEN 'MediumViewer'
+        ELSE NULL
+    END                                                               AS ViewerCategory,
+    COALESCE(NULLIF(u.Location,''), 'Unknown')                         AS Location,
+    LOWER(SUBSTRING(COALESCE(u.DisplayName,'x') FROM 1 FOR 1))||'.'   AS Initial
+FROM Users u
+LEFT OUTER JOIN UserPosts up      ON up.OwnerUserId = u.Id
+LEFT OUTER JOIN UserReputationGrowth ur ON ur.UserId = u.Id
+LEFT OUTER JOIN BadgePoints bp   ON bp.UserId = u.Id
+LEFT OUTER JOIN RecentActivity ra ON ra.UserId = u.Id
+LEFT OUTER JOIN TopUserTags t    ON t.UserId = u.Id
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, ur.RevGrowthLastMonth,
+    bp.TotalBadgePoints, ra.HasRecentVote, ra.HasRecentPost,
+    u.Views, u.Location
+UNION ALL
+SELECT
+    b.UserId,
+    COALESCE(u.DisplayName,'anonymous')          AS DisplayName,
+    u.Reputation,
+    0                                             AS RevGrowthLastMonth,
+    0                                             AS QuestionCount,
+    0                                             AS AnswerCount,
+    NULL                                          AS AvgQuestionScore,
+    0                                             AS AcceptedAnswerCount,
+    SUM(CASE 
+        WHEN b.Class = 1 THEN 100
+        WHEN b.Class = 2 THEN 50
+        WHEN b.Class = 3 THEN 10
+        ELSE 0 END)                              AS TotalBadgePoints,
+    0                                             AS HasRecentVote,
+    0                                             AS HasRecentPost,
+    NULL                                          AS TopTags,
+    NULL                                          AS ViewerCategory,
+    COALESCE(NULLIF(u.Location,''), 'Unknown')    AS Location,
+    LOWER(SUBSTRING(COALESCE(u.DisplayName,'x') FROM 1 FOR 1))||'.' AS Initial
+FROM Badges b
+LEFT JOIN Users u ON u.Id = b.UserId
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = b.UserId)
+GROUP BY b.UserId, u.DisplayName, u.Reputation, u.Location;

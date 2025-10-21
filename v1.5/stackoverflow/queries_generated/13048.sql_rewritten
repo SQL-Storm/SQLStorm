@@ -1,0 +1,68 @@
+-- {"query": "13048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 667} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS EditCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 0
+),
+CombinedData AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.BadgeCount,
+        ua.EditCount,
+        tq.PostId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.LinkedPostCount,
+        tq.Tags,
+        DENSE_RANK() OVER (PARTITION BY ua.UserId ORDER BY tq.Score DESC) AS UserQuestionRank
+    FROM UserActivity ua
+    CROSS JOIN TopQuestions tq
+    WHERE ua.ReputationRank <= 100
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    BadgeCount,
+    EditCount,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    LinkedPostCount,
+    Tags,
+    (SELECT AVG(ph.CreationDate::timestamp::date - p.CreationDate::timestamp::date)
+     FROM Posts p
+     INNER JOIN PostHistory ph ON p.Id = ph.PostId
+     WHERE ph.PostHistoryTypeId = 5 AND p.OwnerUserId = cd.UserId
+     GROUP BY p.OwnerUserId) AS AvgEditTimeDays
+FROM CombinedData cd
+WHERE UserQuestionRank <= 3
+ORDER BY Reputation DESC, Score DESC;

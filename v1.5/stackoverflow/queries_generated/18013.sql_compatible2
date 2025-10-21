@@ -1,0 +1,127 @@
+WITH RankedPostEdits AS (
+  SELECT
+    ph.PostId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.PostHistoryTypeId,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+  FROM PostHistory AS ph
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+    AVG(p.Score) AS AveragePostScore,
+    COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotesGiven,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownvotesGiven,
+    MAX(p.CreationDate) AS LastPostCreationDate
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  LEFT JOIN Votes AS v
+    ON u.Id = v.UserId
+  WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+  GROUP BY
+    u.Id,
+    u.DisplayName
+),
+PostEditQuality AS (
+  SELECT
+    rpe.PostId,
+    rpe.UserId,
+    rpe.CreationDate,
+    CASE
+      WHEN rpe.PostHistoryTypeId = 4 THEN 'Title Edit'
+      WHEN rpe.PostHistoryTypeId = 5 THEN 'Body Edit'
+      WHEN rpe.PostHistoryTypeId = 6 THEN 'Tags Edit'
+      ELSE 'Unknown Edit Type'
+    END AS EditType,
+    p.Score AS PostScoreBeforeEdit,
+    CASE
+      WHEN p.Score > 0 THEN 'Positive Score'
+      WHEN p.Score < 0 THEN 'Negative Score'
+      ELSE 'Zero Score'
+    END AS PostScoreCategory
+  FROM RankedPostEdits AS rpe
+  JOIN Posts AS p
+    ON rpe.PostId = p.Id
+  WHERE
+    rpe.rn = 1
+),
+CommunityFlagging AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(DISTINCT pf.Id) AS NumberOfFlags
+  FROM Posts AS p
+  JOIN Votes AS pf
+    ON p.Id = pf.PostId
+  WHERE
+    pf.VoteTypeId IN (4, 10, 12) /* Offensive, Deletion, Spam */ AND pf.CreationDate >= DATE 'now' - INTERVAL '1 year'
+  GROUP BY
+    p.Id
+  HAVING
+    COUNT(DISTINCT pf.Id) > 5
+)
+SELECT
+  ua.DisplayName,
+  ua.TotalPostsCreated,
+  ua.QuestionsCount,
+  ua.AnswersCount,
+  ua.AveragePostScore,
+  ua.TotalCommentsMade,
+  ua.TotalUpvotesGiven,
+  ua.TotalDownvotesGiven,
+  CASE
+    WHEN ua.LastPostCreationDate < DATE 'now' - INTERVAL '3 months' THEN 'Inactive'
+    WHEN ua.LastPostCreationDate < DATE 'now' - INTERVAL '1 month' THEN 'Moderately Active'
+    ELSE 'Very Active'
+  END AS UserActivityLevel,
+  COALESCE(peq.EditType, 'No Recent Edits') AS LatestEditType,
+  peq.PostScoreCategory AS ScoreCategoryOfLastEditedPost,
+  CASE
+    WHEN cf.NumberOfFlags IS NOT NULL THEN 'Flagged'
+    ELSE 'Not Flagged'
+  END AS CommunityFlaggingStatus,
+  CASE
+    WHEN POSITION('SQL' IN u.AboutMe) > 0 THEN 'SQL Enthusiast'
+    WHEN POSITION('performance' IN u.AboutMe) > 0 THEN 'Performance Focused'
+    ELSE 'General User'
+  END AS UserInterestCategory,
+  LENGTH(u.AboutMe) AS AboutMeLength,
+  (CAST(strftime('%Y', u.CreationDate) AS INTEGER) - CAST(strftime('%Y', u.LastAccessDate) AS INTEGER)) AS YearsSinceLastAccess,
+  CASE
+    WHEN p_count.TotalPosts IS NULL THEN 0
+    ELSE ROUND(CAST(p_count.TotalPosts AS REAL) / ua.TotalPostsCreated, 2)
+  END AS RatioOfPostsWithMoreThan100Score,
+  COALESCE(p_count.TotalPosts, 0) AS PostsWithMoreThan100Score
+FROM UserActivity AS ua
+LEFT JOIN Users AS u
+  ON ua.UserId = u.Id
+LEFT JOIN PostEditQuality AS peq
+  ON ua.UserId = peq.UserId AND peq.rn = 1
+LEFT JOIN CommunityFlagging AS cf
+  ON ua.UserId = cf.PostId
+LEFT JOIN (
+  SELECT
+    OwnerUserId,
+    COUNT(*) AS TotalPosts
+  FROM Posts
+  WHERE
+    Score > 100
+  GROUP BY
+    OwnerUserId
+) AS p_count
+  ON ua.UserId = p_count.OwnerUserId
+WHERE
+  ua.TotalPostsCreated > 50 AND ua.AveragePostScore > 5
+ORDER BY
+  ua.AveragePostScore DESC,
+  ua.TotalPostsCreated DESC
+LIMIT 100;

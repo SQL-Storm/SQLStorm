@@ -1,0 +1,242 @@
+with recent_users as (
+    select u.id as user_id, u.displayname, u.reputation, u.creationdate
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+active_questions as (
+    select p.id as question_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.owneruserid,
+           p.title,
+           p.tags,
+           coalesce(p.answercount, 0) as answercount
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answer_owner_id,
+           a.creationdate,
+           a.score
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 2)
+),
+question_votes as (
+    select v.postid as question_id,
+           sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+           count(*) filter (where v.votetypeid = 2) as upvotes,
+           count(*) filter (where v.votetypeid = 3) as downvotes
+    from votes v
+    join active_questions q on q.question_id = v.postid
+    group by v.postid
+),
+answer_votes as (
+    select a.question_id,
+           sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_answer_votes,
+           count(*) filter (where v.votetypeid = 2) as answer_upvotes,
+           count(*) filter (where v.votetypeid = 3) as answer_downvotes
+    from votes v
+    join answers a on a.answer_id = v.postid
+    group by a.question_id
+),
+comment_activity as (
+    select c.postid as post_id,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+    group by c.postid
+),
+postlinks_dupes as (
+    select pl.postid as question_id,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+           count(*) filter (where pl.linktypeid = 1) as linked_refs
+    from postlinks pl
+    group by pl.postid
+),
+closure_events as (
+    select ph.postid as question_id,
+           min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+           count(*) filter (where ph.posthistoryid = 10) as close_events,
+           count(*) filter (where ph.posthistoryid = 11) as reopen_events
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+owner_stats as (
+    select u.id as user_id,
+           count(*) filter (where p.posttypeid = 1) as total_questions,
+           count(*) filter (where p.posttypeid = 2) as total_answers,
+           sum(p.score) as total_post_score,
+           sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as total_question_views,
+           percentile_cont(0.5) within group (order by p.score) as median_post_score
+    from users u
+    join posts p on p.owneruserid = u.id
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    group by u.id
+),
+tag_expansion as (
+    select q.question_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from active_questions q
+    where q.tags is not null and q.tags like '<%>'
+),
+tag_popularity as (
+    select t.tag,
+           count(*) as tag_count,
+           avg(q.score) as avg_tag_score,
+           avg(q.viewcount) as avg_tag_views
+    from tag_expansion t
+    join active_questions q on q.question_id = t.question_id
+    group by t.tag
+),
+fastest_answers as (
+    select a.question_id,
+           min(a.creationdate) as first_answer_at
+    from answers a
+    group by a.question_id
+),
+answer_latency as (
+    select q.question_id,
+           q.creationdate,
+           fa.first_answer_at,
+           extract(epoch from (fa.first_answer_at - q.creationdate))/60.0 as minutes_to_first_answer
+    from active_questions q
+    left join fastest_answers fa on fa.question_id = q.question_id
+),
+accepted_answers as (
+    select q.id as question_id,
+           q.acceptedanswerid as accepted_id,
+           a.owneruserid as accepted_owner_id,
+           a.score as accepted_score,
+           a.creationdate as accepted_created_at
+    from posts q
+    left join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+bounty_activity as (
+    select a.question_id,
+           count(*) filter (where v.votetypeid = 8) as bounty_started,
+           sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as total_bounty_amount
+    from votes v
+    join answers a on a.answer_id = v.postid
+    where v.votetypeid in (8,9)
+    group by a.question_id
+),
+engagement_score as (
+    select q.question_id,
+           coalesce(qv.upvotes,0) * 3
+           + coalesce(qv.downvotes,0) * -1
+           + coalesce(av.answer_upvotes,0) * 2
+           + coalesce(av.answer_downvotes,0) * -0.5
+           + coalesce(ca.comment_count,0) * 0.5
+           + coalesce(pl.linked_refs,0) * 1.5
+           + coalesce(pl.duplicate_marks,0) * -2
+           + coalesce(bn.total_bounty_amount,0) * 0.01
+           + coalesce(q.viewcount,0) * 0.001
+           as engagement_score
+    from active_questions q
+    left join question_votes qv on qv.question_id = q.question_id
+    left join answer_votes av on av.question_id = q.question_id
+    left join comment_activity ca on ca.post_id = q.question_id
+    left join postlinks_dupes pl on pl.question_id = q.question_id
+    left join bounty_activity bn on bn.question_id = q.question_id
+),
+owner_quality as (
+    select q.question_id,
+           u.id as owner_id,
+           u.displayname as owner_name,
+           u.reputation,
+           os.total_questions,
+           os.total_answers,
+           os.total_post_score,
+           os.total_question_views,
+           os.median_post_score
+    from active_questions q
+    left join users u on u.id = q.owneruserid
+    left join owner_stats os on os.user_id = u.id
+),
+question_rank as (
+    select q.question_id,
+           q.title,
+           q.tags,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           eq.engagement_score,
+           al.minutes_to_first_answer,
+           coalesce(al.minutes_to_first_answer, 1440.0) as latency_for_rank,
+           dense_rank() over (order by eq.engagement_score desc nulls last) as engagement_rank,
+           dense_rank() over (order by coalesce(al.minutes_to_first_answer, 1e9) asc) as speed_rank
+    from active_questions q
+    left join engagement_score eq on eq.question_id = q.question_id
+    left join answer_latency al on al.question_id = q.question_id
+),
+top_tag for update as (
+    select t.tag,
+           t.tag_count,
+           t.avg_tag_score,
+           t.avg_tag_views,
+           dense_rank() over (order by t.tag_count desc, t.avg_tag_views desc) as tag_rank
+    from tag_popularity t
+),
+final as (
+    select
+        qr.question_id,
+        qr.title,
+        qr.tags,
+        qr.creationdate,
+        qr.score,
+        qr.viewcount,
+        qr.answercount,
+        qr.engagement_score,
+        qr.engagement_rank,
+        qr.minutes_to_first_answer,
+        qr.speed_rank,
+        oq.owner_id,
+        oq.owner_name,
+        oq.reputation,
+        oq.total_questions,
+        oq.total_answers,
+        oq.total_post_score,
+        oq.total_question_views,
+        oq.median_post_score,
+        coalesce(qv.upvotes,0) as question_upvotes,
+        coalesce(qv.downvotes,0) as question_downvotes,
+        coalesce(av.answer_upvotes,0) as answer_upvotes,
+        coalesce(av.answer_downvotes,0) as answer_downvotes,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.last_comment_at, null) as last_comment_at,
+        coalesce(pl.duplicate_marks,0) as duplicate_marks,
+        coalesce(pl.linked_refs,0) as linked_refs,
+        ce.first_closed_at,
+        ce.close_events,
+        ce.reopen_events,
+        aa.accepted_id,
+        aa.accepted_owner_id,
+        aa.accepted_score,
+        aa.accepted_created_at,
+        coalesce(bn.bounty_started,0) as bounty_started,
+        coalesce(bn.total_bounty_amount,0) as total_bounty_amount
+    from question_rank qr
+    left join owner_quality oq on oq.question_id = qr.question_id
+    left join question_votes qv on qv.question_id = qr.question_id
+    left join answer_votes av on av.question_id = qr.question_id
+    left join comment_activity ca on ca.post_id = qr.question_id
+    left join postlinks_dupes pl on pl.question_id = qr.question_id
+    left join closure_events ce on ce.question_id = qr.question_id
+    left join accepted_answers aa on aa.question_id = qr.question_id
+    left join bounty_activity bn on bn.question_id = qr.question_id
+)
+select f.*
+from final f
+where (f.engagement_rank <= 200 or f.speed_rank <= 200)
+order by f.engagement_rank nulls last, f.speed_rank, f.viewcount desc, f.score desc
+limit 500;

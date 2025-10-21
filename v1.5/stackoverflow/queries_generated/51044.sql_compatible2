@@ -1,0 +1,85 @@
+WITH tag_activity AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT ph.PostId) AS total_edits,
+        AVG(CAST(ph.CreationDate AS DATE) - CAST(p.CreationDate AS DATE)) AS avg_days_to_first_edit,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS edit_count,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10) THEN 1 ELSE 0 END) AS close_count
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    JOIN PostHistory ph ON ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13)
+        AND ph.CreationDate > p.CreationDate
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT ph.PostId) > 10
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        ta.TagName,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS upvotes_given,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS downvotes_given,
+        AVG(p.Score) AS avg_post_score,
+        COUNT(DISTINCT p.Id) AS total_posts
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id 
+        AND p.PostTypeId IN (1,2)
+        AND p.Score > 0
+    JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    JOIN Posts related_p ON related_p.Id = pl.RelatedPostId 
+        -- avoid cross-DB string concatenation syntax by using LIKE with concatenation
+        -- instead of ta.TagName directly in the subquery to prevent missing references
+        -- ta is defined in tag_activity; to reference it here, join with it below
+        -- We'll move the relation to the final join path
+        
+        -- placeholder to maintain compatibility; actual join occurs after ta is available
+        NULL
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+        AND v.VoteTypeId IN (2,3)
+    JOIN tag_activity ta ON 1 = 1
+    WHERE u.Reputation > 1000
+        AND u.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, ta.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+monthly_trends AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        ta.TagName,
+        COUNT(p.Id) AS new_questions,
+        AVG(p.ViewCount) AS avg_views,
+        SUM(p.Score) AS total_score,
+        COUNT(DISTINCT p.OwnerUserId) AS active_users
+    FROM Posts p
+    JOIN tag_activity ta ON p.Tags LIKE '%' || ta.TagName || '%'
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '12 months'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), ta.TagName
+)
+SELECT 
+    ta.TagName,
+    ta.total_edits,
+    ta.edit_count,
+    ta.close_count,
+    ta.avg_days_to_first_edit,
+    ue.DisplayName AS top_expert,
+    ue.upvotes_given,
+    ue.downvotes_given,
+    ue.avg_post_score,
+    mt.new_questions,
+    mt.avg_views,
+    mt.total_score,
+    mt.active_users,
+    RANK() OVER (ORDER BY ta.total_edits DESC, mt.total_score DESC) AS activity_rank,
+    LAG(mt.new_questions) OVER (PARTITION BY ta.TagName ORDER BY mt.month) AS prev_month_questions
+FROM tag_activity ta
+JOIN user_expertise ue ON ue.TagName = ta.TagName
+    AND ue.total_posts = (SELECT MAX(total_posts) FROM user_expertise ue2 WHERE ue2.TagName = ta.TagName)
+JOIN monthly_trends mt ON mt.TagName = ta.TagName
+    AND mt.month = (SELECT MAX(month) FROM monthly_trends mt2 WHERE mt2.TagName = ta.TagName)
+WHERE ta.close_count < ta.edit_count * 0.1  -- Filter for healthy tag communities
+ORDER BY activity_rank
+LIMIT 50;

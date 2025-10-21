@@ -1,0 +1,222 @@
+-- {"query": "4002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2254} 
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        COALESCE(u.WebsiteUrl,'') AS WebsiteUrl,
+        COALESCE(u.AboutMe,'') AS AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS RankInReputation
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+UserQuestions AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS QuestionId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.CreationDate,
+        p.ClosedDate,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(ph.CreationDate) AS LastRevisionDate
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, p.Id, p.Title, p.ViewCount, p.Score, p.AnswerCount, p.FavoriteCount, p.Tags, p.CreationDate, p.ClosedDate
+),
+LatestAcceptedAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerUserId,
+        a.CreationDate AS AcceptedAnswerCreationDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+TagExploded AS (
+    SELECT
+        QuestionId,
+        LOWER(TRIM(tag)) AS TagName
+    FROM UserQuestions, LATERAL UNNEST(string_to_array(REPLACE(REPLACE(Tags, '<', ''), '>', ','), ',')) AS tag
+    WHERE Tags IS NOT NULL AND LENGTH(TRIM(tag)) > 0
+),
+TopTagsPerUser AS (
+    SELECT
+        uq.OwnerUserId,
+        te.TagName,
+        COUNT(*) AS TagUsageCount,
+        RANK() OVER (PARTITION BY uq.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserQuestions uq
+    JOIN TagExploded te ON te.QuestionId = uq.QuestionId
+    GROUP BY uq.OwnerUserId, te.TagName
+),
+FilteredTopTags AS (
+    SELECT OwnerUserId, TagName, TagUsageCount
+    FROM TopTagsPerUser
+    WHERE TagRank <= 3
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgesEarned
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotesGiven,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT ph.Id) AS TotalEditsMade
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(DISTINCT CASE WHEN a.Score >= 10 THEN a.Id END) AS HighScoreAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+UserQuestionRecentActivity AS (
+    SELECT
+        uq.OwnerUserId,
+        MAX(uq.LastRevisionDate) AS LastQuestionRevision,
+        MAX(uq.CreationDate) AS LastQuestionCreated
+    FROM UserQuestions uq
+    GROUP BY uq.OwnerUserId
+),
+UserNetworkInfluence AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.Id END) AS DuplicateLinksCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY u.Id
+),
+FinalUserOverview AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.RankInReputation,
+        rua.CreationDate,
+        rua.LastAccessDate,
+        rua.Location,
+        rua.WebsiteUrl,
+        rua.AboutMe,
+        rua.Views,
+        rua.UpVotes,
+        rua.DownVotes,
+        COALESCE(ubs_badge_gold.BadgesEarned,0) AS GoldBadges,
+        COALESCE(ubs_badge_silver.BadgesEarned,0) AS SilverBadges,
+        COALESCE(ubs_badge_bronze.BadgesEarned,0) AS BronzeBadges,
+        COALESCE(us.TotalAnswers,0) AS TotalAnswers,
+        COALESCE(us.AvgAnswerScore,0) AS AvgAnswerScore,
+        COALESCE(us.MaxAnswerScore,0) AS MaxAnswerScore,
+        COALESCE(us.HighScoreAnswers,0) AS HighScoreAnswers,
+        COALESCE(ue.TotalUpVotesGiven,0) AS UpVotesGiven,
+        COALESCE(ue.TotalDownVotesGiven,0) AS DownVotesGiven,
+        COALESCE(ue.TotalCommentsMade,0) AS CommentsMade,
+        COALESCE(ue.TotalEditsMade,0) AS EditsMade,
+        COALESCE(un.LinkedPostCount,0) AS LinkedPostsByUser,
+        COALESCE(un.DuplicateLinksCount,0) AS DuplicateLinksByUser,
+        STRING_AGG(DISTINCT ftt.TagName, ', ') FILTER (WHERE ftt.TagName IS NOT NULL) AS TopTags,
+        uqr.LastQuestionRevision,
+        uqr.LastQuestionCreated
+    FROM RecursiveUserActivity rua
+    LEFT JOIN UserBadgeSummary ubs_badge_gold ON ubs_badge_gold.UserId = rua.UserId AND ubs_badge_gold.Class = 1
+    LEFT JOIN UserBadgeSummary ubs_badge_silver ON ubs_badge_silver.UserId = rua.UserId AND ubs_badge_silver.Class = 2
+    LEFT JOIN UserBadgeSummary ubs_badge_bronze ON ubs_badge_bronze.UserId = rua.UserId AND ubs_badge_bronze.Class = 3
+    LEFT JOIN UserAnswerStats us ON us.OwnerUserId = rua.UserId
+    LEFT JOIN UserEngagement ue ON ue.UserId = rua.UserId
+    LEFT JOIN UserNetworkInfluence un ON un.UserId = rua.UserId
+    LEFT JOIN FilteredTopTags ftt ON ftt.OwnerUserId = rua.UserId
+    LEFT JOIN UserQuestionRecentActivity uqr ON uqr.OwnerUserId = rua.UserId
+    GROUP BY
+        rua.UserId, rua.DisplayName, rua.Reputation, rua.RankInReputation, rua.CreationDate, rua.LastAccessDate,
+        rua.Location, rua.WebsiteUrl, rua.AboutMe, rua.Views, rua.UpVotes, rua.DownVotes,
+        ubs_badge_gold.BadgesEarned, ubs_badge_silver.BadgesEarned, ubs_badge_bronze.BadgesEarned,
+        us.TotalAnswers, us.AvgAnswerScore, us.MaxAnswerScore, us.HighScoreAnswers,
+        ue.TotalUpVotesGiven, ue.TotalDownVotesGiven, ue.TotalCommentsMade, ue.TotalEditsMade,
+        un.LinkedPostCount, un.DuplicateLinksCount,
+        uqr.LastQuestionRevision, uqr.LastQuestionCreated
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    RankInReputation,
+    CreationDate,
+    LastAccessDate,
+    COALESCE(Location, 'Not specified') AS Location,
+    COALESCE(NULLIF(WebsiteUrl, ''), 'No website') AS Website,
+    CASE
+        WHEN LENGTH(AboutMe) > 100 THEN SUBSTRING(AboutMe FROM 1 FOR 97) || '...'
+        ELSE COALESCE(AboutMe, 'No bio')
+    END AS AboutSummary,
+    Views,
+    UpVotes,
+    DownVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalAnswers,
+    ROUND(AvgAnswerScore::numeric, 2) AS AverageAnswerScore,
+    MaxAnswerScore,
+    HighScoreAnswers,
+    UpVotesGiven,
+    DownVotesGiven,
+    CommentsMade,
+    EditsMade,
+    LinkedPostsByUser,
+    DuplicateLinksByUser,
+    COALESCE(TopTags, 'No top tags') AS TopTags,
+    LastQuestionRevision,
+    LastQuestionCreated,
+    CASE
+        WHEN LastAccessDate > NOW() - INTERVAL '30 days' THEN 'Active'
+        WHEN LastAccessDate > NOW() - INTERVAL '1 year' THEN 'Inactive'
+        ELSE 'Dormant'
+    END AS ActivityStatus,
+    CASE
+        WHEN Reputation > 50000 THEN 'Legendary'
+        WHEN Reputation > 10000 THEN 'Expert'
+        WHEN Reputation > 5000 THEN 'Experienced'
+        ELSE 'Intermediate'
+    END AS ReputationLevel
+FROM FinalUserOverview
+WHERE RankInReputation <= 100
+ORDER BY RankInReputation;

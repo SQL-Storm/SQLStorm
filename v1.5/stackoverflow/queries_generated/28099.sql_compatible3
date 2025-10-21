@@ -1,0 +1,67 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        AVG(p.Score) OVER (PARTITION BY u.Location) AS AvgLocationScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > DATE '2010-01-01' OR u.WebsiteUrl IS NOT NULL
+    GROUP BY u.Id, u.Location, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, p.ParentId) AS LinkedPostId,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Wiki'
+            ELSE 'Active'
+        END AS PostStatus,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (
+            SELECT STRING_AGG(DISTINCT SUBSTRING(t.Tags, 2, LENGTH(t.Tags) - 2), ', ')
+            FROM Posts t
+            WHERE t.PostTypeId = 5 AND t.Tags LIKE CONCAT('%<', SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '>%')
+        ) AS RelatedWikis
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.AnswerCount > 0
+)
+SELECT 
+    u.UserId,
+    u.GlobalRank,
+    pa.PostStatus,
+    pa.Upvotes * 100.0 / NULLIF(u.UpVotes + u.DownVotes, 0) AS VoteRatio,
+    (
+        SELECT COUNT(*) FROM PostHistory ph
+        WHERE ph.PostId = pa.Id AND ph.PostHistoryTypeId = 10
+        AND CAST(ph.Comment AS INTEGER) IN (SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%')
+    ) AS DuplicateCloseEvents,
+    u.AvgLocationScore,
+    u.PrevPostScore,
+    (
+        SELECT SUM(BountyAmount) FROM Votes v
+        WHERE v.UserId = u.UserId AND v.VoteTypeId = 8
+        AND v.CreationDate BETWEEN TIMESTAMP '2015-01-01 00:00:00' AND TIMESTAMP '2020-01-01 00:00:00'
+    ) AS TotalBounty,
+    pa.RelatedWikis,
+    (
+        EXTRACT(YEAR FROM CAST(u.Reputation AS DATE)) - EXTRACT(YEAR FROM (SELECT MIN(CreationDate) FROM Posts WHERE OwnerUserId = u.UserId))
+    ) AS AccountAgeYears
+FROM UserStats u
+JOIN PostAnalysis pa ON u.UserId = pa.OwnerUserId
+LEFT JOIN Comments c ON c.PostId = pa.Id AND c.UserId = u.UserId
+WHERE u.GoldBadges > (SELECT AVG(GoldBadges) FROM UserStats)
+  AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.UserId AND p2.ClosedDate IS NOT NULL)
+  AND (u.Reputation > 10000 OR pa.Upvotes > 50)
+ORDER BY 
+    u.GlobalRank,
+    VoteRatio DESC NULLS LAST
+LIMIT 100;

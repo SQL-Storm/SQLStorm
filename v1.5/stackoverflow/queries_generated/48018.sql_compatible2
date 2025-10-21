@@ -1,0 +1,99 @@
+WITH QuestionScores AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(CASE WHEN a.OwnerUserId = p.OwnerUserId THEN 1 ELSE 0 END) AS AnswersFromSameOwner,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        SUM(CASE WHEN c.UserId IS NOT NULL THEN 1 ELSE 0 END) AS CommentCountOnQuestion
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.OwnerUserId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStartCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPostCount,
+        COUNT(pt.Id) AS QuestionsWithTag
+    FROM Tags t
+    LEFT JOIN Posts pt ON pt.Tags LIKE '%' || t.TagName || '%' AND pt.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+)
+SELECT
+    qs.Title AS QuestionTitle,
+    qs.QuestionScore,
+    qs.AnswerCount,
+    qs.AverageAnswerScore,
+    qs.MaxAnswerScore,
+    qs.MinAnswerScore,
+    qs.AnswersFromSameOwner,
+    qs.CommentCountOnQuestion,
+    ua.DisplayName AS QuestionOwnerDisplayName,
+    ua.Reputation AS QuestionOwnerReputation,
+    ua.UserCreationDate AS QuestionOwnerCreationDate,
+    ua.PostHistoryCount AS QuestionOwnerPostHistory,
+    ua.BadgeCount AS QuestionOwnerBadges,
+    ua.UpVoteCount AS QuestionOwnerUpvotes,
+    ua.DownVoteCount AS QuestionOwnerDownvotes,
+    ua.BountyStartCount AS QuestionOwnerBountiesStarted,
+    ua.FavoriteCount AS QuestionOwnerFavorites,
+    tp.TagName,
+    tp.TagPostCount,
+    tp.QuestionsWithTag,
+    qs.QuestionCreationDate
+FROM QuestionScores qs
+JOIN UserActivity ua ON qs.OwnerUserId = ua.UserId
+CROSS JOIN TagPopularity tp
+WHERE qs.QuestionScore > 0
+  AND qs.AnswerCount > 0
+  AND qs.AverageAnswerScore > 0
+  AND ua.Reputation > 1000
+  AND tp.TagPostCount > 10000
+GROUP BY
+    qs.Title,
+    qs.QuestionScore,
+    qs.AnswerCount,
+    qs.AverageAnswerScore,
+    qs.MaxAnswerScore,
+    qs.MinAnswerScore,
+    qs.AnswersFromSameOwner,
+    qs.CommentCountOnQuestion,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.PostHistoryCount,
+    ua.BadgeCount,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    ua.BountyStartCount,
+    ua.FavoriteCount,
+    tp.TagName,
+    tp.TagPostCount,
+    tp.QuestionsWithTag,
+    qs.QuestionCreationDate
+ORDER BY qs.QuestionScore DESC, qs.AnswerCount DESC, ua.Reputation DESC, tp.QuestionsWithTag DESC, qs.QuestionCreationDate ASC
+LIMIT 1000;

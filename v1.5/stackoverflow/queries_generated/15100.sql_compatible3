@@ -1,0 +1,53 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        AVG(u.Reputation) OVER (PARTITION BY b.TagBased) AS AvgReputationByBadgeType,
+        RANK() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeCountRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        b.TagBased
+),
+PostActivityMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxViewCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate > CAST('2010-01-01 00:00:00' AS TIMESTAMP)
+    GROUP BY
+        p.OwnerUserId,
+        p.PostTypeId
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    pam.PostCount,
+    pam.AvgPostScore,
+    ubs.AvgReputationByBadgeType,
+    COALESCE(pam.UpVotes, 0) AS NormalizedUpVotes,
+    CASE 
+        WHEN ubs.TotalBadges > 10 AND pam.AvgPostScore > 5 THEN 'High Performer'
+        WHEN ubs.TotalBadges BETWEEN 5 AND 10 THEN 'Emerging Contributor'
+        ELSE 'New User'
+    END AS UserCategory,
+    (ubs.BadgeCountRank * pam.AvgPostScore) AS CompositeMerit
+FROM UserBadgeStats ubs
+JOIN PostActivityMetrics pam ON ubs.UserId = pam.OwnerUserId
+WHERE 
+    (ubs.GoldBadges > 0 OR pam.PostCount > 5)
+    AND (pam.MaxViewCount > 1000 OR ubs.AvgReputationByBadgeType > 500)
+ORDER BY CompositeMerit DESC
+LIMIT 100;

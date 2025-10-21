@@ -1,0 +1,155 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    CASE
+      WHEN p.OwnerUserId IS NOT NULL THEN u.Reputation
+      ELSE NULL
+    END AS OwnerReputation
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+),
+tag_summary AS (
+  SELECT
+    UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag,
+    p.Id AS PostId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_popularity AS (
+  SELECT
+    t.tag,
+    COUNT(*) AS tag_post_count,
+    SUM(p.ViewCount) AS total_views,
+    AVG(p.Score) AS avg_score
+  FROM tag_summary t
+  JOIN Posts p ON p.Id = t.PostId
+  GROUP BY t.tag
+),
+complex_metrics AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.ViewCount,
+    rq.Score,
+    rq.OwnerName,
+    rq.OwnerReputation,
+    rk.tag AS TagUsed,
+    tt.Name AS PostTypeName,
+    rq.CommentCount,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    CASE
+      WHEN rq.ViewCount > 1000 THEN true
+      ELSE false
+    END AS HeavyTraffic,
+    CASE
+      WHEN rq.Score >= 10 THEN 'High'
+      WHEN rq.Score >= 0 THEN 'Medium'
+      ELSE 'Low'
+    END AS ScoreBand
+  FROM recent_questions rq
+  LEFT JOIN PostTypes tt ON rq.PostTypeId = tt.Id
+  LEFT JOIN tag_summary rk ON rk.PostId = rq.PostId
+  ORDER BY rq.LastActivityDate DESC
+  LIMIT 100
+),
+window_analytics AS (
+  SELECT
+    cm.PostId,
+    cm.Title,
+    cm.TagUsed,
+    cm.Score,
+    cm.ViewCount,
+    SUM(pv.cumulative_views) OVER (
+      PARTITION BY cm.PostId
+      ORDER BY cm.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cumulative_views
+  FROM complex_metrics cm
+  LEFT JOIN (
+    SELECT
+      cm.PostId,
+      cm.Title,
+      cm.CreationDate,
+      SUM(cm.ViewCount) AS cumulative_views
+    FROM complex_metrics cm
+    GROUP BY cm.PostId, cm.Title, cm.CreationDate
+  ) pv ON pv.PostId = cm.PostId
+),
+correlated_search AS (
+  SELECT
+    p1.Id AS PrimaryPostId,
+    p1.Title AS PrimaryTitle,
+    p2.Id AS RelatedPostId,
+    p2.Title AS RelatedTitle,
+    p2.ViewCount AS RelatedViews,
+    p2.Score AS RelatedScore
+  FROM Posts p1
+  LEFT JOIN PostLinks pl ON pl.PostId = p1.Id
+  LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE p1.PostTypeId = 1 AND p2.PostTypeId = 1
+    AND pl.LinkTypeId IN (1,3)
+    AND p1.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '180 days')
+),
+final_union AS (
+  SELECT
+    *
+
+  FROM complex_metrics
+  UNION ALL
+  SELECT
+    NULL AS PostId, NULL AS Title, NULL AS Tags, NULL AS CreationDate, NULL AS ViewCount,
+    NULL AS Score, NULL AS OwnerName, NULL AS OwnerReputation, NULL AS TagUsed, NULL AS PostTypeName,
+    NULL AS CommentCount, NULL AS AnswerCount, NULL AS FavoriteCount, NULL AS HeavyTraffic,
+    NULL AS ScoreBand
+  FROM dual
+)
+SELECT
+  fu.PostId,
+  fu.Title,
+  fu.Tags,
+  fu.CreationDate,
+  fu.ViewCount,
+  fu.Score,
+  fu.OwnerName,
+  fu.OwnerReputation,
+  fu.TagUsed,
+  fu.PostTypeName,
+  fu.CommentCount,
+  fu.AnswerCount,
+  fu.FavoriteCount,
+  fu.HeavyTraffic,
+  fu.ScoreBand,
+  wa.cumulative_views,
+  cs.PrimaryPostId,
+  cs.PrimaryTitle,
+  cs.RelatedPostId,
+  cs.RelatedTitle,
+  cs.RelatedViews,
+  cs.RelatedScore,
+  ts.tag AS TopTag,
+  ta.tag_post_count,
+  ta.total_views AS TagTotalViews,
+  ta.avg_score AS TagAvgScore
+FROM final_union fu
+LEFT JOIN window_analytics wa ON fu.PostId = wa.PostId
+LEFT JOIN correlated_search cs ON fu.PostId = cs.PrimaryPostId
+LEFT JOIN tag_popularity ta ON fu.TagUsed = ta.tag
+ORDER BY fu.CreationDate DESC
+LIMIT 200;

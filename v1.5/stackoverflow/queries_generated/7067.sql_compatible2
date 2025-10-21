@@ -1,0 +1,183 @@
+WITH
+AuthorStats AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, '<deleted>') AS DisplayName,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    SUM(p.Score) AS TotalPostScore,
+    AVG(NULLIF((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400), 0)) OVER () AS AvgDaysSinceSignup,
+    COALESCE(
+      SUM(
+        CASE
+          WHEN p.PostTypeId = 2 THEN p.Score * 1.5
+          WHEN p.PostTypeId = 1 THEN p.Score * 1.0
+          ELSE p.Score * 0.1
+        END
+      ),0
+    ) AS WeightedScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.CreationDate
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    COALESCE(
+      (SELECT c.Text
+       FROM Comments c
+       WHERE c.PostId = p.Id
+         AND c.Text IS NOT NULL
+       ORDER BY c.CreationDate DESC
+       LIMIT 1),
+      '[no comments]'
+    ) AS LastCommentText,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.BountyAmount IS NOT NULL),0) AS TotalBounty
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+ExplodedTags AS (
+  SELECT
+    p.Id AS PostId,
+    LOWER(TRIM(BOTH '<>' FROM tag)) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    CASE
+      WHEN p.Tags IS NULL OR LENGTH(TRIM(p.Tags)) = 0 THEN ARRAY[]::text[]
+      ELSE string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')
+    END
+  ) AS tags(tag)
+),
+TagStats AS (
+  SELECT
+    t.Tag,
+    COUNT(et.PostId) AS TotalQuestions,
+    SUM(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 1) AS TagQuestionScore,
+    SUM(COALESCE(p.ViewCount,0)) FILTER (WHERE p.PostTypeId = 1) AS TagViews,
+    RANK() OVER (ORDER BY COUNT(et.PostId) DESC, SUM(COALESCE(p.ViewCount,0)) DESC) AS PopularityRank
+  FROM ExplodedTags et
+  LEFT JOIN Posts p ON p.Id = et.PostId
+  GROUP BY t.Tag
+),
+LinkedPairs AS (
+  SELECT DISTINCT
+    LEAST(pl.PostId, pl.RelatedPostId) AS A,
+    GREATEST(pl.PostId, pl.RelatedPostId) AS B,
+    pl.LinkTypeId
+  FROM PostLinks pl
+),
+BenchmarkSeed AS (
+  SELECT
+    pa.PostId,
+    pa.PostTypeId,
+    pa.Title,
+    pa.CreationDate,
+    pa.LastActivityDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.UpVotes,
+    pa.DownVotes,
+    pa.TotalBounty,
+    pa.LastCommentText,
+    a.DisplayName AS OwnerName,
+    a.WeightedScore AS OwnerWeightedScore,
+    COALESCE(ts.Tag, '[untagged]') AS PrimaryTag,
+    COALESCE(ts.TotalQuestions,0) AS PrimaryTagQuestions,
+    COALESCE(ts.TagViews,0) AS PrimaryTagViews,
+    CASE
+      WHEN pa.LastActivityDate IS NULL THEN NULL
+      ELSE (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.LastActivityDate)) / 3600.0)
+    END AS HoursSinceLastActivity,
+    lp.LinkCount,
+    COALESCE(
+      (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = pa.PostId), 0
+    ) AS ChildCount
+  FROM PostActivity pa
+  LEFT JOIN AuthorStats a ON a.UserId = pa.OwnerUserId
+  LEFT JOIN LATERAL (
+    SELECT et.Tag
+    FROM ExplodedTags et
+    WHERE et.PostId = pa.PostId
+    ORDER BY et.Tag
+    LIMIT 1
+  ) ts_tag ON true
+  LEFT JOIN TagStats ts ON ts.Tag = ts_tag.Tag
+  LEFT JOIN (
+    SELECT
+      A AS PostId,
+      COUNT(*) AS LinkCount
+    FROM LinkedPairs
+    GROUP BY A
+  ) lp ON lp.PostId = pa.PostId
+),
+Windowed AS (
+  SELECT
+    bs.*,
+    ROW_NUMBER() OVER (PARTITION BY bs.PostTypeId ORDER BY COALESCE(bs.Score,0) DESC, COALESCE(bs.ViewCount,0) DESC) AS RankByScore,
+    AVG(COALESCE(bs.Score,0)) OVER (PARTITION BY bs.PrimaryTag ORDER BY bs.CreationDate ROWS BETWEEN 50 PRECEDING AND 10 FOLLOWING) AS MovingAvgScore_Tag,
+    SUM(COALESCE(bs.ViewCount,0)) OVER (PARTITION BY bs.OwnerName ORDER BY bs.CreationDate ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS OwnerRecentViews,
+    PERCENT_RANK() OVER (PARTITION BY bs.PrimaryTag ORDER BY COALESCE(bs.ViewCount,0)) AS TagViewPercentile,
+    NTILE(10) OVER (ORDER BY COALESCE(bs.HoursSinceLastActivity, 1e9)) AS ActivityDecile
+  FROM BenchmarkSeed bs
+)
+SELECT
+  w.PostId,
+  w.PostTypeId,
+  COALESCE(w.Title, SUBSTRING(w.LastCommentText FROM 1 FOR 120)) AS TitleOrCommentPreview,
+  w.OwnerName,
+  w.OwnerWeightedScore,
+  w.PrimaryTag,
+  w.PrimaryTagQuestions,
+  w.PrimaryTagViews,
+  w.Score,
+  w.ViewCount,
+  w.UpVotes,
+  w.DownVotes,
+  w.TotalBounty,
+  w.ChildCount,
+  w.LinkCount,
+  ROUND(COALESCE(w.MovingAvgScore_Tag,0)::numeric,3) AS MovingAvgScore_Tag,
+  COALESCE(w.OwnerRecentViews,0) AS OwnerRecentViews,
+  ROUND(COALESCE(w.TagViewPercentile,0)::numeric,4) AS TagViewPercentile,
+  w.ActivityDecile,
+  ROUND((
+    COALESCE(w.Score,0) * 1.2
+    + LOG(GREATEST(COALESCE(w.ViewCount,0),1)) * 0.8
+    + (COALESCE(w.UpVotes,0) - COALESCE(w.DownVotes,0)) * 1.5
+    + (CASE WHEN w.TotalBounty > 0 THEN SQRT(w.TotalBounty) * 2 ELSE 0 END)
+    + (CASE WHEN w.PrimaryTagQuestions > 1000 THEN 5 ELSE 0 END)
+    + (COALESCE(w.OwnerWeightedScore,0) / NULLIF(GREATEST(w.OwnerRecentViews,1),0)) * 0.5
+    - (COALESCE(w.HoursSinceLastActivity,100000) / 24.0) * 0.1
+  )::numeric,4) AS CompositeSignal,
+  COALESCE((
+    SELECT COUNT(DISTINCT b.Class)
+    FROM Posts p_link
+    JOIN Posts p_other ON (p_other.Id = p_link.RelatedPostId OR p_other.Id = p_link.PostId)
+    LEFT JOIN Badges b ON b.UserId = p_other.OwnerUserId
+    WHERE (p_link.PostId = w.PostId OR p_link.RelatedPostId = w.PostId)
+      AND p_other.OwnerUserId IS NOT NULL
+  ),0) AS DistinctBadgeClassesAround
+FROM Windowed w
+WHERE
+  (
+    (w.Score > 0 OR w.ViewCount > 500)
+    AND (w.PrimaryTag IS NULL OR w.PrimaryTag <> '[untagged]')
+    AND (w.ActivityDecile <= 8 OR w.TagViewPercentile > 0.75)
+  )
+  AND EXISTS (
+    SELECT 1 FROM Votes v
+    WHERE v.PostId = w.PostId
+      AND v.VoteTypeId IN (2,3)
+      AND v.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+  )
+ORDER BY CompositeSignal DESC NULLS LAST
+LIMIT 250;

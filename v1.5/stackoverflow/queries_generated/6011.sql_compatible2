@@ -1,0 +1,109 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1  -- Questions
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY)
+),
+tag_bench AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.ProfileImageUrl,
+    u.Location,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+pledged_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.VoteTypeId IN (2,3,14,16)  -- UpMod, DownMod, NominateModerator, ApproveEditSuggestion
+),
+complex_dump AS (
+  SELECT
+    rp.PostId,
+    rp.RelatedPostId,
+    lt.Name AS LinkType,
+    rp.CreationDate AS LinkCreationDate
+  FROM PostLinks rp
+  JOIN LinkTypes lt ON rp.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked','Duplicate')
+)
+SELECT
+  q.PostId,
+  q.Title,
+  q.Tags,
+  q.CreationDate AS QuestionCreated,
+  q.LastActivityDate,
+  q.ViewCount,
+  q.Score AS QuestionScore,
+  q.AnswerCount,
+  q.CommentCount,
+  q.FavoriteCount,
+  u.UserId AS OwnerId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.Location,
+  u.ProfileImageUrl,
+  u.AccountId,
+  CASE
+    WHEN q.OwnerUserId IS NULL THEN 'Unknown'
+    ELSE 'Registered'
+  END AS OwnerStatus,
+  t.TagName,
+  t.TagCount,
+  b.Name AS BadgeName,
+  b.Date AS BadgeDate,
+  b.Class AS BadgeClass,
+  b.TagBased AS IsTagBased,
+  pv.CreationDate AS VotedOnDate,
+  pv.VoteTypeId,
+  pv.BountyAmount,
+  clr.Name AS CloseReason
+FROM recent_questions q
+LEFT JOIN (
+  SELECT Id, DisplayName AS DisplayName
+  FROM Users
+) u ON q.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT TagName, Count AS TagCount
+  FROM Tags
+  WHERE IsModeratorOnly = 0
+  LIMIT 50
+) t ON 1 = 1
+LEFT JOIN Badges b ON b.UserId = q.OwnerUserId
+LEFT JOIN pledged_votes pv ON pv.PostId = q.PostId
+LEFT JOIN CloseReasonTypes clr ON CAST(SUBSTRING(pv.Comment FROM 1 FOR 3) AS varchar) = CAST(clr.Id AS varchar)
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS C
+  FROM Comments
+  GROUP BY PostId
+) c ON c.PostId = q.PostId
+ORDER BY q.LastActivityDate DESC
+FETCH FIRST 200 ROWS ONLY;

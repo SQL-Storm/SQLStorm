@@ -1,0 +1,59 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalBadges,
+        MIN(Date) AS FirstBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Date) AS BadgeSequence
+    FROM Badges
+    GROUP BY UserId
+), PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.UserId = p.OwnerUserId) AS OwnerComments,
+        COALESCE(NULLIF(p.Tags, ''), 'untagged') AS ProcessedTags,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRecencyRank,
+        (p.Score * (p.ViewCount / 1000.0) + p.AnswerCount * 10) AS EngagementScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Legendary'
+        WHEN u.Reputation BETWEEN 50000 AND 100000 THEN 'Epic'
+        WHEN u.Reputation BETWEEN 20000 AND 49999 THEN 'Mythical'
+        ELSE 'Common'
+    END AS ReputationTier,
+    pa.PostId,
+    (pa.Score * (pa.ViewCount / 1000.0) + pa.AnswerCount * 10) AS EngagementScore,
+    STRING_AGG(DISTINCT ph.Comment, '; ') AS CloseReasons,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) -
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) AS NetVotes,
+    ARRAY_LENGTH(STRING_TO_ARRAY(pa.ProcessedTags, '><'), 1) AS TagCount,
+    (SELECT COALESCE(SUM(BountyAmount), 0) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 8) AS TotalBountyGiven,
+    COALESCE(ub.TotalBadges, 0) AS BadgeCount,
+    FIRST_VALUE(pa.ProcessedTags) OVER (PARTITION BY u.Id ORDER BY pa.EngagementScore DESC) AS TopPostTags
+FROM Users u
+LEFT JOIN PostActivity pa ON u.Id = pa.OwnerUserId AND pa.PostRecencyRank <= 3
+LEFT JOIN UserBadgeStats ub ON u.Id = ub.UserId AND ub.BadgeSequence = 1
+LEFT JOIN PostHistory ph ON pa.PostId = ph.PostId AND ph.PostHistoryTypeId IN (10, 11, 12)
+LEFT JOIN (
+    SELECT PostId, 'Upvote' AS VoteType FROM Votes WHERE VoteTypeId = 2
+    UNION ALL
+    SELECT PostId, 'Downvote' AS VoteType FROM Votes WHERE VoteTypeId = 3
+) v ON pa.PostId = v.PostId
+WHERE u.Reputation > 1000
+    AND (CAST(pa.Score * (pa.ViewCount / 1000.0) + pa.AnswerCount * 10 AS NUMERIC) > 100 OR pa.OwnerComments > 5)
+    AND u.Id IN (SELECT UserId FROM Badges WHERE Class = 1)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, pa.PostId, pa.Score, pa.ViewCount, pa.AnswerCount, pa.ProcessedTags, ub.TotalBadges
+HAVING ARRAY_LENGTH(STRING_TO_ARRAY(pa.ProcessedTags, '><'), 1) > 3
+ORDER BY u.Reputation DESC, EngagementScore DESC, NetVotes DESC
+LIMIT 100;

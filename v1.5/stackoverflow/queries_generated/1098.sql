@@ -1,0 +1,73 @@
+-- {"query": "1098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 588} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserPostsCount AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+PopularPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS Upvotes,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS Downvotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.ViewCount
+    HAVING COALESCE(SUM(v.VoteTypeId = 2), 0) > 10
+),
+ClosedPosts AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        c.Name AS CloseReason
+    FROM PostHistory ph
+    JOIN CloseReasonTypes c ON ph.Comment::int = c.Id
+    WHERE ph.PostHistoryTypeId = 10
+)
+SELECT 
+    up.UserId,
+    u.DisplayName,
+    RPC.Title AS RecentPostTitle,
+    RPC.CreationDate AS RecentPostDate,
+    RPC.ViewCount AS RecentPostViews,
+    CASE 
+        WHEN up.TotalPosts IS NULL THEN 0 
+        ELSE up.TotalPosts 
+    END AS TotalPosts,
+    CASE 
+        WHEN up.PositivePosts IS NULL THEN 0 
+        ELSE up.PositivePosts 
+    END AS PositivePosts,
+    pp.Title AS PopularPostTitle,
+    pp.ViewCount AS PopularPostViews,
+    cp.CloseReason AS LastClosedReason
+FROM UserPostsCount up
+JOIN Users u ON up.UserId = u.Id
+LEFT JOIN RankedPosts RPC ON RPC.OwnerUserId = u.Id AND RPC.PostRank = 1
+LEFT JOIN PopularPosts pp ON pp.Id = (
+    SELECT p.Id 
+    FROM PopularPosts p 
+    WHERE p.Upvotes = (SELECT MAX(Upvotes) FROM PopularPosts)
+    LIMIT 1
+)
+LEFT JOIN ClosedPosts cp ON cp.PostId = (SELECT MAX(PostId) FROM ClosedPosts WHERE CloseReason IS NOT NULL)
+WHERE u.Reputation > 1000
+ORDER BY up.TotalPosts DESC, up.PositivePosts DESC;

@@ -1,0 +1,64 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1 -- Only questions
+        AND p.CreationDate >= DATE '2022-01-01' -- Filter by creation date
+    GROUP BY 
+        p.Id, u.DisplayName
+), 
+TopQuestions AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.OwnerDisplayName,
+        rp.VoteCount,
+        rp.OwnerRank
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.OwnerRank <= 5  -- Top 5 by score for each user
+)
+SELECT 
+    tq.PostId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score,
+    tq.OwnerDisplayName,
+    tq.VoteCount,
+    COUNT(c.Id) AS CommentCount,
+    ARRAY_AGG(DISTINCT t.TagName) AS Tags
+FROM 
+    TopQuestions tq
+LEFT JOIN 
+    Comments c ON tq.PostId = c.PostId
+LEFT JOIN (
+    SELECT 
+        LOWER(TRIM(value)) AS TagName,
+        p.PostId
+    FROM 
+        TopQuestions p
+    CROSS JOIN LATERAL
+        (
+            SELECT TRIM(v) AS value
+            FROM (VALUES (REGEXP_REPLACE(p.Tags, '\\s+', ' ', 'g'))) AS v(val)
+        ) AS s
+) AS t ON tq.PostId = t.PostId
+GROUP BY 
+    tq.PostId, tq.Title, tq.CreationDate, tq.Score, tq.OwnerDisplayName, tq.VoteCount
+ORDER BY 
+    tq.Score DESC, tq.CreationDate DESC;

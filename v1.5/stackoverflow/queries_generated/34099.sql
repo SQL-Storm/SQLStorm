@@ -1,0 +1,172 @@
+-- {"query": "34099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1646} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        1 AS Level, 
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        h.Level + 1, 
+        h.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy h 
+        ON t.Count < h.Count AND t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    WHERE NOT t.TagName = ANY (h.Path)
+    AND h.Level < 3
+),
+TopTagPairs AS (
+    SELECT 
+        h1.TagName AS ParentTag, 
+        h2.TagName AS ChildTag,
+        h2.Count AS ChildCount
+    FROM RecursiveTagHierarchy h1
+    JOIN RecursiveTagHierarchy h2 
+        ON h2.Level = h1.Level + 1
+        AND h2.Path[1:h1.Level] = h1.Path
+),
+QuestionStatsByTag AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS Tag,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(COALESCE(vc.UpVotes, 0)) AS TotalUpVotes,
+        SUM(COALESCE(vd.DownVotes, 0)) AS TotalDownVotes,
+        COUNT(DISTINCT ans.Id) AS TotalAnswers,
+        AVG(ans.Score) AS AvgAnswerScore
+    FROM Posts p
+    LEFT JOIN Posts ans ON ans.ParentId = p.Id AND ans.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id AND vt.Name = 'UpMod'
+        GROUP BY PostId
+    ) vc ON vc.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id AND vt.Name = 'DownMod'
+        GROUP BY PostId
+    ) vd ON vd.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY Tag
+),
+TopUsersByReputation AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        MAX(b.Date) FILTER (WHERE b.Class = 1) AS LastGoldBadgeDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS CreationYear,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, CreationYear
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id AS UserId,
+        DATE_TRUNC('month', ph.CreationDate) AS ActivityMonth,
+        COUNT(ph.Id) AS Edits,
+        COUNT(DISTINCT ph.PostId) AS DistinctPostsEdited,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 10) AS Closures,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 11) AS Reopens,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 14) AS SuggestedEdits
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.CreationDate >= current_date - interval '1 year'
+    GROUP BY UserId, ActivityMonth
+),
+TagLinkStats AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Tags AS PostTags,
+        pt2.Tags AS RelatedPostTags,
+        lt.Name AS LinkType,
+        COUNT(*) OVER (PARTITION BY lt.Name) AS TotalLinksByType
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pt1.Id = pl.PostId AND pt1.PostTypeId = 1
+    JOIN Posts pt2 ON pt2.Id = pl.RelatedPostId AND pt2.PostTypeId = 1
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+AggregateTagLinkStats AS (
+    SELECT
+        unnest(string_to_array(substring(PostTags from 2 for length(PostTags)-2), '><')) AS PostTag,
+        unnest(string_to_array(substring(RelatedPostTags from 2 for length(RelatedPostTags)-2), '><')) AS RelatedTag,
+        LinkType,
+        COUNT(*) AS LinkCount
+    FROM TagLinkStats
+    GROUP BY PostTag, RelatedTag, LinkType
+),
+FinalTagSummary AS (
+    SELECT
+        q.Tag,
+        q.QuestionCount,
+        q.AvgQuestionScore,
+        q.TotalViews,
+        q.TotalUpVotes,
+        q.TotalDownVotes,
+        q.TotalAnswers,
+        q.AvgAnswerScore,
+        COALESCE(SUM(atl.LinkCount) FILTER (WHERE atl.LinkType = 'Duplicate'), 0) AS DuplicateLinks,
+        COALESCE(SUM(ntl.LinkCount) FILTER (WHERE ntl.LinkType = 'Linked'), 0) AS LinkedPosts
+    FROM QuestionStatsByTag q
+    LEFT JOIN AggregateTagLinkStats atl ON atl.PostTag = q.Tag
+    LEFT JOIN AggregateTagLinkStats ntl ON ntl.PostTag = q.Tag
+    GROUP BY q.Tag, q.QuestionCount, q.AvgQuestionScore, q.TotalViews, q.TotalUpVotes, q.TotalDownVotes, q.TotalAnswers, q.AvgAnswerScore
+)
+SELECT 
+    f.Tag AS TagName,
+    f.QuestionCount,
+    f.AvgQuestionScore,
+    f.TotalViews,
+    f.TotalUpVotes,
+    f.TotalDownVotes,
+    f.TotalAnswers,
+    f.AvgAnswerScore,
+    f.DuplicateLinks,
+    f.LinkedPosts,
+    t.Level AS TagHierarchyLevel,
+    t.Path AS TagHierarchyPath,
+    u.DisplayName AS TopUserDisplayName,
+    u.Reputation AS TopUserReputation,
+    u.BadgeCount AS TopUserBadgeCount,
+    u.HighestBadgeClass AS TopUserHighestBadgeClass,
+    u.LastGoldBadgeDate AS TopUserLastGoldBadgeDate,
+    a.ActivityMonth,
+    a.Edits AS UserEditsInMonth,
+    a.Closures AS UserClosuresInMonth,
+    a.SuggestedEdits AS UserSuggestedEditsInMonth
+FROM FinalTagSummary f
+LEFT JOIN RecursiveTagHierarchy t ON t.TagName = f.Tag
+LEFT JOIN LATERAL (
+    SELECT * FROM TopUsersByReputation u
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Tags LIKE '%' || f.Tag || '%'
+    )
+    ORDER BY u.Reputation DESC LIMIT 1
+) u ON TRUE
+LEFT JOIN LATERAL (
+    SELECT * FROM UserActivityWindow a
+    WHERE a.UserId = u.Id
+    ORDER BY a.ActivityMonth DESC 
+    LIMIT 1
+) a ON TRUE
+WHERE f.QuestionCount > 1000
+ORDER BY f.TotalViews DESC
+LIMIT 50;

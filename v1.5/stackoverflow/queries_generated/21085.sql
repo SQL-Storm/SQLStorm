@@ -1,0 +1,105 @@
+-- {"query": "21085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1362} 
+
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS question_count,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS positive_score_questions,
+        AVG(p.ViewCount) AS avg_views,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ' | ') AS all_tags
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    WHERE u.Reputation > 100 OR u.CreationDate < CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 0 OR u.UpVotes > 50
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        b.Name AS badge_name,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS recency_rank,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS prev_badge_date
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '6 months'
+),
+linked_posts_stats AS (
+    SELECT 
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS link_count,
+        AVG(pl.RelatedPostId - pl.PostId) AS avg_link_offset,
+        MAX(CASE WHEN l.Name = 'Duplicate' THEN pl.RelatedPostId END) AS top_duplicate
+    FROM PostLinks pl
+    INNER JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+    WHERE pl.CreationDate > CURRENT_DATE - INTERVAL '3 months'
+    GROUP BY pl.PostId
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 1) THEN 1 ELSE 0 END) AS upvotes_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_given,
+        FIRST_VALUE(v.CreationDate) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS first_vote_date,
+        NTILE(4) OVER (PARTITION BY v.UserId ORDER BY v.CreationDate) AS vote_quartile
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1, 2, 3) AND v.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY v.PostId, v.UserId, v.CreationDate
+)
+SELECT 
+    ua.user_id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.question_count,
+    (ua.positive_score_questions * 100.0 / NULLIF(ua.question_count, 0)) AS positive_question_pct,
+    COALESCE(ua.avg_views, 0) AS avg_views,
+    LENGTH(COALESCE(ua.all_tags, '')) AS tag_complexity,
+    COUNT(DISTINCT ba.badge_name) AS recent_badges,
+    SUM(CASE WHEN ba.recency_rank = 1 AND ba.Class = 1 THEN 1 ELSE 0 END) AS gold_badges_recent,
+    AVG(EXTRACT(DAY FROM (ba.Date - ba.prev_badge_date))) AS avg_days_between_badges,
+    COALESCE(lps.link_count, 0) AS post_links,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0 AND c.UserId = ua.user_id) AS positive_comments,
+    CASE 
+        WHEN ua.Reputation > 10000 THEN 'Veteran'
+        WHEN ua.question_count > 50 THEN 'Active'
+        WHEN vp.upvotes_given > downvotes_given * 2 THEN 'Optimist Voter'
+        ELSE 'Newcomer'
+    END AS user_category,
+    (vp.upvotes_given - vp.downvotes_given) / NULLIF(vp.upvotes_given + vp.downvotes_given, 0) AS vote_ratio
+FROM user_activity ua
+INNER JOIN Posts p ON ua.user_id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT OUTER JOIN badge_achievements ba ON ua.user_id = ba.UserId AND ba.recency_rank <= 5
+LEFT OUTER JOIN linked_posts_stats lps ON p.Id = lps.PostId
+LEFT OUTER JOIN vote_patterns vp ON ua.user_id = vp.UserId AND p.Id = vp.PostId
+WHERE (p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+       OR p.ViewCount > 10000 
+       OR EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11)))
+  AND NOT EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = ua.user_id AND b2.Name ILIKE '%spam%' AND b2.Date > CURRENT_DATE - INTERVAL '1 month')
+GROUP BY 
+    ua.user_id, ua.DisplayName, ua.Reputation, ua.question_count, ua.positive_score_questions, 
+    ua.avg_views, ua.all_tags, lps.link_count, p.Id, vp.upvotes_given, vp.downvotes_given
+HAVING COUNT(DISTINCT ba.Date) > 0 OR lps.link_count > 1
+UNION ALL
+SELECT 
+    NULL AS user_id,
+    'Community Aggregate' AS DisplayName,
+    SUM(ua.Reputation) AS Reputation,
+    SUM(ua.question_count) AS question_count,
+    AVG(ua.positive_question_pct) AS positive_question_pct,
+    AVG(ua.avg_views) AS avg_views,
+    MAX(LENGTH(ua.all_tags)) AS tag_complexity,
+    COUNT(DISTINCT ba.badge_name) AS recent_badges,
+    SUM(gold_badges_recent) AS gold_badges_recent,
+    AVG(avg_days_between_badges) AS avg_days_between_badges,
+    SUM(post_links) AS post_links,
+    SUM(positive_comments) AS positive_comments,
+    'Overall' AS user_category,
+    AVG(vote_ratio) AS vote_ratio
+FROM user_activity ua
+LEFT JOIN badge_achievements ba ON ua.user_id = ba.UserId
+LEFT JOIN vote_patterns vp ON ua.user_id = vp.UserId
+ORDER BY user_category DESC, Reputation DESC
+LIMIT 100;

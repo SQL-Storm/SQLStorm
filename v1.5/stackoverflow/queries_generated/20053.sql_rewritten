@@ -1,0 +1,127 @@
+-- {"query": "20053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1374} 
+WITH PostStats AS (
+    SELECT
+        Id AS PostId,
+        OwnerUserId,
+        PostTypeId,
+        Score,
+        ViewCount,
+        FavoriteCount,
+        CASE WHEN PostTypeId = 1 THEN Id END AS QuestionId,
+        CASE WHEN PostTypeId = 2 THEN ParentId END AS ParentQuestionId
+    FROM Posts
+    WHERE DeletionDate IS NULL
+),
+UserContributions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        p.PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        q.AcceptedAnswerId,
+        p.QuestionId,
+        p.ParentQuestionId
+    FROM Users u
+    JOIN PostStats p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts q ON p.ParentQuestionId = q.Id OR p.QuestionId = q.Id
+    WHERE u.Reputation > 100
+),
+AggregatedUserStats AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        UserCreationDate,
+        COUNT(PostId) AS TotalPosts,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(Score) AS TotalScore,
+        AVG(Score) AS AverageScore,
+        SUM(ViewCount) AS TotalViews,
+        SUM(FavoriteCount) AS TotalFavorites,
+        SUM(CASE WHEN PostId = AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM UserContributions
+    GROUP BY UserId, DisplayName, Reputation, UserCreationDate
+),
+RankedUsers AS (
+    SELECT
+        *,
+        (TotalScore / NULLIF(TotalPosts, 0)) + (AcceptedAnswers * 10) + (Reputation / 100.0) AS WeightedScore,
+        NTILE(100) OVER (ORDER BY (TotalScore / NULLIF(TotalPosts, 0)) + (AcceptedAnswers * 10) + (Reputation / 100.0) DESC) AS PercentileRank
+    FROM AggregatedUserStats
+    WHERE TotalAnswers > 5 OR TotalQuestions > 5
+)
+SELECT
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.TotalQuestions,
+    ru.TotalAnswers,
+    ru.AcceptedAnswers,
+    CAST(ru.AcceptedAnswers AS REAL) / NULLIF(ru.TotalAnswers, 0) AS AcceptanceRate,
+    ru.TotalViews,
+    ru.WeightedScore,
+    ru.PercentileRank,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId) AS BadgeCount,
+    (SELECT STRING_AGG(b.Name, ', ') FROM (SELECT Name FROM Badges WHERE UserId = ru.UserId AND Class = 1 ORDER BY Date DESC LIMIT 3) AS GoldBadges) AS RecentGoldBadges,
+    CASE
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph
+            JOIN Posts p ON ph.PostId = p.Id
+            WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+            AND p.OwnerUserId = ru.UserId
+            AND ph.CreationDate > ru.UserCreationDate + INTERVAL '1 year'
+        ) THEN 'HasHadPostsClosed'
+        ELSE 'NoRecentClosures'
+    END AS ClosureStatus,
+    REPLACE(LOWER(SUBSTRING(u.AboutMe, 1, 50)), 'a', '@') || '...' AS ModifiedAboutMe
+FROM RankedUsers ru
+LEFT JOIN Users u ON ru.UserId = u.Id
+WHERE
+    ru.PercentileRank <= 10
+    AND ru.Reputation > (SELECT AVG(Reputation) FROM Users)
+    AND u.Location LIKE ANY (ARRAY['%USA%', '%United Kingdom%', '%Germany%', '%India%', '%Canada%'])
+    AND u.WebsiteUrl IS NOT NULL
+UNION ALL
+SELECT
+    '-- TOP TAG SPECIALISTS --' AS DisplayName,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM Users LIMIT 1 -- Dummy row for separation
+UNION ALL
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id),
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),
+    (SELECT COUNT(*) FROM Posts a JOIN Posts q ON a.ParentId = q.Id WHERE q.AcceptedAnswerId = a.Id AND a.OwnerUserId = u.Id AND q.Tags LIKE '%<sql>%'),
+    NULL,
+    SUM(p.ViewCount),
+    AVG(p.Score),
+    NULL,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.TagBased = '1'),
+    t.TagName AS RecentGoldBadges,
+    'Specialist' AS ClosureStatus,
+    NULL AS ModifiedAboutMe
+FROM Users u
+JOIN Posts p ON u.Id = p.OwnerUserId
+JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE
+    u.Reputation > 5000
+    AND t.TagName IN ('sql', 'python', 'java', 'c#', 'javascript')
+    AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year'
+    AND u.Id IN (
+        SELECT v.UserId
+        FROM Votes v
+        WHERE v.VoteTypeId = 2 -- UpMod
+        GROUP BY v.UserId
+        HAVING COUNT(v.Id) > 1000
+    )
+GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+ORDER BY Reputation DESC, WeightedScore DESC, TotalPosts DESC
+LIMIT 200;

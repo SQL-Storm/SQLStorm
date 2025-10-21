@@ -1,0 +1,151 @@
+WITH active_users AS (
+    SELECT u.Id AS user_id, u.Reputation, u.CreationDate AS user_creation_date
+    FROM Users u
+    WHERE u.Reputation >= 1000
+      AND u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+question_stats AS (
+    SELECT 
+        p.Id AS post_id,
+        p.OwnerUserId AS user_id,
+        p.CreationDate AS post_date,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.ClosedDate, p.CreationDate + INTERVAL '30 days') AS effective_date,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS view_rank,
+        AVG(p.ViewCount) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate)) AS monthly_avg_views
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+      AND p.DeletionDate IS NULL
+      AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+),
+answer_contributions AS (
+    SELECT 
+        a.ParentId AS question_id,
+        a.OwnerUserId AS user_id,
+        COUNT(*) AS answer_count,
+        SUM(a.Score) AS total_answer_score,
+        STRING_AGG(SUBSTRING(a.Body, 1, 50), ' | ' ORDER BY a.CreationDate) AS sample_bodies
+    FROM Posts a
+    INNER JOIN PostTypes pt ON a.PostTypeId = pt.Id
+    WHERE pt.Name = 'Answer'
+      AND a.DeletionDate IS NULL
+    GROUP BY a.ParentId, a.OwnerUserId
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        b.Name AS badge_name,
+        b.Date AS award_date,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS class_count
+    FROM Badges b
+    WHERE b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years'
+),
+post_evolution AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS edit_count,
+        MAX(ph.CreationDate) AS last_edit,
+        STRING_AGG(ph.Comment, '; ' ORDER BY ph.CreationDate) AS edit_comments
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+      AND ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    GROUP BY ph.PostId, ph.UserId
+)
+SELECT 
+    au.user_id,
+    u.DisplayName,
+    u.Location,
+    au.Reputation,
+    COUNT(DISTINCT qs.post_id) AS question_count,
+    COALESCE(SUM(qs.AnswerCount), 0) AS total_answers,
+    AVG(qs.monthly_avg_views) AS avg_monthly_engagement,
+    SUM(COALESCE(ac.total_answer_score, 0)) AS total_answer_upvotes,
+    COUNT(DISTINCT ba.badge_name) AS unique_badges,
+    SUM(CASE 
+        WHEN ba.class_count >= 5 AND ba.Class = 1 THEN 1 
+        ELSE 0 
+    END) AS gold_elite_count,
+    ROUND(
+        CASE 
+            WHEN SUM(qs.ViewCount) > 0 
+            THEN (SUM(qs.Score * 1.0) / NULLIF(SUM(qs.ViewCount), 0)) * 1000 
+            ELSE 0 
+        END, 2
+    ) AS score_per_thousand_views,
+    CONCAT(
+        UPPER(SUBSTRING(u.Location, 1, 1)), 
+        LOWER(SUBSTRING(u.Location, 2, LENGTH(u.Location))),
+        ' (',
+        CAST(EXTRACT(YEAR FROM au.user_creation_date) AS VARCHAR),
+        ')'
+    ) AS formatted_profile,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+     FROM Posts p2 
+     INNER JOIN UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags, 2, LENGTH(p2.Tags)-2), '><')) AS t(TagName) ON true 
+     WHERE p2.Id = qs.post_id 
+       AND t.TagName IS NOT NULL 
+     LIMIT 5) AS top_tags,
+    CASE 
+        WHEN pe.edit_count > 10 THEN 'Power Editor'
+        WHEN pe.edit_count > 0 THEN 'Active Editor'
+        ELSE 'Static Poster'
+    END AS editor_tier,
+    RANK() OVER (ORDER BY SUM(qs.ViewCount + COALESCE(ac.total_answer_score, 0)) DESC) AS overall_impact_rank
+FROM active_users au
+INNER JOIN Users u ON au.user_id = u.Id
+LEFT JOIN question_stats qs ON au.user_id = qs.user_id 
+    AND qs.view_rank <= 3  -- Only top 3 questions per user
+LEFT JOIN answer_contributions ac ON qs.post_id = ac.question_id 
+    AND au.user_id = ac.user_id
+LEFT JOIN badge_achievements ba ON au.user_id = ba.UserId
+LEFT JOIN post_evolution pe ON qs.post_id = pe.PostId 
+    AND au.user_id = pe.UserId
+WHERE (qs.post_date IS NULL OR qs.post_date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+   OR EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = qs.post_id AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')
+GROUP BY au.user_id, u.DisplayName, u.Location, au.Reputation, au.user_creation_date
+HAVING COUNT(DISTINCT qs.post_id) > 0 
+   OR SUM(COALESCE(ac.answer_count, 0)) >= 5
+   OR COUNT(DISTINCT ba.UserId) > 0
+UNION ALL
+SELECT 
+    NULL AS user_id,
+    'Community Aggregate' AS DisplayName,
+    'Global' AS Location,
+    SUM(au.Reputation) AS Reputation,
+    COUNT(DISTINCT qs.post_id) AS question_count,
+    COALESCE(SUM(qs.AnswerCount), 0) AS total_answers,
+    AVG(COALESCE(qs.monthly_avg_views, 0)) AS avg_monthly_engagement,
+    SUM(COALESCE(ac.total_answer_score, 0)) AS total_answer_upvotes,
+    COUNT(DISTINCT ba.badge_name) AS unique_badges,
+    SUM(CASE 
+        WHEN ba.class_count >= 5 AND ba.Class = 1 THEN 1 
+        ELSE 0 
+    END) AS gold_elite_count,
+    ROUND(
+        CASE 
+            WHEN SUM(qs.ViewCount) > 0 
+            THEN (SUM(qs.Score * 1.0) / NULLIF(SUM(qs.ViewCount), 0)) * 1000 
+            ELSE 0 
+        END, 2
+    ) AS score_per_thousand_views,
+    'Community Overview' AS formatted_profile,
+    NULL AS top_tags,
+    'Aggregate' AS editor_tier,
+    1 AS overall_impact_rank  -- Always rank 1 for aggregate
+FROM active_users au
+INNER JOIN Users u ON au.user_id = u.Id
+LEFT JOIN question_stats qs ON au.user_id = qs.user_id 
+LEFT JOIN answer_contributions ac ON qs.post_id = ac.question_id 
+    AND au.user_id = ac.user_id
+LEFT JOIN badge_achievements ba ON au.user_id = ba.UserId
+LEFT JOIN post_evolution pe ON qs.post_id = pe.PostId 
+    AND au.user_id = pe.UserId
+ORDER BY overall_impact_rank, Reputation DESC NULLS LAST
+LIMIT 50;

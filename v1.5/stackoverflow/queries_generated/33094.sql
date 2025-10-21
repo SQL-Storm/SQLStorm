@@ -1,0 +1,65 @@
+-- {"query": "33094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 577} 
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    u.Id AS OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    c.CommentId,
+    c.Score AS CommentScore,
+    c.Text AS CommentText,
+    c.CreationDate AS CommentCreationDate,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    v.CreationDate AS VoteCreationDate,
+    pl.RelatedPostId,
+    rt.TagName,
+    t.TagName AS QuestionTag,
+    th.PostHistoryTypeId,
+    pht.Name AS PostHistoryTypeName,
+    pht.Id AS PostHistoryTypeId,
+    ph.RevisionGUID,
+    ph.CreationDate AS PostHistoryDate,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN Posts rel_post ON pl.RelatedPostId = rel_post.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Taggings tt ON p.Id = tt.PostId
+LEFT JOIN Tags t ON tt.TagId = t.Id
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN TagWikiArticles twa ON t.WikiPostId = twa.PostId
+LEFT JOIN QuestionTags qtags ON p.Id = qtags.PostId
+WHERE
+    p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    AND (u.Reputation >= 1000 OR u.Views >= 10000)
+    AND (EXISTS (
+        SELECT 1 FROM Votes vv WHERE vv.PostId = p.Id AND vv.VoteTypeId IN (2, 3)
+    ) OR p.Score >= 10)
+    AND EXISTS (
+        SELECT 1 FROM PostLinks plk WHERE plk.PostId = p.Id AND plk.LinkTypeId = 1
+    )
+ORDER BY
+    p.CreationDate DESC
+LIMIT 100;

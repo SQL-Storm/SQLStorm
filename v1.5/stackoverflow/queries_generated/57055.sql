@@ -1,0 +1,114 @@
+-- {"query": "57055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1103} 
+
+WITH TopUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(P.Id) AS PostCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(V.Id) AS VoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(C.Id) AS CommentCount
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation
+    ORDER BY
+        Reputation DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count,
+        COUNT(P.Id) AS PostCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(P.CreationDate) AS LastActivityDate
+    FROM
+        Tags T
+    LEFT JOIN
+        Posts P ON T.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), ''><''))
+    GROUP BY
+        T.Id, T.TagName, T.Count
+    ORDER BY
+        PostCount DESC
+    LIMIT 50
+),
+RecentPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        U.DisplayName AS OwnerDisplayName,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(V.Id) AS VoteCount
+    FROM
+        Posts P
+    LEFT JOIN
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    WHERE
+        P.CreationDate >= NOW() - INTERVAL '7 days'
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.Title, U.DisplayName
+    ORDER BY
+        CreationDate DESC
+    LIMIT 1000
+)
+SELECT
+    TU.UserId,
+    TU.DisplayName,
+    TU.Reputation,
+    TU.PostCount,
+    TU.QuestionCount,
+    TU.AnswerCount,
+    TU.VoteCount,
+    TU.UpVoteCount,
+    TU.DownVoteCount,
+    TU.CommentCount,
+    AT.TagId,
+    AT.TagName,
+    AT.Count,
+    AT.PostCount AS TagPostCount,
+    AT.QuestionCount AS TagQuestionCount,
+    AT.AnswerCount AS TagAnswerCount,
+    AT.LastActivityDate,
+    RP.PostId,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.Title,
+    RP.OwnerDisplayName,
+    RP.CommentCount AS Recent PostCommentCount,
+    RP.VoteCount AS Recent PostVoteCount
+FROM
+    TopUsers TU
+CROSS JOIN
+    ActiveTags AT
+LEFT JOIN
+    RecentPosts RP ON TU.UserId = RP.OwnerUserId
+WHERE
+    AT.TagName IN (SELECT TAGNAME FROM Tags WHERE Count > 1000)
+ORDER BY
+    TU.Reputation DESC,
+    AT.PostCount DESC,
+    RP.CreationDate DESC;
+ ;

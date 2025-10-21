@@ -1,0 +1,93 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+BadgeCounts AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.UserId <> p.OwnerUserId) AS ExternalComments
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.UserId IS NOT NULL)
+),
+RankedUsers AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.QuestionScore,
+        COALESCE(us.AvgAnswerScore, 0) AS AvgAnswerScore,
+        us.ClosedPosts,
+        COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+        tp.ExternalComments AS TopPostExternalComments,
+        UPPER(LEFT(us.DisplayName, 3)) || '-' || CAST(us.Id AS VARCHAR) AS UserCode,
+        RANK() OVER (ORDER BY (us.QuestionScore + COALESCE(us.AvgAnswerScore, 0) * 1.5 + bc.GoldBadges * 100 + bc.SilverBadges * 50 + bc.BronzeBadges * 10) DESC) AS OverallRank
+    FROM UserStats us
+    LEFT JOIN BadgeCounts bc ON us.Id = bc.UserId
+    LEFT JOIN TopPosts tp ON us.Id = tp.OwnerUserId AND tp.PostRank = 1
+)
+SELECT 
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.PostCount,
+    ru.QuestionScore,
+    ru.AvgAnswerScore,
+    ru.ClosedPosts,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.TopPostExternalComments,
+    ru.UserCode,
+    ru.OverallRank
+FROM RankedUsers ru
+WHERE ru.OverallRank <= 10
+UNION ALL
+SELECT 
+    NULL AS Id,
+    'Average of All' AS DisplayName,
+    AVG(ru.Reputation) AS Reputation,
+    AVG(ru.PostCount) AS PostCount,
+    AVG(ru.QuestionScore) AS QuestionScore,
+    AVG(ru.AvgAnswerScore) AS AvgAnswerScore,
+    AVG(ru.ClosedPosts) AS ClosedPosts,
+    AVG(ru.GoldBadges) AS GoldBadges,
+    AVG(ru.SilverBadges) AS SilverBadges,
+    AVG(ru.BronzeBadges) AS BronzeBadges,
+    AVG(COALESCE(ru.TopPostExternalComments, 0)) AS TopPostExternalComments,
+    'AVG-USER' AS UserCode,
+    NULL AS OverallRank
+FROM RankedUsers ru
+ORDER BY
+    CASE WHEN Id IS NULL THEN 11 ELSE OverallRank END,
+    Id ASC NULLS LAST;

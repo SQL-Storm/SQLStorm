@@ -1,0 +1,102 @@
+WITH TopTags AS (
+    SELECT
+        unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY TagName
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+TagUsers AS (
+    SELECT
+        t.TagName,
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as AnswersCount,
+        AVG(p.Score) as AvgAnswerScore
+    FROM TopTags t
+    JOIN Posts p ON p.PostTypeId = 2
+    JOIN Posts q ON p.ParentId = q.Id
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE q.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, u.Id, u.DisplayName, u.Reputation
+),
+TopUsersByTag AS (
+    SELECT DISTINCT ON (TagName)
+        TagName,
+        UserId,
+        DisplayName,
+        Reputation,
+        AnswersCount,
+        AvgAnswerScore
+    FROM TagUsers
+    ORDER BY TagName, AnswersCount DESC, AvgAnswerScore DESC, Reputation DESC
+),
+UserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, b.Class
+),
+PostActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.Score) AS AvgPostScore
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.OwnerUserId
+),
+UserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(pb1.BadgeCount, 0) AS GoldBadges,
+        COALESCE(pb2.BadgeCount, 0) AS SilverBadges,
+        COALESCE(pb3.BadgeCount, 0) AS BronzeBadges,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.CloseVotes,
+        pa.MaxPostScore,
+        pa.AvgPostScore
+    FROM Users u
+    LEFT JOIN UserBadges pb1 ON u.Id = pb1.UserId AND pb1.Class = 1
+    LEFT JOIN UserBadges pb2 ON u.Id = pb2.UserId AND pb2.Class = 2
+    LEFT JOIN UserBadges pb3 ON u.Id = pb3.UserId AND pb3.Class = 3
+    LEFT JOIN PostActivity pa ON u.Id = pa.UserId
+    WHERE u.Reputation > 1000
+)
+SELECT
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.TotalViews,
+    tu.UserId,
+    tu.DisplayName AS TopUserDisplayName,
+    tu.Reputation AS TopUserReputation,
+    tu.AnswersCount AS TopUserAnswersCount,
+    tu.AvgAnswerScore AS TopUserAvgAnswerScore,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount AS UserQuestionCount,
+    us.AnswerCount AS UserAnswerCount,
+    us.CloseVotes AS UserCloseVotes,
+    us.MaxPostScore AS UserMaxPostScore,
+    us.AvgPostScore AS UserAvgPostScore
+FROM TopTags tt
+LEFT JOIN TopUsersByTag tu ON tt.TagName = tu.TagName
+LEFT JOIN UserSummary us ON tu.UserId = us.Id
+ORDER BY tt.QuestionCount DESC, tu.AnswersCount DESC NULLS LAST, us.Reputation DESC NULLS LAST
+LIMIT 50;

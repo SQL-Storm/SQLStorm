@@ -1,0 +1,95 @@
+WITH UserActivity AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+           COUNT(CASE WHEN v.VoteTypeValue = 2 THEN v.Id END) AS UpVoteGiven,
+           COUNT(CASE WHEN v.VoteTypeValue = 3 THEN v.Id END) AS DownVoteGiven,
+           COUNT(b.Id) AS BadgeCount,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           COUNT(c.Id) AS CommentCount,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes   v ON v.UserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT t.Id,
+           t.TagName,
+           t.Count AS TagUseCount,
+           SUM(p.Score) AS QuestionScoreSum,
+           SUM(p.FavoriteCount) AS FavoriteSum,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.Id, t.TagName, t.Count
+),
+UserTagAffinity AS (
+    SELECT ua.Id AS UserId,
+           tt.TagName,
+           COUNT(*) AS PostsWithTag,
+           RANK() OVER (PARTITION BY ua.Id ORDER BY COUNT(*) DESC) AS TagAffinityRank
+    FROM UserActivity ua
+    JOIN Posts p ON p.OwnerUserId = ua.Id
+    JOIN LATERAL (
+        SELECT tagname
+        FROM regexp_split_to_table(p.Tags, '[><]') AS tag(tagname)
+    ) AS tag ON TRUE
+    JOIN Tags t ON t.TagName = tag.tagname
+    JOIN TopTags tt ON tt.TagName = t.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY ua.Id, tt.TagName
+),
+PostLinkStats AS (
+    SELECT pl.PostId,
+           COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount,
+           COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT ua.Id,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.BadgeCount,
+       ua.GoldBadges,
+       ua.SilverBadges,
+       ua.BronzeBadges,
+       ua.CommentCount,
+       ua.UpVoteGiven,
+       ua.DownVoteGiven,
+       ua.LastPostDate,
+       tt.TagName AS TopTag,
+       tt.TagUseCount,
+       uta.PostsWithTag,
+       pl.LinkedCount,
+       pl.DuplicateCount
+FROM UserActivity ua
+LEFT JOIN LATERAL (
+    SELECT TagName, TagUseCount
+    FROM UserTagAffinity uta
+    JOIN TopTags tt ON tt.TagName = uta.TagName
+    WHERE uta.UserId = ua.Id AND uta.TagAffinityRank = 1
+    LIMIT 1
+) tt ON TRUE
+LEFT JOIN LATERAL (
+    SELECT PostsWithTag
+    FROM UserTagAffinity uta2
+    WHERE uta2.UserId = ua.Id AND uta2.TagAffinityRank = 1
+) uta ON TRUE
+LEFT JOIN PostLinkStats pl ON pl.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = ua.Id
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+ORDER BY ua.Reputation DESC
+LIMIT 100;

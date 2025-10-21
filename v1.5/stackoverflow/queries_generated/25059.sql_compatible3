@@ -1,0 +1,164 @@
+WITH 
+/* ---------------------------------------------------------------------------
+   1. Per‑user badge counts by class (gold/silver/bronze)
+   --------------------------------------------------------------------------- */
+badge_counts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* ---------------------------------------------------------------------------
+   2. Per‑user post statistics (questions, answers, total score, last activity)
+   --------------------------------------------------------------------------- */
+post_stats AS (
+    SELECT 
+        p.OwnerUserId               AS user_id,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS q_cnt,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS a_cnt,
+        COALESCE(SUM(p.Score),0)                 AS post_score,
+        MAX(p.LastActivityDate)                  AS last_activity
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* ---------------------------------------------------------------------------
+   3. Per‑user vote aggregates (up‑votes minus down‑votes)
+   --------------------------------------------------------------------------- */
+vote_agg AS (
+    SELECT 
+        p.OwnerUserId                                   AS user_id,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 
+                         WHEN v.VoteTypeId = 3 THEN -1 
+                         ELSE 0 END),0)           AS net_votes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* ---------------------------------------------------------------------------
+   4. Most recent activity per user across posts, comments & history
+   --------------------------------------------------------------------------- */
+recent_activity AS (
+    SELECT 
+        u.Id                                            AS user_id,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate),      TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE(MAX(c.CreationDate),      TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE(MAX(ph.CreationDate),     TIMESTAMP '1970-01-01 00:00:00')
+        )                                              AS recent_dt
+    FROM Users u
+    LEFT JOIN Posts       p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments    c  ON c.UserId      = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId     = u.Id
+    GROUP BY u.Id
+),
+
+/* ---------------------------------------------------------------------------
+   5. Tag popularity with window rank
+   --------------------------------------------------------------------------- */
+tag_rank AS (
+    SELECT 
+        t.TagName,
+        t.Count                                   AS tag_use_cnt,
+        COALESCE(SUM(p.Score),0)                  AS total_score,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.PostTypeId = 1                       -- only questions have tags
+       AND p.Tags LIKE '%' || t.TagName || '%'       -- naive tag match
+    GROUP BY t.TagName, t.Count
+),
+
+/* ---------------------------------------------------------------------------
+   6. Assemble the per‑user view combining all prior CTEs
+   --------------------------------------------------------------------------- */
+user_view AS (
+    SELECT 
+        u.Id AS id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.gold_cnt,0)   AS gold_badges,
+        COALESCE(bc.silver_cnt,0) AS silver_badges,
+        COALESCE(bc.bronze_cnt,0) AS bronze_badges,
+        COALESCE(ps.q_cnt,0)      AS q_cnt,
+        COALESCE(ps.a_cnt,0)      AS a_cnt,
+        COALESCE(ps.post_score,0) AS total_post_score,
+        COALESCE(v.net_votes,0)     AS net_votes,
+        ps.last_activity,
+        ra.recent_dt,
+        /* Reputation tier calculated with CASE expression */
+        CASE 
+            WHEN u.Reputation >= 20000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 5000  THEN 'Experienced'
+            ELSE 'Newbie'
+        END AS rep_tier,
+        /* LATERAL sub‑query to fetch the top tag for the user (if any) */
+        lt.tag_name,
+        lt.tag_use_cnt,
+        lt.tag_rank
+    FROM Users u
+    LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+    LEFT JOIN post_stats     ps ON ps.user_id = u.Id
+    LEFT JOIN vote_agg       v  ON v.user_id = u.Id
+    LEFT JOIN recent_activity ra ON ra.user_id = u.Id
+    LEFT JOIN LATERAL (
+        SELECT tr.TagName AS tag_name,
+               tr.tag_use_cnt,
+               tr.tag_rank
+        FROM tag_rank tr
+        WHERE u.Tags IS NOT NULL 
+          AND u.Tags LIKE '%'||tr.TagName||'%'
+        ORDER BY tr.tag_rank
+        LIMIT 1
+    ) lt ON TRUE
+    WHERE (COALESCE(ps.q_cnt,0)+COALESCE(ps.a_cnt,0)) > 50          -- active contributors
+      AND (COALESCE(v.net_votes,0) > 0 OR COALESCE(bc.gold_cnt,0) > 0)
+      AND ps.last_activity IS NOT NULL
+),
+
+/* ---------------------------------------------------------------------------
+   7. Aggregated summary row (unioned later)
+   --------------------------------------------------------------------------- */
+summary_row AS (
+    SELECT 
+        -1                AS id,
+        'Aggregated'      AS DisplayName,
+        SUM(Reputation)   AS Reputation,
+        SUM(gold_badges)  AS gold_badges,
+        SUM(silver_badges)AS silver_badges,
+        SUM(bronze_badges)AS bronze_badges,
+        SUM(q_cnt)        AS q_cnt,
+        SUM(a_cnt)        AS a_cnt,
+        SUM(total_post_score) AS total_post_score,
+        SUM(net_votes)    AS net_votes,
+        MAX(last_activity)   AS last_activity,
+        MAX(recent_dt)       AS recent_dt,
+        'Aggregate'      AS rep_tier,
+        NULL             AS tag_name,
+        NULL             AS tag_use_cnt,
+        NULL             AS tag_rank
+    FROM user_view
+)
+
+/* ---------------------------------------------------------------------------
+   Final result: top 100 users + aggregated row
+   --------------------------------------------------------------------------- */
+SELECT *
+FROM (
+    SELECT *
+    FROM user_view
+    ORDER BY Reputation DESC
+    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+    UNION ALL
+    SELECT *
+    FROM summary_row
+) final_result
+ORDER BY Reputation DESC NULLS LAST;

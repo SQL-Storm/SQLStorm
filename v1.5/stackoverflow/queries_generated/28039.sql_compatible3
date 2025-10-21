@@ -1,0 +1,84 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 3
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2020-01-01'
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+), PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS Views,
+        LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', '')) AS CodeBlockCount,
+        (SELECT COUNT(*) FROM PostHistory ph 
+          WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        (SELECT STRING_AGG(TagName, '; ') 
+          FROM Tags t
+          WHERE t.Id IN (
+              SELECT CAST(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS INTEGER)
+          )
+        ) AS TagList,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS _rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    us.UserId,
+    u.DisplayName,
+    CASE WHEN u.Location IS NULL THEN 'Unknown' 
+         ELSE REGEXP_REPLACE(u.Location, '[,;]', '', 'g') 
+    END AS CleanLocation,
+    us.Reputation,
+    us.BadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    pm.Score AS TopQuestionScore,
+    pm.Views,
+    pm.CodeBlockCount,
+    pm.EditCount,
+    pm.TagList,
+    (SELECT COUNT(*) FROM Comments c 
+      WHERE c.UserId = us.UserId AND c.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2025-01-01') AS CommentCount,
+    AVG(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) OVER (PARTITION BY us.UserId) AS AvgBounty,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS GlobalRank,
+    LEAD(us.UserId, 1) OVER (ORDER BY us.Reputation DESC) AS NextTopUserId
+FROM UserStats us
+JOIN Users u ON us.UserId = u.Id
+LEFT JOIN PostMetrics pm ON us.UserId = pm.OwnerUserId 
+    AND pm.PostId = (SELECT Id FROM Posts WHERE OwnerUserId = us.UserId ORDER BY Score DESC LIMIT 1)
+LEFT JOIN Votes v ON us.UserId = v.UserId AND v.VoteTypeId IN (2,8)
+WHERE us.Reputation > 1000
+    AND EXISTS (SELECT 1 FROM Badges WHERE UserId = us.UserId AND Name LIKE '%Legendary%')
+    AND (us.UpVotes / NULLIF(us.DownVotes, 0) > 5 OR us.DownVotes = 0)
+GROUP BY 
+    us.UserId,
+    u.DisplayName,
+    u.Location,
+    us.Reputation,
+    us.BadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    pm.Score,
+    pm.Views,
+    pm.CodeBlockCount,
+    pm.EditCount,
+    pm.TagList,
+    AvgBounty,
+    us.GlobalRank,
+    NextTopUserId
+HAVING COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 8) > 0
+ORDER BY 
+    us.Reputation DESC, 
+    us.PostRank, 
+    pm.Score DESC NULLS LAST
+LIMIT 100;

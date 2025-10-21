@@ -1,0 +1,79 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  COALESCE(q.TotalQuestions, 0) + COALESCE(a.TotalAnswers, 0) AS TotalPosts_ByUser,
+  (COALESCE(q.TotalQuestions, 0) * 3)
+  + (COALESCE(a.TotalAnswers, 0) * 2)
+  + (COALESCE(v.Upvotes, 0) * 0.5)
+  - (COALESCE(v.Downvotes, 0) * 0.25) AS ActivityScore,
+  GREATEST(COALESCE(p.LastEditDate, p.CreationDate), COALESCE(p.LastActivityDate, p.CreationDate)) AS LastActiveDate,
+  COUNT(DISTINCT t.TagName) AS DistinctTagCount,
+  CONCAT(u.DisplayName, ' [Rep=', u.Reputation, ']') AS UserLabel,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.UserId = u.Id AND b.Class = 1
+    ) THEN 'Has Gold'
+    WHEN EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.UserId = u.Id AND b.Class = 2
+    ) THEN 'Has Silver'
+    WHEN EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.UserId = u.Id AND b.Class = 3
+    ) THEN 'Has Bronze'
+    ELSE 'No Badges'
+  END AS BadgeTier
+FROM
+  Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS TotalQuestions
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND OwnerUserId IS NOT NULL
+      AND ClosedDate IS NULL
+    GROUP BY OwnerUserId
+  ) q ON q.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS TotalAnswers
+    FROM Posts
+    WHERE PostTypeId = 2
+      AND OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) a ON a.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = pl.RelatedPostId
+WHERE
+  COALESCE(q.TotalQuestions, 0) + COALESCE(a.TotalAnswers, 0) > 0
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  COALESCE(q.TotalQuestions, 0) + COALESCE(a.TotalAnswers, 0),
+  COALESCE(v.Upvotes, 0),
+  COALESCE(v.Downvotes, 0),
+  p.LastEditDate,
+  p.LastActivityDate,
+  /* include any non-aggregated, non-grouped columns referenced in SELECT */
+  u.ProfileImageUrl
+ORDER BY
+  ActivityScore DESC
+LIMIT 100;

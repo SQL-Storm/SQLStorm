@@ -393,7 +393,7 @@ def make_queries_compatible(query_dir, queries, version, dataset, errors={}, pos
     Returns:
         int: Number of queries regenerated.
     """
-    model = "gpt-4o-mini" if version == "v1.0" else "gpt-5-mini"
+    model = "gpt-4o-mini" if version == "v1.0" else "gpt-5-nano" if version in ["v1.4", "v1.5"] else "gpt-5-mini"
     prompt = "Make the following SQL query more compatible with different SQL dialects. The query might contain \'::\' casts, rewrite them to standard SQL. The query might contain some errors, fix them if you can find any mistakes. Remember to put all ungrouped columns and columns that appear in windows into the group by clause. Do not explain the query, only output the converted query."
 
     ids = []

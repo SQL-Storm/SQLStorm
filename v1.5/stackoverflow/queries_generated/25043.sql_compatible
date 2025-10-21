@@ -1,0 +1,156 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(bc.Gold, 0)   AS GoldBadges,
+           COALESCE(bc.Silver, 0) AS SilverBadges,
+           COALESCE(bc.Bronze, 0) AS BronzeBadges,
+           COALESCE(pcnt.PostCount, 0)     AS TotalPosts,
+           COALESCE(anscnt.AnswerCount, 0) AS TotalAnswers,
+           COALESCE(qcnt.QuestionCount,0)  AS QuestionCount,
+           COALESCE(vs.AvgScore, 0)        AS AvgPostScore,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON bc.UserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS PostCount
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) pcnt ON pcnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS AnswerCount
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) anscnt ON anscnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS QuestionCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) qcnt ON qcnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               AVG(CAST(Score AS FLOAT)) AS AvgScore
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) vs ON vs.OwnerUserId = u.Id
+),
+
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE RepRank <= 100
+),
+
+RecentClosedQuestions AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.Tags,
+           ph.CreationDate AS ClosedDate,
+           ph.Comment        AS CloseReasonJson,
+           ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph
+      ON ph.PostId = p.Id
+     AND ph.PostHistoryTypeId = 10            -- Post Closed
+    WHERE p.PostTypeId = 1
+),
+
+LatestClose AS (
+    SELECT Id,
+           Title,
+           CreationDate,
+           Score,
+           Tags,
+           ClosedDate,
+           CASE
+               WHEN CloseReasonJson IS NULL THEN 'Unknown'
+               ELSE COALESCE(NULLIF(substr(CloseReasonJson, 1, 3), ''), 'Other')
+           END AS CloseReasonSnippet
+    FROM RecentClosedQuestions
+    WHERE rn = 1
+),
+
+TagStats AS (
+    SELECT t.TagName,
+           t.Count                               AS TagUseCount,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.Score >= 0) AS PosScoreQuestions,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.Score < 0)  AS NegScoreQuestions,
+           AVG(p.Score)                          AS AvgScore,
+           STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS TopContributors
+    FROM Tags t
+    LEFT JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u
+      ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 1000
+),
+
+Combined AS (
+    SELECT tu.Id                              AS UserId,
+           tu.DisplayName,
+           tu.Reputation,
+           tu.GoldBadges,
+           tu.SilverBadges,
+           tu.BronzeBadges,
+           tu.TotalPosts,
+           tu.AvgPostScore,
+           lc.Title                           AS RecentClosedTitle,
+           lc.CloseReasonSnippet,
+           ts.TagName,
+           ts.AvgScore                        AS TagAvgScore,
+           ts.TopContributors
+    FROM TopUsers tu
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM LatestClose lc
+        WHERE lc.Id = (
+            SELECT p.Id
+            FROM Posts p
+            WHERE p.OwnerUserId = CAST(tu.Id AS BIGINT)
+              AND p.PostTypeId = 1
+              AND p.CreationDate > DATE '2023-01-01'
+            ORDER BY p.CreationDate DESC
+            LIMIT 1
+        )
+    ) lc ON TRUE
+    LEFT JOIN TagStats ts
+      ON ts.TagName = ANY (string_to_array(trim(both '<>' FROM tu.DisplayName), ','))
+)
+
+SELECT *
+FROM Combined
+WHERE (GoldBadges + SilverBadges + BronzeBadges) > 10
+   OR (AvgPostScore IS NOT NULL AND AvgPostScore > 5)
+ORDER BY Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT NULL AS UserId,
+       'Aggregate' AS DisplayName,
+       NULL AS Reputation,
+       SUM(GoldBadges)   OVER () AS GoldBadges,
+       SUM(SilverBadges) OVER () AS SilverBadges,
+       SUM(BronzeBadges) OVER () AS BronzeBadges,
+       SUM(TotalPosts)   OVER () AS TotalPosts,
+       AVG(AvgPostScore) OVER () AS AvgPostScore,
+       NULL AS RecentClosedTitle,
+       NULL AS CloseReasonSnippet,
+       NULL AS TagName,
+       NULL AS TagAvgScore,
+       NULL AS TopContributors
+FROM Combined
+WHERE UserId IS NOT NULL;

@@ -1,0 +1,86 @@
+-- {"query": "2087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 517} 
+WITH Recents AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.Title, 
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId IN (1, 2)
+),
+UserInteractions AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        COALESCE(p.OwnerDisplayName, u.DisplayName) AS OwnerName,
+        STRING_AGG(t.TagName, ', ') AS TagList
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Tags t ON p.Tags LIKE '%' || t.TagName || '%' 
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    GROUP BY 
+        p.Id, OwnerName
+),
+ComplexResults AS (
+    SELECT 
+        r.PostId, 
+        r.Title,
+        ui.DisplayName,
+        ui.BadgeCount,
+        ui.CommentCount,
+        ui.VoteCount,
+        pd.TagList
+    FROM 
+        Recents r
+    INNER JOIN 
+        UserInteractions ui ON r.PostId IN (
+            SELECT PostId FROM Posts WHERE OwnerUserId = ui.UserId
+        )
+    INNER JOIN 
+        PostDetails pd ON r.PostId = pd.PostId
+    WHERE 
+        r.rn = 1
+        AND r.Title IS NOT NULL
+        AND ui.BadgeCount > 0
+),
+RankedResults AS (
+    SELECT 
+        PostId,
+        Title,
+        DisplayName,
+        BadgeCount,
+        CommentCount,
+        VoteCount,
+        TagList,
+        RANK() OVER (ORDER BY BadgeCount DESC, VoteCount DESC) AS Rank
+    FROM 
+        ComplexResults
+)
+SELECT 
+    *,
+    CASE 
+        WHEN Rank <= 10 THEN 'Top 10'
+        ELSE 'Others'
+    END AS RankCategory
+FROM 
+    RankedResults;

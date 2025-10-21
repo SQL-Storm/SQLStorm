@@ -1,0 +1,246 @@
+-- {"query": "38042.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2437} 
+with params as (
+  select
+    date_trunc('month', now()) - interval '24 months' as start_month,
+    date_trunc('month', now()) as end_month
+),
+months as (
+  select generate_series(p.start_month, p.end_month, interval '1 month') as month_start
+  from params p
+),
+question_posts as (
+  select
+    p.Id,
+    p.CreationDate,
+    date_trunc('month', p.CreationDate) as month_bucket,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.Tags
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select start_month from params)
+    and p.CreationDate <  (select end_month from params) + interval '1 month'
+),
+answers as (
+  select a.Id, a.ParentId as QuestionId, a.CreationDate, a.OwnerUserId, a.Score
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select
+    q.Id as QuestionId,
+    min(a.CreationDate) as FirstAnswerDate
+  from question_posts q
+  join answers a on a.QuestionId = q.Id
+  group by q.Id
+),
+time_to_first_answer as (
+  select
+    q.Id as QuestionId,
+    q.month_bucket,
+    extract(epoch from (fa.FirstAnswerDate - q.CreationDate)) / 3600.0 as hours_to_first_answer
+  from question_posts q
+  join first_answer fa on fa.QuestionId = q.Id
+),
+comment_counts as (
+  select
+    c.PostId,
+    date_trunc('month', c.CreationDate) as month_bucket,
+    count(*) as comment_count,
+    avg(c.Score) as avg_comment_score
+  from Comments c
+  group by c.PostId, date_trunc('month', c.CreationDate)
+),
+post_link_dupes as (
+  select
+    pl.PostId,
+    date_trunc('month', pl.CreationDate) as month_bucket,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicate_links
+  from PostLinks pl
+  group by pl.PostId, date_trunc('month', pl.CreationDate)
+),
+votes_agg as (
+  select
+    v.PostId,
+    date_trunc('month', v.CreationDate) as month_bucket,
+    count(*) filter (where v.VoteTypeId = 2) as upvotes,
+    count(*) filter (where v.VoteTypeId = 3) as downvotes,
+    count(*) filter (where v.VoteTypeId = 5) as favorites,
+    sum(v.BountyAmount) filter (where v.VoteTypeId in (8,9)) as bounty_total
+  from Votes v
+  group by v.PostId, date_trunc('month', v.CreationDate)
+),
+closed_events as (
+  select
+    ph.PostId,
+    date_trunc('month', ph.CreationDate) as month_bucket,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as closed_count,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as reopened_count
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId, date_trunc('month', ph.CreationDate)
+),
+tag_expand as (
+  select
+    q.Id as PostId,
+    q.month_bucket,
+    unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tagname
+  from question_posts q
+  where q.Tags is not null and length(q.Tags) > 2
+),
+tag_stats as (
+  select
+    te.month_bucket,
+    te.tagname,
+    count(*) as questions_with_tag,
+    avg(q.Score::float) as avg_score_with_tag,
+    avg(q.ViewCount::float) as avg_views_with_tag
+  from tag_expand te
+  join question_posts q on q.Id = te.PostId
+  group by te.month_bucket, te.tagname
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    date_trunc('month', u.CreationDate) as user_cohort,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+  from Users u
+),
+author_dim as (
+  select
+    q.Id as QuestionId,
+    q.month_bucket,
+    u.UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+  from question_posts q
+  left join user_activity u on u.UserId = q.OwnerUserId
+),
+monthly_question_rollup as (
+  select
+    m.month_start as month_bucket,
+    count(q.Id) as questions,
+    avg(q.Score::float) as avg_question_score,
+    avg(q.ViewCount::float) as avg_views,
+    avg(q.AnswerCount::float) as avg_answer_count,
+    percentile_cont(0.5) within group (order by q.Score) as p50_score,
+    percentile_cont(0.9) within group (order by q.ViewCount) as p90_views
+  from months m
+  left join question_posts q on q.month_bucket = m.month_start
+  group by m.month_start
+),
+monthly_time_to_answer as (
+  select
+    month_bucket,
+    avg(hours_to_first_answer) as avg_hours_to_first_answer,
+    percentile_cont(0.5) within group (order by hours_to_first_answer) as p50_hours_to_first_answer,
+    count(*) as answered_questions
+  from time_to_first_answer
+  group by month_bucket
+),
+engagement_agg as (
+  select
+    q.month_bucket,
+    count(distinct q.Id) as posts_count,
+    sum(coalesce(v.upvotes,0)) as upvotes,
+    sum(coalesce(v.downvotes,0)) as downvotes,
+    sum(coalesce(v.favorites,0)) as favorites,
+    sum(coalesce(v.bounty_total,0)) as bounty_total,
+    sum(coalesce(c.comment_count,0)) as comments,
+    avg(coalesce(c.avg_comment_score,0)) as avg_comment_score,
+    sum(coalesce(l.duplicate_links,0)) as duplicate_links,
+    sum(coalesce(closed.closed_count,0)) as closed_count,
+    sum(coalesce(closed.reopened_count,0)) as reopened_count
+  from question_posts q
+  left join votes_agg v on v.PostId = q.Id and v.month_bucket = q.month_bucket
+  left join comment_counts c on c.PostId = q.Id and c.month_bucket = q.month_bucket
+  left join post_link_dupes l on l.PostId = q.Id and l.month_bucket = q.month_bucket
+  left join closed_events closed on closed.PostId = q.Id and closed.month_bucket = q.month_bucket
+  group by q.month_bucket
+),
+author_quality as (
+  select
+    a.month_bucket,
+    count(*) as authored_questions,
+    avg(coalesce(a.Reputation,0)::float) as avg_author_rep,
+    percentile_cont(0.75) within group (order by coalesce(a.Reputation,0)) as p75_author_rep,
+    avg(coalesce(a.UpVotes,0)::float - coalesce(a.DownVotes,0)::float) as avg_author_net_votes
+  from author_dim a
+  group by a.month_bucket
+),
+top_tags as (
+  select
+    ts.month_bucket,
+    ts.tagname,
+    ts.questions_with_tag,
+    ts.avg_score_with_tag,
+    row_number() over (partition by ts.month_bucket order by ts.questions_with_tag desc, ts.avg_score_with_tag desc, ts.tagname) as rn
+  from tag_stats ts
+),
+top5_tags_pivot as (
+  select
+    month_bucket,
+    max(case when rn = 1 then tagname end) as top_tag_1,
+    max(case when rn = 2 then tagname end) as top_tag_2,
+    max(case when rn = 3 then tagname end) as top_tag_3,
+    max(case when rn = 4 then tagname end) as top_tag_4,
+    max(case when rn = 5 then tagname end) as top_tag_5
+  from top_tags
+  where rn <= 5
+  group by month_bucket
+),
+question_quality_buckets as (
+  select
+    q.month_bucket,
+    count(*) filter (where q.Score >= 10) as high_score_questions,
+    count(*) filter (where q.Score between 0 and 9) as mid_score_questions,
+    count(*) filter (where q.Score < 0) as low_score_questions,
+    count(*) filter (where q.ViewCount >= 10000) as high_view_questions
+  from question_posts q
+  group by q.month_bucket
+)
+select
+  mqr.month_bucket::date as month,
+  mqr.questions,
+  mqr.avg_question_score,
+  mqr.avg_views,
+  mqr.avg_answer_count,
+  mqr.p50_score,
+  mqr.p90_views,
+  coalesce(mta.avg_hours_to_first_answer, null) as avg_hours_to_first_answer,
+  coalesce(mta.p50_hours_to_first_answer, null) as p50_hours_to_first_answer,
+  coalesce(mta.answered_questions, 0) as answered_questions,
+  coalesce(e.upvotes, 0) as upvotes,
+  coalesce(e.downvotes, 0) as downvotes,
+  coalesce(e.favorites, 0) as favorites,
+  coalesce(e.bounty_total, 0) as bounty_total,
+  coalesce(e.comments, 0) as comments,
+  coalesce(e.avg_comment_score, 0) as avg_comment_score,
+  coalesce(e.duplicate_links, 0) as duplicate_links,
+  coalesce(e.closed_count, 0) as closed_count,
+  coalesce(e.reopened_count, 0) as reopened_count,
+  coalesce(aq.authored_questions, 0) as authored_questions,
+  coalesce(aq.avg_author_rep, 0) as avg_author_rep,
+  coalesce(aq.p75_author_rep, 0) as p75_author_rep,
+  coalesce(aq.avg_author_net_votes, 0) as avg_author_net_votes,
+  coalesce(tt.top_tag_1, '-') as top_tag_1,
+  coalesce(tt.top_tag_2, '-') as top_tag_2,
+  coalesce(tt.top_tag_3, '-') as top_tag_3,
+  coalesce(tt.top_tag_4, '-') as top_tag_4,
+  coalesce(tt.top_tag_5, '-') as top_tag_5,
+  coalesce(qq.high_score_questions, 0) as high_score_questions,
+  coalesce(qq.mid_score_questions, 0) as mid_score_questions,
+  coalesce(qq.low_score_questions, 0) as low_score_questions,
+  coalesce(qq.high_view_questions, 0) as high_view_questions
+from monthly_question_rollup mqr
+left join monthly_time_to_answer mta on mta.month_bucket = mqr.month_bucket
+left join engagement_agg e on e.month_bucket = mqr.month_bucket
+left join author_quality aq on aq.month_bucket = mqr.month_bucket
+left join top5_tags_pivot tt on tt.month_bucket = mqr.month_bucket
+left join question_quality_buckets qq on qq.month_bucket = mqr.month_bucket
+order by month asc;

@@ -1,0 +1,78 @@
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes,
+        AVG(p.Score) AS avg_post_score
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.DeletionDate IS NULL
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate > u.CreationDate - INTERVAL '30 days'
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+post_performance AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        tu.question_count,
+        tu.answer_count,
+        tu.total_upvotes,
+        tu.avg_post_score,
+        COUNT(DISTINCT PL.RelatedPostId) AS linked_posts,
+        COUNT(DISTINCT c.Id) AS comment_count_detail,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS edit_count,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges_earned,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC) AS yearly_rank,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_views
+    FROM Posts p
+    INNER JOIN top_users tu ON p.OwnerUserId = tu.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    LEFT JOIN Comments c ON c.PostId = p.Id AND c.Score > 0
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.CreationDate > p.CreationDate
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId AND b.Date BETWEEN p.CreationDate AND p.LastActivityDate
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate > DATE '2024-10-01' - INTERVAL '2 years'
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+      AND p.ViewCount > 1000
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, p.AnswerCount, 
+        p.CommentCount, p.FavoriteCount, p.ClosedDate, tu.question_count, 
+        tu.answer_count, tu.total_upvotes, tu.avg_post_score
+)
+SELECT 
+    pp.Id,
+    pp.Title,
+    pp.CreationDate,
+    pp.ViewCount,
+    pp.Score * (1.0 + pp.AnswerCount * 0.5 + pp.comment_count_detail * 0.1) AS engagement_score,
+    pp.linked_posts,
+    pp.edit_count,
+    pp.gold_badges_earned,
+    pp.yearly_rank,
+    CASE 
+        WHEN pp.prev_post_views IS NULL THEN 0
+        WHEN pp.ViewCount > pp.prev_post_views * 1.5 THEN 'High Growth'
+        WHEN pp.ViewCount < pp.prev_post_views * 0.8 THEN 'Declining'
+        ELSE 'Stable'
+    END AS performance_trend,
+    tu.Reputation,
+    tu.question_count,
+    tu.answer_count,
+    (pp.ViewCount::float / NULLIF(EXTRACT(EPOCH FROM (DATE '2024-10-01' - pp.CreationDate)), 0)) AS views_per_day,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY pp.ViewCount) OVER () AS top_10p_views,
+    CORR(pp.Score, pp.ViewCount) OVER (PARTITION BY EXTRACT(MONTH FROM pp.CreationDate)) AS score_view_correlation
+FROM post_performance pp
+INNER JOIN top_users tu ON pp.OwnerUserId = tu.Id
+WHERE pp.yearly_rank <= 100
+  AND (pp.ViewCount::float / NULLIF(EXTRACT(EPOCH FROM (DATE '2024-10-01' - pp.CreationDate)), 0)) > 10
+ORDER BY engagement_score DESC, pp.CreationDate DESC
+LIMIT 500;

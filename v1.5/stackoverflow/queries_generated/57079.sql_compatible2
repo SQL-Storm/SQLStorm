@@ -1,0 +1,103 @@
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(p.Id) DESC, SUM(p.Score) DESC) AS Rank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+)
+, TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.AnswerCount DESC) AS Rank
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 50
+        AND p.ViewCount > 1000
+)
+, TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, COUNT(p.Id) DESC, SUM(p.Score) DESC) AS Rank
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName AS UserName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.TotalScore AS UserTotalScore,
+    tu.TotalViews AS UserTotalViews,
+    tu.AnswerCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tp.PostId,
+    tp.Title AS PostTitle,
+    tp.Score AS PostScore,
+    tp.ViewCount AS PostViewCount,
+    tp.AnswerCount AS PostAnswerCount,
+    tp.CommentCount AS PostCommentCount,
+    tp.CreationDate AS PostCreationDate,
+    tp.OwnerDisplayName,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.PostCount AS TagPostCount,
+    tt.TotalScore AS TagTotalScore,
+    tt.TotalViews AS TagTotalViews,
+    tu.Rank AS UserRank,
+    tp.Rank AS PostRank,
+    tt.Rank AS TagRank
+FROM
+    TopUsers tu
+LEFT JOIN
+    TopPosts tp ON tu.UserId = tp.OwnerDisplayName
+LEFT JOIN
+    TopTags tt ON tp.Title LIKE CONCAT('%<', tt.TagName, '>%')
+WHERE
+    tu.Rank <= 100
+    AND tp.Rank <= 100
+    AND tt.Rank <= 100
+ORDER BY
+    tu.Reputation DESC, tu.PostCount DESC, tp.Score DESC, tt.Count DESC;

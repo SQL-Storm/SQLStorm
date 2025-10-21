@@ -1,0 +1,98 @@
+-- {"query": "44034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 77996, "output_tokens": 29019} 
+WITH cte AS (
+  SELECT 
+    p.Id, 
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    DATEDIFF(p.LastActivityDate, p.CreationDate) AS days_since_creation,
+    DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), p.LastActivityDate) AS days_since_last_activity,
+    CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS is_closed,
+    CASE WHEN p.CommunityOwnedDate IS NULL THEN 0 ELSE 1 END AS is_community_owned,
+    COALESCE(u.Reputation, 0) AS owner_reputation,
+    COALESCE(u.Views, 0) AS owner_views,
+    COALESCE(u.UpVotes, 0) AS owner_upvotes,
+    COALESCE(u.DownVotes, 0) AS owner_downvotes,
+    COALESCE(b.Name, '') AS owner_badges,
+    COALESCE(b.Class, 0) AS owner_badge_class,
+    COALESCE(b.TagBased, 0) AS owner_badge_is_tag_based
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE p.PostTypeId = 1 -- questions only
+),
+post_stats AS (
+  SELECT
+    Id,
+    CreationDate,
+    LastActivityDate,
+    OwnerUserId,
+    ViewCount,
+    Score,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    Tags,
+    days_since_creation,
+    days_since_last_activity,
+    is_closed,
+    is_community_owned,
+    owner_reputation,
+    owner_views,
+    owner_upvotes,
+    owner_downvotes,
+    STRING_AGG(owner_badges, ',') AS owner_badges,
+    MAX(owner_badge_class) AS owner_max_badge_class,
+    MAX(owner_badge_is_tag_based) AS owner_has_tag_badge
+  FROM cte
+  GROUP BY
+    Id,
+    CreationDate,
+    LastActivityDate,
+    OwnerUserId,
+    ViewCount,
+    Score,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    Tags,
+    days_since_creation,
+    days_since_last_activity,
+    is_closed,
+    is_community_owned,
+    owner_reputation,
+    owner_views,
+    owner_upvotes,
+    owner_downvotes
+)
+SELECT
+  Id,
+  CreationDate,
+  LastActivityDate,
+  OwnerUserId,
+  ViewCount,
+  Score,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  Tags,
+  days_since_creation,
+  days_since_last_activity,
+  is_closed,
+  is_community_owned,
+  owner_reputation,
+  owner_views,
+  owner_upvotes,
+  owner_downvotes,
+  owner_badges,
+  owner_max_badge_class,
+  owner_has_tag_badge
+FROM post_stats
+ORDER BY Score DESC
+LIMIT 100;

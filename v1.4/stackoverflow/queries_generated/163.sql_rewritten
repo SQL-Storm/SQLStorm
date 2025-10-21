@@ -1,0 +1,139 @@
+-- {"query": "163.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1899} 
+WITH
+-- Last 60 days activity per post, with computed engagement
+RecentPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.Tags,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    -- Normalize Tags text for downstream processing
+    CASE
+      WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+      ELSE string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '><')
+    END AS TagArray
+  FROM Posts p
+  WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+),
+-- Per-user top post by score in the recent window
+UserTopPosts AS (
+  SELECT
+    rp.*,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.CreationDate DESC) AS rn,
+    COUNT(*) OVER () AS total_posts_in_user_group
+  FROM RecentPosts rp
+  LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+),
+-- Tag popularity snapshot for the 60-day window
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    SUM(CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END) OVER () AS ModeratorOnlyTags
+  FROM Tags t
+  WHERE t.Count > 0
+),
+-- Correlated subquery: recent upvotes per post by type 2 (UpMod)
+RecentUpvotes AS (
+  SELECT
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpModCount,
+    MAX(v.CreationDate) AS LastUpModDate
+  FROM Votes v
+  GROUP BY v.PostId
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.AccountId,
+  t.Id AS PostId,
+  t.Title,
+  t.PostTypeId,
+  t.CreationDate,
+  t.LastActivityDate,
+  t.ViewCount,
+  t.Score,
+  t.CommentCount,
+  t.AnswerCount,
+  t.Tags,
+  t.FavoriteCount,
+  -- Tag-derived features
+  (SELECT COUNT(*) FROM LATERAL UNNEST(t.TagArray) AS tag) AS TagElementCount,
+  -- Join to gather a few badge dimensions for the owner
+  b.GoldBadgeCount,
+  b.SilverBadgeCount,
+  b.BronzeBadgeCount,
+  -- Engagement via upvotes (correlated subquery)
+  COALESCE((SELECT SUM(CASE WHEN v2.VoteTypeId = 2 THEN 1 ELSE 0 END)
+            FROM Votes v2
+            WHERE v2.PostId = t.Id), 0) AS UpvotesOnPost,
+  COALESCE((SELECT SUM(CASE WHEN v2.VoteTypeId = 3 THEN 1 ELSE 0 END)
+            FROM Votes v2
+            WHERE v2.PostId = t.Id), 0) AS DownvotesOnPost,
+  COALESCE(rup.UpModCount, 0) AS UpModCount,
+  ru.LastUpModDate
+FROM UserTopPosts t
+-- Owner details
+LEFT JOIN Users u ON u.Id = t.OwnerUserId
+-- Badges per user (aggregate from Badges table)
+LEFT JOIN (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadgeCount,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadgeCount
+  FROM Badges b
+  GROUP BY b.UserId
+) b ON b.UserId = t.OwnerUserId
+-- Correlated upvotes per post
+LEFT JOIN RecentUpvotes rup ON rup.PostId = t.Id
+-- Last upvote date for the owner per post
+LEFT JOIN Votes ru ON ru.PostId = t.Id AND ru.VoteTypeId = 2
+WHERE t.rn = 1
+  AND (t.OwnerUserId IS NULL OR t.OwnerUserId <> -1)
+ORDER BY t.Score DESC NULLS LAST, t.LastActivityDate DESC
+LIMIT 100
+UNION ALL
+-- Include a small set of posts that are linked to their duplicates (if any) to exercise set-ops
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.AccountId,
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  p.AnswerCount,
+  p.Tags,
+  p.FavoriteCount,
+  0 AS TagElementCount,
+  0 AS GoldBadgeCount,
+  0 AS SilverBadgeCount,
+  0 AS BronzeBadgeCount,
+  0 AS UpvotesOnPost,
+  NULL AS LastUpModDate,
+  0 AS UpModCount,
+  NULL AS LastUpModDate2
+FROM Posts p
+JOIN Users u ON u.Id = p.OwnerUserId
+JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+WHERE p.Id IN (
+  SELECT RelatedPostId FROM PostLinks WHERE LinkTypeId = 3
+)
+ORDER BY p.CreationDate DESC
+LIMIT 20;

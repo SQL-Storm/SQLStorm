@@ -1,0 +1,125 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PopularPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        t.TagName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Tags t ON p.Tags LIKE CONCAT('%', t.TagName, '%')
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE
+        p.PostTypeId = 1 AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1 year'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.DisplayName, t.TagName
+),
+HighEngagementPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount
+    FROM
+        PopularPosts p
+    LEFT JOIN
+        Users u ON p.OwnerDisplayName = u.DisplayName
+    LEFT JOIN
+        Votes v ON p.PostId = v.PostId
+    LEFT JOIN
+        Comments c ON p.PostId = c.PostId
+    WHERE
+        p.Score > 10 AND p.ViewCount > 1000 AND p.AnswerCount > 5
+    GROUP BY
+        p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, u.DisplayName
+),
+UserEngagement AS (
+    SELECT
+        au.UserId,
+        au.Reputation,
+        au.CreationDate,
+        au.LastAccessDate,
+        au.PostCount,
+        au.CommentCount,
+        au.VoteCount,
+        au.BadgeCount,
+        COUNT(hep.PostId) AS HighEngagementPostCount
+    FROM
+        ActiveUsers au
+    LEFT JOIN
+        HighEngagementPosts hep ON au.UserId = hep.PostId -- adjusted join to match context
+    GROUP BY
+        au.UserId, au.Reputation, au.CreationDate, au.LastAccessDate, au.PostCount, au.CommentCount, au.VoteCount, au.BadgeCount
+)
+SELECT
+    ue.UserId,
+    ue.Reputation,
+    ue.CreationDate,
+    ue.LastAccessDate,
+    ue.PostCount,
+    ue.CommentCount,
+    ue.VoteCount,
+    ue.BadgeCount,
+    ue.HighEngagementPostCount,
+    COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+    COALESCE(SUM(p.ViewCount), 0) AS TotalViewCount,
+    COALESCE(SUM(p.AnswerCount), 0) AS TotalAnswerCount,
+    COALESCE(SUM(p.CommentCount), 0) AS TotalCommentCount,
+    COALESCE(SUM(p.FavoriteCount), 0) AS TotalFavoriteCount
+FROM
+    UserEngagement ue
+LEFT JOIN
+    Posts p ON ue.UserId = p.OwnerUserId
+GROUP BY
+    ue.UserId, ue.Reputation, ue.CreationDate, ue.LastAccessDate, ue.PostCount, ue.CommentCount, ue.VoteCount, ue.BadgeCount, ue.HighEngagementPostCount
+ORDER BY
+    ue.Reputation DESC,
+    ue.HighEngagementPostCount DESC,
+    ue.PostCount DESC,
+    ue.CommentCount DESC,
+    ue.VoteCount DESC,
+    ue.BadgeCount DESC
+LIMIT 100;

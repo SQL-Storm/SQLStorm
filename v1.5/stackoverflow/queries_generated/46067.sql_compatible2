@@ -1,0 +1,101 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        AVG(p.Score) as AvgScore,
+        SUM(p.ViewCount) as TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererUserId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+        AND a.OwnerUserId IS NOT NULL
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT v.Id) as VotesCast,
+        COUNT(DISTINCT c.Id) as CommentsPosted
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(p.AnswerCount) as AvgAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as MedianViews
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2018-01-01'
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 100
+)
+SELECT 
+    tqa.OwnerUserId,
+    ue.DisplayName,
+    ue.Reputation,
+    tqa.QuestionCount,
+    tqa.AvgScore as AvgQuestionScore,
+    tqa.TotalViews,
+    ue.BadgeCount,
+    ue.GoldBadges,
+    COUNT(DISTINCT am.AnswerId) as AnswersReceived,
+    AVG(am.AnswerScore) as AvgAnswerScore,
+    COUNT(DISTINCT CASE WHEN am.AnswerRank = 1 THEN am.AnswerId END) as TopAnswersReceived,
+    COUNT(DISTINCT ph.Id) as EditHistoryCount,
+    COUNT(DISTINCT pl.Id) as LinkedPosts,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.QuestionCount DESC) 
+        FILTER (WHERE tp.QuestionCount IS NOT NULL) as TopTags,
+    MAX(tp.AvgQuestionScore) as BestTagAvgScore,
+    ue.VotesCast,
+    ue.CommentsPosted,
+    EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate)))/86400.0 as DaysActive
+FROM TopQuestionAuthors tqa
+JOIN UserEngagement ue ON tqa.OwnerUserId = ue.UserId
+JOIN Posts p ON p.OwnerUserId = tqa.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN AnswerMetrics am ON p.Id = am.QuestionId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN TagPerformance tp ON p.Tags LIKE '%' || '<' || tp.TagName || '>' || '%'
+WHERE ue.Reputation > 1000
+GROUP BY 
+    tqa.OwnerUserId,
+    ue.DisplayName,
+    ue.Reputation,
+    tqa.QuestionCount,
+    tqa.AvgScore,
+    tqa.TotalViews,
+    ue.BadgeCount,
+    ue.GoldBadges,
+    ue.VotesCast,
+    ue.CommentsPosted
+HAVING COUNT(DISTINCT am.AnswerId) > 5
+ORDER BY 
+    (tqa.AvgScore * 0.3 + 
+     ue.Reputation * 0.0001 + 
+     COUNT(DISTINCT CASE WHEN am.AnswerRank = 1 THEN am.AnswerId END) * 0.4 + 
+     ue.GoldBadges * 0.3) DESC
+LIMIT 100;

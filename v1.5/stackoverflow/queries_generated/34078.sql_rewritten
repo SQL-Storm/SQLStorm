@@ -1,0 +1,126 @@
+-- {"query": "34078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1291} 
+WITH RankedAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2 -- Answers
+),
+TopAnswers AS (
+    SELECT AnswerId, QuestionId, AnswerScore, AnswerCreationDate
+    FROM RankedAnswers
+    WHERE RankByScore <= 3
+),
+QuestionStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.CreationDate AS QuestionCreationDate,
+        u.Id AS OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    WHERE q.PostTypeId = 1 -- Questions
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate, u.Id, u.DisplayName, u.Reputation
+),
+AnswerDetails AS (
+    SELECT
+        ta.AnswerId,
+        ta.QuestionId,
+        ta.AnswerScore,
+        ta.AnswerCreationDate,
+        u.DisplayName AS AnswerOwnerDisplayName,
+        u.Reputation AS AnswerOwnerReputation,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerUpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS AnswerDownVotes,
+        COUNT(DISTINCT c.Id) AS AnswerCommentCount
+    FROM TopAnswers ta
+    LEFT JOIN Posts a ON a.Id = ta.AnswerId
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = ta.AnswerId
+    LEFT JOIN Comments c ON c.PostId = ta.AnswerId
+    GROUP BY ta.AnswerId, ta.QuestionId, ta.AnswerScore, ta.AnswerCreationDate, u.DisplayName, u.Reputation
+),
+BadgeCounts AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+QuestionTagCounts AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(t.Id) AS TagCount
+    FROM Posts p
+    CROSS JOIN LATERAL string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><') AS tagname(tag)
+    LEFT JOIN Tags t ON t.TagName = tagname.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+QuestionsWithTags AS (
+    SELECT q.QuestionId, q.Title, q.QuestionScore, q.ViewCount, q.QuestionCreationDate,
+           q.OwnerUserId, q.OwnerDisplayName, q.Reputation, q.CommentCount, q.UpVotes, q.DownVotes,
+           COALESCE(tc.TagCount, 0) AS TagCount,
+           COALESCE(bc.GoldBadges, 0) AS OwnerGoldBadges,
+           COALESCE(bc.SilverBadges, 0) AS OwnerSilverBadges,
+           COALESCE(bc.BronzeBadges, 0) AS OwnerBronzeBadges
+    FROM QuestionStats q
+    LEFT JOIN QuestionTagCounts tc ON tc.QuestionId = q.QuestionId
+    LEFT JOIN BadgeCounts bc ON bc.UserId = q.OwnerUserId
+),
+FinalAnswerAggregates AS (
+    SELECT
+        QuestionId,
+        COUNT(*) AS TopAnswerCount,
+        AVG(AnswerScore) AS AvgTopAnswerScore,
+        SUM(AnswerScore) AS SumTopAnswerScore,
+        MAX(AnswerScore) AS MaxTopAnswerScore,
+        MIN(AnswerScore) AS MinTopAnswerScore,
+        AVG(AnswerOwnerReputation) AS AvgTopAnswerOwnerReputation,
+        SUM(AnswerUpVotes) AS TotalTopAnswerUpVotes,
+        SUM(AnswerDownVotes) AS TotalTopAnswerDownVotes
+    FROM AnswerDetails
+    GROUP BY QuestionId
+)
+SELECT
+    qwt.QuestionId,
+    qwt.Title,
+    qwt.QuestionScore,
+    qwt.ViewCount,
+    qwt.QuestionCreationDate,
+    qwt.OwnerDisplayName,
+    qwt.Reputation AS OwnerReputation,
+    qwt.OwnerGoldBadges,
+    qwt.OwnerSilverBadges,
+    qwt.OwnerBronzeBadges,
+    qwt.TagCount,
+    fa.TopAnswerCount,
+    fa.AvgTopAnswerScore,
+    fa.SumTopAnswerScore,
+    fa.MaxTopAnswerScore,
+    fa.MinTopAnswerScore,
+    fa.AvgTopAnswerOwnerReputation,
+    fa.TotalTopAnswerUpVotes,
+    fa.TotalTopAnswerDownVotes
+FROM QuestionsWithTags qwt
+LEFT JOIN FinalAnswerAggregates fa ON fa.QuestionId = qwt.QuestionId
+WHERE qwt.QuestionCreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+AND qwt.TagCount >= 3
+AND qwt.OwnerReputation > 1000
+AND qwt.QuestionScore > 5
+ORDER BY fa.AvgTopAnswerScore DESC NULLS LAST, qwt.QuestionScore DESC
+LIMIT 50;

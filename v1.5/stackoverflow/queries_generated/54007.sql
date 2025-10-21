@@ -1,0 +1,71 @@
+-- {"query": "54007.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1915} 
+
+WITH
+    -- Split each question's tags into individual rows
+    question_tags AS (
+        SELECT
+            p.Id          AS question_id,
+            unnest(regexp_split_to_array(btrim(p.Tags, '<>'), '><')) AS tag,
+            p.Score, 
+            p.AnswerCount,
+            p.CreationDate,
+            p.OwnerUserId
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+
+    -- Aggregate up‑votes and down‑votes per question
+    vote_sums AS (
+        SELECT
+            ph.question_id,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+        FROM question_tags ph
+        JOIN Votes v ON v.PostId = ph.question_id
+        GROUP BY ph.question_id
+    ),
+
+    -- Count recent body/ tag edits per question
+    edit_counts AS (
+        SELECT
+            ph.PostId,
+            COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (5, 6)) AS edit_cnt
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (5, 6)
+        GROUP BY ph.PostId
+    ),
+
+    -- Count duplicate links (questions that have been marked as duplicates)
+    duplicate_counts AS (
+        SELECT
+            lt.RelatedPostId AS dup_of,
+            COUNT(*)         AS dup_cnt
+        FROM PostLinks lt
+        JOIN Posts p ON p.Id = lt.RelatedPostId
+        WHERE lt.LinkTypeId = 3
+        GROUP BY lt.RelatedPostId
+    ),
+
+    -- Per‑tag aggregated statistics
+    tag_stats AS (
+        SELECT
+            qt.tag,
+            COUNT(*)                                AS questions,
+            AVG(qt.Score)                           AS avg_score,
+            SUM(qt.AnswerCount)                     AS total_answers,
+            SUM(vs.upvotes)                         AS total_upvotes,
+            SUM(vs.downvotes)                       AS total_downvotes,
+            AVG(ec.edit_cnt)                        AS avg_edits,
+            SUM(COALESCE(dc.dup_cnt, 0))            AS total_duplications,
+            COUNT(DISTINCT qt.OwnerUserId)          AS unique_askers
+        FROM question_tags qt
+        LEFT JOIN vote_sums vs  ON vs.question_id = qt.question_id
+        LEFT JOIN edit_counts ec ON ec.PostId      = qt.question_id
+        LEFT JOIN duplicate_counts dc ON dc.dup_of   = qt.question_id
+        GROUP BY qt.tag
+    )
+
+SELECT *
+FROM tag_stats
+ORDER BY questions DESC, avg_score DESC
+LIMIT 30;

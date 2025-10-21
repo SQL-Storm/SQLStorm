@@ -1,0 +1,350 @@
+-- {"query": "8062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3206} 
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        coalesce(u.upvotes, 0) - coalesce(u.downvotes, 0) as net_votes,
+        u.creationdate,
+        u.lastaccessdate,
+        u.location,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(distinct c.id) as total_comments,
+        count(distinct v.id) filter (where v.votetypeid in (2,3)) as total_votes_cast
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join comments c on c.userid = u.id
+    left join votes v on v.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.upvotes, u.downvotes, u.creationdate, u.lastaccessdate, u.location
+),
+badge_summary as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+post_links_agg as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        count(*) as total_links,
+        count(distinct pl.relatedpostid) as distinct_related
+    from postlinks pl
+    group by pl.postid
+),
+vote_stats as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        count(*) as vote_events
+    from votes v
+    group by v.postid
+),
+comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+tag_explode as (
+    select
+        rp.id as postid,
+        unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tagname
+    from recent_posts rp
+    where rp.posttypeid = 1
+      and rp.tags is not null
+      and rp.tags <> ''
+),
+tag_weights as (
+    select
+        te.postid,
+        te.tagname,
+        t.count as global_tag_count,
+        case
+            when t.count is null or t.count = 0 then 0.0
+            else 1.0 / sqrt(t.count::float)
+        end as rarity_weight
+    from tag_explode te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+post_enriched as (
+    select
+        rp.*,
+        coalesce(vs.upvotes,0) as upvotes,
+        coalesce(vs.downvotes,0) as downvotes,
+        coalesce(vs.bounty_started,0) as bounty_started,
+        coalesce(vs.bounty_awarded,0) as bounty_awarded,
+        coalesce(vs.vote_events,0) as vote_events,
+        coalesce(cs.comment_count,0) as comment_count,
+        cs.avg_comment_score,
+        cs.last_comment_date,
+        coalesce(pla.linked_count,0) as linked_count,
+        coalesce(pla.duplicate_count,0) as duplicate_count,
+        coalesce(pla.total_links,0) as total_links,
+        coalesce(pla.distinct_related,0) as distinct_related,
+        sum(tw.rarity_weight) over (partition by rp.id) as tag_rarity_sum,
+        avg(tw.rarity_weight) over (partition by rp.id) as tag_rarity_avg,
+        count(tw.tagname) over (partition by rp.id) as tag_count
+    from recent_posts rp
+    left join vote_stats vs on vs.postid = rp.id
+    left join comment_stats cs on cs.postid = rp.id
+    left join post_links_agg pla on pla.postid = rp.id
+    left join tag_weights tw on tw.postid = rp.id
+),
+edits as (
+    select
+        ph.postid,
+        count(*) as total_edits,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as content_edits,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36)) as mod_actions,
+        max(ph.creationdate) as last_edit_date,
+        bool_or(ph.posthistorytypeid = 10) as ever_closed_event
+    from posthistory ph
+    group by ph.postid
+),
+question_closure as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 11) as first_reopened,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        sum(
+            case
+                when ph.posthistorytypeid = 10 then
+                    case
+                        when ph.comment ~ '^[0-9]+$' then 1
+                        when ph.comment ~ '^(101|102|103|104|105)$' then 1
+                        else 0
+                    end
+                else 0
+            end
+        ) as close_with_reason_count
+    from posthistory ph
+    group by ph.postid
+),
+answer_counts as (
+    select
+        p.parentid as questionid,
+        count(*) as answers_total,
+        max(p.score) as max_answer_score,
+        avg(p.score) as avg_answer_score
+    from posts p
+    where p.posttypeid = 2
+    group by p.parentid
+),
+owner_window as (
+    select
+        pe.*,
+        ua.displayname as owner_name,
+        ua.reputation as owner_reputation,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.tag_badges,
+        row_number() over (partition by pe.owneruserid order by pe.score desc nulls last, pe.viewcount desc nulls last) as rn_owner_top,
+        dense_rank() over (order by pe.score desc nulls last) as dr_global_score
+    from post_enriched pe
+    left join user_activity ua on ua.user_id = pe.owneruserid
+    left join badge_summary bs on bs.userid = pe.owneruserid
+),
+question_focus as (
+    select
+        ow.*,
+        ac.answers_total,
+        ac.max_answer_score,
+        ac.avg_answer_score,
+        qc.first_closed,
+        qc.first_reopened,
+        qc.close_events,
+        qc.reopen_events,
+        qc.close_with_reason_count,
+        e.total_edits,
+        e.content_edits,
+        e.mod_actions,
+        e.last_edit_date,
+        e.ever_closed_event
+    from owner_window ow
+    left join answer_counts ac on ac.questionid = ow.id
+    left join edits e on e.postid = ow.id
+    left join question_closure qc on qc.postid = ow.id
+    where ow.posttypeid = 1
+),
+question_scoring as (
+    select
+        qf.*,
+        coalesce(qf.tag_rarity_sum, 0) as tag_rarity_sum_nz,
+        coalesce(qf.tag_rarity_avg, 0) as tag_rarity_avg_nz,
+        coalesce(qf.tag_count, 0) as tag_count_nz,
+        coalesce(qf.upvotes, 0) - coalesce(qf.downvotes, 0) as net_votes,
+        case
+            when qf.viewcount is null or qf.viewcount = 0 then null
+            else (qf.score::float / qf.viewcount::float)
+        end as score_per_view,
+        case
+            when qf.answercount > 0 then qf.score::float / qf.answercount::float
+            else null
+        end as score_per_answer,
+        case
+            when qf.answers_total > 0 then qf.viewcount::float / qf.answers_total::float
+            else null
+        end as views_per_answer,
+        case
+            when qf.comment_count > 0 then qf.viewcount::float / qf.comment_count::float
+            else null
+        end as views_per_comment,
+        coalesce(qf.duplicate_count, 0) > 0 as is_marked_duplicate,
+        (coalesce(qf.close_events,0) > 0 or qf.is_closed = 1) as closed_flag
+    from question_focus qf
+),
+ranked as (
+    select
+        qs.*,
+        percentile_cont(0.5) within group (order by qs.score) over () as p50_score,
+        percentile_cont(0.9) within group (order by qs.viewcount) over () as p90_views,
+        ntile(10) over (order by coalesce(qs.score,0)) as decile_score,
+        ntile(10) over (order by coalesce(qs.viewcount,0)) as decile_views
+    from question_scoring qs
+),
+correlated_flags as (
+    select
+        r.id,
+        exists (
+            select 1
+            from comments c
+            where c.postid = r.id
+              and c.text ilike any (array['%duplicate%', '%dupe%', '%same as%'])
+        ) as has_dupe_comment,
+        exists (
+            select 1
+            from postlinks pl
+            where pl.postid = r.id and pl.linktypeid = 3
+        ) as has_dupe_link,
+        (
+            select count(*)
+            from votes v
+            where v.postid = r.id and v.votetypeid in (2,3)
+              and v.creationdate >= r.creationdate and v.creationdate < r.creationdate + interval '7 days'
+        ) as votes_first_week
+    from ranked r
+),
+final_scores as (
+    select
+        r.*,
+        cf.has_dupe_comment,
+        cf.has_dupe_link,
+        cf.votes_first_week,
+        (
+            coalesce(r.score,0)*2
+            + coalesce(r.net_votes,0)*1.5
+            + coalesce(r.comment_count,0)*0.25
+            + coalesce(r.viewcount,0)*0.01
+            + coalesce(r.tag_rarity_sum_nz,0)*10
+            + case when r.is_marked_duplicate then -25 else 0 end
+            + case when r.closed_flag then -10 else 0 end
+            + case when cf.has_dupe_comment then -5 else 0 end
+            + case when cf.has_dupe_link then -10 else 0 end
+            + coalesce(least(r.bounty_awarded, r.bounty_started),0)*0.05
+        )::float as composite_score
+    from ranked r
+    join correlated_flags cf on cf.id = r.id
+),
+topn as (
+    select
+        fs.*,
+        row_number() over (
+            partition by
+                case
+                    when fs.owner_reputation >= 100000 then 'legend'
+                    when fs.owner_reputation >= 10000 then 'expert'
+                    when fs.owner_reputation >= 1000 then 'intermediate'
+                    else 'novice'
+                end
+            order by fs.composite_score desc nulls last, fs.viewcount desc nulls last, fs.creationdate desc
+        ) as bucket_rank
+    from final_scores fs
+)
+select
+    t.id as question_id,
+    coalesce(nullif(btrim(t.title), ''), '[no title]') as title,
+    t.creationdate,
+    t.owneruserid,
+    coalesce(t.owner_name, '[anonymous]') as owner_name,
+    t.owner_reputation,
+    t.gold_badges,
+    t.silver_badges,
+    t.bronze_badges,
+    t.tag_badges,
+    t.score,
+    t.viewcount,
+    t.answercount,
+    t.upvotes,
+    t.downvotes,
+    t.net_votes,
+    t.comment_count,
+    t.tag_count_nz as tag_count,
+    round(coalesce(t.tag_rarity_avg_nz,0)::numeric, 6) as tag_rarity_avg,
+    t.linked_count,
+    t.duplicate_count,
+    t.total_links,
+    t.distinct_related,
+    t.total_edits,
+    t.content_edits,
+    t.mod_actions,
+    t.first_closed,
+    t.first_reopened,
+    t.close_events,
+    t.reopen_events,
+    t.close_with_reason_count,
+    t.ever_closed_event,
+    t.is_marked_duplicate,
+    t.closed_flag,
+    t.avg_answer_score,
+    t.max_answer_score,
+    t.views_per_answer,
+    t.views_per_comment,
+    t.score_per_view,
+    t.score_per_answer,
+    t.p50_score,
+    t.p90_views,
+    t.decile_score,
+    t.decile_views,
+    t.rn_owner_top,
+    t.dr_global_score,
+    t.votes_first_week,
+    round(t.composite_score::numeric, 3) as composite_score,
+    case
+        when t.tags is null then array[]::varchar[]
+        else string_to_array(substring(t.tags, 2, greatest(length(t.tags)-2,0)), '><')
+    end as tag_array
+from topn t
+where t.bucket_rank <= 50
+order by t.composite_score desc nulls last, t.viewcount desc nulls last, t.creationdate desc;

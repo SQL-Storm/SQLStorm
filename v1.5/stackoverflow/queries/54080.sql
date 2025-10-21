@@ -1,0 +1,78 @@
+WITH
+  -- Extract one tag per question (PostTypeId = 1)
+  question_tags AS (
+    SELECT
+      p.Id AS qid,
+      UPPER(REGEXP_REPLACE(value, '^<|>$', '', 'g')) AS tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      SELECT
+        value
+      FROM
+        UNNEST(string_to_array(p.Tags, '>')) AS t(value)
+      WHERE value <> ''
+    ) AS tagname
+    WHERE p.PostTypeId = 1
+  ),
+  -- Gather answers for each question
+  answers AS (
+    SELECT
+      a.Id AS aid,
+      a.ParentId AS qid,
+      a.Score AS answer_score,
+      a.CreationDate AS answer_date,
+      a.OwnerUserId AS u_id
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+  ),
+  -- Sum up/down votes per answer
+  answer_votes AS (
+    SELECT
+      v.PostId AS aid,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId
+  ),
+  -- Compute per‑answer metrics
+  answer_metrics AS (
+    SELECT
+      a.aid,
+      a.qid,
+      a.answer_score,
+      COALESCE(av.upvotes, 0) AS upvotes,
+      COALESCE(av.downvotes, 0) AS downvotes,
+      COALESCE(av.upvotes, 0) - COALESCE(av.downvotes, 0) AS net_votes,
+      CASE WHEN a.answer_score >= 10 THEN 1 ELSE 0 END AS high_score_flag
+    FROM answers a
+    LEFT JOIN answer_votes av ON av.aid = a.aid
+  ),
+  -- Aggregate per‑tag statistics
+  tag_stats AS (
+    SELECT
+      qt.tag,
+      COUNT(DISTINCT qt.qid) AS question_cnt,
+      AVG(am.upvotes) AS avg_upvotes,
+      AVG(am.downvotes) AS avg_downvotes,
+      MAX(am.net_votes) AS max_net_vote,
+      MIN(am.net_votes) AS min_net_vote,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY am.net_votes) AS median_net_vote,
+      SUM(am.high_score_flag) AS high_scoring_answers
+    FROM question_tags qt
+    JOIN answer_metrics am ON am.qid = qt.qid
+    GROUP BY qt.tag
+  )
+SELECT
+  ts.tag,
+  ts.question_cnt,
+  ts.avg_upvotes,
+  ts.avg_downvotes,
+  ts.max_net_vote,
+  ts.min_net_vote,
+  ts.median_net_vote,
+  ts.high_scoring_answers,
+  ROW_NUMBER() OVER (ORDER BY ts.question_cnt DESC) AS rank
+FROM tag_stats ts
+ORDER BY ts.question_cnt DESC
+LIMIT 50;

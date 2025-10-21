@@ -1,0 +1,83 @@
+-- {"query": "3049.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 897} 
+WITH UserReputation AS (
+    SELECT u.Id AS UserId, u.Reputation, u.DisplayName,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+PostSummary AS (
+    SELECT p.PostTypeId, p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestions
+    FROM Posts p
+    GROUP BY p.PostTypeId, p.OwnerUserId
+),
+TagAnalysis AS (
+    SELECT t.TagName,
+        COUNT(*) AS TagUsageCount,
+        MAX(t.WikiPostId) AS MaxWikiPostId
+    FROM Tags t
+    GROUP BY t.TagName
+),
+RecentVotes AS (
+    SELECT v.PostId, v.UserId, v.VoteTypeId, v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId, v.UserId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Votes v
+),
+RecentVotesFiltered AS (
+    SELECT rv.*
+    FROM RecentVotes rv
+    WHERE rv.VoteRank = 1
+),
+CorrelatedComments AS (
+    SELECT c.Id, c.PostId, c.Score, c.Text, c.CreationDate,
+        c.UserDisplayName,
+        U.DisplayName AS UserName,
+        (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = c.PostId AND c2.Score > c.Score) AS HigherScoreCommentsCount
+    FROM Comments c
+    LEFT JOIN Users U ON c.UserId = U.Id
+),
+PostsWithHistory AS (
+    SELECT p.Id, p.Title, p.Body,
+        ph.PostHistoryTypeId, ph.RevisionGUID,
+        ROW_NUMBER() OVER (PARTITION BY p.Id, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS RecentRevisionRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+),
+LatestRevisions AS (
+    SELECT pwh.*
+    FROM PostsWithHistory pwh
+    WHERE pwh.RecentRevisionRank = 1
+),
+ComplexPostAnalysis AS (
+    SELECT p.Id, p.Title, p.Tags,
+        ARRAY_LENGTH(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '<>')) AS TagCount,
+        CASE WHEN p.Title ILIKE '%performance%' THEN TRUE ELSE FALSE END AS TitleContainsPerformance,
+        p.CreationDate,
+        EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) AS PostAgeSeconds
+    FROM Posts p
+),
+FinalReport AS (
+    SELECT ur.UserId, ur.DisplayName, ur.Reputation, ur.ReputationRank,
+        ps.QuestionCount, ps.AnswerCount, ps.AvgScore, ps.ClosedQuestions,
+        ta.TagName, ta.TagUsageCount,
+        rv.VoteTypeId AS LatestVoteType,
+        cc.HigherScoreCommentsCount,
+        pch.Title AS LatestTitleRevision, pch.Body AS LatestBodyRevision,
+        pch.RevisionGUID AS RevisionID,
+        ca.TagCount, ca.TitleContainsPerformance, ca.PostAgeSeconds,
+        CASE WHEN ca.PostAgeSeconds < 86400 THEN 'New' ELSE 'Old' END AS PostAgeCategory
+    FROM UserReputation ur
+    LEFT JOIN PostSummary ps ON ur.UserId = ps.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON 1=1
+    LEFT JOIN RecentVotesFiltered rv ON rv.PostId = (SELECT Id FROM Posts WHERE OwnerUserId = ur.UserId LIMIT 1)
+    LEFT JOIN CorrelatedComments cc ON cc.PostId = (SELECT Id FROM Posts WHERE OwnerUserId = ur.UserId LIMIT 1)
+    LEFT JOIN LatestRevisions pch ON pch.Id = (SELECT Id FROM Posts WHERE OwnerUserId = ur.UserId LIMIT 1)
+    LEFT JOIN ComplexPostAnalysis ca ON ca.Id = (SELECT Id FROM Posts WHERE OwnerUserId = ur.UserId LIMIT 1)
+)
+SELECT *
+FROM FinalReport
+ORDER BY Reputation DESC, UserId
+LIMIT 100;

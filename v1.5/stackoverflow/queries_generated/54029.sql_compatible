@@ -1,0 +1,56 @@
+WITH post_details AS (
+    SELECT
+        p.Id,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        u.Reputation,
+        string_to_array(regexp_replace(regexp_replace(regexp_replace(p.Tags, '<', '', 'g'), '>', '', 'g'), ',\\s*', ',', 'g')) AS tag_list
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+tag_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(pd.Id)                               AS question_cnt,
+        AVG(CAST(pd.Score AS numeric))            AS avg_score,
+        MAX(pd.AnswerCount)                        AS max_answers,
+        SUM(pd.ViewCount)                          AS total_views,
+        AVG(CAST(pd.Reputation AS numeric))        AS avg_user_rep,
+        COUNT(DISTINCT c.UserId)                   AS distinct_commenters,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS close_votes,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 8  THEN 1 ELSE 0 END) AS bounty_votes
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT pd.*
+        FROM post_details pd
+        WHERE t.TagName = ANY(pd.tag_list)
+    ) AS pd ON TRUE
+    LEFT JOIN Comments c ON c.PostId = pd.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = pd.Id
+    GROUP BY t.TagName
+)
+SELECT
+    ts.TagName,
+    ts.question_cnt,
+    ts.avg_score,
+    ts.max_answers,
+    ts.total_views,
+    ts.avg_user_rep,
+    ts.distinct_commenters,
+    ts.close_votes,
+    ts.bounty_votes,
+    nt.n_top_tags
+FROM tag_stats ts
+CROSS JOIN (
+    SELECT COUNT(*) AS n_top_tags
+    FROM (
+        SELECT t.TagName
+        FROM Tags t
+        LIMIT 100
+    ) AS sub
+) nt
+ORDER BY ts.avg_score DESC
+LIMIT 20;

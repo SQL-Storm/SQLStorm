@@ -1,0 +1,77 @@
+-- {"query": "48035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 788} 
+
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC) as RowNum
+  FROM Posts AS p
+  WHERE
+    p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.AnswerCount IS NOT NULL
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    MAX(u.Reputation) AS MaxReputation,
+    AVG(u.Views) AS AvgUserViews
+  FROM Users AS u
+  LEFT JOIN PostHistory AS ph
+    ON u.Id = ph.UserId
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  LEFT JOIN Votes AS v
+    ON u.Id = v.UserId
+  GROUP BY
+    u.Id
+)
+SELECT
+  rp.Id AS QuestionId,
+  rp.Score AS QuestionScore,
+  rp.AnswerCount AS QuestionAnswerCount,
+  rp.CommentCount AS QuestionCommentCount,
+  rp.FavoriteCount AS QuestionFavoriteCount,
+  rp.ViewCount AS QuestionViewCount,
+  rp.CreationDate AS QuestionCreationDate,
+  rp.LastActivityDate AS QuestionLastActivityDate,
+  ua.PostHistoryCount,
+  ua.CommentCount AS UserCommentCount,
+  ua.VoteCount,
+  ua.MaxReputation,
+  ua.AvgUserViews,
+  CASE
+    WHEN rp.Score > 1000 THEN 'Very High Score'
+    WHEN rp.Score > 100 THEN 'High Score'
+    ELSE 'Moderate Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN rp.AnswerCount > 10 THEN 'Many Answers'
+    WHEN rp.AnswerCount > 0 THEN 'Some Answers'
+    ELSE 'No Answers'
+  END AS AnswerCountCategory,
+  CASE
+    WHEN rp.ViewCount > 100000 THEN 'Very High Views'
+    WHEN rp.ViewCount > 10000 THEN 'High Views'
+    ELSE 'Moderate Views'
+  END AS ViewCountCategory,
+  DATEDIFF(day, rp.CreationDate, GETDATE()) AS DaysSinceCreation,
+  DATEDIFF(day, rp.LastActivityDate, GETDATE()) AS DaysSinceLastActivity,
+  ua.PostHistoryCount * 1.0 / NULLIF(DATEDIFF(day, rp.CreationDate, GETDATE()), 0) AS AvgPostHistoryPerDay,
+  ua.CommentCount * 1.0 / NULLIF(DATEDIFF(day, rp.CreationDate, GETDATE()), 0) AS AvgCommentsPerDay,
+  ua.VoteCount * 1.0 / NULLIF(DATEDIFF(day, rp.CreationDate, GETDATE()), 0) AS AvgVotesPerDay
+FROM RankedPosts AS rp
+JOIN UserActivity AS ua
+  ON rp.OwnerUserId = ua.UserId
+WHERE
+  rp.RowNum <= 1000
+ORDER BY
+  rp.RowNum;

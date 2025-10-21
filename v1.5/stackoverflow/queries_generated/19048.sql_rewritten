@@ -1,0 +1,235 @@
+-- {"query": "19048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3054} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(C.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        MAX(PV.CreationDate) FILTER (WHERE PV.VoteTypeId = 2) AS LastUpvoteDate,
+        MAX(PV.CreationDate) FILTER (WHERE PV.VoteTypeId = 3) AS LastDownvoteDate,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        COALESCE(P.LastEditDate, P.CreationDate) AS EffectiveLastEditDate,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.CreationDate)) / (60*60*24)) AS DaysSincePostCreation,
+        CASE
+            WHEN P.PostTypeId = 1 THEN
+                ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'), 1)
+            ELSE 0
+        END AS TagCount
+    FROM
+        Posts P
+    LEFT JOIN
+        Votes PV ON P.Id = PV.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.Title, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId, P.ClosedDate, P.LastEditDate, P.Tags
+),
+ComplexQuestionAnalytics AS (
+    SELECT
+        PEM.PostId AS QuestionId,
+        PEM.Title AS QuestionTitle,
+        PEM.OwnerUserId,
+        PEM.PostCreationDate,
+        PEM.PostScore,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.PostCommentCount,
+        PEM.FavoriteCount,
+        PEM.AcceptedAnswerId,
+        PEM.ClosedDate,
+        PEM.TotalUpvotesReceived AS QuestionUpvotes,
+        PEM.TotalDownvotesReceived AS QuestionDownvotes,
+        PEM.EffectiveLastEditDate AS QuestionLastEditDate,
+        PEM.DaysSincePostCreation,
+        PEM.TagCount,
+        RANK() OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.PostScore DESC, PEM.PostCreationDate ASC) AS RankAmongUserQuestions,
+        COALESCE(
+            (SELECT MAX(C.Score) FROM Comments C WHERE C.PostId = PEM.PostId),
+            0
+        ) AS MaxCommentScore,
+        CASE
+            WHEN PEM.AnswerCount > 0 AND PEM.AcceptedAnswerId IS NULL THEN 'Unaccepted Answered'
+            WHEN PEM.AnswerCount = 0 THEN 'Unanswered'
+            WHEN PEM.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            ELSE 'No Answer Info'
+        END AS QuestionAnswerStatus,
+        (PEM.PostScore * 0.5 + PEM.ViewCount * 0.01 + PEM.FavoriteCount * 2 + PEM.TotalUpvotesReceived * 1.0) / (PEM.DaysSincePostCreation + 1 + 0.0001) AS PopularityIndex, -- Added small epsilon to avoid division by zero
+        LAG(PEM.PostScore, 1, 0) OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.PostCreationDate) AS PreviousQuestionScore,
+        LEAD(PEM.PostScore, 1, 0) OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.PostCreationDate) AS NextQuestionScore
+    FROM
+        PostEngagementMetrics PEM
+    WHERE
+        PEM.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - A.CreationDate)) / (60*60*24)) AS DaysSinceAnswerCreation,
+        ROW_NUMBER() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerRankInQuestion,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = A.OwnerUserId AND B.Name ILIKE '%Constituent%') THEN TRUE
+            ELSE FALSE
+        END AS IsAnswererEstablished
+    FROM
+        Posts A
+    WHERE
+        A.PostTypeId = 2
+)
+SELECT
+    Tmp.UserId,
+    Tmp.DisplayName,
+    Tmp.Reputation,
+    Tmp.TotalQuestionsCreated,
+    Tmp.TotalAnswersCreated,
+    Tmp.GoldBadges,
+    Tmp.QuestionId,
+    Tmp.QuestionTitle,
+    Tmp.PostCreationDate,
+    Tmp.QuestionScore,
+    Tmp.ViewCount,
+    Tmp.AnswerCount,
+    Tmp.FavoriteCount,
+    Tmp.QuestionAnswerStatus,
+    Tmp.PopularityIndex,
+    Tmp.MaxCommentScore,
+    Tmp.AcceptedAnswerId,
+    Tmp.AcceptedAnswerScore,
+    Tmp.AcceptedAnswerOwnerId,
+    Tmp.AcceptedAnswerOwnerDisplayName,
+    Tmp.AcceptedAnswerDaysOld,
+    Tmp.MostFrequentTag,
+    Tmp.MostFrequentTagUsage,
+    NTILE(10) OVER (ORDER BY Tmp.Reputation DESC, Tmp.PopularityIndex DESC NULLS LAST) AS UserQuestionReputationTier,
+    CASE
+        WHEN Tmp.QuestionId IS NOT NULL AND Tmp.ViewCount >= 1000 AND Tmp.QuestionScore >= 50 AND Tmp.FavoriteCount >= 5 THEN 'Highly Engaged Question'
+        WHEN Tmp.QuestionId IS NOT NULL AND Tmp.AnswerCount > 0 AND Tmp.AcceptedAnswerId IS NULL AND Tmp.DaysSincePostCreation > 30 THEN 'Stale Unaccepted Question'
+        WHEN Tmp.QuestionId IS NULL AND Tmp.TotalPostsCreated = 0 AND Tmp.TotalCommentsMade > 10 THEN 'Commentator User'
+        ELSE 'Regular Activity'
+    END AS UserQuestionProfileCategory,
+    Tmp.UserLocation,
+    Tmp.UserWebsite,
+    Tmp.AvgUserQuestionScore,
+    Tmp.UniqueEditorsCount,
+    Tmp.RecentCloseOrNoticeComments
+FROM (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalQuestionsCreated,
+        UAS.TotalAnswersCreated,
+        UAS.GoldBadges,
+        UAS.TotalCommentsMade, -- needed for CASE statement
+        CQA.QuestionId,
+        CQA.QuestionTitle,
+        CQA.PostCreationDate,
+        CQA.PostScore AS QuestionScore,
+        CQA.ViewCount,
+        CQA.AnswerCount,
+        CQA.FavoriteCount,
+        CQA.QuestionAnswerStatus,
+        CQA.PopularityIndex,
+        CQA.MaxCommentScore,
+        CQA.DaysSincePostCreation, -- needed for CASE statement
+        AD.AnswerId AS AcceptedAnswerId,
+        AD.AnswerScore AS AcceptedAnswerScore,
+        AD.AnswerOwnerUserId AS AcceptedAnswerOwnerId,
+        UAS_AA.DisplayName AS AcceptedAnswerOwnerDisplayName,
+        AD.DaysSinceAnswerCreation AS AcceptedAnswerDaysOld,
+        TA.TagName AS MostFrequentTag,
+        TA.TaggedPostsCount AS MostFrequentTagUsage,
+        COALESCE(UAS.Location, 'Unknown Location') AS UserLocation,
+        NULLIF(UAS.WebsiteUrl, '') AS UserWebsite,
+        (SELECT AVG(PostScore) FROM ComplexQuestionAnalytics WHERE OwnerUserId = UAS.UserId) AS AvgUserQuestionScore,
+        (SELECT COUNT(DISTINCT PH.UserId) FROM PostHistory PH WHERE PH.PostId = CQA.QuestionId AND PH.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(PHC.Comment FROM 1 FOR 50), '; ') FROM PostHistory PHC WHERE PHC.PostId = CQA.QuestionId AND PHC.Comment IS NOT NULL AND PHC.PostHistoryTypeId IN (10,33) LIMIT 3) AS RecentCloseOrNoticeComments,
+        COUNT(CQA.QuestionId) FILTER (WHERE CQA.QuestionAnswerStatus = 'Accepted') OVER (PARTITION BY UAS.UserId) AS UserAcceptedQuestionCount,
+        SUM(CQA.PopularityIndex) OVER (PARTITION BY UAS.UserId) AS UserTotalPopularityIndex
+    FROM
+        UserActivitySummary UAS
+    LEFT JOIN
+        ComplexQuestionAnalytics CQA ON UAS.UserId = CQA.OwnerUserId
+    LEFT JOIN
+        AnswerDetails AD ON CQA.AcceptedAnswerId = AD.AnswerId
+    LEFT JOIN
+        Users UAS_AA ON AD.AnswerOwnerUserId = UAS_AA.Id -- Join for Accepted Answer Owner Display Name
+    LEFT JOIN
+        (
+            SELECT
+                TR.OwnerUserId,
+                TR.TagName,
+                TR.TaggedPostsCount,
+                ROW_NUMBER() OVER (PARTITION BY TR.OwnerUserId ORDER BY TR.TaggedPostsCount DESC, TR.TagName ASC) as rn
+            FROM (
+                SELECT
+                    P.OwnerUserId,
+                    UPPER(TRIM(unnest(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')))) AS TagName,
+                    COUNT(P.Id) AS TaggedPostsCount
+                FROM
+                    Posts P
+                WHERE
+                    P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.OwnerUserId IS NOT NULL
+                GROUP BY
+                    P.OwnerUserId, UPPER(TRIM(unnest(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))))
+            ) TR
+        ) TA ON UAS.UserId = TA.OwnerUserId AND TA.rn = 1 -- Get most frequent tag for each user
+    WHERE
+        (UAS.Reputation > 1000 OR CQA.PostScore > 10) -- Complicated predicate 1
+        AND (CQA.QuestionTitle IS NOT NULL OR UAS.TotalPostsCreated > 0) -- NULL logic combined
+        AND (CQA.QuestionAnswerStatus = 'Accepted' OR CQA.AnswerCount = 0) -- Only accepted or unanswered questions
+        AND (UAS.UserCreationDate >= '2020-01-01' OR UAS.LastAccessDate >= '2023-01-01') -- Date filtering
+        AND (UAS.DisplayName LIKE 'A%' OR UAS.DisplayName ILIKE '%DEV%') -- String patterns, ILIKE for case-insensitivity
+        AND (AD.AnswerId IS NULL OR AD.AnswerScore > 0) -- NULL logic for accepted answer
+) Tmp
+WHERE
+    Tmp.UserAcceptedQuestionCount > 0
+    OR Tmp.UserTotalPopularityIndex > 100
+ORDER BY
+    UserQuestionReputationTier ASC,
+    Tmp.Reputation DESC,
+    Tmp.PopularityIndex DESC NULLS LAST
+LIMIT 1000;

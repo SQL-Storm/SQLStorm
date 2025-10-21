@@ -1,0 +1,64 @@
+-- {"query": "15070.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 165785, "output_tokens": 48718} 
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostQualityMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        DENSE_RANK() OVER (ORDER BY AVG(p.Score) DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    ubc.TotalBadges,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.BadgeRank,
+    pqm.AvgPostScore,
+    pqm.TotalVotes,
+    pqm.UpVotes,
+    pqm.DownVotes,
+    pqm.TotalViews,
+    pqm.ScoreRank,
+    CASE 
+        WHEN ubc.TotalBadges > 0 AND pqm.TotalVotes > 0 
+        THEN ROUND(pqm.AvgPostScore * LOG(ubc.TotalBadges) * LOG(pqm.TotalVotes), 2)
+        ELSE NULL 
+    END AS ComplexityScore,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id) AS TotalEdits
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN PostQualityMetrics pqm ON u.Id = pqm.OwnerUserId
+WHERE 
+    u.Reputation > 100 
+    AND (ubc.TotalBadges > 0 OR pqm.TotalVotes > 0)
+    AND (
+        EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id 
+            AND p.Score > 10
+        )
+    )
+ORDER BY ComplexityScore DESC NULLS LAST
+LIMIT 500;

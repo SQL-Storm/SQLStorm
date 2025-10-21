@@ -1,0 +1,105 @@
+-- {"query": "3013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 854} 
+WITH TagUsage AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COALESCE(p.Title, 'No Title') AS PostTitle,
+        p.PostTypeId,
+        p.CreationDate AS PostDate,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.CreationDate DESC) AS Rank
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+),
+ActiveUserReputation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LastActivityRank
+    FROM 
+        Users u
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        v.UserId,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId, v.VoteTypeId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM 
+        Votes v
+),
+PostAnswerCounts AS (
+    SELECT 
+        p.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        p.Id
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,6)) AS EditsCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory ph
+    GROUP BY 
+        ph.PostId
+),
+ComplexQuery AS (
+    SELECT
+        phs.PostId,
+        phs.EditsCount,
+        phs.LastEditDate,
+        tu.Reputation,
+        tu.DisplayName,
+        ar.LastAccessDate,
+        rv.VoteTypeId,
+        rv.CreationDate AS VoteDate,
+        pa.AnswerCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+        CASE WHEN p.FavoriteCount > 10 THEN TRUE ELSE FALSE END AS IsPopular
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistorySummary phs ON p.Id = phs.PostId
+    LEFT JOIN
+        TagUsage tu ON ',' || p.Tags || ',' LIKE '%,' || tu.TagName || ',%'
+    LEFT JOIN
+        ActiveUserReputation ar ON p.OwnerUserId = ar.UserId AND ar.LastActivityRank = 1
+    LEFT JOIN
+        RecentVotes rv ON p.Id = rv.PostId AND rv.VoteTypeId = 2 AND rv.VoteRank = 1
+    LEFT JOIN
+        PostAnswerCounts pa ON p.Id = pa.QuestionId
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND (p.Score > 0 OR p.FavoriteCount > 0 OR p.ViewCount > 100)
+        AND (p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year')
+)
+SELECT DISTINCT
+    cp.PostId,
+    cp.AnswerCount,
+    cp.Reputation,
+    cp.DisplayName,
+    cp.LastAccessDate,
+    cp.VoteTypeId,
+    cp.VoteDate,
+    cp.IsClosed,
+    cp.IsPopular,
+    ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS Tags,
+    MAX(cp.LastEditDate) OVER (PARTITION BY cp.PostId) AS LastActivity
+FROM
+    ComplexQuery cp
+LEFT JOIN
+    Tags t ON ',' || (SELECT Tags FROM Posts WHERE Id = cp.PostId) || ',' LIKE '%,' || t.TagName || ',%'
+GROUP BY
+    cp.PostId, cp.AnswerCount, cp.Reputation, cp.DisplayName, cp.LastAccessDate, cp.VoteTypeId, cp.VoteDate, cp.IsClosed, cp.IsPopular;

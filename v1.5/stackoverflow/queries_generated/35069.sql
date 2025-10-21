@@ -1,0 +1,67 @@
+-- {"query": "35069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 537} 
+WITH HighlyViewedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount >= (
+          SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ViewCount) FROM Posts WHERE PostTypeId = 1
+      )
+),
+TopContributors AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(p.Score) AS TotalScore,
+        COUNT(p.Id) AS NumPosts
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1,2)
+    WHERE u.CreationDate < NOW() - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+    HAVING SUM(p.Score) > 1000
+),
+TagPopularity AS (
+    SELECT
+        TRIM(BOTH '<>' FROM unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><'))) AS TagName,
+        COUNT(*) AS UsageCount
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    GROUP BY TagName
+),
+MostPopularTags AS (
+    SELECT TagName
+    FROM TagPopularity
+    ORDER BY UsageCount DESC
+    LIMIT 10
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.ViewCount,
+    q.CreationDate,
+    q.Score,
+    q.AnswerCount,
+    u.DisplayName AS QuestionOwner,
+    COUNT(DISTINCT a.Id) AS NumAnswersFromTopContributors,
+    ARRAY(
+        SELECT DISTINCT t.TagName
+        FROM MostPopularTags t
+        WHERE '<' || t.TagName || '>' = ANY(string_to_array(qp.Tags, '><'))
+    ) AS PopularTagsOnQuestion
+FROM HighlyViewedQuestions q
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN Posts qp ON q.QuestionId = qp.Id
+LEFT JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+LEFT JOIN TopContributors tc ON a.OwnerUserId = tc.UserId
+GROUP BY
+    q.QuestionId, q.Title, q.ViewCount, q.CreationDate, q.Score, q.AnswerCount, u.DisplayName, qp.Tags
+ORDER BY
+    q.ViewCount DESC,
+    q.Score DESC
+LIMIT 50;

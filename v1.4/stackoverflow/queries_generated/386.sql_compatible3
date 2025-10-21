@@ -1,0 +1,105 @@
+WITH
+-- basic user basis
+user_base AS (
+  SELECT u.Id AS user_id,
+         COALESCE(u.DisplayName, 'Unknown') AS display_name,
+         u.Reputation,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         u.CreationDate
+  FROM Users u
+),
+-- number of Gold badges per user
+user_gold_badges AS (
+  SELECT ub.user_id,
+         COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges
+  FROM user_base ub
+  LEFT JOIN Badges b ON b.UserId = ub.user_id
+  GROUP BY ub.user_id
+),
+-- last activity date per user (outer join to Posts)
+user_last_activity AS (
+  SELECT ub.user_id,
+         MAX(p.LastActivityDate) AS last_activity
+  FROM user_base ub
+  LEFT JOIN Posts p ON p.OwnerUserId = ub.user_id
+  GROUP BY ub.user_id
+),
+-- recent questions per user (last 30 days)
+user_recent_q AS (
+  SELECT ub.user_id,
+         COUNT(*) AS recent_questions
+  FROM user_base ub
+  LEFT JOIN Posts p ON p.OwnerUserId = ub.user_id
+       AND p.PostTypeId = 1
+       AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+  GROUP BY ub.user_id
+),
+-- per-user top question using a window function
+user_top_q AS (
+  SELECT user_id, top_question_id, top_question_title, top_question_score
+  FROM (
+    SELECT p.OwnerUserId AS user_id,
+           p.Id AS top_question_id,
+           p.Title AS top_question_title,
+           p.Score AS top_question_score,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) s
+  WHERE s.rn = 1
+),
+-- account age in days
+user_account_age AS (
+  SELECT ub.user_id,
+         FLOOR((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ub.CreationDate)) / 86400)) AS account_age_days
+  FROM user_base ub
+),
+-- correlated subquery example: recent posts in last 90 days per user
+correlated_subq AS (
+  SELECT ub.user_id,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ub.user_id AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days')) AS recent_posts_3m
+  FROM user_base ub
+),
+-- final aggregated view combining everything
+base_agg AS (
+  SELECT
+     ub.user_id,
+     ub.display_name,
+     ub.Reputation,
+     ub.Views,
+     ub.UpVotes,
+     ub.DownVotes,
+     COALESCE(ula.last_activity, ub.CreationDate) AS last_activity_date,
+     urq.recent_questions,
+     utq.top_question_id,
+     COALESCE(utq.top_question_title, '') AS top_question_title,
+     COALESCE(utq.top_question_score, 0) AS top_question_score,
+     COALESCE(ugb.gold_badges, 0) AS gold_badges,
+     COALESCE(uca.account_age_days, 0) AS account_age_days,
+     cs.recent_posts_3m,
+     (ub.Reputation * 3.0 + ub.UpVotes - ub.DownVotes + COALESCE(ugb.gold_badges, 0) * 5.0) AS composite_score,
+     CASE
+       WHEN ub.Views IS NULL THEN NULL
+       WHEN (ub.Reputation * 3.0 + ub.UpVotes - ub.DownVotes + COALESCE(ugb.gold_badges, 0) * 5.0) > 350 THEN 'Hyperactive'
+       WHEN (ub.Reputation * 3.0 + ub.UpVotes - ub.DownVotes + COALESCE(ugb.gold_badges, 0) * 5.0) > 200 THEN 'Active'
+       WHEN (ub.Reputation * 3.0 + ub.UpVotes - ub.DownVotes + COALESCE(ugb.gold_badges, 0) * 5.0) > 100 THEN 'Engaged'
+       ELSE 'Newbie'
+     END AS engagement_status,
+     (COALESCE(ub.display_name, 'Unknown') || ' | profile_age:' || COALESCE(uca.account_age_days::text, '0') || 'd | last:' ||
+      COALESCE(TO_CHAR(COALESCE(ula.last_activity, ub.CreationDate), 'YYYY-MM-DD'), 'none')) AS profile_summary
+  FROM user_base ub
+  LEFT JOIN user_last_activity ula ON ula.user_id = ub.user_id
+  LEFT JOIN user_recent_q urq ON urq.user_id = ub.user_id
+  LEFT JOIN user_top_q utq ON utq.user_id = ub.user_id
+  LEFT JOIN user_gold_badges ugb ON ugb.user_id = ub.user_id
+  LEFT JOIN user_account_age uca ON uca.user_id = ub.user_id
+  LEFT JOIN correlated_subq cs ON cs.user_id = ub.user_id
+)
+SELECT * FROM base_agg
+WHERE composite_score > 350
+UNION ALL
+SELECT * FROM base_agg
+WHERE composite_score <= 350
+ORDER BY composite_score DESC NULLS LAST, display_name ASC;

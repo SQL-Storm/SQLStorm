@@ -1,0 +1,194 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        e.DisplayName AS LastEditorDisplayName
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Users e ON p.LastEditorUserId = e.Id
+    WHERE
+        p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '6' MONTH)
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        COALESCE(ua.TotalPosts, 0) AS TotalPosts,
+        COALESCE(ua.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(ua.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ua.LastPostDate, u.CreationDate) AS LastPostDate,
+        COALESCE(ua.LastCommentDate, u.CreationDate) AS LastCommentDate,
+        COALESCE(ua.LastVoteDate, u.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        UserActivity ua ON u.Id = ua.UserId
+    WHERE
+        u.Reputation > 1000
+    ORDER BY
+        u.Reputation DESC
+    LIMIT 100
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        SUM(p.Score) AS TotalScore,
+        COUNT(p.Id) AS PostCount
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+    ORDER BY
+        PostCount DESC
+    LIMIT 50
+),
+PostHistoryStats AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryCreationDate,
+        ph.UserId AS EditorUserId,
+        ph.Comment,
+        ph.Text,
+        u.DisplayName AS EditorDisplayName
+    FROM
+        PostHistory ph
+    JOIN
+        Users u ON ph.UserId = u.Id
+    WHERE
+        ph.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1' MONTH)
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.LastActivityDate,
+    rp.Title,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.OwnerDisplayName,
+    rp.LastEditorDisplayName,
+    hr.UserId AS HighReputationUserId,
+    hr.Reputation AS HighReputation,
+    hr.DisplayName AS HighReputationDisplayName,
+    hr.LastAccessDate,
+    hr.TotalPosts,
+    hr.TotalQuestions,
+    hr.TotalAnswers,
+    hr.LastPostDate,
+    hr.LastCommentDate,
+    hr.LastVoteDate,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.TotalScore,
+    tt.PostCount,
+    phs.PostHistoryTypeId,
+    phs.HistoryCreationDate,
+    phs.EditorUserId,
+    phs.Comment AS HistoryComment,
+    phs.Text AS HistoryText,
+    phs.EditorDisplayName
+FROM
+    RecentPosts rp
+LEFT JOIN
+    HighReputationUsers hr ON rp.OwnerUserId = hr.UserId
+LEFT JOIN
+    TopTags tt ON rp.Tags LIKE CONCAT('%<', tt.TagName, '>%')
+LEFT JOIN
+    PostHistoryStats phs ON rp.PostId = phs.PostId
+GROUP BY
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.LastActivityDate,
+    rp.Title,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.OwnerDisplayName,
+    rp.LastEditorDisplayName,
+    hr.UserId,
+    hr.Reputation,
+    hr.DisplayName,
+    hr.LastAccessDate,
+    hr.TotalPosts,
+    hr.TotalQuestions,
+    hr.TotalAnswers,
+    hr.LastPostDate,
+    hr.LastCommentDate,
+    hr.LastVoteDate,
+    tt.TagName,
+    tt.Count,
+    tt.TotalScore,
+    tt.PostCount,
+    phs.PostHistoryTypeId,
+    phs.HistoryCreationDate,
+    phs.EditorUserId,
+    phs.Comment,
+    phs.Text,
+    phs.EditorDisplayName
+ORDER BY
+    rp.Score DESC,
+    rp.ViewCount DESC,
+    rp.LastActivityDate DESC
+LIMIT 1000;

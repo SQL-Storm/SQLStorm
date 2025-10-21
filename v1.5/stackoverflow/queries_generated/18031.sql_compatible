@@ -1,0 +1,108 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      CASE
+        WHEN p.FavoriteCount IS NULL THEN 0
+        ELSE p.FavoriteCount
+      END AS FavoriteCount,
+      DATEDIFF(day, p.CreationDate, TIMESTAMP '2024-10-01 12:34:56') AS AgeInDays,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH)
+  ),
+  TopCommenters AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS CommentCount
+    FROM Comments
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(Id) > 100
+  ),
+  UserReputation AS (
+    SELECT
+      Id,
+      Reputation,
+      DisplayName,
+      CASE
+        WHEN Location IS NULL THEN 'Unknown'
+        ELSE Location
+      END AS UserLocation
+    FROM Users
+    WHERE
+      Reputation > 50000
+  ),
+  QuestionEngagement AS (
+    SELECT
+      pq.Id AS QuestionId,
+      COUNT(DISTINCT pc.Id) AS CommentCount,
+      SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN pv.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount
+    FROM Posts pq
+    LEFT JOIN Comments pc
+      ON pq.Id = pc.PostId
+    LEFT JOIN Votes pv
+      ON pq.Id = pv.PostId
+    WHERE
+      pq.PostTypeId = 1
+    GROUP BY
+      pq.Id
+  )
+SELECT
+  rq.Id AS QuestionId,
+  rq.Title,
+  ur.DisplayName AS OwnerDisplayName,
+  ur.UserLocation,
+  ur.Reputation,
+  rq.Score,
+  rq.AnswerCount,
+  rq.FavoriteCount,
+  rq.AgeInDays,
+  qe.CommentCount AS QuestionComments,
+  qe.UpVoteCount AS QuestionUpVotes,
+  qe.DownVoteCount AS QuestionDownVotes,
+  qe.FavoriteVoteCount AS QuestionFavorites,
+  COALESCE(tc.CommentCount, 0) AS TopCommenterActivity,
+  CASE
+    WHEN rq.Score > 100 AND rq.AnswerCount > 10 THEN 'High Engagement'
+    WHEN rq.Score > 20 AND rq.AnswerCount > 2 THEN 'Medium Engagement'
+    ELSE 'Low Engagement'
+  END AS EngagementLevel,
+  CASE
+    WHEN rq.Title LIKE '%[?%]%' THEN 'Contains Question Mark Char'
+    WHEN POSITION('<' IN rq.Title) > 0 THEN 'Contains Angle Bracket'
+    ELSE 'Standard Title'
+  END AS TitleCharacteristic,
+  CASE
+    WHEN EXISTS(
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId = rq.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate Link'
+    ELSE 'Not Duplicate Link'
+  END AS LinkStatus
+FROM RecentQuestions rq
+LEFT JOIN UserReputation ur
+  ON rq.OwnerUserId = ur.Id
+LEFT JOIN QuestionEngagement qe
+  ON rq.Id = qe.QuestionId
+LEFT JOIN TopCommenters tc
+  ON rq.OwnerUserId = tc.UserId
+WHERE
+  rq.rn BETWEEN 1 AND 500
+ORDER BY
+  rq.Score DESC,
+  rq.CreationDate DESC;

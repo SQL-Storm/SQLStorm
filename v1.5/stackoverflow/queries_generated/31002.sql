@@ -1,0 +1,56 @@
+-- {"query": "31002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 408} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(c.Id) AS CommentCount,
+        u.Reputation AS OwnerReputation,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, u.Reputation
+),
+TopPosts AS (
+    SELECT 
+        rp.* 
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.PostRank <= 10
+)
+SELECT 
+    tp.PostId,
+    tp.Title,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.CommentCount,
+    tp.OwnerReputation,
+    pt.Name AS PostType,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    ARRAY_AGG(DISTINCT CONCAT(t.TagName, ': ', t.Count)) AS TagsSummary
+FROM 
+    TopPosts tp
+LEFT JOIN 
+    PostTypes pt ON tp.PostTypeId = pt.Id
+LEFT JOIN 
+    Votes v ON tp.PostId = v.PostId AND v.VoteTypeId IN (2, 3)  -- Upvotes and downvotes
+LEFT JOIN 
+    PostsTags ptg ON tp.PostId = ptg.PostId
+LEFT JOIN 
+    Tags t ON ptg.TagId = t.Id
+GROUP BY 
+    tp.PostId, tp.Title, tp.CreationDate, tp.Score, tp.ViewCount, tp.CommentCount, tp.OwnerReputation, pt.Name
+ORDER BY 
+    tp.Score DESC, tp.CreationDate DESC;

@@ -1,0 +1,246 @@
+WITH UserBase AS (
+    SELECT
+        Id AS UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes AS UserUpVotesGiven,
+        DownVotes AS UserDownVotesGiven,
+        CreationDate,
+        LastAccessDate,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - CreationDate)) / (60*60*24) AS AccountAgeDays
+    FROM Users
+    WHERE Reputation >= 10000 AND Views >= 500
+),
+AggregatedPosts AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN P.Id END) AS QuestionsWithAcceptedAnswer,
+        COUNT(CASE WHEN P.PostTypeId = 2 AND P_Accepted.Id IS NOT NULL THEN P.Id END) AS AnswersAcceptedByOthers,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P_Accepted.Id IS NOT NULL THEN P.Score ELSE 0 END) AS ScoreOnAcceptedAnswers,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts
+    FROM Posts P
+    LEFT JOIN Posts P_Accepted ON P.Id = P_Accepted.AcceptedAnswerId AND P_Accepted.PostTypeId = 1
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+AggregatedComments AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScore,
+        AVG(C.Score) AS AvgCommentScore
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+AggregatedBadges AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+AggregatedVotesReceived AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesReceived
+    FROM Votes V
+    JOIN Posts P ON V.PostId = P.Id
+    WHERE P.OwnerUserId IS NOT NULL AND V.VoteTypeId IN (2, 3, 5)
+    GROUP BY P.OwnerUserId
+),
+AggregatedPostHistory AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsByOwner,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalTimesClosed,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalTimesReopened,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS TotalTimesDeleted,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS TotalTimesUndeleted,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 11, 12, 13) THEN PH.PostId END) AS UniquePostsWithLifecycleEvents
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+RankedTagContributions AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(Tags) AS TagName,
+        COUNT(P.Id) AS TagPostCount
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substr(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName
+    ) AS gt
+    JOIN (
+        SELECT DISTINCT TagName FROM (
+            SELECT UNNEST(string_to_array(substr(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName
+        ) AS x
+    ) AS T2 ON TRUE
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL
+    GROUP BY P.OwnerUserId, TagName
+),
+DominantTags AS (
+    SELECT
+        RTC.UserId,
+        RTC.TagName AS DominantTagName,
+        RTC.TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY RTC.UserId ORDER BY RTC.TagPostCount DESC, RTC.TagName) AS rn
+    FROM RankedTagContributions RTC
+),
+CombinedUserMetrics AS (
+    SELECT
+        UB.UserId,
+        UB.DisplayName,
+        UB.Reputation,
+        UB.AccountAgeDays,
+        COALESCE(AP.TotalQuestionsAsked, 0) AS TotalQuestionsAsked,
+        COALESCE(AP.TotalAnswersPosted, 0) AS TotalAnswersPosted,
+        COALESCE(AP.AnswersAcceptedByOthers, 0) AS AnswersAcceptedByOthers,
+        COALESCE(AP.ScoreOnAcceptedAnswers, 0) AS ScoreOnAcceptedAnswers,
+        COALESCE(AC.TotalCommentsMade, 0) AS TotalCommentsMade,
+        COALESCE(AB.GoldBadges, 0) AS GoldBadges,
+        COALESCE(AB.SilverBadges, 0) AS SilverBadges,
+        COALESCE(AB.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ARV.UpVotesReceived, 0) AS UpVotesReceived,
+        COALESCE(ARV.DownVotesReceived, 0) AS DownVotesReceived,
+        COALESCE(ARV.FavoritesReceived, 0) AS FavoritesReceived,
+        COALESCE(APH.TotalEditsByOwner, 0) AS TotalEditsByOwner,
+        COALESCE(APH.TotalTimesClosed, 0) AS TotalTimesClosed,
+        COALESCE(APH.TotalTimesReopened, 0) AS TotalTimesReopened,
+        DT.DominantTagName,
+        DT.TagPostCount AS DominantTagPosts
+    FROM UserBase UB
+    LEFT JOIN AggregatedPosts AP ON UB.UserId = AP.UserId
+    LEFT JOIN AggregatedComments AC ON UB.UserId = AC.UserId
+    LEFT JOIN AggregatedBadges AB ON UB.UserId = AB.UserId
+    LEFT JOIN AggregatedVotesReceived ARV ON UB.UserId = ARV.UserId
+    LEFT JOIN AggregatedPostHistory APH ON UB.UserId = APH.UserId
+    LEFT JOIN DominantTags DT ON UB.UserId = DT.UserId AND DT.rn = 1
+),
+FinalUserRanking AS (
+    SELECT
+        CUM.*,
+        (
+            (CUM.Reputation * 0.01) +
+            (CUM.TotalQuestionsAsked * 0.5) +
+            (CUM.TotalAnswersPosted * 0.7) +
+            (CUM.AnswersAcceptedByOthers * 1.5) +
+            (CUM.ScoreOnAcceptedAnswers * 0.05) +
+            (CUM.UpVotesReceived * 0.02) -
+            (CUM.DownVotesReceived * 0.03) +
+            (CUM.FavoritesReceived * 0.1) +
+            (CUM.TotalCommentsMade * 0.1) +
+            (CUM.GoldBadges * 10) +
+            (CUM.SilverBadges * 5) +
+            (CUM.BronzeBadges * 1) +
+            (CUM.TotalEditsByOwner * 0.05) -
+            (CUM.TotalTimesClosed * 0.2) +
+            (CUM.TotalTimesReopened * 0.3) +
+            (COALESCE(CUM.DominantTagPosts, 0) * 0.01) +
+            (CUM.AccountAgeDays * 0.001)
+        ) AS UserImpactScore,
+        NTILE(10) OVER (ORDER BY (
+            (CUM.Reputation * 0.01) +
+            (CUM.TotalQuestionsAsked * 0.5) +
+            (CUM.TotalAnswersPosted * 0.7) +
+            (CUM.AnswersAcceptedByOthers * 1.5) +
+            (CUM.ScoreOnAcceptedAnswers * 0.05) +
+            (CUM.UpVotesReceived * 0.02) -
+            (CUM.DownVotesReceived * 0.03) +
+            (CUM.FavoritesReceived * 0.1) +
+            (CUM.TotalCommentsMade * 0.1) +
+            (CUM.GoldBadges * 10) +
+            (CUM.SilverBadges * 5) +
+            (CUM.BronzeBadges * 1) +
+            (CUM.TotalEditsByOwner * 0.05) -
+            (CUM.TotalTimesClosed * 0.2) +
+            (CUM.TotalTimesReopened * 0.3) +
+            (COALESCE(CUM.DominantTagPosts, 0) * 0.01) +
+            (CUM.AccountAgeDays * 0.001)
+        ) DESC) AS ImpactScoreDecile
+    FROM CombinedUserMetrics CUM
+    WHERE CUM.TotalQuestionsAsked > 0 OR CUM.TotalAnswersPosted > 0
+)
+SELECT
+    FUR.UserId,
+    FUR.DisplayName,
+    FUR.Reputation,
+    FUR.UserImpactScore,
+    FUR.ImpactScoreDecile,
+    FUR.TotalQuestionsAsked,
+    FUR.TotalAnswersPosted,
+    FUR.AnswersAcceptedByOthers,
+    FUR.GoldBadges,
+    FUR.SilverBadges,
+    FUR.BronzeBadges,
+    FUR.DominantTagName,
+    FUR.DominantTagPosts,
+    FUR.UpVotesReceived,
+    FUR.DownVotesReceived,
+    FUR.FavoritesReceived,
+    FUR.TotalEditsByOwner,
+    FUR.TotalTimesClosed,
+    FUR.TotalTimesReopened,
+    PQ.Title AS TopQuestionTitle,
+    PQ.Score AS TopQuestionScore,
+    PQ.ViewCount AS TopQuestionViews,
+    PA.Title AS TopAnswerTitle,
+    PA.Score AS TopAnswerScore,
+    PL.RelatedPostId AS MostRecentLinkedPost,
+    PL.CreationDate AS MostRecentLinkDate,
+    T.TagName AS TagWithHighestViewsForUser
+FROM FinalUserRanking FUR
+LEFT JOIN LATERAL (
+    SELECT P.Title, P.Score, P.ViewCount
+    FROM Posts P
+    WHERE P.OwnerUserId = FUR.UserId AND P.PostTypeId = 1
+    ORDER BY P.Score DESC, P.ViewCount DESC
+    LIMIT 1
+) AS PQ ON TRUE
+LEFT JOIN LATERAL (
+    SELECT P.Title, P.Score
+    FROM Posts P
+    WHERE P.OwnerUserId = FUR.UserId AND P.PostTypeId = 2
+    ORDER BY P.Score DESC
+    LIMIT 1
+) AS PA ON TRUE
+LEFT JOIN LATERAL (
+    SELECT PL.RelatedPostId, PL.CreationDate
+    FROM PostLinks PL
+    WHERE PL.PostId IN (
+        SELECT P.Id
+        FROM Posts P
+        WHERE P.OwnerUserId = FUR.UserId AND P.PostTypeId IN (1,2)
+        ORDER BY P.CreationDate DESC
+        LIMIT 10
+    )
+    ORDER BY PL.CreationDate DESC
+    LIMIT 1
+) AS PL ON TRUE
+LEFT JOIN LATERAL (
+    SELECT T.TagName
+    FROM Posts P_T
+    JOIN UNNEST(string_to_array(substr(P_T.Tags, 2, length(P_T.Tags)-2), '><')) AS TagName_UNNEST ON TRUE
+    JOIN Tags T ON TagName_UNNEST = T.TagName
+    WHERE P_T.OwnerUserId = FUR.UserId AND P_T.PostTypeId = 1
+    GROUP BY T.TagName
+    ORDER BY SUM(P_T.ViewCount) DESC
+    LIMIT 1
+) AS T ON TRUE
+WHERE FUR.ImpactScoreDecile IN (1, 2)
+ORDER BY FUR.UserImpactScore DESC, FUR.Reputation DESC
+LIMIT 200;

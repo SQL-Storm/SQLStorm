@@ -1,0 +1,183 @@
+-- {"query": "7078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2299} 
+WITH
+-- recent activity: last 180 days posts with some computed metrics
+RecentPosts AS (
+  SELECT p.*,
+         -- normalize tags into array like '<tag1><tag2>' -> array['tag1','tag2']
+         CASE WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+              ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') END AS tag_array,
+         COALESCE(p.Score,0) + COALESCE(p.ViewCount,0)/1000.0 AS crude_popularity,
+         ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY COALESCE(p.LastActivityDate,p.CreationDate) DESC) AS rn_by_type
+  FROM Posts p
+  WHERE COALESCE(p.LastActivityDate,p.CreationDate) >= now() - INTERVAL '180 days'
+),
+-- aggregate votes and comments per post, with conditional aggregates and NULL handling
+PostEngagement AS (
+  SELECT v.PostId,
+         COUNT(*) AS total_votes,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         MIN(v.CreationDate) AS first_vote_date,
+         MAX(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  WHERE v.CreationDate >= now() - INTERVAL '365 days'
+  GROUP BY v.PostId
+),
+PostCommentStats AS (
+  SELECT c.PostId,
+         COUNT(*) AS comment_count,
+         SUM(CASE WHEN c.Score IS NULL THEN 0 ELSE c.Score END) AS comment_score_sum,
+         MAX(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  GROUP BY c.PostId
+),
+-- user derived metrics: recency, badge diversity, and activity windows
+UserActivity AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         COALESCE(u.Views,0) AS Views,
+         COALESCE(u.UpVotes,0) AS UpVotes,
+         COALESCE(u.DownVotes,0) AS DownVotes,
+         COUNT(DISTINCT b.Name) FILTER (WHERE b.Date >= now() - INTERVAL '365 days') AS recent_badge_types,
+         COUNT(b.Id) FILTER (WHERE b.Date >= now() - INTERVAL '365 days') AS recent_badge_count,
+         MAX(b.Date) AS last_badge_date,
+         -- engagement ratio: posts authored in last year / (1 + days since creation)
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= now() - INTERVAL '365 days')::float
+            / GREATEST(1, EXTRACT(DAY FROM now() - u.CreationDate)) AS posts_per_day_since_signup
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+-- top tags per post using unnest, including fuzzy length and null-safe calculations
+PostTags AS (
+  SELECT rp.Id AS PostId,
+         lower(trim(tag)) AS tag,
+         array_length(rp.tag_array,1) AS tag_count,
+         regexp_replace(lower(trim(tag)),'[^a-z0-9_+-]','','g') AS norm_tag
+  FROM RecentPosts rp
+  CROSS JOIN LATERAL unnest(rp.tag_array) AS tag
+  WHERE rp.tag_array IS NOT NULL AND array_length(rp.tag_array,1) > 0
+),
+-- compute tag popularity and correlations to post scores using window functions
+TagStats AS (
+  SELECT pt.norm_tag,
+         COUNT(DISTINCT pt.PostId) AS posts_with_tag,
+         AVG(COALESCE(rp.Score,0)) AS avg_score_for_tag,
+         SUM(COALESCE(pe.upvotes,0)) AS tag_upvotes_sum,
+         RANK() OVER (ORDER BY COUNT(DISTINCT pt.PostId) DESC) AS tag_pop_rank
+  FROM PostTags pt
+  JOIN RecentPosts rp ON rp.Id = pt.PostId
+  LEFT JOIN PostEngagement pe ON pe.PostId = rp.Id
+  GROUP BY pt.norm_tag
+),
+-- correlated subquery to find for each question the "most relevant" answer by a composite score
+BestAnswers AS (
+  SELECT q.Id AS QuestionId,
+         a.Id AS AnswerId,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerDate,
+         pe.upvotes AS AnswerUpvotes,
+         pe.downvotes AS AnswerDownvotes,
+         -- composite answer score includes recency penalty and vote balance
+         (COALESCE(a.Score,0) * 2.0 + COALESCE(pe.upvotes,0) - COALESCE(pe.downvotes,0)
+           - GREATEST(0, EXTRACT(EPOCH FROM (now() - a.CreationDate))/86400.0) * 0.01) AS composite_answer_score,
+         ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY
+           (COALESCE(a.Score,0) * 2.0 + COALESCE(pe.upvotes,0) - COALESCE(pe.downvotes,0)
+           - GREATEST(0, EXTRACT(EPOCH FROM (now() - a.CreationDate))/86400.0) * 0.01) DESC,
+           a.Score DESC,
+           pe.upvotes DESC) AS rk
+  FROM Posts q
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN PostEngagement pe ON pe.PostId = a.Id
+  WHERE q.PostTypeId = 1
+),
+-- assemble a complex ranking combining post popularity, engagement, tag influence, and owner activity
+RankedPosts AS (
+  SELECT rp.Id,
+         rp.PostTypeId,
+         rp.Title,
+         rp.OwnerUserId,
+         rp.crude_popularity,
+         COALESCE(pe.total_votes,0) AS total_votes,
+         COALESCE(pc.comment_count,0) AS comment_count,
+         COALESCE(ts.avg_score_for_tag, (SELECT AVG(Score) FROM Posts WHERE Posts.PostTypeId = rp.PostTypeId)) AS local_tag_avg_score,
+         ua.recent_badge_count,
+         ua.posts_per_day_since_signup,
+         -- complex score mixing many signals with NULL-safe math and CASE expressions
+         (
+           LEAST(100.0, GREATEST(0.0, rp.crude_popularity))
+           + LOG(GREATEST(1.0, COALESCE(pe.total_votes,0))) * 2.0
+           + COALESCE(pc.comment_count,0) * 0.5
+           + COALESCE(ts.avg_score_for_tag,0) * 1.5
+           + CASE WHEN ua.posts_per_day_since_signup > 0.01 THEN 5 ELSE 0 END
+           - CASE WHEN rp.PostTypeId = 1 AND rp.ClosedDate IS NOT NULL THEN 20 ELSE 0 END
+         ) AS composite_rank_score,
+         -- string expression showing top 3 tags concatenated
+         (SELECT string_agg(distinct pt.norm_tag, ',' ORDER BY COUNT(*) DESC)
+            FROM PostTags pt WHERE pt.PostId = rp.Id
+            GROUP BY pt.PostId
+            LIMIT 1) AS top_tags
+  FROM RecentPosts rp
+  LEFT JOIN PostEngagement pe ON pe.PostId = rp.Id
+  LEFT JOIN PostCommentStats pc ON pc.PostId = rp.Id
+  LEFT JOIN (
+    SELECT pt.PostId, AVG(ts.avg_score_for_tag) AS avg_score_for_tag
+    FROM PostTags pt
+    JOIN TagStats ts ON ts.norm_tag = pt.norm_tag
+    GROUP BY pt.PostId
+  ) ts ON ts.PostId = rp.Id
+  LEFT JOIN UserActivity ua ON ua.Id = rp.OwnerUserId
+),
+-- final result: combine questions and their best answers, tag trends, and deltas
+Final AS (
+  SELECT rp.*,
+         ba.AnswerId,
+         ba.composite_answer_score,
+         ts.tag_pop_rank,
+         -- detect anomalies with NULL logic and set operators (EXCEPT used to find tags present in top tag list but not in global top N)
+         (SELECT COUNT(*) FROM (
+             SELECT DISTINCT norm_tag FROM PostTags WHERE PostId = rp.Id
+             EXCEPT
+             SELECT norm_tag FROM TagStats WHERE tag_pop_rank <= 50
+          ) s) AS rare_tag_count,
+         CASE
+           WHEN rp.PostTypeId = 1 AND rp.AnswerCount IS NOT NULL AND rp.AnswerCount > 0 THEN
+             (COALESCE(ba.composite_answer_score,0) / GREATEST(1.0, rp.AnswerCount))
+           ELSE NULL
+         END AS answer_power_per_answer
+  FROM RankedPosts rp
+  LEFT JOIN BestAnswers ba ON ba.QuestionId = rp.Id AND ba.rk = 1
+  LEFT JOIN LATERAL (
+    SELECT MIN(tag_pop_rank) AS tag_pop_rank
+    FROM PostTags pt JOIN TagStats ts2 ON ts2.norm_tag = pt.norm_tag
+    WHERE pt.PostId = rp.Id
+  ) ts ON true
+)
+-- output a rich selection ordered to stress sorting, grouping, and windowing
+SELECT f.Id AS post_id,
+       f.PostTypeId,
+       COALESCE(f.Title, '(no title)') AS title,
+       f.OwnerUserId,
+       COALESCE(f.top_tags, '') AS top_tags,
+       f.crude_popularity,
+       f.total_votes,
+       f.comment_count,
+       f.recent_badge_count,
+       ROUND(f.composite_rank_score::numeric,3) AS composite_rank_score,
+       f.AnswerId,
+       ROUND(COALESCE(f.composite_answer_score,0)::numeric,3) AS best_answer_score,
+       f.rare_tag_count,
+       ROUND(COALESCE(f.answer_power_per_answer,0)::numeric,4) AS answer_power_per_answer,
+       -- dense rank to exercise window function over composite score with partitioning and tie handling
+       DENSE_RANK() OVER (PARTITION BY f.PostTypeId ORDER BY f.composite_rank_score DESC) AS dense_rank_by_type,
+       -- percentile rank to stress window percentile approximation
+       PERCENT_RANK() OVER (PARTITION BY f.PostTypeId ORDER BY f.composite_rank_score DESC) AS pct_rank_by_type
+FROM Final f
+WHERE f.composite_rank_score IS NOT NULL
+  AND (f.crude_popularity > 0 OR f.total_votes > 0 OR f.comment_count > 0)
+ORDER BY f.composite_rank_score DESC NULLS LAST, f.total_votes DESC
+LIMIT 250;

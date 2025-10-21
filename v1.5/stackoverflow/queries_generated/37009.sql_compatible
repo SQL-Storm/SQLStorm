@@ -1,0 +1,172 @@
+WITH
+TagActivity AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    COALESCE(EXP(SUM(LOG(GREATEST(1.0, LEAST(1000.0, p.ViewCount + 1))))) OVER (PARTITION BY t.Id ORDER BY p.CreationDate ROWS BETWEEN 365 PRECEDING AND CURRENT ROW), 0) AS ViewSignal,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Tags t
+  LEFT JOIN Posts p ON p.PostTypeId IN (1,2) AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+  GROUP BY t.Id, t.TagName, t.Count
+),
+UserTagImpact AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    ta.TagId,
+    ta.TagName,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+    SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastAnswerDate
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+  JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+  JOIN TagActivity ta ON q.Tags LIKE CONCAT('%<', ta.TagName, '>%')
+  LEFT JOIN Votes v ON v.PostId = p.Id
+    AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+  GROUP BY u.Id, u.DisplayName, ta.TagId, ta.TagName
+),
+UserTagScore AS (
+  SELECT
+    uti.*,
+    (GREATEST(0, COALESCE(AnswersProvided,0)) * 1.5
+     + GREATEST(0, COALESCE(AcceptedCount,0)) * 5
+     + GREATEST(0, COALESCE(UpVotesReceived,0)) * 0.8
+     - GREATEST(0, COALESCE(DownVotesReceived,0)) * 1.2
+     + COALESCE(AvgAnswerScore,0) * 2
+     + CASE WHEN LastAnswerDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' THEN 10 ELSE 0 END
+    ) * LOG(GREATEST(1.0, 1 + COALESCE(AnswersProvided,0)) ) AS CompositeScore
+  FROM UserTagImpact uti
+),
+TopContributors AS (
+  SELECT DISTINCT ON (TagId)
+    TagId,
+    TagName,
+    UserId,
+    DisplayName,
+    CompositeScore,
+    AnswersProvided,
+    AcceptedCount,
+    UpVotesReceived,
+    DownVotesReceived,
+    AvgAnswerScore,
+    LastAnswerDate
+  FROM UserTagScore
+  ORDER BY TagId, CompositeScore DESC
+),
+TagTrends AS (
+  SELECT
+    ta.TagId,
+    ta.TagName,
+    ta.Count,
+    ta.ViewSignal,
+    ta.QuestionCount,
+    ta.AnswerCount,
+    ta.LastActivity,
+    COALESCE(recent.QRecent,0) AS QuestionsRecent30d,
+    COALESCE(hist.QHistAvg,1) AS Questions30dAvgPrevYears,
+    CASE
+      WHEN COALESCE(hist.QHistAvg,0) = 0 THEN NULL
+      ELSE (COALESCE(recent.QRecent,0)::numeric / NULLIF(COALESCE(hist.QHistAvg,0),0)) - 1
+    END AS QuestionGrowthRate
+  FROM TagActivity ta
+  LEFT JOIN (
+    SELECT
+      t.Id AS TagId,
+      COUNT(q.Id) FILTER (WHERE q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days') AS QRecent
+    FROM Tags t
+    LEFT JOIN Posts q ON q.PostTypeId = 1 AND q.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.Id
+  ) recent ON recent.TagId = ta.TagId
+  LEFT JOIN (
+    SELECT
+      t.Id AS TagId,
+      AVG(cnt) AS QHistAvg
+    FROM (
+      SELECT
+        t2.Id,
+        DATE_TRUNC('day', q2.CreationDate) - (INTERVAL '1 day' * (EXTRACT(doy FROM q2.CreationDate)::int % 365)) AS Dummy,
+        COUNT(q2.Id) FILTER (WHERE q2.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days' * gs.n - INTERVAL '30 days' AND q2.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days' * gs.n) AS cnt
+      FROM generate_series(1,3) AS gs(n)
+      CROSS JOIN Tags t2
+      LEFT JOIN Posts q2 ON q2.PostTypeId = 1 AND q2.Tags LIKE CONCAT('%<', t2.TagName, '>%') AND q2.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days' * gs.n - INTERVAL '30 days' AND q2.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days' * gs.n
+      GROUP BY t2.Id, gs.n
+    ) sub
+    GROUP BY TagId
+  ) hist ON hist.TagId = ta.TagId
+),
+HotTagNetwork AS (
+  SELECT
+    tt.TagId,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.ViewSignal,
+    tt.QuestionGrowthRate,
+    tc.UserId AS TopUserId,
+    tc.DisplayName AS TopUser,
+    tc.CompositeScore AS TopUserScore,
+    hotQ.Id AS HotQuestionId,
+    hotQ.Title AS HotQuestionTitle,
+    hotQ.Score AS HotQuestionScore,
+    hotQ.ViewCount AS HotQuestionViews,
+    hotQ.CreationDate AS HotQuestionCreation,
+    dupLinks.DuplicateCount,
+    linked.RelatedLinkCount
+  FROM TagTrends tt
+  LEFT JOIN TopContributors tc ON tc.TagId = tt.TagId
+  LEFT JOIN LATERAL (
+    SELECT p.*
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags LIKE CONCAT('%<', tt.TagName, '>%')
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    ORDER BY (p.Score * 0.6 + p.ViewCount * 0.0005 + COALESCE(p.FavoriteCount,0) * 2) DESC
+    LIMIT 1
+  ) hotQ ON true
+  LEFT JOIN (
+    SELECT pl.PostId, COUNT(*) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+  ) dupLinks ON dupLinks.PostId = COALESCE(hotQ.Id, -1)
+  LEFT JOIN (
+    SELECT pl.PostId, COUNT(*) AS RelatedLinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+  ) linked ON linked.PostId = COALESCE(hotQ.Id, -1)
+)
+SELECT
+  htn.TagId,
+  htn.TagName,
+  htn.TagCount,
+  ROUND(htn.ViewSignal::numeric,2) AS ViewSignal,
+  ROUND(COALESCE(htn.QuestionGrowthRate,0)::numeric,4) AS QuestionGrowthRate,
+  htn.TopUserId,
+  htn.TopUser,
+  ROUND(htn.TopUserScore::numeric,2) AS TopUserScore,
+  htn.HotQuestionId,
+  LEFT(htn.HotQuestionTitle, 120) AS HotQuestionTitle,
+  htn.HotQuestionScore,
+  htn.HotQuestionViews,
+  htn.HotQuestionCreation,
+  COALESCE(htn.DuplicateCount,0) AS DuplicateLinks,
+  COALESCE(htn.RelatedLinkCount,0) AS RelatedLinks,
+  COALESCE(bd.BadgesLastYear,0) AS TopUserBadgesLastYear,
+  ROW_NUMBER() OVER (ORDER BY (COALESCE(htn.QuestionGrowthRate,0) * 8 + LEAST(100, COALESCE(htn.ViewSignal,0)) * 0.02 + COALESCE(htn.TopUserScore,0) * 0.15) DESC) AS RankByHotness
+FROM HotTagNetwork htn
+LEFT JOIN LATERAL (
+  SELECT COUNT(b.Id) AS BadgesLastYear
+  FROM Badges b
+  WHERE b.UserId = htn.TopUserId
+    AND b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+) bd ON true
+ORDER BY RankByHotness
+LIMIT 200;

@@ -1,0 +1,80 @@
+-- {"query": "54048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1757} 
+WITH UserPosts AS (
+    SELECT u.Id                                     AS UserId,
+           u.Reputation,
+           u.DisplayName,
+           p.Id                                     AS PostId,
+           p.PostTypeId,
+           p.Title,
+           p.Tags,
+           p.CreationDate,
+           COALESCE(v.VoteTypeId, 0)                 AS VoteTypeId
+    FROM Users      u
+    JOIN Posts      p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v  ON v.PostId = p.Id
+    WHERE p.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+),
+UserStats AS (
+    SELECT UserId,
+           SUM(CASE WHEN PostTypeId = 1 THEN 1 END)            AS QCount,
+           SUM(CASE WHEN PostTypeId = 2 THEN 1 END)            AS ACount,
+           SUM(CASE WHEN PostTypeId = 1 THEN Score END)        AS QScore,
+           SUM(CASE WHEN PostTypeId = 2 THEN Score END)        AS AScore,
+           SUM(CASE WHEN VoteTypeId = 1 THEN 1 END)            AS AcceptedAnswers,
+           COUNT(DISTINCT CASE WHEN VoteTypeId IN (2,3) THEN PostId END) AS NetVoters
+    FROM UserPosts
+    GROUP BY UserId
+),
+TagUsage AS (
+    SELECT UserId,
+           TagName,
+           COUNT(*)                                    AS TagCount
+    FROM UserPosts
+    CROSS APPLY STRING_SPLIT(REPLACE(Tags,'<',''), '><') AS tags(TagName)
+    WHERE TagName <> ''
+    GROUP BY UserId, TagName
+),
+TopTags AS (
+    SELECT UserId,
+           STRING_AGG(TagName, ', ') WITHIN GROUP (ORDER BY TagCount DESC) AS TagList
+    FROM TagUsage
+    GROUP BY UserId
+),
+BadgeCounts AS (
+    SELECT UserId,
+           COUNT(*)                                      AS TotalBadges,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+),
+CommentStats AS (
+    SELECT UserId,
+           COUNT(*) AS CommentCount
+    FROM Comments
+    WHERE CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY UserId
+)
+SELECT u.DisplayName,
+       u.Reputation,
+       us.QCount,
+       us.ACount,
+       us.QScore,
+       us.AScore,
+       us.AcceptedAnswers,
+       us.NetVoters,
+       bc.TotalBadges,
+       bc.Gold,
+       bc.Silver,
+       bc.Bronze,
+       COALESCE(tt.TagList, '') AS TrendingTags,
+       COALESCE(cs.CommentCount, 0) AS RecentComments
+FROM Users u
+JOIN UserStats us ON us.UserId = u.Id
+LEFT JOIN TopTags tt  ON tt.UserId  = u.Id
+LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+LEFT JOIN CommentStats cs ON cs.UserId = u.Id
+ORDER BY us.AcceptedAnswers DESC,
+         u.Reputation DESC,
+         us.AScore DESC;

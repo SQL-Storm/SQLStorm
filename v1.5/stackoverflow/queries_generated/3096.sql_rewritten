@@ -1,0 +1,130 @@
+-- {"query": "3096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1034} 
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS QuestionsCount,
+        COUNT(DISTINCT A.Id) AS AnswersCount,
+        COUNT(DISTINCT C.Id) AS CommentsCount,
+        MAX(U.LastAccessDate) OVER (PARTITION BY U.Id) AS LastActive
+    FROM Users U
+    LEFT JOIN Posts P ON P.OwnerUserId = U.Id AND P.PostTypeId = 1
+    LEFT JOIN Posts A ON A.OwnerUserId = U.Id AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON C.UserId = U.Id
+),
+QuestionAnswerLinks AS (
+    SELECT
+        QA.Id AS AnswerId,
+        QA.ParentId AS QuestionId,
+        Q.Title AS QuestionTitle,
+        QA.CreationDate AS AnswerCreationDate,
+        QA.Score AS AnswerScore,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Title AS QuestionTitle,
+        ROW_NUMBER() OVER (PARTITION BY QA.ParentId ORDER BY QA.CreationDate DESC) AS AnswerRank
+    FROM Posts QA
+    INNER JOIN Posts Q ON QA.ParentId = Q.Id
+    WHERE QA.PostTypeId = 2 AND Q.PostTypeId = 1
+),
+RecentComments AS (
+    SELECT
+        C.Id AS CommentId,
+        C.PostId,
+        C.UserId,
+        C.Text,
+        C.CreationDate,
+        U.DisplayName AS CommenterName
+    FROM Comments C
+    LEFT JOIN Users U ON C.UserId = U.Id
+    WHERE C.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+PostTagRanking AS (
+    SELECT
+        TagName,
+        COUNT(*) AS TagCount,
+        MAX(CreationDate) AS LastUsed
+    FROM (
+        SELECT
+            unnest(string_to_array(trim(both '<>' FROM P.Tags), '><')) AS TagName,
+            P.CreationDate
+        FROM Posts P
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    ) AS TagDetails
+    GROUP BY TagName
+),
+ComplexPostAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.Body,
+        P.Score,
+        P.ViewCount,
+        P.Tags,
+        P.CreationDate,
+        P.LastActivityDate,
+        COALESCE(VC.Count, 0) AS VoteCount,
+        COUNT(CD.Id) FILTER (WHERE CD.PostId = P.Id) AS CommentCount,
+        CASE
+            WHEN P.PostTypeId = 1 THEN 'Question'
+            WHEN P.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        NC.QuestionTitle AS RelatedQuestionTitle,
+        NAnswer.AnswerScore AS LatestAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY P.LastActivityDate DESC) AS ActivityRank
+    FROM Posts P
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS Count
+        FROM Votes
+        GROUP BY PostId
+    ) VC ON VC.PostId = P.Id
+    LEFT JOIN Comments C ON C.PostId = P.Id
+    LEFT JOIN (
+        SELECT P2.Id, P2.Title AS QuestionTitle, P2.CreationDate
+        FROM Posts P2 WHERE P2.PostTypeId = 1
+    ) NC ON P.PostTypeId = 1 AND NC.Id = P.Id
+    LEFT JOIN (
+        SELECT A.ParentId, A.Score AS AnswerScore
+        FROM Posts A
+        WHERE A.PostTypeId = 2
+    ) NAnswer ON NAnswer.ParentId = P.Id
+    LEFT JOIN Comments CD ON CD.PostId = P.Id
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.QuestionsCount,
+    UA.AnswersCount,
+    UA.CommentsCount,
+    UA.LastActive,
+    PRA.PostId,
+    PRA.Title,
+    PRA.Body,
+    PRA.Score,
+    PRA.ViewCount,
+    PRA.Tags,
+    PRA.CreationDate,
+    PRA.LastActivityDate,
+    PRA.VoteCount,
+    PRA.CommentCount,
+    PRA.PostType,
+    PRA.RelatedQuestionTitle,
+    PRA.LatestAnswerScore,
+    TLR.TagName,
+    TLR.TagCount,
+    TLR.LastUsed,
+    RComments.CommentId,
+    RComments.UserId AS CommentUserId,
+    RComments.CommenterName,
+    RComments.Text AS CommentText,
+    RComments.CreationDate AS CommentDate
+FROM UserActivity UA
+LEFT JOIN ComplexPostAnalysis PRA ON TRUE
+LEFT JOIN PostTagRanking TLR ON TLR.TagName = ANY(string_to_array(trim(both '<>' FROM PRA.Tags), '><'))
+LEFT JOIN RecentComments RComments ON RComments.PostId = PRA.PostId
+WHERE
+    UA.UserId IS NOT NULL
+ORDER BY
+LAST_ACTIVE DESC, UA.UserId;

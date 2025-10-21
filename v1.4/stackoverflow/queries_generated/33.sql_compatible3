@@ -1,0 +1,45 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  AVG(COALESCE(v.BountyAmount, 0)) AS AvgBounty,
+  MAX(p.CreationDate) AS LastPostDate,
+  MAX(CASE WHEN pv.VoteTypeId = 2 THEN pv.CreationDate END) AS LastUpvoteDate,
+  SUM(CASE WHEN pv.VoteTypeId IN (2,14,16) THEN 1 ELSE 0 END) AS UpvoteCount,
+  SUM(CASE WHEN pv.VoteTypeId IN (3,10) THEN 1 ELSE 0 END) AS DownvoteCount,
+  STRING_AGG(DISTINCT tt.Name, ',') AS TopVoteTypes,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount
+FROM
+  Users AS u
+  LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes AS pv ON pv.PostId = p.Id AND pv.UserId = u.Id
+  LEFT JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+  LEFT JOIN PostHistory AS ph ON ph.PostId = p.Id
+  LEFT JOIN (
+    SELECT Id, Name FROM VoteTypes
+  ) AS vt ON pv.VoteTypeId = vt.Id
+  LEFT JOIN (
+    SELECT Id, Name FROM PostHistoryTypes
+  ) AS sh ON ph.PostHistoryTypeId = sh.Id
+  LEFT JOIN (
+    SELECT Id, Name FROM Tags
+  ) AS t ON t.Id = p.Tags
+  LEFT JOIN (
+    SELECT Id, Name FROM Tags
+  ) AS tt ON tt.Id = p.Tags
+WHERE
+  u.Reputation > 100 AND
+  p.Id IS NOT NULL
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation
+HAVING
+  COUNT(DISTINCT p.Id) > 5
+ORDER BY
+  LastPostDate DESC,
+  u.Reputation DESC
+LIMIT 100;

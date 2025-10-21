@@ -1,0 +1,102 @@
+WITH RECURSIVE TagTree AS (
+    SELECT t.Id, t.TagName, 0 AS depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    UNION ALL
+    SELECT t.Id, t.TagName, tt.depth + 1
+    FROM Tags t
+    JOIN TagTree tt ON t.TagName LIKE tt.TagName || '-%'
+),
+TagQuestions AS (
+    SELECT 
+        p.Id               AS QuestionId,
+        q.Tags,
+        q.CreationDate    AS QCreated,
+        q.Score           AS QScore,
+        q.OwnerUserId     AS QOwner,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Posts q ON q.Id = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+ExplodedTags AS (
+    SELECT
+        tq.QuestionId,
+        TRIM(BOTH '><' FROM UNNEST(string_to_array(SUBSTRING(tq.Tags, 2, LENGTH(tq.Tags)-2), '><'))) AS Tag
+    FROM TagQuestions tq
+),
+UserAnswers AS (
+    SELECT
+        a.OwnerUserId                               AS UserId,
+        et.Tag,
+        COUNT(*)                                    AS AnswerCount,
+        AVG(a.Score)                                AS AvgScore,
+        MAX(a.CreationDate)                         AS LastAnswerDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteSum,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteSum,
+        ROW_NUMBER() OVER (PARTITION BY et.Tag ORDER BY AVG(a.Score) DESC, COUNT(*) DESC) AS TagRank
+    FROM Posts a
+    JOIN ExplodedTags et ON et.QuestionId = a.ParentId
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId IN (2,3)
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId, et.Tag
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentDuplicateInfo AS (
+    SELECT
+        pl.PostId AS QuestionId,
+        pl.RelatedPostId AS DuplicateOf,
+        ph.CreationDate AS ClosedOn,
+        CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostLinks pl
+    JOIN PostHistory ph ON ph.PostId = pl.PostId
+    WHERE pl.LinkTypeId = 3
+      AND ph.PostHistoryTypeId = 10
+)
+SELECT
+    tt.TagName                            AS Tag,
+    ua.UserId,
+    u.DisplayName,
+    u.Reputation,
+    ua.AnswerCount,
+    ROUND(ua.AvgScore,2)                  AS AvgScore,
+    ua.LastAnswerDate,
+    ua.UpVoteSum,
+    ua.DownVoteSum,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(rd.DuplicateOf, -1)          AS DuplicateOfQuestionId,
+    rd.ClosedOn,
+    CASE 
+        WHEN rd.CloseReasonId IS NULL THEN 'Unknown'
+        ELSE cr.Name
+    END                                   AS CloseReason
+FROM UserAnswers ua
+JOIN Users u ON u.Id = ua.UserId
+LEFT JOIN UserBadges ub ON ub.UserId = ua.UserId
+LEFT JOIN TagTree tt ON tt.TagName = ua.Tag
+LEFT JOIN RecentDuplicateInfo rd ON rd.QuestionId = (
+        SELECT q.Id
+        FROM Posts q
+        WHERE q.PostTypeId = 1
+          AND q.Tags LIKE '%' || '<' || tt.TagName || '>' || '%'
+        ORDER BY q.CreationDate DESC
+        LIMIT 1
+    ) AND rd.rn = 1
+LEFT JOIN CloseReasonTypes cr ON cr.Id = rd.CloseReasonId
+WHERE ua.TagRank <= 5
+  AND ua.AnswerCount >= 10
+GROUP BY tt.TagName, ua.UserId, u.DisplayName, u.Reputation, ua.AnswerCount, ua.LastAnswerDate, ua.UpVoteSum, ua.DownVoteSum, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, rd.DuplicateOf, rd.ClosedOn, rd.CloseReasonId, cr.Name
+ORDER BY tt.TagName, ua.TagRank;

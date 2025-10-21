@@ -1,0 +1,103 @@
+-- {"query": "3006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1015} 
+WITH RECURSIVE AnswerHierarchy AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.Body
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2 -- Answers
+), QuestionAnswerCounts AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.Tags,
+        COUNT(a.AnswerId) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS UpvotedAnswers,
+        SUM(CASE WHEN a.Score < 0 THEN 1 ELSE 0 END) AS DownvotedAnswers
+    FROM Posts q
+    LEFT JOIN AnswerHierarchy a ON q.Id = a.ParentId
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 -- Questions
+    GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.OwnerDisplayName, q.Tags
+), RecentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.Comment
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+), CloseReopenHistory AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        ph.Comment,
+        tc.Name AS CloseReason
+    FROM PostHistory ph
+    LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes tc ON CAST(ph.Comment AS INTEGER) = tc.Id
+    WHERE pht.Name IN ('Post Closed', 'Post Reopened')
+), UserParticipations AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsPosted,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswersPosted,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgesEarned
+    FROM Users u
+), TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+), FinalResult AS (
+    SELECT
+        qac.QuestionId,
+        qac.Title,
+        qac.CreationDate,
+        qac.OwnerDisplayName,
+        qac.Tags,
+        qac.AnswerCount,
+        qac.AvgAnswerScore,
+        qac.MaxAnswerScore,
+        qac.UpvotedAnswers,
+        qac.DownvotedAnswers,
+        ARRAY_AGG(DISTINCT re.EditorDisplayName || ' (' || re.EditDate::text || ')') FILTER (WHERE re.PostId IS NOT NULL) AS RecentEditors,
+        ARRAY_AGG(DISTINCT cr.CloseReason || ' at ' || cr.CreationDate::text) FILTER (WHERE cr.PostId IS NOT NULL) AS CloseReopenActivities,
+        UP.QuestionsPosted,
+        UP.AnswersPosted,
+        UP.CommentsMade,
+        UP.BadgesEarned
+    FROM QuestionAnswerCounts qac
+    LEFT JOIN RecentEdits re ON qac.QuestionId = re.PostId
+    LEFT JOIN CloseReopenHistory cr ON qac.QuestionId = cr.PostId
+    LEFT JOIN UserParticipations UP ON qac.OwnerUserId = UP.UserId
+    GROUP BY qac.QuestionId, qac.Title, qac.CreationDate, qac.OwnerDisplayName, qac.Tags, UP.QuestionsPosted, UP.AnswersPosted, UP.CommentsMade, UP.BadgesEarned
+)
+SELECT * FROM FinalResult
+WHERE AnswerCount >= 5
+  AND EXISTS (
+      SELECT 1 FROM TopTags tt WHERE position(',' || tt.TagName || ',' IN ',' || FinalResult.Tags || ',') > 0 AND tt.TagRank <= 10
+  )
+ORDER BY QuestionCreationDate DESC
+LIMIT 100;

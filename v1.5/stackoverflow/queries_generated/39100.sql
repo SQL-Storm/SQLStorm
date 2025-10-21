@@ -1,0 +1,113 @@
+-- {"query": "39100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 2196} 
+
+WITH
+-- recent questions from the last year, exploded by tag
+RecentQuestions AS (
+    SELECT
+        p.Id                      AS QuestionId,
+        p.OwnerUserId             AS OwnerUserId,
+        p.CreationDate            AS QuestionDate,
+        p.Score                   AS QuestionScore,
+        p.ViewCount               AS QuestionViews,
+        unnest(
+            string_to_array(
+                substring(p.Tags, 2, length(p.Tags) - 2),
+                '><'
+            )
+        )                        AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= now() - interval '1 year'
+),
+
+-- aggregated answer statistics per question
+AnswerStats AS (
+    SELECT
+        a.ParentId               AS QuestionId,
+        COUNT(*)                 AS AnswerCount,
+        AVG(a.Score)             AS AvgAnswerScore,
+        MAX(a.Score)             AS MaxAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+
+-- aggregated comment statistics per question over the last year
+CommentsStats AS (
+    SELECT
+        c.PostId                 AS QuestionId,
+        COUNT(*)                 AS CommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= now() - interval '1 year'
+    GROUP BY c.PostId
+),
+
+-- basic user activity measures
+UserActivity AS (
+    SELECT
+        u.Id                      AS UserId,
+        u.DisplayName             AS UserName,
+        u.Reputation              AS Reputation,
+        COUNT(DISTINCT rq.QuestionId) AS QuestionsAsked,
+        COUNT(v.*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesCast
+    FROM Users u
+    LEFT JOIN RecentQuestions rq
+        ON rq.OwnerUserId = u.Id
+    LEFT JOIN Votes v
+        ON v.UserId = u.Id
+           AND v.CreationDate >= now() - interval '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- count of tag‑based badges earned by authors of recent questions, per tag
+TagBadges AS (
+    SELECT
+        rq.Tag                   AS Tag,
+        COUNT(b.Id)              AS TagBadgeCount
+    FROM RecentQuestions rq
+    JOIN Badges b
+      ON b.UserId = rq.OwnerUserId
+     AND b.TagBased = TRUE
+    GROUP BY rq.Tag
+),
+
+-- rank tags by question volume and aggregate all stats
+RankedTags AS (
+    SELECT
+        rq.Tag,
+        COUNT(DISTINCT rq.QuestionId)                AS QuestionCount,
+        SUM(coalesce(as_.AnswerCount,0))             AS TotalAnswers,
+        ROUND(AVG(coalesce(as_.AvgAnswerScore,0)),2)  AS AvgAnswerScore,
+        MAX(coalesce(as_.MaxAnswerScore,0))           AS TopAnswerScore,
+        SUM(coalesce(rq.QuestionViews,0))            AS TotalViews,
+        SUM(coalesce(cs.CommentCount,0))             AS TotalComments,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT rq.QuestionId) DESC) AS TagRank
+    FROM RecentQuestions rq
+    LEFT JOIN AnswerStats as_ ON as_.QuestionId = rq.QuestionId
+    LEFT JOIN CommentsStats cs ON cs.QuestionId = rq.QuestionId
+    GROUP BY rq.Tag
+)
+
+SELECT
+    rt.Tag,
+    rt.TagRank,
+    rt.QuestionCount,
+    rt.TotalAnswers,
+    rt.AvgAnswerScore,
+    rt.TopAnswerScore,
+    rt.TotalComments,
+    rt.TotalViews,
+    tb.TagBadgeCount,
+    ua.QuestionsAsked,
+    ua.UpVotesCast,
+    ua.Reputation,
+    DENSE_RANK() OVER (ORDER BY rt.TotalViews DESC) AS ViewPopularityRank
+FROM RankedTags rt
+LEFT JOIN TagBadges tb
+  ON tb.Tag = rt.Tag
+LEFT JOIN RecentQuestions rq
+  ON rq.Tag = rt.Tag
+LEFT JOIN UserActivity ua
+  ON ua.UserId = rq.OwnerUserId
+WHERE rt.TagRank <= 25
+ORDER BY rt.TagRank;

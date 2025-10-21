@@ -1,0 +1,79 @@
+-- {"query": "1049.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 497} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS Rank
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '1 year'
+),
+TopPosts AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.ViewCount,
+        rp.Score,
+        rp.OwnerDisplayName
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.Rank <= 5
+),
+PostComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM 
+        Comments c
+    GROUP BY 
+        c.PostId
+),
+FinalResults AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.CreationDate,
+        tp.ViewCount,
+        tp.Score,
+        tp.OwnerDisplayName,
+        COALESCE(pc.CommentCount, 0) AS CommentCount,
+        COALESCE(pc.AvgCommentScore, 0) AS AvgCommentScore
+    FROM 
+        TopPosts tp
+    LEFT JOIN 
+        PostComments pc ON tp.PostId = pc.PostId
+)
+SELECT 
+    fr.PostId,
+    fr.Title,
+    fr.CreationDate,
+    fr.ViewCount,
+    fr.Score,
+    fr.OwnerDisplayName,
+    fr.CommentCount,
+    fr.AvgCommentScore,
+    CASE 
+        WHEN fr.Score > 0 THEN 'Positive'
+        WHEN fr.Score < 0 THEN 'Negative'
+        ELSE 'Neutral'
+    END AS Sentiment,
+    ARRAY_AGG(DISTINCT c.Text) FILTER (WHERE c.PostId IS NOT NULL) AS RecentComments
+FROM 
+    FinalResults fr
+LEFT JOIN 
+    Comments c ON fr.PostId = c.PostId AND c.CreationDate > NOW() - INTERVAL '1 month'
+GROUP BY 
+    fr.PostId, fr.Title, fr.CreationDate, fr.ViewCount, fr.Score, fr.OwnerDisplayName
+ORDER BY 
+    fr.Score DESC, fr.Title;

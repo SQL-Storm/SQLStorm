@@ -1,0 +1,68 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Body, 
+        p.OwnerUserId, 
+        p.CreationDate, 
+        p.LastActivityDate,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS post_rank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+post_activity AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Body, 
+        p.OwnerUserId, 
+        p.CreationDate, 
+        p.LastActivityDate,
+        CASE 
+            WHEN DATE_DIFF(p.LastActivityDate, p.CreationDate) < 30 THEN 'Recent'
+            WHEN DATE_DIFF(p.LastActivityDate, p.CreationDate) >= 30 AND DATE_DIFF(p.LastActivityDate, p.CreationDate) < 90 THEN 'Intermediate'
+            ELSE 'Mature'
+        END AS activity_level
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    cte.Id, 
+    cte.Title, 
+    cte.Body, 
+    cte.OwnerUserId, 
+    cte.CreationDate, 
+    cte.LastActivityDate,
+    COALESCE(pa.activity_level, 'New') AS activity_level,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = cte.Id AND v.VoteTypeId IN (2, 3)
+    ) AS vote_count,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c
+        WHERE c.PostId = cte.Id
+    ) AS comment_count,
+    CONCAT(
+        CAST(ROUND(
+            CAST(COALESCE(u.UpVotes, 0) AS FLOAT)
+            / GREATEST(
+                CAST(COALESCE(u.UpVotes, 0) AS FLOAT)
+                + CAST(COALESCE(u.DownVotes, 0) AS FLOAT),
+                1.0
+            ), 2) * 100 AS VARCHAR(10)
+        ), '%'
+    ) AS upvote_ratio
+FROM cte
+LEFT JOIN post_activity pa ON cte.Id = pa.Id
+LEFT JOIN Users u ON cte.OwnerUserId = u.Id
+GROUP BY
+    cte.Id,
+    cte.Title,
+    cte.Body,
+    cte.OwnerUserId,
+    cte.CreationDate,
+    cte.LastActivityDate,
+    pa.activity_level
+ORDER BY cte.post_rank;

@@ -1,0 +1,116 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+top_contributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+tag_buckets AS (
+  SELECT
+    t.TagName AS Tag,
+    COUNT(*) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.Score) AS AvgScore
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId
+  WHERE t.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+complex_metrics AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.ViewCount,
+    rq.Score,
+    rq.CommentCount,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    pc.TotalEdits,
+    pc.LastEditor,
+    pc.Closed,
+    pc.ClosedReason,
+    RANK() OVER (PARTITION BY rq.OwnerUserId ORDER BY rq.LastActivityDate DESC) AS OwnerActivityRank,
+    CASE
+      WHEN rq.ViewCount > 1000 THEN 'Heavy'
+      WHEN rq.ViewCount BETWEEN 100 AND 1000 THEN 'Medium'
+      ELSE 'Light'
+    END AS EngagementBand
+  FROM recent_questions rq
+  LEFT JOIN (
+    SELECT
+      ph.PostId,
+      COUNT(*) AS TotalEdits,
+      MAX(ph.UserDisplayName) AS LastEditor,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS Closed,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS VARCHAR(100)) ELSE NULL END) AS ClosedReason
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+  ) pc ON pc.PostId = rq.PostId
+  LEFT JOIN (
+    SELECT
+      p.Id,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS Closed
+    FROM Posts p
+  ) cl ON cl.Id = rq.PostId
+),
+final_selection AS (
+  SELECT
+    cq.PostId,
+    cq.Title,
+    cq.Tags,
+    cq.CreationDate,
+    cq.ViewCount,
+    cq.Score,
+    cq.CommentCount,
+    cq.AnswerCount,
+    cq.FavoriteCount,
+    cq.TotalEdits,
+    cq.LastEditor,
+    cq.Closed,
+    cq.ClosedReason,
+    cq.OwnerActivityRank,
+    cq.EngagementBand,
+    u.DisplayName AS OwnerDisplayName,
+    v.TotalVotes
+  FROM complex_metrics cq
+  LEFT JOIN Users u ON u.Id = cq.PostId  -- adjusted to join by owner; replaced subquery to reference OwnerUserId via Post
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = cq.PostId
+  ORDER BY cq.LastActivityDate DESC
+)
+SELECT *
+FROM final_selection
+WHERE EngagementBand IN ('Heavy', 'Medium')
+  AND OwnerActivityRank <= 5
+  AND TotalVotes >= 5
+OFFSET 0 ROWS
+FETCH NEXT 50 ROWS ONLY;

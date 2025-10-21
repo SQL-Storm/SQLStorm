@@ -1,0 +1,228 @@
+WITH RecentPostUpdates AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4,5,6,10,14,16)
+),
+LatestPostComments AS (
+    SELECT
+        c.PostId,
+        c.CreationDate,
+        c.UserId,
+        c.UserDisplayName,
+        c.Text,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM
+        Comments c
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+QuestionsWithHighAnswerScore AS (
+    SELECT
+        tq.Id AS QuestionId,
+        tq.Title,
+        tq.Tags,
+        tq.Score,
+        tq.ViewCount,
+        tq.CreationDate,
+        tq.OwnerUserId,
+        tq.AnswerCount,
+        tq.CommentCount,
+        tq.FavoriteCount
+    FROM
+        TopQuestions tq
+    WHERE
+        tq.AnswerCount > (SELECT AVG(AnswerCount) FROM TopQuestions)
+),
+PopularTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rank
+    FROM
+        Tags t
+    WHERE
+        t.IsModeratorOnly = 0
+),
+TagRelations AS (
+    SELECT
+        tt1.TagName AS TagA,
+        tt2.TagName AS TagB,
+        COUNT(*) AS LinkCount
+    FROM
+        Posts p1
+        JOIN Posts p2 ON p1.Id = p2.ParentId
+        JOIN LATERAL unnest(string_to_array(substr(p1.Tags, 2, char_length(p1.Tags) - 2), '><')) AS t1(TagName) ON TRUE
+        JOIN LATERAL unnest(string_to_array(substr(p2.Tags, 2, char_length(p2.Tags) - 2), '><')) AS t2(TagName) ON TRUE
+        JOIN Tags tt1 ON tt1.TagName = t1.TagName
+        JOIN Tags tt2 ON tt2.TagName = t2.TagName
+    GROUP BY
+        TagA, TagB
+),
+MostPopularTags AS (
+    SELECT
+        TagName,
+        Count,
+        ROW_NUMBER() OVER (ORDER BY Count DESC) AS rank
+    FROM
+        Tags
+),
+AnswerCommentAnalysis AS (
+    SELECT
+        c.UserId,
+        c.UserDisplayName,
+        AVG(CASE WHEN c.Comment LIKE '%thank%' OR c.Comment LIKE '%thanks%' THEN 1.0 ELSE 0.0 END) OVER () AS AvgThankComments,
+        COUNT(*) AS TotalComments,
+        COUNT(*) FILTER (WHERE c.Text ILIKE '%bug%' OR c.Text ILIKE '%error%') AS BugRelatedComments
+    FROM
+        Comments c
+    WHERE
+        c.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 2)
+    GROUP BY
+        c.UserId, c.UserDisplayName
+),
+AnswerVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes v
+    WHERE
+        v.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 2)
+    GROUP BY
+        v.PostId
+),
+ActiveUsers AS (
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.EmailHash
+    FROM
+        Users u
+    WHERE
+        u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+)
+SELECT
+    rp.PostId,
+    rp.CreationDate AS PostCreated,
+    uc.DisplayName AS OwnerName,
+    t.Tags,
+    laut.Comment AS LatestPostComment,
+    hp.Title AS QuestionTitle,
+    hr.TypeName AS LastChangeType,
+    last_hot.Comment AS LastComment
+FROM
+    Posts p
+    LEFT JOIN Users uc ON p.OwnerUserId = uc.Id
+    LEFT JOIN (
+        SELECT
+            p.*,
+            ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+        FROM
+            Posts p
+    ) rp ON p.Id = rp.Id AND rp.rn = 1
+    LEFT JOIN LATERAL (
+        SELECT
+            c.Text,
+            c.CreationDate
+        FROM
+            Comments c
+        WHERE
+            c.PostId = p.Id
+        ORDER BY
+            c.CreationDate DESC
+        LIMIT 1
+    ) laut ON TRUE
+    LEFT JOIN (
+        SELECT
+            t.*
+        FROM
+            Tags t
+        WHERE
+            t.TagName IN (SELECT unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')))
+    ) t ON TRUE
+    LEFT JOIN (
+        SELECT
+            ph.*
+        FROM
+            PostHistory ph
+        WHERE
+            ph.PostId = p.Id AND ph.PostHistoryTypeId = 4
+        ORDER BY
+            ph.CreationDate DESC
+        LIMIT 1
+    ) hr ON TRUE
+    LEFT JOIN (
+        SELECT
+            ph.*
+        FROM
+            PostHistory ph
+        WHERE
+            ph.PostId = p.Id AND ph.PostHistoryTypeId = 11
+        ORDER BY
+            ph.CreationDate DESC
+        LIMIT 1
+    ) hl ON TRUE
+    LEFT JOIN (
+        SELECT
+            ph.*
+        FROM
+            PostHistory ph
+        WHERE
+            ph.PostId = p.Id AND ph.PostHistoryTypeId = 52
+        ORDER BY
+            ph.CreationDate DESC
+        LIMIT 1
+    ) last_hot ON TRUE
+JOIN
+    Posts q ON p.AcceptedAnswerId = q.Id
+LEFT JOIN
+    Votes v ON q.Id = v.PostId
+LEFT JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN
+    Users u ON v.UserId = u.Id
+WHERE
+    p.PostTypeId = 1
+    AND EXISTS (
+        SELECT 1
+        FROM
+            PostLinks pl
+        WHERE
+            pl.PostId = p.Id AND pl.LinkTypeId = 3
+    )
+ORDER BY
+    p.CreationDate DESC
+LIMIT 100;

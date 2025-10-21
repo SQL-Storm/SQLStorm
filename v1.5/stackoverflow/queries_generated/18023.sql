@@ -1,0 +1,134 @@
+-- {"query": "18023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1436} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+      AVG(CAST(c.Score AS DECIMAL(10, 2))) OVER (PARTITION BY p.ParentId) AS AvgCommentScoreOnQuestionAnswers,
+      COUNT(c.Id) OVER (PARTITION BY p.ParentId) AS TotalCommentsOnQuestionAnswers,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS PreviousAnswerScore
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+    GROUP BY
+      p.Id,
+      p.ParentId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate
+  ),
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditorsOfQuestion,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ClosedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.QuestionOwnerUserId,
+  ua.DisplayName AS QuestionOwnerDisplayName,
+  qs.QuestionCreationDate,
+  qs.ViewCount,
+  qs.AnswerCount,
+  qs.FavoriteCount,
+  qs.IsClosed,
+  qs.DistinctEditorsOfQuestion,
+  qs.CloseVoteCount,
+  ra.AnswerRank,
+  ra.OwnerUserId AS AnswerOwnerUserId,
+  ua_ans.DisplayName AS AnswerOwnerDisplayName,
+  ra.Score AS AnswerScore,
+  ra.CreationDate AS AnswerCreationDate,
+  ra.AvgCommentScoreOnQuestionAnswers,
+  ra.TotalCommentsOnQuestionAnswers,
+  ra.PreviousAnswerScore,
+  CASE
+    WHEN qs.ViewCount > 10000 AND ra.AnswerRank = 1 AND qs.IsClosed = 0 THEN 'High Traffic, Top Answered, Open'
+    WHEN qs.ViewCount > 5000 AND qs.FavoriteCount > 50 AND qs.AnswerCount > 10 THEN 'Popular Question'
+    WHEN ra.AnswerRank > 1 AND ra.Score > 0 AND ra.PreviousAnswerScore > ra.Score THEN 'Underrated Answer'
+    WHEN qs.CloseVoteCount > 5 AND qs.IsClosed = 0 THEN 'Potential Closure Candidate'
+    WHEN ua.Reputation < 1000 AND ua_ans.Reputation < 1000 AND ra.AnswerScore > 10 THEN 'Newcomer Success'
+    WHEN qs.QuestionCreationDate < DATE('now', '-1 year') AND qs.AnswerCount = 0 THEN 'Old Unanswered Question'
+    WHEN qs.FavoriteCount IS NULL OR qs.FavoriteCount = 0 THEN 'Not Favorited'
+    WHEN ua.BadgeCount > 10 THEN 'Highly Decorated User'
+    ELSE 'Standard Case'
+  END AS PerformanceCategory,
+  (
+    ua.Reputation * 1.0 + ua_ans.Reputation * 1.0
+  ) / (
+    ra.AnswerScore + 1
+  ) AS ReputationToAnswerScoreRatio,
+  UPPER(SUBSTRING(qs.Title, 1, 3)) AS TitlePrefix,
+  CASE
+    WHEN LOWER(qs.Title) LIKE '%sql%' THEN 'SQL Related'
+    WHEN LOWER(qs.Title) LIKE '%performance%' THEN 'Performance Focused'
+    ELSE 'Other Topic'
+  END AS TopicCategory,
+  COALESCE(ua.LastAccessDate, qs.QuestionCreationDate) AS LastRelevantActivity
+FROM QuestionStats AS qs
+JOIN RankedAnswers AS ra
+  ON qs.QuestionId = ra.QuestionId
+LEFT JOIN UserActivity AS ua
+  ON qs.QuestionOwnerUserId = ua.UserId
+LEFT JOIN UserActivity AS ua_ans
+  ON ra.OwnerUserId = ua_ans.UserId
+WHERE
+  ra.AnswerRank <= 3
+  AND qs.ViewCount > 100
+  AND ra.Score > 0
+ORDER BY
+  PerformanceCategory,
+  qs.ViewCount DESC,
+  ra.AnswerScore DESC;

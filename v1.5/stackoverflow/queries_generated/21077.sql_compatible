@@ -1,0 +1,113 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+),
+QuestionStats AS (
+    SELECT p.Id as QuestionId,
+           p.CreationDate,
+           COALESCE(p.Score, 0) as QScore,
+           COALESCE(p.ViewCount, 0) as Views,
+           COALESCE(p.AnswerCount, 0) as Answers,
+           LAG(p.CreationDate) OVER (PARTITION BY au.Id ORDER BY p.CreationDate) as PrevQuestionDate,
+           (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY au.Id ORDER BY p.CreationDate)) as DaysBetweenQuestions
+    FROM Posts p
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId = 1
+      AND (p.DeletedDate IS NULL OR p.DeletedDate IS NULL)
+),
+DetailedQuestions AS (
+    SELECT qs.QuestionId,
+           qs.CreationDate,
+           qs.QScore,
+           qs.Views,
+           qs.Answers,
+           qs.DaysBetweenQuestions,
+           au.RepRank,
+           au.DisplayName,
+           -- Complex string manipulation for tags
+           CASE 
+               WHEN LENGTH(COALESCE(p.Tags, '')) > 2 THEN
+                   SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2)
+               ELSE 'No Tags'
+           END as ProcessedTags,
+           -- Calculate average answer score using correlated subquery
+           (SELECT AVG(COALESCE(pa.Score, 0))
+            FROM Posts pa
+            WHERE pa.ParentId = qs.QuestionId
+              AND pa.PostTypeId = 2
+              AND pa.DeletedDate IS NULL) as AvgAnswerScore,
+           -- Check for null logic in closed questions
+           CASE 
+               WHEN p.ClosedDate IS NOT NULL AND p.ClosedDate < qs.CreationDate + INTERVAL '7 days' THEN 'QuickClose'
+               WHEN p.ClosedDate IS NULL THEN 'Open'
+               ELSE 'LongClose'
+           END as CloseStatus
+    FROM QuestionStats qs
+    INNER JOIN ActiveUsers au ON au.Id = (SELECT OwnerUserId FROM Posts WHERE Id = qs.QuestionId)
+    INNER JOIN Posts p ON p.Id = qs.QuestionId
+    WHERE (qs.DaysBetweenQuestions IS NULL OR qs.DaysBetweenQuestions > INTERVAL '30 days')
+)
+SELECT 
+    dq.DisplayName,
+    dq.RepRank,
+    COUNT(dq.QuestionId) as TotalQuestions,
+    AVG(dq.QScore) as AvgScore,
+    SUM(dq.Views) as TotalViews,
+    AVG(dq.AvgAnswerScore) as AvgAnswerQuality,
+    -- Window function for running totals
+    SUM(COUNT(dq.QuestionId)) OVER (PARTITION BY dq.RepRank / 10 ORDER BY dq.RepRank) as RunningQuestionTotal,
+    -- Complex predicate with string functions
+    STRING_AGG(
+        CASE 
+            WHEN LENGTH(dq.ProcessedTags) > 50 THEN 
+                SUBSTRING(dq.ProcessedTags FROM 1 FOR 50) || '...'
+            ELSE dq.ProcessedTags 
+        END, 
+        '; '
+        ORDER BY dq.CreationDate DESC
+    ) as TopTags,
+    -- Set operation within aggregate
+    (SELECT COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN 1 END)
+     FROM Votes v 
+     WHERE v.PostId = dq.QuestionId
+       AND v.CreationDate > dq.CreationDate) -
+    (SELECT COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN 1 END)
+     FROM Votes v 
+     WHERE v.PostId = dq.QuestionId
+       AND v.CreationDate > dq.CreationDate) as NetUpvotes,
+    -- Outer join to include users without recent activity
+    COALESCE(
+        (SELECT AVG(b.Date - u.CreationDate) 
+         FROM Badges b 
+         INNER JOIN Users u ON b.UserId = u.Id 
+         WHERE b.UserId = dq.Id 
+           AND b.Class = 1 
+           AND b.Date > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'),
+        INTERVAL '0 days'
+    ) as AvgGoldBadgeWait
+FROM DetailedQuestions dq
+LEFT OUTER JOIN Badges b ON b.UserId = dq.Id AND b.Class = 1
+LEFT OUTER JOIN Comments c ON c.PostId = dq.QuestionId 
+    AND c.Score > (SELECT AVG(COALESCE(Score, 0)) FROM Comments)
+WHERE dq.RepRank <= 100
+  AND (dq.CloseStatus = 'Open' OR dq.QScore > 5)
+  AND EXISTS (
+      SELECT 1 FROM PostLinks pl 
+      INNER JOIN Posts related ON pl.RelatedPostId = related.Id 
+      WHERE pl.PostId = dq.QuestionId 
+        AND related.Score > dq.QScore
+        AND pl.LinkTypeId = 3  -- Duplicate links
+  )
+GROUP BY dq.DisplayName, dq.RepRank, dq.Id
+HAVING COUNT(dq.QuestionId) >= 3
+   AND AVG(dq.QScore) > (
+       SELECT AVG(COALESCE(Score, 0)) 
+       FROM Posts 
+       WHERE PostTypeId = 1 
+         AND CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+   )
+ORDER BY TotalQuestions DESC, AvgScore DESC
+LIMIT 50;

@@ -1,0 +1,99 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    p.ParentId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS TotalScore,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    COUNT(*) AS QCount
+  FROM RecentActivePosts r
+  CROSS JOIN LATERAL (
+    SELECT
+      UNNEST(string_to_array(substr(r.Tags, 2, length(r.Tags) - 2), '><')) AS TagName
+  ) t
+  JOIN Posts p ON p.Id = r.PostId
+  GROUP BY t.TagName
+),
+TopContributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(*) AS QuestionCount,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days'
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+CorrelatedActivity AS (
+  SELECT
+    tt.TagName,
+    c.UserId,
+    c.QuestionCount,
+    c.TotalScore AS UserTotalScore,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM TopTags tt
+  CROSS JOIN LATERAL (
+    SELECT tqOwner.Id AS UserId
+    FROM Posts p
+    JOIN Users tqOwner ON tqOwner.Id = p.OwnerUserId
+    WHERE p.Id IN (
+      SELECT PostId FROM Posts WHERE Tags LIKE '%' || tt.TagName || '%'
+    )
+    ORDER BY p.LastActivityDate DESC
+    LIMIT 1
+  ) c
+  LEFT JOIN Badges b ON b.UserId = c.UserId
+  WHERE tt.TotalViews > 1000
+),
+WindowedStats AS (
+  SELECT
+    tt.TagName,
+    tt.TotalViews,
+    tt.TotalScore,
+    ROW_NUMBER() OVER (ORDER BY tt.TotalViews DESC, tt.TotalScore DESC) AS rn
+  FROM TopTags tt
+),
+FinalOutput AS (
+  SELECT
+    w.rn,
+    w.TagName,
+    w.TotalViews,
+    w.TotalScore,
+    tc.QuestionCount AS QuestionsForTag,
+    tc.TotalScore AS TagAggregateScore,
+    ca.UserId AS TopContributorUserId,
+    ca.DisplayName AS TopContributorName,
+    ca.BadgeName,
+    ca.BadgeDate
+  FROM WindowedStats w
+  LEFT JOIN TopContributors tc ON TRUE
+  LEFT JOIN CorrelatedActivity ca ON ca.TagName = w.TagName
+)
+SELECT *
+FROM FinalOutput
+ORDER BY rn
+LIMIT 100;

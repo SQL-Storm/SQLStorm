@@ -1,0 +1,84 @@
+WITH
+ActiveQuestions AS (
+  SELECT
+    p.Id AS Id,
+    p.Title,
+    p.OwnerUserId,
+    COALESCE(u.DisplayName, 'Unknown') AS OwnerDisplayName,
+    COALESCE(p.ViewCount, 0) AS ViewCount,
+    COALESCE(p.Score, 0) AS Score,
+    p.CreationDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+),
+EngagementWindow AS (
+  SELECT
+    aq.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY date_trunc('month', aq.CreationDate)
+      ORDER BY (aq.Score * 2 + aq.ViewCount + COALESCE(aq.CommentCount, 0)) DESC
+    ) AS rn
+  FROM ActiveQuestions aq
+),
+TopQMonth AS (
+  SELECT Id, Title, ViewCount, Score, CreationDate, CommentCount,
+         LENGTH(Title) AS TitleLength
+  FROM EngagementWindow
+  WHERE rn = 1
+),
+TagSummary AS (
+  SELECT TRIM(t.TagName) AS TagName, COUNT(*) AS TagCount
+  FROM Posts p
+  JOIN LATERAL regexp_split_to_table(substr(coalesce(p.Tags, ''), 2,
+      CASE WHEN p.Tags IS NULL THEN 0 ELSE GREATEST(char_length(p.Tags) - 2, 0) END), '><') AS t(TagName)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  GROUP BY TRIM(t.TagName)
+  ORDER BY TagCount DESC
+  LIMIT 25
+),
+UserInfluenceBase AS (
+  SELECT u.Id,
+         COALESCE(u.DisplayName, 'Unknown') AS DisplayName,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+         COALESCE(u.Reputation, 0) AS Reputation
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserInfluenceRanked AS (
+  SELECT ui.Id, ui.DisplayName, ui.QuestionCount, ui.AnswerCount, ui.TotalViews, ui.Reputation,
+         ROW_NUMBER() OVER (ORDER BY ui.Reputation DESC) AS RepRank
+  FROM UserInfluenceBase ui
+)
+SELECT
+  'TopQuestionMonthly' AS BenchmarkGroup,
+  CAST(Id AS text) AS RefId,
+  Title AS RefValue,
+  CAST(ViewCount AS text) AS metric1,
+  CAST(Score AS text) AS metric2,
+  CAST(TitleLength AS text) AS Meta
+FROM TopQMonth
+UNION ALL
+SELECT
+  'TagPopularity' AS BenchmarkGroup,
+  TagName AS RefId,
+  CAST(TagCount AS text) AS RefValue,
+  NULL AS metric1,
+  NULL AS metric2,
+  NULL AS Meta
+FROM TagSummary
+UNION ALL
+SELECT
+  'UserInfluence' AS BenchmarkGroup,
+  CAST(Id AS text) AS RefId,
+  DisplayName AS RefValue,
+  CAST(TotalViews AS text) AS metric1,
+  CAST(RepRank AS text) AS metric2,
+  NULL AS Meta
+FROM UserInfluenceRanked
+ORDER BY BenchmarkGroup, RefId;

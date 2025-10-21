@@ -1,0 +1,130 @@
+-- {"query": "12092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 987} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.DisplayName,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.Reputation, U.DisplayName
+    HAVING 
+        COUNT(B.Id) > 0
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        MAX(V.CreationDate) AS LastVoteDate
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.Id = ANY(string_to_array(P.Tags, '<'))
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        T.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalRevisions,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS CloseDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS ReopenDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.Tags,
+    RP.UserPostRank,
+    RP.ScoreRank,
+    TU.DisplayName,
+    TU.TotalBadges,
+    TU.GoldBadges,
+    TU.SilverBadges,
+    TU.BronzeBadges,
+    UA.TotalPosts,
+    UA.TotalComments,
+    UA.TotalVotes,
+    UA.LastPostDate,
+    UA.LastCommentDate,
+    UA.LastVoteDate,
+    TS.TagName,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    PHS.TotalRevisions,
+    PHS.LastEditDate,
+    PHS.CloseDate,
+    PHS.ReopenDate
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+JOIN 
+    TagStats TS ON RP.Tags LIKE '%' || TS.TagName || '%'
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+WHERE 
+    RP.UserPostRank <= 3
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

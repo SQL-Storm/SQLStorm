@@ -1,0 +1,217 @@
+-- {"query": "37002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1828} 
+WITH
+-- recent active questions with tag arrays and answer stats
+Q AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    COALESCE(p.Tags, '') AS Tags,
+    regexp_split_to_array( substring(COALESCE(p.Tags, ''), 2, GREATEST(length(COALESCE(p.Tags, ''))-2,0) ), '><') AS TagArray,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '2 years'
+    AND p.Score >= 0
+),
+
+-- answers joined to their questions
+A AS (
+  SELECT
+    a.Id,
+    a.ParentId AS QuestionId,
+    a.CreationDate,
+    a.Score,
+    a.OwnerUserId,
+    a.CommentCount,
+    a.AcceptedAnswerId
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+
+-- aggregate answer metrics per question
+AnswerAgg AS (
+  SELECT
+    q.Id AS QuestionId,
+    COUNT(a.Id) AS AnswersTotal,
+    SUM(CASE WHEN a.Score >= 0 THEN 1 ELSE 0 END) AS NonNegativeAnswers,
+    MAX(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS MaxAnswerScore,
+    AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+    MIN(a.CreationDate) AS FirstAnswerDate,
+    MAX(a.CreationDate) AS LastAnswerDate
+  FROM Q q
+  LEFT JOIN A a ON a.ParentId = q.Id
+  GROUP BY q.Id
+),
+
+-- compute recent comment activity for posts (questions + answers)
+RecentComments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) FILTER (WHERE c.CreationDate >= now() - interval '90 days') AS CommentsLast90D,
+    AVG(EXTRACT(EPOCH FROM (now() - c.CreationDate))) FILTER (WHERE c.CreationDate >= now() - interval '365 days') AS AvgCommentAgeSecPastYear
+  FROM Comments c
+  GROUP BY c.PostId
+),
+
+-- badge summary per user
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze,
+    COUNT(DISTINCT b.Name) FILTER (WHERE b.TagBased = 1) AS DistinctTagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+-- recent votes breakdown per post
+VoteAgg AS (
+  SELECT
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+    COUNT(*) FILTER (WHERE v.CreationDate >= now() - interval '30 days') AS VotesLast30D
+  FROM Votes v
+  GROUP BY v.PostId
+),
+
+-- link graph metrics: incoming links (linked/duplicate) and outgoing links
+LinkAgg AS (
+  SELECT
+    p.Id AS PostId,
+    COALESCE(inl.IncomingLinks,0) AS IncomingLinks,
+    COALESCE(outl.OutgoingLinks,0) AS OutgoingLinks,
+    COALESCE(dup.IncomingDuplicates,0) AS IncomingDuplicates
+  FROM Posts p
+  LEFT JOIN (
+    SELECT RelatedPostId, COUNT(*) AS IncomingLinks
+    FROM PostLinks
+    GROUP BY RelatedPostId
+  ) inl ON inl.RelatedPostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS OutgoingLinks
+    FROM PostLinks
+    GROUP BY PostId
+  ) outl ON outl.PostId = p.Id
+  LEFT JOIN (
+    SELECT RelatedPostId, COUNT(*) AS IncomingDuplicates
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY RelatedPostId
+  ) dup ON dup.RelatedPostId = p.Id
+),
+
+-- heavy-weight users: reputation and activity
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes,
+    COALESCE(b.BadgeCount,0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN UserBadges b ON b.UserId = u.Id
+),
+
+-- identify hot tags by questions with high view-to-age ratio and high answer activity
+TagStats AS (
+  SELECT
+    unnest(TagArray) AS Tag,
+    q.Id AS QuestionId,
+    q.CreationDate,
+    q.ViewCount,
+    aa.AnswersTotal,
+    q.Score
+  FROM Q q
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+),
+TagAgg AS (
+  SELECT
+    Tag,
+    COUNT(*) AS QuestionCount,
+    SUM(ViewCount) AS TotalViews,
+    SUM(AnswersTotal) AS TotalAnswers,
+    AVG(AnswersTotal) AS AvgAnswersPerQuestion,
+    SUM(CASE WHEN Score >= 5 THEN 1 ELSE 0 END) AS HighlyScoredQuestions
+  FROM TagStats
+  GROUP BY Tag
+  HAVING COUNT(*) >= 25
+),
+
+-- tie everything together and compute a composite "engagement" score for questions
+Final AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    qa.AnswersTotal,
+    qa.MaxAnswerScore,
+    qa.AvgAnswerScore,
+    COALESCE(vc.UpVotes,0) AS UpVotes,
+    COALESCE(vc.DownVotes,0) AS DownVotes,
+    COALESCE(rc.CommentsLast90D,0) AS CommentsLast90D,
+    la.IncomingLinks,
+    la.IncomingDuplicates,
+    ua.Reputation AS OwnerReputation,
+    COALESCE(ub.BadgeCount,0) AS OwnerBadgeCount,
+    -- engagement: weighted combination (arbitrary for benchmarking)
+    (
+      -- views per day since creation (stabilize with +1 day)
+      (q.ViewCount::numeric / GREATEST(EXTRACT(EPOCH FROM (now() - q.CreationDate))/86400.0, 1)) * 0.35
+      + GREATEST(qa.AvgAnswerScore,0) * 1.5
+      + (qa.AnswersTotal * 1.2)
+      + (COALESCE(vc.UpVotes,0) * 0.8)
+      - (COALESCE(vc.DownVotes,0) * 1.0)
+      + (COALESCE(rc.CommentsLast90D,0) * 0.9)
+      + (la.IncomingLinks * 0.6)
+      + (la.IncomingDuplicates * 0.4)
+      + (GREATEST(ua.Reputation,0) / 10000.0)
+    ) AS EngagementScore,
+    -- tag compact list
+    array_to_string(q.TagArray[1:5], ',') AS TopTags
+  FROM Q q
+  LEFT JOIN AnswerAgg qa ON qa.QuestionId = q.Id
+  LEFT JOIN VoteAgg vc ON vc.PostId = q.Id
+  LEFT JOIN RecentComments rc ON rc.PostId = q.Id
+  LEFT JOIN LinkAgg la ON la.PostId = q.Id
+  LEFT JOIN Users ua ON ua.Id = q.OwnerUserId
+  LEFT JOIN UserBadges ub ON ub.UserId = q.OwnerUserId
+)
+
+SELECT
+  f.Id AS QuestionId,
+  f.Title,
+  f.TopTags,
+  round(f.EngagementScore::numeric,4) AS EngagementScore,
+  f.ViewCount,
+  f.Score AS QuestionScore,
+  f.AnswersTotal,
+  f.MaxAnswerScore,
+  f.AvgAnswerScore,
+  f.UpVotes,
+  f.DownVotes,
+  f.CommentsLast90D,
+  f.IncomingLinks,
+  f.IncomingDuplicates,
+  f.OwnerReputation,
+  f.OwnerBadgeCount
+FROM Final f
+WHERE f.AnswersTotal IS NOT NULL
+ORDER BY EngagementScore DESC NULLS LAST, f.ViewCount DESC
+LIMIT 200;

@@ -1,0 +1,185 @@
+-- {"query": "7052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1910} 
+with
+-- active users with weighted reputation and recent activity score
+active_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    coalesce(u.views,0) as views,
+    -- recency score: more recent last access gives higher value, nulls treated as far past
+    extract(epoch from (now() - coalesce(u.lastaccessdate, '1970-01-01'::timestamp))) as seconds_since_access,
+    greatest(0, ln(1 + u.reputation) * 2 + sqrt(coalesce(u.views,0)) / 10 - least(100, extract(epoch from (now() - coalesce(u.creationdate, '1970-01-01'::timestamp)))/86400)/100) as activity_score
+  from users u
+  where u.reputation > 50
+),
+-- most prolific answerers in last year with window functions and complex string ops
+recent_answers as (
+  select
+    p.owneruserid as userid,
+    count(*) filter (where p.creationdate >= now() - interval '365 days') as answers_last_year,
+    count(*) as total_answers,
+    avg(p.score) as avg_answer_score,
+    -- accumulate tag list from parent question tags (for answers parentid -> question)
+    string_agg(distinct regexp_replace(t.tagname, '[^a-z0-9\-_]+','', 'gi') , ',' order by max_tag_count desc nulls last) as tags_agg
+  from posts p
+  left join posts q on q.id = p.parentid and q.posttypeid = 1
+  left join lateral (
+    select unnest(string_to_array(substring(coalesce(q.tags,''),2, greatest(0, length(coalesce(q.tags,'')) - 2)), '><')) as tagname
+  ) t on q.id is not null
+  left join lateral (
+    select count(*) as max_tag_count from posts p2 where p2.owneruserid = p.owneruserid and p2.parentid is not null
+  ) mt on true
+  where p.posttypeid = 2
+  group by p.owneruserid
+),
+-- compute various post metrics including complex null logic and correlated subqueries
+post_metrics as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.title,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.tags,
+    -- popularity index (non-linear) with null-safe math
+    (coalesce(p.score,0) * 3 + coalesce(p.viewcount,0) / nullif(greatest(1, coalesce(p.answercount,0)),0) + case when p.creationdate >= now() - interval '30 days' then 50 else 0 end)::numeric as popularity_index,
+    -- count distinct commenters using correlated subquery with NULL handling
+    (select count(distinct coalesce(c.userid, -1))
+     from comments c
+     where c.postid = p.id
+    ) as distinct_commenters,
+    -- latest edit author (from posthistory) using correlated subquery
+    (select ph.userid
+     from posthistory ph
+     where ph.postid = p.id and ph.creationdate is not null
+     order by ph.creationdate desc nulls last
+     limit 1
+    ) as latest_editor,
+    -- whether the post is linked from at least one duplicate link type
+    exists (
+      select 1 from postlinks pl where pl.postid = p.id and pl.linktypeid = 3
+    ) as has_duplicate_link
+  from posts p
+  where p.posttypeid in (1,2)
+),
+-- compute tag popularity using set operators and aggregates
+tag_stats as (
+  select
+    tag,
+    count(*) as question_count,
+    sum(popularity_index) as total_popularity,
+    avg(popularity_index) as avg_popularity,
+    percentile_disc(0.75) within group (order by popularity_index) as p75_popularity
+  from (
+    select
+      p.id,
+      unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(0, length(coalesce(p.tags,'')) - 2)), '><')) as tag,
+      pm.popularity_index
+    from posts p
+    join post_metrics pm on pm.id = p.id
+    where p.posttypeid = 1 and coalesce(p.tags,'') <> ''
+  ) t
+  group by tag
+),
+-- join users, answers and metrics, plus compute rank and z-score like metric
+user_summary as (
+  select
+    au.id as userid,
+    au.displayname,
+    au.reputation,
+    ra.answers_last_year,
+    ra.total_answers,
+    ra.avg_answer_score,
+    coalesce(pm_count.total_posts,0) as total_posts,
+    coalesce(pm_avg.avg_popularity,0) as avg_post_popularity,
+    -- composite score combining activity_score, answers and average popularity with NULL-aware math
+    (au.activity_score * 0.4 + coalesce(ra.answers_last_year,0) * 1.25 + coalesce(pm_avg.avg_popularity,0) * 0.75 + ln(1 + coalesce(au.reputation,0)) ) as composite_score,
+    row_number() over (order by (au.activity_score * 0.4 + coalesce(ra.answers_last_year,0) * 1.25 + coalesce(pm_avg.avg_popularity,0) * 0.75 + ln(1 + coalesce(au.reputation,0))) desc) as activity_rank
+  from active_users au
+  left join recent_answers ra on ra.userid = au.id
+  left join lateral (
+    select count(*) as total_posts
+    from posts p where p.owneruserid = au.id
+  ) pm_count on true
+  left join lateral (
+    select avg(pm.popularity_index) as avg_popularity
+    from posts p join post_metrics pm on pm.id = p.id
+    where p.owneruserid = au.id
+  ) pm_avg on true
+),
+-- combine everything for final complex result, using outer joins and set operator (union all) to create mixed rows
+combined as (
+  select
+    us.userid,
+    us.displayname,
+    us.reputation,
+    us.answers_last_year,
+    us.total_posts,
+    us.avg_post_popularity,
+    us.composite_score,
+    ts.tag as top_tag,
+    ts.question_count,
+    ts.avg_popularity,
+    pm.id as sample_post_id,
+    pm.title as sample_post_title,
+    pm.popularity_index,
+    pm.distinct_commenters,
+    pm.has_duplicate_link
+  from user_summary us
+  left join lateral (
+    select tag from tag_stats order by question_count desc limit 1
+  ) ts on true
+  left join lateral (
+    select pm.*
+    from post_metrics pm
+    where pm.owneruserid = us.userid
+    order by pm.popularity_index desc nulls last
+    limit 1
+  ) pm on true
+
+  union all
+
+  -- include top tags rows to stress set operator combining different schemas (pad nulls)
+  select
+    null::int as userid,
+    null::varchar as displayname,
+    null::int as reputation,
+    null::int as answers_last_year,
+    null::int as total_posts,
+    null::numeric as avg_post_popularity,
+    null::numeric as composite_score,
+    ts.tag as top_tag,
+    ts.question_count,
+    ts.avg_popularity,
+    null::int as sample_post_id,
+    null::varchar as sample_post_title,
+    ts.total_popularity as popularity_index,
+    null::int as distinct_commenters,
+    null::boolean as has_duplicate_link
+  from tag_stats ts
+  where ts.question_count > 50
+)
+select
+  c.*,
+  -- derived columns with complicated expressions
+  case
+    when c.userid is not null then concat(c.displayname, ' (#', c.userid::text, ')')
+    when c.top_tag is not null then concat('tag:', c.top_tag)
+    else 'unknown'
+  end as label,
+  -- score normalization using window function across combined set
+  (c.composite_score - min(c.composite_score) over ()) / nullif((max(c.composite_score) over () - min(c.composite_score) over ()),0) as normalized_composite_score,
+  dense_rank() over (order by c.popularity_index desc nulls last) as popularity_rank,
+  -- a fuzzy relevance combining popularity and commenter engagement
+  (coalesce(c.popularity_index,0) * 0.7 + coalesce(c.distinct_commenters,0) * 5 + coalesce(c.avg_popularity,0) * 2)::numeric as fuzzy_relevance
+from combined c
+order by
+  -- complex ordering mixing nulls last and computed ranks to create non-trivial execution plan
+  case when c.userid is not null then 0 else 1 end,
+  popularity_rank asc,
+  c.composite_score desc nulls last
+limit 250;

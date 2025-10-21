@@ -1,0 +1,266 @@
+-- {"query": "38047.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2267} 
+with recent_q as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as AnswerTotal,
+    avg(a.Score::numeric) as AvgAnswerScore,
+    sum(case when a.CreationDate <= q.CreationDate + interval '7 days' then 1 else 0 end) as AnswersIn7d
+  from Posts a
+  join recent_q q on q.Id = a.ParentId
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+  from Votes v
+  group by v.PostId
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    avg(c.Score::numeric) as AvgCommentScore,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+edits as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditCount,
+    min(ph.CreationDate) as FirstEditDate,
+    max(ph.CreationDate) as LastEditDate
+  from PostHistory ph
+  group by ph.PostId
+),
+closures as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+    max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastClosedAt,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenedAt,
+    jsonb_agg(
+      jsonb_build_object(
+        'Type', ph.PostHistoryTypeId,
+        'When', ph.CreationDate,
+        'Meta', ph.Text
+      )
+      order by ph.CreationDate
+    ) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenTimeline
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+dupes as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks,
+    jsonb_agg(
+      jsonb_build_object(
+        'Type', lt.Name,
+        'RelatedPostId', pl.RelatedPostId,
+        'When', pl.CreationDate
+      ) order by pl.CreationDate
+    ) as LinkTimeline
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  group by pl.PostId
+),
+owners as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.LastAccessDate as UserLastAccess,
+    u.UpVotes as UserUpVotes,
+    u.DownVotes as UserDownVotes,
+    u.Views as ProfileViews
+  from Users u
+),
+owner_badges as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges,
+    jsonb_agg(
+      jsonb_build_object(
+        'Name', b.Name,
+        'Class', b.Class,
+        'Date', b.Date,
+        'TagBased', b.TagBased
+      ) order by b.Date desc
+    ) as BadgesJson
+  from Badges b
+  group by b.UserId
+),
+tag_explode as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+  from recent_q q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    array_agg(te.tag order by te.tag) as TagList,
+    count(*) as TagCount,
+    max(t.Count) as MaxTagGlobalCount
+  from tag_explode te
+  left join Tags t on t.TagName = te.tag
+  group by te.QuestionId
+),
+hot_candidates as (
+  select
+    q.QuestionId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    coalesce(v.Favorites,0) as Favorites,
+    coalesce(v.BountyTotal,0) as BountyTotal,
+    coalesce(a.AnswerTotal,0) as AnswerTotal,
+    coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(a.AnswersIn7d,0) as AnswersIn7d,
+    coalesce(c.CommentCount,0) as CommentCount,
+    coalesce(c.AvgCommentScore,0) as AvgCommentScore,
+    c.LastCommentDate,
+    coalesce(e.EditCount,0) as EditCount,
+    e.FirstEditDate,
+    e.LastEditDate,
+    coalesce(cl.CloseEvents,0) as CloseEvents,
+    coalesce(cl.ReopenEvents,0) as ReopenEvents,
+    cl.LastClosedAt,
+    cl.LastReopenedAt,
+    cl.CloseReopenTimeline,
+    coalesce(d.DuplicateLinks,0) as DuplicateLinks,
+    coalesce(d.LinkedLinks,0) as LinkedLinks,
+    d.LinkTimeline,
+    ts.TagList,
+    ts.TagCount,
+    ts.MaxTagGlobalCount
+  from recent_q q
+  left join votes_agg v on v.PostId = q.QuestionId
+  left join answers a on a.QuestionId = q.QuestionId
+  left join comment_agg c on c.PostId = q.QuestionId
+  left join edits e on e.PostId = q.QuestionId
+  left join closures cl on cl.PostId = q.QuestionId
+  left join dupes d on d.QuestionId = q.QuestionId
+  left join tag_stats ts on ts.QuestionId = q.QuestionId
+),
+owner_enriched as (
+  select
+    q.QuestionId,
+    o.UserId,
+    o.DisplayName,
+    o.Reputation,
+    o.UserCreated,
+    o.UserLastAccess,
+    ob.BadgeCount,
+    ob.GoldBadges,
+    ob.SilverBadges,
+    ob.BronzeBadges,
+    ob.BadgesJson
+  from Posts p
+  join hot_candidates q on q.QuestionId = p.Id
+  left join owners o on o.UserId = p.OwnerUserId
+  left join owner_badges ob on ob.UserId = p.OwnerUserId
+),
+scoreboard as (
+  select
+    h.*,
+    oe.UserId as OwnerId,
+    oe.DisplayName as OwnerName,
+    oe.Reputation as OwnerReputation,
+    oe.BadgeCount,
+    oe.GoldBadges,
+    oe.SilverBadges,
+    oe.BronzeBadges,
+    -- Composite scores for benchmarking
+    (
+      greatest(h.Score,0)*3
+      + coalesce(h.UpVotes,0)*2
+      - coalesce(h.DownVotes,0)
+      + coalesce(h.Favorites,0)
+      + least(coalesce(h.ViewCount,0)/100, 200)
+      + coalesce(h.AnswerTotal,0)*2
+      + coalesce(h.AvgAnswerScore,0)
+      + coalesce(h.CommentCount,0)
+      + coalesce(h.EditCount,0)
+      + case when h.CloseEvents > h.ReopenEvents then -25 else 0 end
+      + case when coalesce(h.BountyTotal,0) > 0 then 15 else 0 end
+      + least(coalesce(oe.Reputation,0)/500, 50)
+      - least(coalesce(h.DuplicateLinks,0)*5, 50)
+    )::numeric as HotnessScore
+  from hot_candidates h
+  left join owner_enriched oe on oe.QuestionId = h.QuestionId
+)
+select
+  s.QuestionId,
+  p.Title,
+  p.CreationDate,
+  s.HotnessScore,
+  s.Score,
+  s.ViewCount,
+  s.UpVotes,
+  s.DownVotes,
+  s.Favorites,
+  s.BountyTotal,
+  s.AnswerTotal,
+  s.AvgAnswerScore,
+  s.AnswersIn7d,
+  s.CommentCount,
+  s.AvgCommentScore,
+  s.EditCount,
+  s.CloseEvents,
+  s.ReopenEvents,
+  s.DuplicateLinks,
+  s.LinkedLinks,
+  s.TagList,
+  s.TagCount,
+  s.MaxTagGlobalCount,
+  s.LastCommentDate,
+  s.FirstEditDate,
+  s.LastEditDate,
+  s.LastClosedAt,
+  s.LastReopenedAt,
+  s.CloseReopenTimeline,
+  s.LinkTimeline,
+  oe.OwnerId,
+  oe.OwnerName,
+  oe.OwnerReputation,
+  oe.BadgeCount,
+  oe.GoldBadges,
+  oe.SilverBadges,
+  oe.BronzeBadges
+from scoreboard s
+join Posts p on p.Id = s.QuestionId
+left join owner_enriched oe on oe.QuestionId = s.QuestionId
+where p.PostTypeId = 1
+order by s.HotnessScore desc nulls last, s.Score desc, s.ViewCount desc
+limit 200;

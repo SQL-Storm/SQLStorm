@@ -1,0 +1,132 @@
+WITH RECURSIVE UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '5' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS tag_array,
+        COUNT(*) AS tag_post_count,
+        AVG(p.Score) AS avg_tag_score
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, p.Tags
+),
+TopTagsPerUser AS (
+    SELECT 
+        te.OwnerUserId,
+        UNNEST(te.tag_array) AS TagName,
+        SUM(te.tag_post_count) AS PostsInTag,
+        AVG(te.avg_tag_score) AS AvgScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY te.OwnerUserId ORDER BY SUM(te.tag_post_count) DESC) AS tag_rank
+    FROM TagExpertise te,
+         UNNEST(te.tag_array) AS tag
+    GROUP BY te.OwnerUserId, UNNEST(te.tag_array)
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AnswerAcceptanceMetrics AS (
+    SELECT 
+        ans.OwnerUserId,
+        COUNT(*) AS TotalAnswers,
+        COUNT(CASE WHEN q.AcceptedAnswerId = ans.Id THEN 1 END) AS AcceptedAnswers,
+        CASE 
+            WHEN COUNT(*) > 0 THEN 
+                ROUND(100.0 * COUNT(CASE WHEN q.AcceptedAnswerId = ans.Id THEN 1 END) / COUNT(*), 2)
+            ELSE 0 
+        END AS AcceptanceRate
+    FROM Posts AS ans
+    JOIN Posts AS q ON ans.ParentId = q.Id
+    WHERE ans.PostTypeId = 2 AND q.PostTypeId = 1
+    GROUP BY ans.OwnerUserId
+),
+VotingBehavior AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) AS TotalVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoritesGiven
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+        AND v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.UserId
+),
+CommentActivity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(DISTINCT c.PostId) AS UniquePostsCommented
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT 
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    EXTRACT(YEAR FROM AGE(CAST('2024-10-01' AS DATE), uem.UserCreationDate)) AS YearsActive,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.TotalPosts,
+    ROUND(uem.AvgPostScore, 2) AS AvgPostScore,
+    uem.TotalViews,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(aam.AcceptanceRate, 0) AS AnswerAcceptanceRate,
+    COALESCE(aam.AcceptedAnswers, 0) AS AcceptedAnswers,
+    COALESCE(vb.UpvotesGiven, 0) AS UpvotesGiven,
+    COALESCE(vb.DownvotesGiven, 0) AS DownvotesGiven,
+    COALESCE(ca.TotalComments, 0) AS TotalComments,
+    COALESCE(ca.AvgCommentScore, 0) AS AvgCommentScore,
+    STRING_AGG(DISTINCT (ttp.TagName || ':' || CAST(ttp.PostsInTag AS TEXT)), ', ' ORDER BY (ttp.TagName || ':' || CAST(ttp.PostsInTag AS TEXT)))
+        FILTER (WHERE ttp.tag_rank <= 5) AS TopFiveTags,
+    CASE 
+        WHEN uem.Reputation >= 10000 AND bs.GoldBadges >= 5 THEN 'Elite'
+        WHEN uem.Reputation >= 5000 AND uem.TotalPosts >= 50 THEN 'Expert'
+        WHEN uem.Reputation >= 1000 THEN 'Active'
+        ELSE 'Beginner'
+    END AS UserTier,
+    ROUND((uem.Reputation::numeric / NULLIF(uem.TotalPosts, 0))::numeric, 2) AS ReputationPerPost
+FROM UserEngagementMetrics uem
+LEFT JOIN BadgeStats bs ON uem.UserId = bs.UserId
+LEFT JOIN AnswerAcceptanceMetrics aam ON uem.UserId = aam.OwnerUserId
+LEFT JOIN VotingBehavior vb ON uem.UserId = vb.UserId
+LEFT JOIN CommentActivity ca ON uem.UserId = ca.UserId
+LEFT JOIN TopTagsPerUser ttp ON uem.UserId = ttp.OwnerUserId AND ttp.tag_rank <= 5
+WHERE uem.TotalPosts > 10
+    AND uem.Reputation > 500
+GROUP BY 
+    uem.UserId, uem.DisplayName, uem.Reputation, uem.UserCreationDate,
+    uem.QuestionCount, uem.AnswerCount, uem.TotalPosts, uem.AvgPostScore, uem.TotalViews,
+    bs.TotalBadges, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges,
+    aam.AcceptanceRate, aam.AcceptedAnswers,
+    vb.UpvotesGiven, vb.DownvotesGiven,
+    ca.TotalComments, ca.AvgCommentScore
+ORDER BY uem.Reputation DESC, uem.TotalPosts DESC
+LIMIT 1000;

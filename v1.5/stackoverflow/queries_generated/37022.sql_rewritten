@@ -1,0 +1,164 @@
+-- {"query": "37022.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2131} 
+WITH
+-- recent highly active questions with tag arrays
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(p.Tags,'') AS TagsText,
+         CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[]
+              ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+         END AS TagArray,
+         p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- compute per-question aggregated metrics: recent answers, avg answer score, distinct answerers, last activity gap
+AnswersAgg AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS RecentAnswerCount,
+         AVG(a.Score) FILTER (WHERE a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS AvgRecentAnswerScore,
+         COUNT(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS DistinctAnswerers,
+         MAX(a.CreationDate) AS LastAnswerDate,
+         MAX(a.Score) AS MaxAnswerScore
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY q.Id
+),
+-- compute recent comment activity and sentiment proxy (ratio of commenters who are high-rep)
+CommentsAgg AS (
+  SELECT p.Id AS PostId,
+         COUNT(c.Id) FILTER (WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS RecentComments,
+         COUNT(DISTINCT c.UserId) FILTER (WHERE c.UserId IS NOT NULL AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS RecentCommenters,
+         COUNT(DISTINCT c.UserId) FILTER (WHERE c.UserId IS NOT NULL AND exists (select 1 from Users u where u.Id = c.UserId and u.Reputation >= 10000) AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS HighRepCommenters
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+-- user-level summary for owners of questions
+OwnerSummary AS (
+  SELECT u.Id AS OwnerId,
+         u.Reputation, u.CreationDate AS OwnerCreation,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+         COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersGiven
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+-- identify highly linked questions and duplicates network metrics
+LinksAgg AS (
+  SELECT pl.PostId AS QuestionId,
+         COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount,
+         COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateMarkedCount,
+         COUNT(DISTINCT pl.RelatedPostId) AS DistinctRelatedPosts,
+         MAX(pl.CreationDate) AS LastLinkDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  GROUP BY pl.PostId
+),
+-- Votes summary per question and its answers
+VotesAgg AS (
+  SELECT p.Id AS PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+-- compute tag popularity from Questions set
+TagExplode AS (
+  SELECT q.Id AS QuestionId, unnest(q.TagArray) AS Tag
+  FROM Questions q
+),
+TagStats AS (
+  SELECT te.Tag,
+         COUNT(*) AS QuestionCount,
+         AVG(q.Score) AS AvgQuestionScore,
+         SUM(COALESCE(q.ViewCount,0)) AS TotalViews,
+         COUNT(DISTINCT q.OwnerUserId) FILTER (WHERE q.OwnerUserId IS NOT NULL) AS DistinctAskers
+  FROM TagExplode te
+  JOIN Questions q ON q.Id = te.QuestionId
+  GROUP BY te.Tag
+),
+-- rank tags by composite popularity
+TagRank AS (
+  SELECT Tag, QuestionCount, AvgQuestionScore, TotalViews,
+         rank() OVER (ORDER BY QuestionCount DESC, TotalViews DESC, AvgQuestionScore DESC) AS TagRank
+  FROM TagStats
+),
+-- final candidate selection: interesting questions that combine many signals
+Candidates AS (
+  SELECT q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.TagArray,
+         COALESCE(a.RecentAnswerCount,0) AS RecentAnswerCount,
+         COALESCE(a.AvgRecentAnswerScore,0) AS AvgRecentAnswerScore,
+         COALESCE(a.DistinctAnswerers,0) AS DistinctAnswerers,
+         COALESCE(ca.RecentComments,0) AS RecentComments,
+         COALESCE(ca.HighRepCommenters,0) AS HighRepCommenters,
+         COALESCE(l.LinkedCount,0) AS LinkedCount,
+         COALESCE(l.DuplicateMarkedCount,0) AS DuplicateMarkedCount,
+         COALESCE(v.UpVotes,0) AS UpVotes, COALESCE(v.DownVotes,0) AS DownVotes, COALESCE(v.Favorites,0) AS Favorites,
+         os.Reputation AS OwnerReputation, os.GoldBadges, os.SilverBadges, os.BronzeBadges,
+         (COALESCE(a.RecentAnswerCount,0) * 2.0 + COALESCE(ca.RecentComments,0) * 1.2 + COALESCE(v.UpVotes,0) * 0.8 + COALESCE(q.ViewCount,0)::float / GREATEST(NULLIF(date_part('day', cast('2024-10-01 12:34:56' as timestamp)-q.CreationDate),0),1) * 0.01
+          + COALESCE(a.DistinctAnswerers,0) * 1.5 + COALESCE(l.LinkedCount,0) * 1.1) AS EngagementScore
+  FROM Questions q
+  LEFT JOIN AnswersAgg a ON a.QuestionId = q.Id
+  LEFT JOIN CommentsAgg ca ON ca.PostId = q.Id
+  LEFT JOIN LinksAgg l ON l.QuestionId = q.Id
+  LEFT JOIN VotesAgg v ON v.PostId = q.Id
+  LEFT JOIN OwnerSummary os ON os.OwnerId = q.OwnerUserId
+  WHERE q.Score >= 0
+),
+-- pick top tags for each candidate to annotate
+CandidateTags AS (
+  SELECT c.*, t.Tag
+  FROM Candidates c
+  LEFT JOIN LATERAL (
+    SELECT te.Tag
+    FROM unnest(c.TagArray) WITH ORDINALITY AS te(Tag, ord)
+    LEFT JOIN TagRank tr ON tr.Tag = te.Tag
+    ORDER BY coalesce(tr.TagRank,999999) ASC, te.ord
+    LIMIT 3
+  ) t ON true
+)
+SELECT
+  c.Id AS QuestionId,
+  c.Title,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  array_agg(DISTINCT c.Tag) FILTER (WHERE c.Tag IS NOT NULL) AS TopTags,
+  c.RecentAnswerCount,
+  round(c.AvgRecentAnswerScore::numeric,2) AS AvgRecentAnswerScore,
+  c.DistinctAnswerers,
+  c.RecentComments,
+  c.HighRepCommenters,
+  c.LinkedCount,
+  c.DuplicateMarkedCount,
+  c.UpVotes, c.DownVotes, c.Favorites,
+  c.OwnerReputation,
+  c.GoldBadges, c.SilverBadges, c.BronzeBadges,
+  round(c.EngagementScore::numeric,4) AS EngagementScore,
+  -- derived fields for benchmarking: temporal recency bucket and hotness category
+  CASE
+    WHEN c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' THEN '0-30d'
+    WHEN c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' THEN '31-90d'
+    WHEN c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' THEN '91-365d'
+    ELSE '>1y'
+  END AS AgeBucket,
+  CASE
+    WHEN c.EngagementScore >= 100 THEN 'Hot'
+    WHEN c.EngagementScore >= 30 THEN 'Warm'
+    ELSE 'Cold'
+  END AS HeatCategory
+FROM CandidateTags c
+GROUP BY c.Id, c.Title, c.CreationDate, c.Score, c.ViewCount, c.RecentAnswerCount, c.AvgRecentAnswerScore,
+         c.DistinctAnswerers, c.RecentComments, c.HighRepCommenters, c.LinkedCount, c.DuplicateMarkedCount,
+         c.UpVotes, c.DownVotes, c.Favorites, c.OwnerReputation, c.GoldBadges, c.SilverBadges, c.BronzeBadges, c.EngagementScore
+ORDER BY c.EngagementScore DESC NULLS LAST, c.ViewCount DESC
+LIMIT 250;

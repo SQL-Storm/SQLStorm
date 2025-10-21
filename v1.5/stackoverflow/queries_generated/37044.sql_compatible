@@ -1,0 +1,198 @@
+WITH
+-- active questions within last 2 years with tag parsing
+Questions AS (
+  SELECT
+    p.Id,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags) - 2), E'><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- compute per-question aggregates: accepted answer score, top answer delta, median answer score, distinct answerers
+AnswerAgg AS (
+  SELECT
+    q.Id AS QuestionId,
+    COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS AnswersTotal,
+    MAX(a.Score) FILTER (WHERE a.ParentId = q.Id) AS MaxAnswerScore,
+    COALESCE(
+      (SELECT score FROM Posts a2 WHERE a2.ParentId = q.Id ORDER BY score DESC NULLS LAST LIMIT 1 OFFSET 0),
+      0
+    ) AS TopAnswerScore,
+    COALESCE(
+      (SELECT score FROM Posts a3 WHERE a3.ParentId = q.Id AND a3.Id = q.AcceptedAnswerId LIMIT 1),
+      NULL
+    ) AS AcceptedAnswerScore,
+    (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY score) FROM Posts a4 WHERE a4.ParentId = q.Id) AS MedianAnswerScore,
+    COUNT(DISTINCT a_user.Id) FILTER (WHERE a_user.Id IS NOT NULL) AS DistinctAnswerers,
+    SUM(a.Score) FILTER (WHERE a.ParentId = q.Id) AS SumAnswerScore
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id
+  LEFT JOIN Users a_user ON a.OwnerUserId = a_user.Id
+  GROUP BY q.Id, q.AcceptedAnswerId
+),
+-- badge signal for question owner recent activity
+OwnerBadges AS (
+  SELECT
+    u.Id AS OwnerId,
+    COUNT(b.Id) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS RecentBadges,
+    MAX(b.Date) AS LastBadgeDate,
+    SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS WeightedBadgeScore
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+-- compute comment sentiment proxies and commenter diversity for question and its answers
+CommentAgg AS (
+  SELECT
+    q.Id AS QuestionId,
+    COUNT(cq.Id) FILTER (WHERE cq.PostId = q.Id) AS QuestionComments,
+    COUNT(ca.Id) FILTER (WHERE ca.PostId IN (SELECT id FROM Posts WHERE ParentId = q.Id)) AS AnswerComments,
+    COUNT(DISTINCT cq.UserId) FILTER (WHERE cq.PostId = q.Id) AS DistinctQuestionCommenters,
+    COUNT(DISTINCT ca.UserId) FILTER (WHERE ca.PostId IN (SELECT id FROM Posts WHERE ParentId = q.Id)) AS DistinctAnswerCommenters,
+    AVG(char_length(cq.Text)) FILTER (WHERE cq.PostId = q.Id AND cq.Text IS NOT NULL) AS AvgQuestionCommentLen,
+    AVG(char_length(ca.Text)) FILTER (WHERE ca.PostId IN (SELECT id FROM Posts WHERE ParentId = q.Id) AND ca.Text IS NOT NULL) AS AvgAnswerCommentLen
+  FROM Questions q
+  LEFT JOIN Comments cq ON cq.PostId = q.Id
+  LEFT JOIN Comments ca ON ca.PostId IN (SELECT id FROM Posts WHERE ParentId = q.Id)
+  GROUP BY q.Id
+),
+-- tag popularity and recency
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count AS GlobalTagCount,
+    coalesce(MAX(p.CreationDate), TIMESTAMP '1900-01-01 00:00:00') AS LastUsed,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months') AS RecentQuestionsWithTag
+  FROM Tags t
+  LEFT JOIN Questions p ON p.Tag = t.TagName
+  GROUP BY t.TagName, t.Count
+),
+-- link graph features: number of duplicates and links in/out within 1 year
+LinkAgg AS (
+  SELECT
+    q.Id AS QuestionId,
+    SUM(CASE WHEN pl.LinkTypeId = 3 AND pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' THEN 1 ELSE 0 END) AS RecentDuplicateLinksOut,
+    SUM(CASE WHEN pl.LinkTypeId = 1 AND pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' THEN 1 ELSE 0 END) AS RecentLinkedOut,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS TotalLinkedOut
+  FROM Questions q
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id OR pl.RelatedPostId = q.Id
+  GROUP BY q.Id
+),
+-- assemble a final enriched set and compute a composite "heat" score for benchmarking
+Enriched AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    q.Tag,
+    aa.AnswersTotal,
+    aa.TopAnswerScore,
+    aa.AcceptedAnswerScore,
+    aa.MedianAnswerScore,
+    aa.DistinctAnswerers,
+    coalesce(ob.RecentBadges,0) AS OwnerRecentBadges,
+    coalesce(ca.QuestionComments,0) AS QuestionComments,
+    coalesce(ca.AnswerComments,0) AS AnswerComments,
+    coalesce(ts.GlobalTagCount,0) AS TagGlobalCount,
+    coalesce(ts.RecentQuestionsWithTag,0) AS TagRecentQuestions,
+    coalesce(la.RecentDuplicateLinksOut,0) AS RecentDupOut,
+    coalesce(la.RecentLinkedOut,0) AS RecentLinksOut,
+    -- composite heat score: weighted and non-linear combination to stress numeric ops
+    (
+      (
+        (greatest(q.Score,0) * 1.5)
+        + (log(1 + q.ViewCount) * 2.2)
+        + (aa.AnswersTotal * 3.0)
+        + (coalesce(aa.TopAnswerScore,0) * 2.5)
+        + (coalesce(aa.MedianAnswerScore,0) * 1.8)
+        + (coalesce(ca.QuestionComments,0) * 1.2)
+        + (coalesce(ca.AnswerComments,0) * 0.9)
+        + (coalesce(ob.RecentBadges,0) * 4.0)
+        + (coalesce(ts.RecentQuestionsWithTag,0) * 0.7)
+        - (coalesce(la.RecentDupOut,0) * 5.0)
+      )
+      * (1 + least(coalesce(aa.DistinctAnswerers,0),10) / 20.0)
+      * (CASE WHEN aa.AnswersTotal = 0 THEN 0.6 WHEN aa.AnswersTotal = 1 THEN 0.9 ELSE 1.0 END)
+    ) AS HeatScore
+  FROM Questions q
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+  LEFT JOIN OwnerBadges ob ON ob.OwnerId = q.OwnerUserId
+  LEFT JOIN CommentAgg ca ON ca.QuestionId = q.Id
+  LEFT JOIN TagStats ts ON ts.TagName = q.Tag
+  LEFT JOIN LinkAgg la ON la.QuestionId = q.Id
+),
+-- rank per tag and compute percentiles
+Ranked AS (
+  SELECT
+    e.*,
+    RANK() OVER (PARTITION BY e.Tag ORDER BY e.HeatScore DESC NULLS LAST) AS TagRank,
+    PERCENT_RANK() OVER (PARTITION BY e.Tag ORDER BY e.HeatScore) AS TagPercentile,
+    ROW_NUMBER() OVER (ORDER BY e.HeatScore DESC NULLS LAST) AS GlobalRank
+  FROM Enriched e
+)
+-- final select: top 200 by heat but include heavy joins, windowing, aggregates and JSON building
+SELECT
+  r.GlobalRank,
+  r.TagRank,
+  r.TagPercentile,
+  r.Id AS QuestionId,
+  r.Title,
+  r.Tags AS RawTags,
+  r.Tag AS SingleTag,
+  r.CreationDate,
+  r.Score,
+  r.ViewCount,
+  r.AnswersTotal,
+  r.TopAnswerScore,
+  r.AcceptedAnswerScore,
+  r.MedianAnswerScore,
+  r.DistinctAnswerers,
+  r.OwnerRecentBadges,
+  r.QuestionComments,
+  r.AnswerComments,
+  r.TagGlobalCount,
+  r.TagRecentQuestions,
+  r.RecentDupOut,
+  r.RecentLinksOut,
+  round(r.HeatScore, 3) AS HeatScore,
+  -- heavy correlated subqueries to stress IO: recent voters, recent edits, co-occuring tags
+  (
+    SELECT json_agg(json_build_object('UserId', v.UserId, 'VoteType', vt.Name, 'When', v.CreationDate) ORDER BY v.CreationDate DESC)
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.PostId = r.Id AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    LIMIT 10
+  ) AS RecentVotes,
+  (
+    SELECT json_agg(json_build_object('HistoryId', ph.Id, 'Type', pht.Name, 'UserId', ph.UserId, 'Date', ph.CreationDate) ORDER BY ph.CreationDate DESC)
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostId = r.Id AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    LIMIT 8
+  ) AS RecentHistory,
+  (
+    SELECT json_agg(distinct t.TagName ORDER BY count(*) DESC) FROM (
+      SELECT regexp_split_to_table(substring(p.Tags,2,length(p.Tags)-2), E'><') AS TagName
+      FROM Posts p
+      WHERE p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+      AND p.Id IN (
+        SELECT p2.Id FROM Posts p2 WHERE position(regexp_replace(r.Tag, E'([\\W])','', 'g') IN regexp_replace(p2.Tags, E'([\\W])','', 'g')) > 0 LIMIT 1000
+      )
+    ) t
+  ) AS CoOccurringTags
+FROM Ranked r
+ORDER BY r.HeatScore DESC NULLS LAST
+LIMIT 200;

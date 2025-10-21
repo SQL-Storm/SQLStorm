@@ -1,0 +1,62 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT v.Id) as VoteCount,
+    COUNT(DISTINCT ph.Id) as HistoryCount,
+    COUNT(DISTINCT pl.Id) as LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    STRING_AGG(DISTINCT b.Name, ', ') as Badges,
+    MAX(ph.CreationDate) as LastActivityDate,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END as PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Unanswered'
+    END as Status,
+    DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56')) as AgeInDays,
+    (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) as ScorePerViewRatio,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2 AND p2.DeletionDate IS NULL) as AnswerCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId IN (2,3)) as NetVotes,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = p.OwnerUserId AND p3.PostTypeId = 1 AND p3.CreationDate >= TIMESTAMPADD(year, -1, TIMESTAMP '2024-10-01 12:34:56')) as QuestionsLastYear,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = p.OwnerUserId AND p4.PostTypeId = 2 AND p4.CreationDate >= TIMESTAMPADD(year, -1, TIMESTAMP '2024-10-01 12:34:56')) as AnswersLastYear,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = p.OwnerUserId AND b2.Date >= TIMESTAMPADD(year, -1, TIMESTAMP '2024-10-01 12:34:56')) as BadgesLastYear
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT Id, TagName FROM Tags WHERE TagName IS NOT NULL
+) t ON p.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+WHERE p.CreationDate >= TIMESTAMPADD(month, -6, TIMESTAMP '2024-10-01 12:34:56')
+    AND p.PostTypeId IN (1, 2)
+    AND p.DeletionDate IS NULL
+    AND u.Reputation >= 100
+GROUP BY 
+    p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+    u.DisplayName, u.Reputation, p.PostTypeId, p.ClosedDate, 
+    p.CommunityOwnedDate, p.AnswerCount, p.OwnerUserId, 
+    p.Tags, p.DeletionDate
+HAVING 
+    COUNT(DISTINCT c.Id) >= 0
+    AND COUNT(DISTINCT v.Id) >= 0
+    AND COUNT(DISTINCT ph.Id) >= 0
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 10000;

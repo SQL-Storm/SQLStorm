@@ -1,0 +1,146 @@
+WITH highly_active_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+recent_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.AnswerCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+post_history_summary AS (
+  SELECT
+    ph.PostId,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID,
+    ph.Comment AS RevisionComment,
+    ph.Text AS RevisionText
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 50, 52, 53)
+),
+tag_counts AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.WikiPostId,
+    t.ExcerptPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+cross_link_aggregation AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked', 'Duplicate')
+),
+recent_comments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.UserId,
+    c.UserDisplayName,
+    c.Text,
+    c.CreationDate,
+    c.Score
+  FROM Comments c
+  WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+),
+top_votes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+    SUM(CASE WHEN v.VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyCloses
+  FROM Votes v
+  GROUP BY v.PostId
+),
+performance_benchmark AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    (SELECT AVG(p2.Score)
+     FROM Posts p2
+     WHERE p2.OwnerUserId = p.OwnerUserId
+       AND p2.CreationDate >= p.CreationDate - INTERVAL '30 days'
+       AND p2.CreationDate <= p.CreationDate) AS AvgUserScoreLast30Days,
+    ROW_NUMBER() OVER (PARTITION BY DATE(p.CreationDate)
+                       ORDER BY p.Score DESC, p.ViewCount DESC) AS RankToday,
+    NULL AS UnionDummy
+  FROM Posts p
+)
+SELECT
+  hu.UserId,
+  hu.DisplayName,
+  hu.Reputation,
+  hu.AccountId,
+  rp.PostId,
+  rp.Title,
+  rp.Score AS PostScore,
+  rp.ViewCount,
+  rp.LastActivityDate,
+  vc.Upvotes,
+  vc.Downvotes,
+  vc.CloseVotes,
+  vc.BountyStarts,
+  vc.BountyCloses,
+  cb.CommentId AS LastCommentId,
+  cb.Text AS LastCommentText,
+  tc.TagName AS MostUsedTag,
+  rc.CommentId AS RecentCommentId,
+  rc.Text AS RecentCommentText,
+  pbae.AvgUserScoreLast30Days,
+  perf.RankToday
+FROM highly_active_users hu
+LEFT JOIN Posts rp ON rp.OwnerUserId = hu.UserId
+LEFT JOIN top_votes vc ON vc.PostId = rp.Id
+LEFT JOIN recent_comments cb ON cb.PostId = rp.Id
+LEFT JOIN recent_comments rc ON rc.PostId = rp.Id
+LEFT JOIN performance_benchmark pbae ON pbae.PostId = rp.Id
+LEFT JOIN Tags tc ON tc.WikiPostId = rp.Id OR tc.ExcerptPostId = rp.Id
+LEFT JOIN post_history_summary phs ON phs.PostId = rp.Id
+LEFT JOIN Posts p ON p.Id = rp.Id
+LEFT JOIN cross_link_aggregation cla ON cla.PostId = rp.Id
+ORDER BY hu.Reputation DESC, rp.LastActivityDate DESC
+LIMIT 100;

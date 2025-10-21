@@ -1,0 +1,18 @@
+WITH RECURSIVE RecursiveUserCount AS (
+    SELECT UserId, COUNT(*) AS TotalVotes
+    FROM Votes
+    WHERE CreationDate >= DATE '2022-01-01'
+    GROUP BY UserId
+
+    UNION ALL
+
+    SELECT V.UserId, R.TotalVotes + COUNT(*) AS TotalVotes
+    FROM Votes V
+    JOIN RecursiveUserCount R ON V.UserId = R.UserId
+    WHERE V.CreationDate >= DATE '2022-01-01'
+    GROUP BY V.UserId, R.TotalVotes
+)
+SELECT UserId, TotalVotes
+FROM RecursiveUserCount
+WHERE TotalVotes > 100
+ORDER BY TotalVotes DESC;

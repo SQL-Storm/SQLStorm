@@ -1,0 +1,116 @@
+WITH cte AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastEditDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId 
+      WHEN p.PostTypeId = 2 THEN p.ParentId 
+      ELSE NULL 
+    END AS RelatedPostId,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN (
+        SELECT c.Name 
+        FROM CloseReasonTypes c
+        JOIN PostHistory ph ON ph.Comment = CAST(c.Id AS VARCHAR)
+        WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+      ) 
+      ELSE NULL
+    END AS CloseReason,
+    CASE 
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN (
+        SELECT u.DisplayName 
+        FROM Users u
+        JOIN PostHistory ph ON ph.UserId = u.Id
+        WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 16
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+      ) 
+      ELSE p.OwnerDisplayName
+    END AS OwnerDisplayName,
+    CASE 
+      WHEN p.LastEditorUserId IS NOT NULL THEN (
+        SELECT u.DisplayName 
+        FROM Users u 
+        WHERE u.Id = p.LastEditorUserId
+      )
+      ELSE p.LastEditorDisplayName
+    END AS LastEditorDisplayName
+  FROM Posts p
+),
+vote_counts AS (
+  SELECT 
+    PostId, 
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+  FROM Votes
+  GROUP BY PostId
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId
+  FROM Users u
+)
+SELECT
+  c.Id,
+  c.PostTypeId,
+  c.OwnerUserId,
+  c.LastEditorUserId,
+  c.Title,
+  c.Tags,
+  c.CreationDate,
+  c.LastEditDate,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ClosedDate,
+  c.CommunityOwnedDate,
+  c.RelatedPostId,
+  c.CloseReason,
+  c.OwnerDisplayName,
+  c.LastEditorDisplayName,
+  vc.UpVotes,
+  vc.DownVotes,
+  vc.Favorites,
+  us.Reputation AS OwnerReputation,
+  us.UserCreationDate,
+  us.LastAccessDate,
+  us.WebsiteUrl,
+  us.Location,
+  us.AboutMe,
+  us.Views AS OwnerViews,
+  us.UserUpVotes,
+  us.UserDownVotes,
+  us.ProfileImageUrl,
+  us.EmailHash,
+  us.AccountId
+FROM cte c
+LEFT JOIN vote_counts vc ON c.Id = vc.PostId
+LEFT JOIN user_stats us ON c.OwnerUserId = us.UserId
+ORDER BY c.CreationDate DESC
+LIMIT 100;

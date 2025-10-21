@@ -1,0 +1,170 @@
+-- {"query": "21017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1764} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        NTILE(10) OVER (ORDER BY u.CreationDate) AS ActivityDecile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    WHERE u.Reputation > 0 
+        AND u.LastAccessDate > CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 0 OR u.Reputation >= 100
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        COALESCE(
+            SUBSTRING(p.Tags FROM '<([a-zA-Z0-9-]*)>' LIMIT 1),
+            'untagged'
+        ) AS FirstTag,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL 
+                THEN EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 3600
+            ELSE NULL 
+        END AS HoursToClosure,
+        LAG(p.Score) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate
+        ) AS PrevPostScore,
+        LEAD(p.Title) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate
+        ) AS NextPostTitle,
+        RANK() OVER (
+            PARTITION BY p.PostTypeId 
+            ORDER BY p.ViewCount DESC, p.Score DESC
+        ) AS PopularityRank
+    FROM Posts p
+    WHERE (p.PostTypeId IN (1, 2) 
+           AND p.Score > 5 
+           AND p.ViewCount > 100)
+       OR (p.PostTypeId = 1 
+           AND p.AnswerCount >= 3 
+           AND p.CommentCount > 10)
+),
+UserAchievements AS (
+    SELECT 
+        au.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(CASE WHEN b.Name LIKE '%Editor%' THEN b.Date END) AS LastEditorBadgeDate,
+        STRING_AGG(
+            DISTINCT b.Name, 
+            ', ' ORDER BY b.Date DESC
+        ) AS BadgeNames,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM ActiveUsers au
+    LEFT JOIN Badges b ON au.UserId = b.UserId
+        AND b.Date >= au.UserCreationDate
+    GROUP BY au.UserId
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        COUNT(*) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        AVG(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - v.CreationDate))) / 3600 AS AvgVoteAgeHours,
+        BOOL_OR(v.VoteTypeId = 1) AS HasAcceptedVote,
+        DENSE_RANK() OVER (
+            PARTITION BY v.UserId 
+            ORDER BY COUNT(*) DESC
+        ) AS UserVotingRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1, 2, 3)
+        AND v.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY v.PostId, v.UserId
+    HAVING COUNT(*) > 1
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.RepRank,
+    au.ActivityDecile,
+    COALESCE(hip.PostCount, 0) AS UserPostCount,
+    COALESCE(ua.GoldBadges, 0) AS GoldCount,
+    COALESCE(ua.SilverBadges, 0) AS SilverCount,
+    COALESCE(hip.AvgPostScore, 0) AS AverageScore,
+    (COALESCE(hip.QuestionCount, 0) * 1.0 / NULLIF(hip.PostCount, 0)) AS QuestionRatio,
+    CASE 
+        WHEN hip.PopularityRank <= 100 THEN 'High Impact'
+        WHEN hip.PopularityRank <= 1000 THEN 'Medium Impact' 
+        ELSE 'Low Impact'
+    END AS ImpactCategory,
+    -- Complex string manipulation
+    CONCAT(
+        UPPER(SUBSTRING(au.DisplayName FROM 1 FOR 1)),
+        LOWER(SUBSTRING(au.DisplayName FROM 2)),
+        ' (',
+        TO_CHAR(hip.PostCreationDate, 'YYYY-MM'),
+        ')'
+    ) AS FormattedName,
+    -- NULL-safe calculations
+    COALESCE(
+        hip.HoursToClosure, 
+        EXTRACT(EPOCH FROM (CURRENT_DATE - hip.PostCreationDate)) / 3600
+    ) AS EffectiveLifetimeHours,
+    -- Correlated subquery for vote ratio
+    (SELECT AVG(vp.TotalVotes * 1.0 / NULLIF(vp.Upvotes, 0))
+     FROM VotingPatterns vp 
+     WHERE vp.UserId = au.UserId
+       AND vp.TotalVotes > 0) AS AvgUpvoteRatio,
+    -- Window function for running totals
+    SUM(COALESCE(ua.GoldBadges, 0)) OVER (
+        ORDER BY au.RepRank 
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS CumulativeGoldBadges,
+    -- Set operation simulation with CASE
+    CASE 
+        WHEN COALESCE(hip.ViewCount, 0) > 10000 THEN 'Viral'
+        WHEN COALESCE(hip.Score, 0) > 50 THEN 'Popular'
+        WHEN COALESCE(ua.BadgeNames, '') != '' THEN 'Active'
+        ELSE 'Emerging'
+    END AS UserStatus
+FROM ActiveUsers au
+LEFT OUTER JOIN HighImpactPosts hip ON au.UserId = hip.OwnerUserId
+    AND (hip.PostTypeId = 1 OR (hip.PostTypeId = 2 AND hip.Score > 10))
+LEFT OUTER JOIN UserAchievements ua ON au.UserId = ua.UserId
+LEFT OUTER JOIN VotingPatterns vp ON au.UserId = vp.UserId
+    AND vp.TotalVotes = (
+        SELECT MAX(vp2.TotalVotes)
+        FROM VotingPatterns vp2 
+        WHERE vp2.UserId = au.UserId
+    )
+WHERE au.RepRank <= 500 
+    OR (au.PostCount >= 10 AND COALESCE(ua.GoldBadges, 0) > 0)
+    OR EXISTS (
+        SELECT 1 FROM Posts p2 
+        WHERE p2.OwnerUserId = au.UserId 
+            AND p2.Score > (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = au.UserId)
+    )
+GROUP BY 
+    au.UserId, au.DisplayName, au.Reputation, au.RepRank, 
+    au.ActivityDecile, hip.PostCount, ua.GoldBadges, ua.SilverBadges,
+    hip.AvgPostScore, hip.QuestionCount, hip.PostCreationDate,
+    hip.PopularityRank, au.CreationDate
+HAVING AVG(COALESCE(hip.Score, 0)) > 1
+   OR COUNT(DISTINCT hip.FirstTag) > 3
+ORDER BY au.RepRank, COALESCE(hip.PopularityRank, 999999)
+LIMIT 100;

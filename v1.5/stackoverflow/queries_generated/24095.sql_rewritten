@@ -1,0 +1,119 @@
+-- {"query": "24095.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2978} 
+WITH
+/* -----------------------------------------------------------------------
+   1. Grab the 5 most popular recent questions that contain each tag
+   -----------------------------------------------------------------------*/
+  TaggedPosts AS (
+    SELECT
+      t.TagName,
+      t.Count            AS tag_count,
+      p.Id                AS post_id,
+      p.Score             AS post_score,
+      p.OwnerUserId       AS owner_id,
+      p.LastActivityDate  ,
+      p.Title,
+      p.ViewCount,
+      p.CreationDate
+    FROM Tags t
+    CROSS JOIN LATERAL (
+      SELECT p.Id, p.Score, p.OwnerUserId, p.LastActivityDate,
+             p.Title, p.ViewCount, p.CreationDate
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.Tags LIKE '%' || t.TagName || '%'
+      ORDER BY p.Score DESC, p.CreationDate DESC
+      LIMIT 5
+    ) p
+  ),
+/* -----------------------------------------------------------------------
+   2. Aggregate votes per post (up +1, down –1, other 0)
+   -----------------------------------------------------------------------*/
+  PostVotes AS (
+    SELECT
+      pv.PostId,
+      SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1
+               WHEN pv.VoteTypeId = 3 THEN -1
+               ELSE 0 END)          AS net_votes,
+      COUNT(*) FILTER (WHERE pv.VoteTypeId = 2) AS up_votes,
+      COUNT(*) FILTER (WHERE pv.VoteTypeId = 3) AS down_votes
+    FROM Votes pv
+    GROUP BY pv.PostId
+  ),
+/* -----------------------------------------------------------------------
+   3. Compute per‑tag aggregates that tie in the top posts
+   -----------------------------------------------------------------------*/
+  TagAggregates AS (
+    SELECT
+      tp.TagName,
+      COUNT(*)                                 AS linked_posts,
+      AVG(tp.post_score)                       AS avg_score,
+      SUM(COALESCE(pv.net_votes,0))            AS total_net_votes,
+      STRING_AGG(DISTINCT COALESCE(tp.owner_id::text,'-1'), ',') AS owners
+    FROM TaggedPosts tp
+    LEFT JOIN PostVotes pv
+      ON pv.PostId = tp.post_id
+    GROUP BY tp.TagName
+  ),
+/* -----------------------------------------------------------------------
+   4. Add a window‑function ranking and a normalisation factor
+   -----------------------------------------------------------------------*/
+  ActivityWindow AS (
+    SELECT
+      ta.TagName,
+      ta.linked_posts,
+      ta.avg_score,
+      ta.total_net_votes,
+      ta.owners,
+      RANK() OVER (ORDER BY ta.total_net_votes DESC)          AS vn_rnk,
+      NULLIF(SUM(ABS(ta.avg_score)) OVER(), 0) AS norm_factor
+    FROM TagAggregates ta
+  ),
+/* -----------------------------------------------------------------------
+   5. Include a set‑operator that aggregates everything into an
+      additional pseudo‑row named 'All'
+   -----------------------------------------------------------------------*/
+  SetOps AS (
+    SELECT
+      aw.TagName,
+      aw.linked_posts,
+      aw.avg_score,
+      aw.total_net_votes,
+      aw.owners
+    FROM ActivityWindow aw
+
+    UNION ALL
+
+    SELECT
+      'All'   AS TagName,
+      SUM(linked_posts) FROM ActivityWindow,
+      SUM(avg_score)    FROM ActivityWindow,
+      SUM(total_net_votes) FROM ActivityWindow,
+      NULL               AS owners
+  )
+/* -----------------------------------------------------------------------
+   Final selection – mix of complex predicates, NULL juggling and
+   string concatenation logic
+   -----------------------------------------------------------------------*/
+SELECT
+  so.TagName,
+  so.linked_posts,
+  so.avg_score,
+  so.total_net_votes,
+  so.owners,
+  CASE
+    WHEN so.total_net_votes > 0 THEN '+' || ROUND(so.total_net_votes::numeric,0)
+    WHEN so.total_net_votes < 0 THEN '-' || ROUND(ABS(so.total_net_votes::numeric),0)
+    ELSE '0'
+  END                 AS net_vote_str,
+  CONCAT('https://stackoverflow.com/tags/', LOWER(so.TagName)) AS tag_url
+FROM SetOps so
+WHERE
+  /* Only tags with more than 10 linked posts or the aggregate row */
+  (so.TagName <> 'All' AND so.linked_posts > 10 OR so.TagName = 'All')
+  /* Complex predicate: include rows where avg_score is positive or null */
+  AND (so.avg_score > 0 OR so.avg_score IS NULL)
+ORDER BY
+  /* Window rank columns are NULL in the aggregate row—place it last */
+  CASE WHEN so.TagName = 'All' THEN 9999 ELSE so.vn_rnk END,
+  so.total_net_votes DESC NULLS LAST
+LIMIT 20;

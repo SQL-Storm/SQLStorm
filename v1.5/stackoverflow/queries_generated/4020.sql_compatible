@@ -1,0 +1,163 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.Count > 100
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        rth.TagPath || t2.TagName,
+        rth.Depth + 1
+    FROM Tags t2
+    JOIN Posts p ON POSITION('<' || t2.TagName || '>' IN p.Tags) > 0
+    JOIN RecursiveTagHierarchy rth ON POSITION('<' || rth.TagName || '>' IN p.Tags) > 0
+    WHERE rth.Depth < 3
+),
+UserBadgesAggregate AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+PostScoresRanked AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS GlobalScoreRank
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        cr.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserQuestionActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+ComplexUserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.TotalBadges,
+        uba.LastBadgeDate,
+        uba.TotalBadges * 0.5 + u.Reputation * 0.001 AS EngagementScore,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalViews,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        COALESCE(
+          (SELECT COUNT(DISTINCT ph.PostId)
+           FROM PostHistory ph
+           WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId = 24),
+          0) AS SuggestedEditsApplied
+    FROM Users u
+    LEFT JOIN UserBadgesAggregate uba ON uba.UserId = u.Id
+    LEFT JOIN UserQuestionActivity ua ON ua.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+FilteredHighScorePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ua.DisplayName AS OwnerDisplayName,
+        ua.EngagementScore,
+        p.CreationDate,
+        p.PostTypeId,
+        cs.CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS PostScoreRank
+    FROM Posts p
+    LEFT JOIN ComplexUserStats ua ON ua.Id = p.OwnerUserId
+    LEFT JOIN ClosedQuestionsWithReasons cs ON cs.PostId = p.Id
+    WHERE p.Score >= 50 AND ua.Id IS NOT NULL
+),
+FinalSelectedPosts AS (
+    SELECT DISTINCT
+        f.Id,
+        f.Title,
+        f.Score,
+        f.ViewCount,
+        f.Tags,
+        f.OwnerDisplayName,
+        f.EngagementScore,
+        f.CreationDate,
+        f.PostTypeId,
+        f.CloseReasonName,
+        (
+            SELECT STRING_AGG(CONCAT(COALESCE(u2.DisplayName,'[deleted]'), ': ', c.Text), ' || ')
+            FROM Comments c
+            LEFT JOIN Users u2 ON u2.Id = c.UserId
+            WHERE c.PostId = f.Id
+            ORDER BY c.CreationDate DESC
+            LIMIT 3
+        ) AS RecentCommentsSnippet,
+        (
+            SELECT COUNT(*) 
+            FROM PostLinks pl
+            WHERE pl.PostId = f.Id AND pl.LinkTypeId = 3
+        ) AS DuplicateCount,
+        LENGTH(f.Tags) - LENGTH(REPLACE(f.Tags, '><', '')) + 1 AS TagCount,
+        LEAD(f.Score) OVER (PARTITION BY f.PostTypeId ORDER BY f.Score DESC NULLS LAST) AS NextHigherScore,
+        CASE 
+          WHEN f.CloseReasonName IS NULL THEN false 
+          ELSE true 
+        END AS IsClosed
+    FROM FilteredHighScorePosts f
+)
+SELECT
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.OwnerDisplayName,
+    p.EngagementScore,
+    p.PostTypeId,
+    p.CloseReasonName,
+    p.RecentCommentsSnippet,
+    p.DuplicateCount,
+    p.TagCount,
+    p.NextHigherScore,
+    p.IsClosed,
+    array_to_string(rth.TagPath, ' > ') AS SampleTagHierarchy
+FROM FinalSelectedPosts p
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = REGEXP_SUBSTR(p.Tags, '<([^>]+)>', 1, 1, 'B')
+WHERE p.TagCount BETWEEN 2 AND 5
+ORDER BY p.EngagementScore DESC NULLS LAST, p.Score DESC NULLS LAST
+LIMIT 100;

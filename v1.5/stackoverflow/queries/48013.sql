@@ -1,0 +1,72 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY u.Id
+),
+TopQuestions AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        Score,
+        AnswerCount,
+        CommentCount,
+        CreationDate
+    FROM RankedPosts
+    WHERE rn <= 100
+),
+TopAnswers AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        Score,
+        CreationDate
+    FROM RankedPosts
+    WHERE rn <= 100 AND PostTypeId = 2
+)
+SELECT
+    'Top Questions Performance' AS Metric,
+    COUNT(tq.Id) AS NumberOfPosts,
+    AVG(tq.Score) AS AverageScore,
+    AVG(tq.AnswerCount) AS AverageAnswers,
+    AVG(tq.CommentCount) AS AverageComments,
+    AVG(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - tq.CreationDate)) AS AverageAgeInDays
+FROM TopQuestions tq
+UNION ALL
+SELECT
+    'Top Answers Performance' AS Metric,
+    COUNT(ta.Id) AS NumberOfPosts,
+    AVG(ta.Score) AS AverageScore,
+    NULL AS AverageAnswers,
+    NULL AS AverageComments,
+    AVG(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - ta.CreationDate)) AS AverageAgeInDays
+FROM TopAnswers ta
+UNION ALL
+SELECT
+    'Active Users Performance' AS Metric,
+    COUNT(ua.UserId) AS NumberOfPosts,
+    AVG(ua.TotalScore) AS AverageScore,
+    AVG(ua.AnswerCount) AS AverageAnswers,
+    NULL AS AverageComments,
+    AVG(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - ua.LastPostDate)) AS AverageAgeInDays
+FROM UserActivity ua
+WHERE ua.QuestionCount > 0 OR ua.AnswerCount > 0;

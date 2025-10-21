@@ -1,0 +1,103 @@
+WITH user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        COUNT(DISTINCT a.Id) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotesReceived,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(a.Score) as AvgAnswerScore,
+        STRING_AGG(DISTINCT t.TagName, '|' ORDER BY t.TagName) as TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON (p.Id = v.PostId OR a.Id = v.PostId)
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) as tag
+    ) tag_split ON true
+    LEFT JOIN Tags t ON t.TagName = tag_split.tag
+    WHERE u.Reputation > 1000 
+        AND u.CreationDate >= (DATE '2024-10-01') - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT a.Id) >= 10
+),
+question_metrics AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.CreationDate as QuestionDate,
+        q.OwnerUserId,
+        COALESCE(ans.Id, 0) as AcceptedAnswerId,
+        ans.Score as AcceptedAnswerScore,
+        COUNT(DISTINCT ph.Id) as EditCount,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT pl.Id) as LinkedQuestions,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as BountyAmount,
+        EXTRACT(EPOCH FROM (COALESCE(ans.CreationDate, q.LastActivityDate) - q.CreationDate))/3600.0 as HoursToAnswer
+    FROM Posts q
+    LEFT JOIN Posts ans ON q.AcceptedAnswerId = ans.Id
+    LEFT JOIN PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+    LEFT JOIN Votes v ON q.Id = v.PostId
+    WHERE q.PostTypeId = 1 
+        AND q.CreationDate >= (DATE '2024-10-01') - INTERVAL '2 years'
+        AND q.Score >= 5
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, 
+             q.FavoriteCount, q.CreationDate, q.OwnerUserId, ans.Id, ans.Score, ans.CreationDate, q.LastActivityDate
+),
+tag_performance AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagUsageCount,
+        AVG(qm.QuestionScore) as AvgScore,
+        AVG(qm.ViewCount) as AvgViews,
+        AVG(qm.AnswerCount) as AvgAnswers,
+        COUNT(DISTINCT qm.QuestionId) as QuestionsInPeriod,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qm.HoursToAnswer) as MedianTimeToAnswer
+    FROM Tags t
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) as tag_name, p.Id
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) pt ON t.TagName = pt.tag_name
+    JOIN question_metrics qm ON pt.Id = qm.QuestionId
+    WHERE t.Count >= 100
+    GROUP BY t.TagName, t.Count
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.UpVotesReceived,
+    ROUND(ue.AvgQuestionScore::numeric, 2) as AvgQuestionScore,
+    ROUND(ue.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    ue.TopTags,
+    COUNT(DISTINCT qm.QuestionId) as RecentQuestions,
+    ROUND(AVG(qm.ViewCount)::numeric, 2) as AvgViewsPerQuestion,
+    ROUND(AVG(qm.QuestionScore)::numeric, 2) as AvgRecentScore,
+    SUM(qm.BountyAmount) as TotalBountiesOffered,
+    COUNT(DISTINCT CASE WHEN qm.AcceptedAnswerId > 0 THEN qm.QuestionId END) as QuestionsWithAcceptedAnswer,
+    ROUND(AVG(qm.HoursToAnswer)::numeric, 2) as AvgHoursToAnswer,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName) FILTER (WHERE tp.AvgScore > 10) as HighPerformanceTags,
+    ROUND(AVG(tp.AvgScore)::numeric, 2) as UserTagAvgScore,
+    RANK() OVER (ORDER BY ue.Reputation DESC, COUNT(DISTINCT qm.QuestionId) DESC) as UserRank
+FROM user_expertise ue
+LEFT JOIN question_metrics qm ON ue.UserId = qm.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(ue.TopTags, '|')) as user_tag
+) ut ON true
+LEFT JOIN tag_performance tp ON ut.user_tag = tp.TagName
+WHERE qm.QuestionDate >= (DATE '2024-10-01') - INTERVAL '1 year'
+GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, ue.QuestionCount, ue.AnswerCount, 
+         ue.UpVotesReceived, ue.AvgQuestionScore, ue.AvgAnswerScore, ue.TopTags
+HAVING COUNT(DISTINCT qm.QuestionId) >= 3
+ORDER BY UserRank, TotalBountiesOffered DESC, AvgRecentScore DESC
+LIMIT 100;

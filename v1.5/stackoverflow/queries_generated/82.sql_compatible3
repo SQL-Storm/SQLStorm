@@ -1,0 +1,22 @@
+WITH UserReputationPerDay AS (
+    SELECT UserId, SUM(Reputation) AS TotalReputation, COUNT(DISTINCT DATE(CreationDate)) AS ActiveDays
+    FROM Users
+    GROUP BY UserId
+),
+UserBadgeCount AS (
+    SELECT UserId, COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId
+),
+UserPostCount AS (
+    SELECT COALESCE(OwnerUserId, 0) AS UserId, COUNT(*) AS PostCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+)
+SELECT u.DisplayName, u.LastAccessDate, r.TotalReputation, r.ActiveDays, b.BadgeCount, p.PostCount
+FROM Users AS u
+LEFT JOIN UserReputationPerDay AS r ON u.Id = r.UserId
+LEFT JOIN UserBadgeCount AS b ON u.Id = b.UserId
+LEFT JOIN UserPostCount AS p ON u.Id = p.UserId
+ORDER BY r.TotalReputation DESC, p.PostCount DESC;

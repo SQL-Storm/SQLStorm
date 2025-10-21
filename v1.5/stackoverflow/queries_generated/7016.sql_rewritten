@@ -1,0 +1,155 @@
+-- {"query": "7016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1742} 
+with
+-- recent active questions with tag parsing and computed hotness
+recent_q as (
+  select p.id, p.title, p.creationdate, p.owneruserid, p.score, p.viewcount,
+         coalesce(p.answercount,0) as answers,
+         coalesce(p.favoritecount,0) as favorites,
+         substring(p.tags from 2 for char_length(p.tags)-2) as raw_tags,
+         -- split tags into an array-like set by replacing >< with |
+         regexp_replace(substring(p.tags from 2 for char_length(p.tags)-2), '><', '|', 'g') as tag_pipe,
+         coalesce(p.lastactivitydate, p.creationdate) as last_activity,
+         -- compute a "hotness" score combining recency, views, score and answers (nonlinear)
+         ( 
+           power(greatest(p.viewcount,1)::numeric, 0.35) * 0.6
+           + greatest(p.score,0) * 1.2
+           + least(coalesce(p.answercount,0),10) * 2
+           + case when p.lastactivitydate > cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 20 else 0 end
+         ) / (1 + date_part('epoch', cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.lastactivitydate, p.creationdate))/86400.0) as hotness
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- exploded tags: each tag as separate row using generate_series on string positions
+exploded_tags as (
+  select rq.*, unnest(string_to_array(rq.tag_pipe, '|')) as tag
+  from recent_q rq
+),
+-- tag aggregates: popularity and median-like stats using percentile_cont
+tag_stats as (
+  select et.tag,
+         count(*) as question_count,
+         avg(et.hotness) as avg_hotness,
+         percentile_cont(0.5) within group (order by et.hotness) as median_hotness,
+         max(et.viewcount) as max_views,
+         sum(et.answers) as total_answers
+  from exploded_tags et
+  group by et.tag
+  having count(*) >= 3
+),
+-- user activity: combine posts, comments, votes to get weighted activity
+user_activity as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         count(distinct p.id) filter (where p.posttypeid = 1) as q_count,
+         count(distinct p.id) filter (where p.posttypeid = 2) as a_count,
+         coalesce(sum(c.score),0) as comment_score_sum,
+         coalesce(sum(v.vote_type_id = 2::int)::int,0) as upvotes_received,
+         rank() over (order by u.reputation desc) as rep_rank
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+-- top contributors per tag using lateral correlated subquery
+top_contributors_per_tag as (
+  select ts.tag, ts.question_count, ts.avg_hotness, ts.median_hotness,
+         u.user_id, u.displayname, u.reputation,
+         uc.answers_by_user, uc.questions_by_user,
+         uc.latest_contribution
+  from tag_stats ts
+  left join lateral (
+    select ua.user_id, ua.displayname, ua.reputation,
+           coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as answers_by_user,
+           coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as questions_by_user,
+           max(coalesce(p.lastactivitydate, p.creationdate)) as latest_contribution
+    from users ua
+    join posts p on p.owneruserid = ua.id
+    where p.posttypeid in (1,2)
+      and position(('<' || ts.tag || '>') in p.tags) > 0
+    group by ua.user_id, ua.displayname, ua.reputation
+    order by answers_by_user desc nulls last, questions_by_user desc nulls last, ua.reputation desc
+    limit 3
+  ) uc on true
+),
+-- windowing: rank questions by hotness within each tag, and compute moving average hotness
+tag_question_ranks as (
+  select et.tag, et.id as question_id, et.title, et.owneruserid,
+         et.hotness,
+         row_number() over (partition by et.tag order by et.hotness desc, et.viewcount desc) as tag_rank,
+         avg(et.hotness) over (partition by et.tag order by et.hotness desc rows between 2 preceding and current row) as moving_avg_hotness_3
+  from exploded_tags et
+),
+-- combine everything and include some set operations and outer joins
+combined as (
+  select tqr.tag,
+         tqr.question_id,
+         tqr.title,
+         tqr.tag_rank,
+         tqr.hotness,
+         tqr.moving_avg_hotness_3,
+         tc.question_count,
+         tc.avg_hotness,
+         tc.median_hotness,
+         tc.max_views,
+         tc.total_answers,
+         tcp.user_id as top_user_id,
+         tcp.displayname as top_user_name,
+         tcp.reputation as top_user_reputation,
+         ua.q_count, ua.a_count, ua.reputation as actor_reputation,
+         -- complex expression mixing strings, null handling, and conditional
+         case
+           when tqr.hotness is null then 'unknown'
+           when tqr.hotness > coalesce(tc.median_hotness,0) * 1.5 then concat('hot:', round(tqr.hotness::numeric,2))
+           when tqr.hotness > coalesce(tc.median_hotness,0) then concat('warm:', round(tqr.hotness::numeric,2))
+           else concat('cold:', round(tqr.hotness::numeric,2))
+         end as heat_label,
+         -- synthetic fingerprint combining ids and dates
+         md5(coalesce(cast(tqr.question_id as text),'') || '|' || coalesce(cast(tcp.user_id as text), '') || '|' || coalesce(to_char(cast('2024-10-01 12:34:56' as timestamp),'YYYYMMDD'),'')) as fingerprint
+  from tag_question_ranks tqr
+  left join tag_stats tc on tc.tag = tqr.tag
+  left join lateral (
+    select user_id, displayname, reputation from top_contributors_per_tag tcp2
+    where tcp2.tag = tqr.tag
+    order by tcp2.reputation desc nulls last
+    limit 1
+  ) tcp on true
+  left join user_activity ua on ua.user_id = tqr.owneruserid
+),
+-- final filtration and union for variety: include some low-activity tags via EXCEPT/UNION
+final_selection as (
+  select c.*
+  from combined c
+  where c.tag_rank <= 5
+    and c.question_id is not null
+  union
+  -- include some borderline rows: questions with no owner or low reputation owners
+  select c2.*
+  from combined c2
+  where (c2.top_user_id is null or c2.actor_reputation < 50)
+    and c2.tag_rank <= 3
+)
+select fs.tag,
+       fs.question_id,
+       left(fs.title, 140) as title_snip,
+       fs.tag_rank,
+       round(fs.hotness::numeric,3) as hotness,
+       round(fs.moving_avg_hotness_3::numeric,3) as moving_avg_hotness_3,
+       fs.heat_label,
+       fs.question_count,
+       round(fs.avg_hotness::numeric,3) as tag_avg_hotness,
+       fs.median_hotness,
+       fs.max_views,
+       fs.total_answers,
+       fs.top_user_id,
+       fs.top_user_name,
+       fs.top_user_reputation,
+       fs.q_count as owner_question_count,
+       fs.a_count as owner_answer_count,
+       fs.actor_reputation as owner_reputation,
+       fs.fingerprint
+from final_selection fs
+order by fs.tag, fs.tag_rank, fs.hotness desc
+limit 250;

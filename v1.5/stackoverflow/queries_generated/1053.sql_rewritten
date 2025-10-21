@@ -1,0 +1,69 @@
+-- {"query": "1053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 491} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.ViewCount,
+        P.Score,
+        P.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS RankScore,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 END) OVER (PARTITION BY P.Id) AS DownVotes
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp)) 
+        AND P.ViewCount > 100
+),
+PostStatistics AS (
+    SELECT 
+        RP.PostId,
+        RP.Title,
+        RP.ViewCount,
+        RP.Score,
+        RP.CreationDate,
+        RP.RankScore,
+        COALESCE(RP.UpVotes - RP.DownVotes, 0) AS NetVotes,
+        CASE 
+            WHEN RP.RankScore = 1 THEN 'Top' 
+            WHEN RP.RankScore <= 5 THEN 'High' 
+            ELSE 'Normal' 
+        END AS Rating
+    FROM 
+        RankedPosts RP
+    WHERE 
+        RP.RankScore <= 10
+),
+ClosedPosts AS (
+    SELECT 
+        PH.PostId,
+        COUNT(*) AS CloseCount,
+        STRING_AGG(DISTINCT C.Name, ', ') AS CloseReasons
+    FROM 
+        PostHistory PH
+    JOIN 
+        CloseReasonTypes C ON PH.Comment::int = C.Id
+    WHERE 
+        PH.PostHistoryTypeId IN (10, 11) -- 10 = Closed, 11 = Reopened
+    GROUP BY 
+        PH.PostId
+)
+
+SELECT 
+    PS.PostId,
+    PS.Title,
+    PS.ViewCount,
+    PS.Score,
+    PS.CreationDate,
+    PS.NetVotes,
+    PS.Rating,
+    COALESCE(CP.CloseCount, 0) AS CloseCount,
+    CP.CloseReasons
+FROM 
+    PostStatistics PS
+LEFT JOIN 
+    ClosedPosts CP ON PS.PostId = CP.PostId
+ORDER BY 
+    PS.RankScore, PS.CreationDate DESC;

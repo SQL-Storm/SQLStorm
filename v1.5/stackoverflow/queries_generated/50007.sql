@@ -1,0 +1,96 @@
+-- {"query": "50007.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1155} 
+
+WITH UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views,
+        -- Aggregate post statistics
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2), 0) AS TotalAnswerScore,
+        COALESCE(SUM(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1), 0) AS TotalFavoriteCount,
+        -- Aggregate badge statistics using conditional aggregation
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges AS b ON u.Id = b.UserId
+    WHERE
+        u.Id > 0 AND u.Reputation > 1000 -- Filter for established, non-community users
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+),
+RankedAnswers AS (
+    SELECT
+        a.OwnerUserId,
+        q.Title AS QuestionTitle,
+        a.Score,
+        a.CreationDate,
+        -- Rank answers for each user based on score to find their best one
+        ROW_NUMBER() OVER(PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate DESC) as rn
+    FROM
+        Posts AS a
+    JOIN
+        Posts AS q ON a.ParentId = q.Id
+    WHERE
+        a.PostTypeId = 2 -- Answers
+        AND q.PostTypeId = 1 -- Questions
+        AND a.OwnerUserId IS NOT NULL
+),
+UserEngagement AS (
+    SELECT
+        c.UserId,
+        -- Calculate time difference between first comment and user creation
+        EXTRACT(EPOCH FROM (MIN(c.CreationDate) - u.CreationDate)) / 3600 AS HoursToFirstComment,
+        COUNT(DISTINCT v.Id) AS TotalVotesCast,
+        COUNT(DISTINCT c.Id) AS TotalComments
+    FROM
+        Users u
+    JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3) -- UpMod, DownMod
+    WHERE
+        u.Reputation > 1000
+    GROUP BY
+        c.UserId, u.CreationDate
+)
+SELECT
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    -- Calculate a composite 'PowerScore' using various weighted metrics
+    (um.Reputation * 0.2 + um.TotalAnswerScore * 0.3 + um.Views * 0.1 + um.GoldBadges * 100 + um.SilverBadges * 25 + um.BronzeBadges * 5 + ue.TotalVotesCast * 0.05) AS PowerScore,
+    -- Rank users globally based on their PowerScore
+    DENSE_RANK() OVER (ORDER BY (um.Reputation * 0.2 + um.TotalAnswerScore * 0.3 + um.Views * 0.1 + um.GoldBadges * 100 + um.SilverBadges * 25 + um.BronzeBadges * 5 + ue.TotalVotesCast * 0.05) DESC) AS GlobalRank,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.GoldBadges,
+    um.SilverBadges,
+    ue.TotalComments,
+    ue.HoursToFirstComment,
+    ra.QuestionTitle AS BestAnswerQuestion,
+    ra.Score AS BestAnswerScore,
+    -- Correlated subquery to find the tag of the user's highest-scoring answer
+    (SELECT Tags FROM Posts WHERE Id = ra.QuestionTitle) AS BestAnswerTags
+FROM
+    UserMetrics um
+JOIN
+    UserEngagement ue ON um.UserId = ue.UserId
+LEFT JOIN
+    RankedAnswers ra ON um.UserId = ra.OwnerUserId AND ra.rn = 1
+WHERE
+    um.AnswerCount > 50 -- Only include users with significant contributions
+    AND um.UserCreationDate < (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '5 year' -- Users active for at least 5 years
+    AND um.TotalFavoriteCount > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY FavoriteCount) FROM Posts WHERE PostTypeId=1 and FavoriteCount > 0)
+ORDER BY
+    PowerScore DESC, um.UserCreationDate ASC
+LIMIT 100;
+

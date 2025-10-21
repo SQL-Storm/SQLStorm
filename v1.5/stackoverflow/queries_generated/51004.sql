@@ -1,0 +1,135 @@
+-- {"query": "51004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1208} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(CASE WHEN pt.Id = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(CASE WHEN pt.Id = 2 THEN p.Id END) AS AnswersPosted,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionPerformance AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViews,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(v.UpVotes, 0) AS UserUpVotes,
+        COALESCE(ph.EditCount, 0) AS EditCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS QuestionTags
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes
+        FROM Votes v
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY OwnerUserId
+    ) v ON p.OwnerUserId = v.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4, 5, 6) -- Title, Body, Tags edits
+        GROUP BY PostId
+    ) ph ON p.Id = ph.PostId
+    LEFT JOIN (
+        SELECT 
+            p.Id,
+            REGEXP_SPLIT_TO_TABLE(
+                SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), 
+                E'<'
+            ) AS TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+    ) tag_split ON p.Id = tag_split.Id
+    LEFT JOIN Tags t ON tag_split.TagName = t.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+        p.FavoriteCount, p.CreationDate, p.OwnerUserId, v.UpVotes, ph.EditCount,
+        p.ClosedDate, p.CommunityOwnedDate
+),
+AnswerQuality AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Score >= 5 THEN 1 ELSE 0 END) AS HighQualityAnswers,
+        COUNT(CASE WHEN va.VoteTypeId = 2 THEN 1 END) AS TotalUpvotes,
+        AVG(EXTRACT(EPOCH FROM (a.LastActivityDate - a.CreationDate))/3600) AS AvgAnswerAgeHours
+    FROM Posts a
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Votes va ON a.Id = va.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName AS TopPerformer,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AvgPostScore,
+    ua.TotalViews,
+    ua.BadgeCount,
+    qp.QuestionId,
+    qp.Title AS SampleQuestionTitle,
+    qp.QuestionScore,
+    qp.QuestionViews,
+    qp.AnswerCount,
+    qp.AvgAnswerScore AS AvgAnswerQuality,
+    qp.HighQualityAnswers,
+    qp.EditCount,
+    qp.QuestionStatus,
+    qp.QuestionTags,
+    ROUND(
+        (qp.QuestionViews::float / NULLIF(qp.AnswerCount, 0))::numeric, 2
+    ) AS ViewsPerAnswerRatio,
+    CASE 
+        WHEN qp.AvgAnswerScore > 2 THEN 'High Quality'
+        WHEN qp.AvgAnswerScore > 0 THEN 'Average Quality'
+        ELSE 'Low Quality'
+    END AS QuestionEngagementLevel,
+    ROW_NUMBER() OVER (
+        PARTITION BY EXTRACT(YEAR FROM qp.CreationDate) 
+        ORDER BY qp.QuestionViews DESC, qp.QuestionScore DESC
+    ) AS YearlyRank,
+    DENSE_RANK() OVER (
+        ORDER BY ua.Reputation DESC, ua.BadgeCount DESC
+    ) AS OverallUserRank
+FROM UserActivity ua
+INNER JOIN QuestionPerformance qp ON ua.UserId = qp.OwnerUserId
+LEFT JOIN AnswerQuality aq ON qp.QuestionId = aq.QuestionId
+WHERE 
+    ua.Reputation > 1000
+    AND qp.QuestionViews > 100
+    AND qp.CreationDate >= NOW() - INTERVAL '1 year'
+    AND (qp.QuestionStatus = 'Open' OR qp.ClosedDate IS NULL)
+    AND ua.BadgeCount > 5
+ORDER BY 
+    ua.Reputation DESC,
+    qp.QuestionViews DESC,
+    ua.BadgeCount DESC
+LIMIT 50;

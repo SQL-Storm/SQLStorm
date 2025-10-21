@@ -1,0 +1,96 @@
+WITH top_users AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        COUNT(c.Id) AS CommentCount,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    WHERE u.Reputation >= 5000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 50
+),
+user_badges AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+hot_questions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        ARRAY(
+            SELECT tag
+            FROM UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS tag
+        ) AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 10000
+      AND p.Score > 10
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+),
+tag_stats AS (
+    SELECT
+        tag,
+        COUNT(*) AS HotQuestionCount
+    FROM hot_questions
+    CROSS JOIN UNNEST(TagArray) AS tag
+    GROUP BY tag
+    HAVING COUNT(*) > 5
+),
+answer_stats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        COUNT(*) AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.QuestionsCount,
+    tu.AnswersCount,
+    tu.CommentCount,
+    tu.TotalPostScore,
+    tu.TotalViews,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    hq.Id AS HotQuestionId,
+    hq.Title AS HotQuestionTitle,
+    hq.CreationDate AS HotQuestionCreated,
+    hq.ViewCount AS HotQuestionViews,
+    hq.Score AS HotQuestionScore,
+    ts.tag AS FrequentHotTag,
+    ts.HotQuestionCount,
+    astats.AvgAnswerScore,
+    astats.MaxAnswerScore,
+    astats.AnswerCount
+FROM top_users tu
+LEFT JOIN user_badges ub ON tu.UserId = ub.UserId
+LEFT JOIN hot_questions hq ON hq.OwnerUserId = tu.UserId
+LEFT JOIN UNNEST(hq.TagArray) AS t(tag) ON TRUE
+LEFT JOIN tag_stats ts ON ts.tag = t.tag
+LEFT JOIN answer_stats astats ON astats.QuestionId = hq.Id
+WHERE ts.tag IS NOT NULL
+ORDER BY tu.Reputation DESC, hq.ViewCount DESC, ts.HotQuestionCount DESC
+LIMIT 100;

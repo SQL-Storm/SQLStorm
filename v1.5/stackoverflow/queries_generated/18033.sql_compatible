@@ -1,0 +1,156 @@
+WITH RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_desc_date,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn_desc_score,
+        SUM(p.ViewCount) OVER(PARTITION BY p.OwnerUserId) AS TotalUserViews
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND pt.Name IN ('Question', 'Answer')
+),
+UserContributionStats AS (
+    SELECT
+        up.OwnerUserId,
+        COUNT(CASE WHEN up.PostTypeName = 'Question' THEN up.PostId END) AS NumQuestions,
+        COUNT(CASE WHEN up.PostTypeName = 'Answer' THEN up.PostId END) AS NumAnswers,
+        MAX(CASE WHEN up.PostTypeName = 'Question' THEN up.PostScore END) AS HighestQuestionScore,
+        AVG(CASE WHEN up.PostTypeName = 'Answer' THEN up.PostScore END) AS AvgAnswerScore,
+        up.TotalUserViews,
+        (SELECT PostId FROM RankedUserPosts WHERE OwnerUserId = up.OwnerUserId ORDER BY PostCreationDate DESC LIMIT 1) AS LatestPostId,
+        (SELECT PostId FROM RankedUserPosts WHERE OwnerUserId = up.OwnerUserId ORDER BY PostScore DESC LIMIT 1) AS BestScoringPostId
+    FROM RankedUserPosts AS up
+    GROUP BY up.OwnerUserId, up.TotalUserViews
+),
+PostVoteSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpVoteCount,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownVoteCount,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS FavoriteCount
+    FROM Posts AS p
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    GROUP BY p.Id
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS RecentCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    WHERE c.CreationDate >= DATEADD(day, -30, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+    GROUP BY c.PostId
+)
+SELECT
+    u.DisplayName,
+    COALESCE(ucs.NumQuestions, 0) AS TotalQuestions,
+    COALESCE(ucs.NumAnswers, 0) AS TotalAnswers,
+    COALESCE(pvs.UpVoteCount, 0) AS UpVoteCount,
+    COALESCE(pvs.DownVoteCount, 0) AS DownVoteCount,
+    COALESCE(rc.RecentCommentCount, 0) AS CommentsLast30Days,
+    CASE
+        WHEN u.Reputation > 10000 THEN 'High Reputation'
+        WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationLevel,
+    CASE
+        WHEN ucs.HighestQuestionScore IS NULL THEN 'N/A'
+        WHEN ucs.HighestQuestionScore > 100 THEN 'Excellent'
+        WHEN ucs.HighestQuestionScore > 50 THEN 'Good'
+        ELSE 'Average'
+    END AS QuestionPerformance,
+    DATEDIFF(DAY, u.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS DaysSinceLastAccess,
+    CASE
+        WHEN LOG(1 + u.Views) > 5 THEN 'High Visibility User'
+        ELSE 'Standard Visibility User'
+    END AS VisibilityTier,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges AS b WHERE b.UserId = u.Id AND b.Name LIKE '%Tag%') THEN 'Has Tag Badge'
+        ELSE 'No Tag Badge'
+    END AS HasTagBadge,
+    CASE
+        WHEN ucs.AvgAnswerScore IS NOT NULL AND ucs.AvgAnswerScore < 0 THEN 'Negative Average Answer Score'
+        WHEN ucs.AvgAnswerScore IS NOT NULL AND ucs.AvgAnswerScore > 5 THEN 'Positive Average Answer Score'
+        ELSE 'Neutral or No Answers'
+    END AS AnswerQualityIndicator,
+    SUBSTRING(u.AboutMe FROM 1 FOR 50) AS AboutMeSnippet,
+    (SELECT COUNT(*) FROM Votes AS v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS TotalUpvotesGiven,
+    (SELECT COUNT(*) FROM Votes AS v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS TotalDownvotesGiven,
+    CASE
+        WHEN ucs.LatestPostId IS NOT NULL THEN (SELECT Title FROM Posts WHERE Id = ucs.LatestPostId)
+        ELSE 'No Posts'
+    END AS TitleOfLatestPost,
+    CASE
+        WHEN ucs.BestScoringPostId IS NOT NULL THEN (SELECT Title FROM Posts WHERE Id = ucs.BestScoringPostId)
+        ELSE 'No Posts'
+    END AS TitleOfBestPost,
+    CASE
+        WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+        WHEN u.WebsiteUrl LIKE '%stackoverflow%' THEN 'Stack Overflow Related Website'
+        ELSE 'External Website'
+    END AS WebsiteType,
+    CASE
+        WHEN u.Location LIKE '%USA%' OR u.Location LIKE '%United States%' THEN 'USA User'
+        ELSE 'Non-USA User'
+    END AS LocationIndicator,
+    CAST(u.Reputation AS FLOAT) / (DATEDIFF(DAY, u.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) + 1) AS AvgDailyReputation,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory AS ph
+            JOIN PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+            WHERE ph.UserId = u.Id AND pht.Name = 'Post Closed'
+        ) THEN 'HasClosedPosts'
+        ELSE 'HasNotClosedPosts'
+    END AS PostClosureActivity,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks AS pl WHERE pl.PostId = ucs.LatestPostId OR pl.RelatedPostId = ucs.LatestPostId) THEN 'Linked Post Involved'
+        ELSE 'No Linked Post Involved'
+    END AS LatestPostLinkStatus,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Comments AS c
+            WHERE c.UserId = u.Id AND c.Score > 10
+        ) THEN 'Has Highly Scored Comments'
+        ELSE 'No Highly Scored Comments'
+    END AS CommentScoreStatus
+FROM Users AS u
+LEFT JOIN UserContributionStats AS ucs ON u.Id = ucs.OwnerUserId
+LEFT JOIN PostVoteSummary AS pvs ON u.Id = pvs.PostId
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        SUM(pvs_inner.UpVoteCount) AS TotalUpVoteCount,
+        SUM(pvs_inner.DownVoteCount) AS TotalDownVoteCount,
+        SUM(pvs_inner.FavoriteCount) AS TotalFavoriteCount
+    FROM Posts AS p
+    JOIN PostVoteSummary AS pvs_inner ON p.Id = pvs_inner.PostId
+    GROUP BY p.OwnerUserId
+) AS UserVoteStats ON u.Id = UserVoteStats.OwnerUserId
+LEFT JOIN RecentComments AS rc ON u.Id = rc.PostId
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        SUM(COALESCE(rc_inner.RecentCommentCount, 0)) AS TotalRecentComments,
+        MAX(rc_inner.LastCommentDate) AS LatestCommentDate
+    FROM Posts AS p
+    LEFT JOIN RecentComments AS rc_inner ON p.Id = rc_inner.PostId
+    GROUP BY p.OwnerUserId
+) AS UserCommentStats ON u.Id = UserCommentStats.OwnerUserId
+WHERE u.DisplayName IS NOT NULL AND u.DisplayName <> '' AND u.Id < 500000
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.Id
+ORDER BY u.Reputation DESC;

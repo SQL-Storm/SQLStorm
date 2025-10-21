@@ -1,0 +1,202 @@
+with
+active_users as (
+  select u.id,
+         u.reputation,
+         case
+           when u.reputation >= 100000 then 'elite'
+           when u.reputation >= 10000 then 'pro'
+           when u.reputation >= 1000 then 'experienced'
+           when u.reputation >= 100 then 'regular'
+           else 'novice'
+         end as rep_bucket,
+         lower(coalesce(nullif(u.displayname,''),'[anon]')) as display_norm,
+         split_part(coalesce(nullif(u.displayname,''),'[anon]'),' ',1) as name_token,
+         row_number() over (order by u.lastaccessdate desc nulls last) as recent_rank
+  from users u
+  where u.creationdate < timestamp '2024-10-01 12:34:56' and u.id is not null
+),
+question_tags as (
+  select p.id as post_id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.tags,
+         trim(both ' ' from nullif(regexp_replace(tag, '[<>]', '','g'),'')) as tagname
+  from posts p
+  cross join lateral (
+    select unnest(
+      case
+        when p.tags is null or p.tags = '' then array[]::text[]
+        else string_to_array(substring(p.tags,2,length(p.tags)-2),'><')
+      end
+    ) as tag
+  ) t
+  where p.posttypeid = 1
+),
+tag_stats as (
+  select qt.tagname,
+         count(distinct qt.post_id) as questions_with_tag,
+         avg(qt.score) filter (where qt.score is not null) as avg_score,
+         sum(coalesce(qt.viewcount,0)) as total_views,
+         max(qt.score) as max_score,
+         (array_agg(qt.post_id order by qt.score desc nulls last, qt.viewcount desc nulls last))[1] as top_question_id
+  from question_tags qt
+  group by qt.tagname
+),
+question_metrics as (
+  select q.id,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.tags,
+         (
+           select extract(epoch from (a.creationdate - q.creationdate))/3600.0
+           from posts a
+           where a.id = q.acceptedanswerid and a.posttypeid = 2
+           limit 1
+         )::numeric(18,3) as hours_to_accept,
+         (select count(*) from comments c where c.postid = q.id) as comments_on_post,
+         (select count(*) filter (where v.votetypeid = 2) from votes v where v.postid = q.id) as upvotes,
+         (select count(*) filter (where v.votetypeid = 3) from votes v where v.postid = q.id) as downvotes,
+         (coalesce(q.score,0) + coalesce((select count(*) filter (where v.votetypeid=2) from votes v where v.postid = q.id),0)
+          - coalesce((select count(*) filter (where v.votetypeid=3) from votes v where v.postid = q.id),0)
+         ) / greatest(1.0, sqrt(greatest(coalesce(q.viewcount,0),1))) as contested_score
+  from posts q
+  where q.posttypeid = 1
+),
+questions_enriched as (
+  select qm.*,
+         qt.tagname,
+         ts.questions_with_tag,
+         ts.avg_score as tag_avg_score,
+         au.display_norm as owner_display,
+         au.rep_bucket as owner_bucket,
+         au.recent_rank
+  from question_metrics qm
+  left join question_tags qt on qt.post_id = qm.id
+  left join tag_stats ts on ts.tagname = qt.tagname
+  left join active_users au on au.id = qm.owneruserid
+),
+tag_popularity as (
+  select ts.*,
+         (ts.questions_with_tag * 0.6 + coalesce(ts.total_views,0)/100.0 * 0.3 + coalesce(ts.max_score,0) * 0.1) as popularity_index,
+         dense_rank() over (order by (ts.questions_with_tag * 0.6 + coalesce(ts.total_views,0)/100.0 * 0.3 + coalesce(ts.max_score,0) * 0.1) desc) as pop_rank,
+         avg(ts.questions_with_tag) over () as avg_questions_per_tag,
+         percentile_cont(0.5) within group (order by ts.questions_with_tag) over () as median_questions_per_tag
+  from tag_stats ts
+),
+user_contrib as (
+  select u.id,
+         u.display_norm,
+         u.reputation,
+         coalesce(qc.questions_posted,0) as questions_posted,
+         coalesce(ac.answers_posted,0) as answers_posted,
+         coalesce(score_stats.avg_q_score,0) as avg_question_score,
+         coalesce(score_stats.max_q_score,0) as max_question_score,
+         extract(epoch from (timestamp '2024-10-01 12:34:56' - u.creationdate))/86400.0 as account_age_days,
+         extract(epoch from (timestamp '2024-10-01 12:34:56' - u.lastaccessdate))/86400.0 as days_since_last_access
+  from users u
+  left join (
+    select owneruserid, count(*) as questions_posted
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) qc on qc.owneruserid = u.id
+  left join (
+    select owneruserid, count(*) as answers_posted
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) ac on ac.owneruserid = u.id
+  left join (
+    select owneruserid,
+           avg(score) as avg_q_score,
+           max(score) as max_q_score
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) score_stats on score_stats.owneruserid = u.id
+),
+anomalous_tags as (
+  select tp.tagname,
+         tp.questions_with_tag,
+         tp.avg_score,
+         tp.total_views,
+         tp.popularity_index
+  from tag_popularity tp
+  where tp.questions_with_tag < greatest(5, tp.avg_questions_per_tag * 0.2)
+    and tp.avg_score > greatest(1.0, tp.avg_score * 0)
+    and tp.popularity_index > 10
+),
+final_enriched as (
+  select qe.*,
+         case when at.tagname is not null then true else false end as is_tag_anomalous,
+         rank() over (partition by qe.tagname order by qe.contested_score desc nulls last) as within_tag_rank,
+         dense_rank() over (order by qe.contested_score desc nulls last) as global_contested_rank,
+         (coalesce(qe.title,'') || ' | tags: ' || coalesce(qe.tagname,'[none]') || ' | owner: ' || coalesce(qe.owner_display,'[unknown]')) as summary_text
+  from questions_enriched qe
+  left join anomalous_tags at on at.tagname = qe.tagname
+),
+final as (
+  select fe.tagname,
+         coalesce(fe.title, '[untitled]') as sample_title,
+         min(fe.creationdate) as earliest_question_with_tag,
+         max(fe.creationdate) as newest_question_with_tag,
+         count(distinct fe.id) as sample_questions_count,
+         count(distinct fe.owneruserid) as distinct_askers,
+         avg(fe.contested_score) as avg_contested_score,
+         sum(fe.viewcount) as total_views_for_sample,
+         sum(case when fe.hours_to_accept is null then 0 else 1 end) as accepted_count,
+         avg(fe.hours_to_accept) filter (where fe.hours_to_accept is not null) as avg_hours_to_accept,
+         max(fe.within_tag_rank) as worst_rank_in_tag,
+         min(fe.global_contested_rank) as best_global_rank_in_sample,
+         bool_or(fe.is_tag_anomalous) as tag_has_anomaly,
+         exists (
+           select 1 from posts a
+           join users uu on uu.id = a.owneruserid
+           where a.posttypeid = 2
+             and a.parentid = fe.id
+             and uu.reputation > 50000
+           limit 1
+         ) as has_highrep_answer,
+         case when fe.tagname in (
+           select tagname from tag_popularity tp2 where tp2.pop_rank <= 10
+           union
+           select tagname from tag_popularity tp3 where tp3.total_views > (select avg(total_views) from tag_popularity)
+         ) then 'top_or_viral' else 'regular' end as tag_category,
+         sum(case when (fe.owner_bucket = 'elite' or fe.owner_bucket = 'pro') and fe.comments_on_post > 5 and coalesce(fe.score,0) >= 0 then 1 else 0 end) as highrep_engaged_count,
+         listagg(distinct fe.summary_text, ' || ') within group (order by fe.global_contested_rank nulls last) as sample_summaries
+  from final_enriched fe
+  where fe.tagname is not null
+    and fe.title is not null
+    and fe.creationdate > timestamp '2024-10-01 12:34:56' - interval '5 years'
+  group by fe.tagname, fe.tagname, fe.is_tag_anomalous
+  having count(distinct fe.id) > 3
+)
+select f.tagname,
+       f.sample_title,
+       f.earliest_question_with_tag,
+       f.newest_question_with_tag,
+       f.sample_questions_count,
+       f.distinct_askers,
+       f.avg_contested_score,
+       f.total_views_for_sample,
+       f.accepted_count,
+       f.avg_hours_to_accept,
+       f.worst_rank_in_tag,
+       f.best_global_rank_in_sample,
+       f.tag_has_anomaly,
+       f.has_highrep_answer,
+       f.tag_category,
+       f.highrep_engaged_count,
+       f.sample_summaries
+from final f
+where f.tagname is not null
+  and f.sample_title is not null
+  and f.creationdate > timestamp '2024-10-01 12:34:56' - interval '5 years'
+limit 200;

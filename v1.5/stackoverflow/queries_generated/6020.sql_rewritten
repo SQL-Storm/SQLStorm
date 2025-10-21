@@ -1,0 +1,114 @@
+-- {"query": "6020.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 874} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Posts p
+  JOIN UNNEST(string_to_array(p.Tags, '<>')) AS t(TagName) ON true
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  ORDER BY PostCount DESC
+  LIMIT 50
+),
+CorrelationMetrics AS (
+  SELECT
+    p1.Id AS PostId,
+    p1.Title,
+    p1.Score AS PostScore,
+    p2.Score AS AnswerScore,
+    (CASE WHEN p1.ParentId IS NULL THEN 1 ELSE 0 END) AS IsQuestionRoot,
+    (p1.LastActivityDate - p1.CreationDate) AS ActivitySpan,
+    (SELECT AVG(v.CreationDate - p.CreationDate)
+     FROM Votes v
+     JOIN Posts c ON v.PostId = c.Id
+     WHERE c.Id = p1.Id AND v.VoteTypeId IN (2,3)) AS AvgVoteTime
+  FROM Posts p1
+  LEFT JOIN Posts p2 ON p2.ParentId = p1.Id
+  WHERE p1.PostTypeId = 1
+    AND p1.LastActivityDate > p1.CreationDate
+),
+WindowedActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('week', p.CreationDate) ORDER BY p.Score DESC) AS RankInWeek
+  FROM Posts p
+  WHERE p.CreationDate >= DATE_TRUNC('week', cast('2024-10-01 12:34:56' as timestamp)) - INTERVAL '12 weeks'
+),
+MixedSignal AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerUserId,
+    tp.TagName,
+    tp.PostCount,
+    rp.Score AS PostScore,
+    coalesce(vt.TotalUpVotes, 0) AS UpVotesOnPost,
+    coalesce(vt.TotalDownVotes, 0) AS DownVotesOnPost
+  FROM TopTags tp
+  CROSS JOIN LATERAL (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.Tags,
+      p.Score
+    FROM Posts p
+    WHERE p.Tags LIKE '%' || tp.TagName || '%'
+      AND p.PostTypeId = 1
+    ORDER BY p.Score DESC
+    LIMIT 1
+  ) rp
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vt ON vt.PostId = rp.PostId
+)
+SELECT
+  -- Diverse benchmarking-oriented fields
+  rp.PostId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.TagName AS PrimaryTag,
+  rp.PostCount AS TagPostCount,
+  rp.PostScore AS Score,
+  rp.UpVotesOnPost,
+  rp.DownVotesOnPost,
+  w.RankInWeek,
+  ca.ActivitySpan,
+  ca.AvgVoteTime
+FROM MixedSignal rp
+LEFT JOIN WindowedActivity w ON w.PostId = rp.PostId
+LEFT JOIN CorrelationMetrics ca ON ca.PostId = rp.PostId
+ORDER BY rp.PostCount DESC, rp.PostScore DESC
+LIMIT 100;

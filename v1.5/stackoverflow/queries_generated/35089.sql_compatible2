@@ -1,0 +1,70 @@
+WITH user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        MAX(u.Reputation) AS MaxReputation,
+        DATE_TRUNC('month', u.CreationDate) AS SignupMonth
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, DATE_TRUNC('month', u.CreationDate)
+),
+most_used_tags AS (
+    SELECT
+        t.TagName,
+        SUM(t.Count) AS TotalUsage
+    FROM Tags t
+    GROUP BY t.TagName
+    ORDER BY TotalUsage DESC
+    FETCH FIRST 20 ROWS ONLY
+),
+tag_post_popularity AS (
+    SELECT
+        CAST(REGEXP_REPLACE(p.Tags, '^\\(|\\)$', '') AS TEXT) AS TagsClean,
+        COUNT(*) AS PostsWithTag,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY CAST(REGEXP_REPLACE(p.Tags, '^\\(|\\)$', '') AS TEXT)
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.TotalPosts,
+    u.TotalComments,
+    u.TotalAnswers,
+    u.TotalUpvotes,
+    u.TotalDownvotes,
+    u.MaxReputation,
+    u.SignupMonth,
+    mt.TagName AS Tag,
+    tpt.PostsWithTag,
+    tpt.AvgScore,
+    tpt.AvgViews
+FROM user_activity u
+JOIN Posts p ON p.OwnerUserId = u.UserId
+JOIN most_used_tags mt ON mt.TagName = (
+    SELECT TagName
+    FROM (
+        SELECT unnest(string_to_array(substr(COALESCE(p.Tags, ''), 2, length(p.Tags) - 2), '><')) AS TagName
+        LIMIT 1
+    ) AS sub
+)
+JOIN tag_post_popularity tpt ON tpt.TagsClean = (
+    SELECT TagsClean
+    FROM (
+        SELECT unnest(string_to_array(substr(COALESCE(p.Tags, ''), 2, length(p.Tags) - 2), '><')) AS TagsClean
+        LIMIT 1
+    ) AS sub
+)
+WHERE u.TotalPosts > 10 AND u.MaxReputation > 1000
+ORDER BY u.MaxReputation DESC, tpt.AvgViews DESC
+LIMIT 100;

@@ -1,0 +1,96 @@
+WITH ActiveUsers AS (
+    SELECT
+        "UserId",
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        COALESCE(AboutMe, '') AS AboutMe,
+        ROW_NUMBER() OVER (PARTITION BY Reputation ORDER BY LastAccessDate DESC) AS Rank
+    FROM
+        Users
+    WHERE
+        LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+PopularPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AnswerCount, p.AcceptedAnswerId
+),
+TagMetrics AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        STRING_AGG(p.Title, '; ') AS RelatedTitles
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY(STRING_TO_ARRAY(p.Tags, '><'))
+    GROUP BY
+        t.TagName, t.Count
+)
+SELECT
+    u."UserId",
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AboutMe,
+    u.Rank,
+    pp.PostId,
+    pp.PostTypeId,
+    pp.Title,
+    pp.Tags,
+    pp.Score,
+    pp.ViewCount,
+    pp.AnswerCount,
+    pp.CommentCount,
+    pp.VoteCount,
+    pp.PostRank,
+    tp.TagName,
+    tp.Count,
+    tp.PostCount,
+    tp.AvgScore,
+    tp.TotalViews,
+    tp.RelatedTitles
+FROM
+    ActiveUsers u
+LEFT JOIN
+    PopularPosts pp ON u."UserId" = pp.OwnerUserId
+LEFT JOIN
+    TagMetrics tp ON pp.Tags LIKE ('%' || '><' || tp.TagName || '><%')
+WHERE
+    u.Rank <= 100
+    AND (pp.PostTypeId IS NULL OR pp.PostRank <= 50)
+ORDER BY
+    u.Reputation DESC,
+    pp.PostRank ASC;

@@ -1,0 +1,250 @@
+with recent_users as (
+  select u.id,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.displayname), ''), concat('user_', cast(u.id as varchar))) as displayname
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) from users)
+),
+active_questions as (
+  select p.id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.title,
+         p.tags,
+         p.lastactivitydate
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select date_trunc('year', max(creationdate)) from posts)
+    and p.closeddate is null
+),
+tag_expanded as (
+  select q.id as question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+  from active_questions q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_stats as (
+  select t.tagname,
+         count(distinct te.question_id) as q_count_year,
+         sum(aq.viewcount) as total_views_year,
+         sum(aq.score) as total_score_year
+  from tag_expanded te
+  join active_questions aq on aq.id = te.question_id
+  left join tags t on t.tagname = te.tagname
+  group by t.tagname
+),
+answerers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as user_id,
+         a.score as answer_score,
+         a.creationdate as answer_date,
+         row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc) as rn_score,
+         dense_rank() over (partition by a.parentid order by a.creationdate asc) as dr_first
+  from posts a
+  where a.posttypeid = 2
+    and a.parentid in (select id from active_questions)
+),
+accepted as (
+  select q.id as question_id,
+         q.acceptedanswerid,
+         case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted
+  from posts q
+  where q.id in (select id from active_questions)
+),
+comment_activity as (
+  select c.postid as question_id,
+         count(*) filter (where c.creationdate >= (select date_trunc('year', max(creationdate)) from comments)) as comments_year,
+         count(*) as comments_all,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  where c.postid in (select id from active_questions)
+  group by c.postid
+),
+vote_agg as (
+  select v.postid as post_id,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 5) as favorites,
+         sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total
+  from votes v
+  where v.postid in (select id from active_questions)
+  group by v.postid
+),
+dupe_links as (
+  select pl.relatedpostid as canonical_question_id,
+         count(*) filter (where pl.linktypeid = 3) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+    and pl.relatedpostid in (select id from active_questions)
+  group by pl.relatedpostid
+),
+question_core as (
+  select aq.id,
+         aq.owneruserid,
+         aq.creationdate,
+         aq.score,
+         aq.viewcount,
+         aq.answercount,
+         aq.title,
+         aq.tags,
+         aq.lastactivitydate,
+         coalesce(va.upvotes, 0) as upvotes,
+         coalesce(va.downvotes, 0) as downvotes,
+         coalesce(va.favorites, 0) as favorites,
+         coalesce(va.bounty_total, 0) as bounty_total,
+         coalesce(ca.comments_year, 0) as comments_year,
+         coalesce(ca.comments_all, 0) as comments_all,
+         ca.last_comment_date,
+         coalesce(dl.dup_count, 0) as dup_count
+  from active_questions aq
+  left join vote_agg va on va.post_id = aq.id
+  left join comment_activity ca on ca.question_id = aq.id
+  left join dupe_links dl on dl.canonical_question_id = aq.id
+),
+best_answer as (
+  select an.question_id,
+         an.user_id,
+         an.answer_id,
+         an.answer_score,
+         an.answer_date,
+         an.rn_score,
+         an.dr_first
+  from answerers an
+  where an.rn_score = 1
+),
+first_answer as (
+  select an.question_id,
+         an.user_id,
+         an.answer_id,
+         an.answer_score,
+         an.answer_date
+  from answerers an
+  where an.dr_first = 1
+),
+user_badge_agg as (
+  select b.userid,
+         count(*) as badge_count,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_owner as (
+  select qc.id as question_id,
+         u.id as owner_id,
+         u.reputation as owner_rep,
+         ru.displayname as owner_name,
+         coalesce(uba.badge_count, 0) as owner_badges,
+         coalesce(uba.gold_count, 0) as owner_gold,
+         coalesce(uba.silver_count, 0) as owner_silver,
+         coalesce(uba.bronze_count, 0) as owner_bronze
+  from question_core qc
+  left join users u on u.id = qc.owneruserid
+  left join recent_users ru on ru.id = u.id
+  left join user_badge_agg uba on uba.userid = u.id
+),
+answer_user_agg as (
+  select an.user_id,
+         count(*) as answers_year,
+         sum(case when an.answer_score > 0 then 1 else 0 end) as positive_answers_year,
+         avg(case when an.answer_score is not null then cast(an.answer_score as numeric) end) as avg_answer_score_year
+  from answerers an
+  group by an.user_id
+),
+question_rank as (
+  select qc.*,
+         row_number() over (order by qc.score desc nulls last, qc.viewcount desc nulls last) as rn_score_views,
+         row_number() over (order by qc.viewcount desc nulls last) as rn_views,
+         ntile(10) over (order by qc.viewcount desc nulls last) as decile_views,
+         ntile(10) over (order by qc.score desc nulls last) as decile_score,
+         (coalesce(qc.upvotes,0) - coalesce(qc.downvotes,0)) as net_votes
+  from question_core qc
+),
+final as (
+  select
+    qr.id as question_id,
+    qr.title,
+    qr.tags,
+    qr.creationdate as question_date,
+    qr.lastactivitydate,
+    qr.viewcount,
+    qr.score as question_score,
+    qr.answercount,
+    qr.upvotes,
+    qr.downvotes,
+    qr.net_votes,
+    qr.favorites,
+    qr.bounty_total,
+    qr.comments_year,
+    qr.comments_all,
+    qr.last_comment_date,
+    qr.dup_count,
+
+    qo.owner_id,
+    qo.owner_name,
+    qo.owner_rep,
+    qo.owner_badges,
+    qo.owner_gold,
+    qo.owner_silver,
+    qo.owner_bronze,
+
+    ba.answer_id as top_answer_id,
+    ba.user_id as top_answer_user_id,
+    ba.answer_score as top_answer_score,
+    ba.answer_date as top_answer_date,
+
+    fa.answer_id as first_answer_id,
+    fa.user_id as first_answer_user_id,
+    fa.answer_score as first_answer_score,
+    fa.answer_date as first_answer_date,
+
+    aua.answers_year as top_answerer_answers_year,
+    aua.positive_answers_year as top_answerer_positive_answers_year,
+    aua.avg_answer_score_year as top_answerer_avg_answer_score_year,
+
+    ts.tagname as dominant_tag,
+    ts.q_count_year as tag_questions_year,
+    ts.total_views_year as tag_views_year,
+    ts.total_score_year as tag_score_year,
+
+    qr.rn_score_views,
+    qr.rn_views,
+    qr.decile_views,
+    qr.decile_score
+  from question_rank qr
+  left join accepted acc on acc.question_id = qr.id
+  left join best_answer ba on ba.question_id = qr.id
+  left join first_answer fa on fa.question_id = qr.id
+  left join answer_user_agg aua on aua.user_id = ba.user_id
+  left join question_owner qo on qo.question_id = qr.id
+  left join lateral (
+    select te.tagname
+    from tag_expanded te
+    where te.question_id = qr.id
+    order by te.tagname asc
+    limit 1
+  ) dt(tagname) on true
+  left join tag_stats ts on ts.tagname = dt.tagname
+)
+select *
+from final
+where
+  (score > 0 or net_votes > 0 or favorites > 0)
+  and viewcount > (
+    select percentile_cont(0.5) within group (order by viewcount) from question_rank
+  )
+order by
+  decile_views asc,
+  decile_score asc,
+  question_score desc nulls last,
+  viewcount desc nulls last,
+  question_id asc
+limit 500;

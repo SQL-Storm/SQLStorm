@@ -1,0 +1,97 @@
+WITH TagPosts AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName,
+    p.Id AS QuestionId,
+    p.CreationDate AS QuestionCreated,
+    p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+),
+AnswerStats AS (
+  SELECT
+    q.Id AS QuestionId,
+    count(a.Id) AS TotalAnswers,
+    avg(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgAnswerLatency
+  FROM Posts a
+  JOIN Posts q
+    ON q.Id = a.ParentId
+   AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+  GROUP BY q.Id
+),
+BadgeStats AS (
+  SELECT
+    UserId,
+    sum(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    sum(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    sum(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges
+  GROUP BY UserId
+),
+UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    count(c.Id) FILTER (WHERE c.UserId IS NOT NULL) AS CommentsMade,
+    count(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS ReceivedUpvotes
+  FROM Users u
+  LEFT JOIN BadgeStats bs
+    ON bs.UserId = u.Id
+  LEFT JOIN Comments c
+    ON c.UserId = u.Id
+  LEFT JOIN Votes v
+    ON v.UserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges
+),
+TopTags AS (
+  SELECT
+    tp.TagName,
+    count(tp.QuestionId) AS QuestionCount,
+    avg(ans.TotalAnswers) AS AvgAnswersPerQuestion,
+    avg(ans.AvgAnswerLatency) AS AvgAnswerLatency
+  FROM TagPosts tp
+  LEFT JOIN AnswerStats ans
+    ON ans.QuestionId = tp.QuestionId
+  GROUP BY tp.TagName
+  HAVING count(tp.QuestionId) > 100
+  ORDER BY QuestionCount DESC
+  LIMIT 10
+)
+SELECT
+  tt.TagName,
+  tt.QuestionCount,
+  round(tt.AvgAnswersPerQuestion, 2) AS AvgAnswers,
+  round(tt.AvgAnswerLatency / 3600, 2) AS AvgAnswerHours,
+  json_agg(
+    json_build_object(
+      'User', um.DisplayName,
+      'Rep', um.Reputation,
+      'Gold', um.GoldBadges,
+      'Silver', um.SilverBadges,
+      'Bronze', um.BronzeBadges,
+      'Comments', um.CommentsMade,
+      'Upvotes', um.ReceivedUpvotes
+    )
+    ORDER BY um.Reputation DESC
+  ) AS TopContributors
+FROM TopTags tt
+JOIN (
+  SELECT DISTINCT
+    tp.TagName,
+    um.*
+  FROM TagPosts tp
+  JOIN UserMetrics um
+    ON um.UserId = tp.OwnerUserId
+) um
+  ON um.TagName = tt.TagName
+GROUP BY
+  tt.TagName, tt.QuestionCount,
+  tt.AvgAnswersPerQuestion, tt.AvgAnswerLatency
+ORDER BY tt.QuestionCount DESC;

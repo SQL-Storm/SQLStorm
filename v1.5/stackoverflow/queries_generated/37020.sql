@@ -1,0 +1,194 @@
+-- {"query": "37020.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2016} 
+WITH
+-- top active users by combined score and badges
+user_scores AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COALESCE(SUM(p.Score),0) AS PostScoreSum,
+         COALESCE(b.BadgeScore,0) AS BadgeScore,
+         (u.Reputation * 2 + COALESCE(SUM(p.Score),0) + COALESCE(b.BadgeScore,0)) AS CompositeScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, SUM(CASE Class WHEN 1 THEN 50 WHEN 2 THEN 10 ELSE 1 END) AS BadgeScore
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, b.BadgeScore
+),
+-- recent hot questions: high view/score and many answers in last 90 days
+recent_questions AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.Tags,
+         DATE_PART('day', now() - q.CreationDate) AS AgeDays
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate >= now() - INTERVAL '90 days'
+),
+-- compute tag explosion: tags exploded per question
+question_tags AS (
+  SELECT rq.QuestionId,
+         unnest(string_to_array(substring(rq.Tags from 2 for char_length(rq.Tags)-2), '><')) AS Tag
+  FROM recent_questions rq
+),
+-- tag popularity in recent window
+tag_stats AS (
+  SELECT qt.Tag,
+         COUNT(*) AS Questions,
+         SUM(rq.ViewCount) AS TotalViews,
+         SUM(rq.Score) AS TotalScore,
+         AVG(rq.AnswerCount) AS AvgAnswers
+  FROM question_tags qt
+  JOIN recent_questions rq ON rq.QuestionId = qt.QuestionId
+  GROUP BY qt.Tag
+),
+-- answer quality: answers in last 180 days with their authors and acceptance/upvotes
+recent_answers AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId,
+         a.CreationDate,
+         a.Score,
+         a.CommentCount,
+         CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= now() - INTERVAL '180 days'
+),
+answerer_stats AS (
+  SELECT ra.OwnerUserId AS UserId,
+         COUNT(*) AS AnswersGiven,
+         SUM(ra.Score) AS AnswerScoreSum,
+         SUM(ra.IsAccepted) AS AcceptedCount,
+         AVG(ra.Score) AS AvgAnswerScore,
+         MAX(ra.Score) AS MaxAnswerScore
+  FROM recent_answers ra
+  GROUP BY ra.OwnerUserId
+),
+-- join users with their activity and recent high-impact posts
+top_users AS (
+  SELECT us.UserId,
+         us.DisplayName,
+         us.Reputation,
+         us.PostScoreSum,
+         us.BadgeScore,
+         us.CompositeScore,
+         COALESCE(a.AnswersGiven,0) AS AnswersGiven,
+         COALESCE(a.AnswerScoreSum,0) AS AnswerScoreSum,
+         COALESCE(a.AcceptedCount,0) AS AcceptedCount
+  FROM user_scores us
+  LEFT JOIN answerer_stats a ON a.UserId = us.UserId
+  ORDER BY us.CompositeScore DESC
+  LIMIT 50
+),
+-- compute network of links between recent questions (duplicates/links)
+recent_post_links AS (
+  SELECT pl.Id, pl.CreationDate, pl.PostId, pl.RelatedPostId, lt.Name AS LinkType
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.CreationDate >= now() - INTERVAL '365 days'
+),
+-- aggregate metrics per tag combined with top users activity
+tag_user_matrix AS (
+  SELECT
+    ts.Tag,
+    ts.Questions,
+    ts.TotalViews,
+    ts.TotalScore,
+    ts.AvgAnswers,
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.CompositeScore,
+    COALESCE(au.AnswersGiven,0) AS UserAnswersInWindow,
+    COALESCE( (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId=1 AND p.OwnerUserId=tu.UserId AND p.CreationDate >= now()-INTERVAL '365 days' AND p.Tags LIKE '%' || '<' || ts.Tag || '>' || '%' ), 0) AS QuestionsByUserWithTag
+  FROM tag_stats ts
+  CROSS JOIN top_users tu
+),
+-- heavy query: rank tags by a composite hotness and correlate with top users contributions and link graph centrality
+hot_tag_rank AS (
+  SELECT
+    tum.Tag,
+    tum.Questions,
+    tum.TotalViews,
+    tum.TotalScore,
+    tum.AvgAnswers,
+    SUM(tum.UserAnswersInWindow) AS AnswersFromTopUsers,
+    SUM(tum.QuestionsByUserWithTag) AS QuestionsByTopUsers,
+    MAX(tum.CompositeScore) AS MaxTopUserScore,
+    (ts.TotalViews * 0.0001 + ts.TotalScore * 0.5 + ts.Questions * 1.0 + COALESCE(SUM(tum.UserAnswersInWindow),0) * 2.0) AS HotnessScore
+  FROM tag_stats ts
+  JOIN tag_user_matrix tum ON tum.Tag = ts.Tag
+  GROUP BY tum.Tag, ts.TotalViews, ts.TotalScore, ts.Questions, ts.AvgAnswers
+),
+-- enrich with link centrality: count how many recent links reference questions having the tag
+tag_link_enrichment AS (
+  SELECT htr.*,
+         COALESCE(link_counts.InboundLinks,0) AS InboundLinks,
+         COALESCE(link_counts.OutboundLinks,0) AS OutboundLinks,
+         (htr.HotnessScore + COALESCE(link_counts.InboundLinks,0) * 3 + COALESCE(link_counts.OutboundLinks,0) * 1) AS GlobalScore
+  FROM hot_tag_rank htr
+  LEFT JOIN (
+    SELECT qt.Tag,
+           SUM(CASE WHEN pl.RelatedPostId IS NOT NULL THEN 1 ELSE 0 END) FILTER (WHERE pl.PostId IS NOT NULL) AS OutboundLinks,
+           SUM(CASE WHEN pl.PostId IS NOT NULL THEN 1 ELSE 0 END) FILTER (WHERE pl.RelatedPostId IS NOT NULL) AS InboundLinks
+    FROM question_tags qt
+    JOIN recent_post_links pl ON pl.PostId = qt.QuestionId OR pl.RelatedPostId = qt.QuestionId
+    GROUP BY qt.Tag
+  ) link_counts ON link_counts.Tag = htr.Tag
+),
+-- final selection: combine top users, hot tags, and exemplar questions and answers
+exemplar_content AS (
+  SELECT
+    tle.Tag,
+    tle.Questions,
+    tle.TotalViews,
+    tle.TotalScore,
+    tle.AvgAnswers,
+    tle.InboundLinks,
+    tle.OutboundLinks,
+    tle.GlobalScore,
+    -- pick top question for the tag in last 90 days by (score * logarithmic views)
+    (SELECT q.Id FROM recent_questions q WHERE q.Tags LIKE '%' || '<' || tle.Tag || '>' || '%' ORDER BY (q.Score * LOG(1+q.ViewCount)) DESC NULLS LAST LIMIT 1) AS TopQuestionId,
+    -- pick highest scoring recent answer for that top question
+    (SELECT a.Id FROM Posts a WHERE a.PostTypeId=2 AND a.ParentId = (SELECT q.Id FROM recent_questions q WHERE q.Tags LIKE '%' || '<' || tle.Tag || '>' || '%' ORDER BY (q.Score * LOG(1+q.ViewCount)) DESC NULLS LAST LIMIT 1) ORDER BY a.Score DESC NULLS LAST LIMIT 1) AS TopAnswerId,
+    -- top contributing user for that tag (from top_users)
+    (SELECT tu.UserId FROM top_users tu
+       WHERE EXISTS (
+         SELECT 1 FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId=1 AND p.Tags LIKE '%' || '<' || tle.Tag || '>' || '%'
+         AND p.CreationDate >= now() - INTERVAL '365 days'
+       )
+       ORDER BY tu.CompositeScore DESC LIMIT 1
+    ) AS TopUserId
+  FROM tag_link_enrichment tle
+)
+SELECT
+  row_number() OVER (ORDER BY tle.GlobalScore DESC) AS Rank,
+  tle.Tag,
+  tle.Questions,
+  tle.TotalViews,
+  tle.TotalScore,
+  tle.AvgAnswers,
+  tle.InboundLinks,
+  tle.OutboundLinks,
+  ROUND(tle.GlobalScore,2) AS GlobalScore,
+  tq.Title AS TopQuestionTitle,
+  tq.Score AS TopQuestionScore,
+  ta.Score AS TopAnswerScore,
+  u.DisplayName AS TopUser,
+  u.Reputation AS TopUserReputation,
+  u.CompositeScore AS TopUserCompositeScore
+FROM exemplar_content tle
+LEFT JOIN Posts tq ON tq.Id = tle.TopQuestionId
+LEFT JOIN Posts ta ON ta.Id = tle.TopAnswerId
+LEFT JOIN Users u ON u.Id = tle.TopUserId
+ORDER BY tle.GlobalScore DESC
+LIMIT 100;

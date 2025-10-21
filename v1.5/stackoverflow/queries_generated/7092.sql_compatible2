@@ -1,0 +1,205 @@
+with
+-- recent active questions with tag arrays and cleaned title
+questions as (
+  select
+    p.id,
+    p.creationdate,
+    p.title,
+    coalesce(nullif(p.tags, ''), '') as raw_tags,
+    -- split tags like '<sql><performance>' into array: DBMS-specific; simulate with regexp
+    regexp_split_to_array(substring(coalesce(p.tags, ''), 2, greatest(length(coalesce(p.tags, ''))-2,0)), '><') as tag_array,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.owneruserid
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- answers with aggregated metrics and whether accepted
+answers as (
+  select
+    a.id,
+    a.parentid as questionid,
+    a.creationdate,
+    a.owneruserid,
+    a.score,
+    a.body,
+    case when q.acceptedanswerid = a.id then true else false end as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+-- vote summaries per post with conditional aggregation and null-sensitive math
+votes_summary as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 1) as accepted_votes,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_votes,
+    sum(coalesce(v.bountyamount,0)) as total_bounty
+  from votes v
+  group by v.postid
+),
+-- window: per-question ranking of answers by composite score (score weighted, recency penalty, acceptance bonus)
+answer_rank as (
+  select
+    a.*,
+    row_number() over (
+      partition by a.questionid
+      order by
+        (coalesce(a.score,0) * 1000 + (case when a.is_accepted then 100000 else 0 end)
+          - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - a.creationdate))/86400 * 10
+        ) desc,
+        a.creationdate asc
+    ) as answer_rank
+  from answers a
+),
+-- tag popularity computed from questions in window
+tag_popularity as (
+  select
+    t.tag as tag,
+    count(*) filter (where q.viewcount > 100) as popular_views_cnt,
+    count(*) as total_questions,
+    avg(q.score) as avg_score,
+    percentile_cont(0.5) within group (order by q.answercount) as median_answers
+  from (
+    select unnest(tag_array) as tag
+    from questions
+  ) t
+  join questions q on true
+  group by t.tag
+),
+-- users with activity, badges and derived quality score
+user_metrics as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    coalesce(b.badge_count,0) as badge_count,
+    -- quality score: reputation * log(1+views) + badges*500 - downvotes*10
+    (u.reputation * ln(1 + coalesce(u.views,0)) + coalesce(b.badge_count,0) * 500 - coalesce(u.downvotes,0) * 10) as quality_score
+  from users u
+  left join (
+    select userId, count(*) as badge_count
+    from badges
+    group by userId
+  ) b on b.userId = u.id
+),
+-- correlated subquery: per-question top answer metrics pulled via lateral-like join
+question_top_answers as (
+  select
+    q.id as questionid,
+    q.title,
+    q.creationdate as question_created,
+    q.score as question_score,
+    q.viewcount as question_views,
+    qa_top.top_answer_id,
+    qa_top.top_score,
+    qa_top.top_is_accepted,
+    qa_top.top_owneruserid
+  from questions q
+  left join lateral (
+    select a.id as top_answer_id, a.score as top_score, a.is_accepted as top_is_accepted, a.owneruserid as top_owneruserid
+    from answer_rank a
+    where a.questionid = q.id
+    order by a.answer_rank asc
+    limit 1
+  ) qa_top on true
+),
+-- compute closing/flagging propensity from posthistory correlated aggregates
+post_history_signals as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (10,12,35,36)) as close_or_migration_events,
+    count(*) filter (where ph.posthistorytypeid in (24,52)) as suggested_edits_or_hot_events,
+    max(ph.creationdate) as last_history_date,
+    bool_or(ph.text is null) as any_text_null
+  from posthistory ph
+  group by ph.postid
+),
+-- assemble final candidate set with complex predicates and string manipulations
+candidates as (
+  select
+    qt.questionid,
+    qt.title,
+    qt.question_created,
+    qt.question_score,
+    qt.question_views,
+    qt.top_answer_id,
+    qt.top_score,
+    qt.top_is_accepted,
+    qt.top_owneruserid,
+    vs.upvotes,
+    vs.downvotes,
+    vs.total_bounty,
+    phs.close_or_migration_events,
+    (length(lower(coalesce(qt.title,''))) - length(replace(lower(coalesce(qt.title,'')), 'duplicate', ''))) as duplicate_word_chars,
+    case
+      when qt.question_views / greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qt.question_created))/86400) > 100 then 'hot_views'
+      when qt.question_score > 50 and qt.top_score > 20 then 'hot_score_combo'
+      else 'normal'
+    end as hotness_bucket
+  from question_top_answers qt
+  left join votes_summary vs on vs.postid = qt.questionid
+  left join post_history_signals phs on phs.postid = qt.questionid
+  where qt.question_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- final ranking with window functions, set operations and a union to introduce variety
+ranked_candidates as (
+  select
+    c.*,
+    (
+      coalesce(c.question_score,0) * 50
+      + coalesce(c.top_score,0) * 200
+      + coalesce(c.upvotes,0) * 30
+      - coalesce(c.downvotes,0) * 40
+      + coalesce(c.total_bounty,0) * 10
+      - coalesce(c.close_or_migration_events,0) * 1000
+      + (case when c.top_is_accepted then 5000 else 0 end)
+    ) as raw_rank_score
+  from candidates c
+),
+-- create a small synthetic set: top 100 by raw_rank_score and union with a sample of older/low-score posts
+top_and_sample as (
+  select * from (
+    select *, row_number() over (order by raw_rank_score desc, question_views desc nulls last) rn
+    from ranked_candidates
+  ) t
+  where t.rn <= 100
+
+  union
+
+  select * from (
+    select rc.*, row_number() over (order by raw_rank_score asc nulls last, question_created desc) rn2
+    from ranked_candidates rc
+  ) low_sample
+  where low_sample.rn2 <= 25
+)
+select
+  tas.questionid,
+  left(nullif(tas.title,''), 200) as title_snippet,
+  tas.question_created,
+  tas.question_score,
+  tas.question_views,
+  tas.top_answer_id,
+  tas.top_score,
+  tas.top_is_accepted,
+  tas.upvotes,
+  tas.downvotes,
+  tas.total_bounty,
+  tas.close_or_migration_events,
+  tas.hotness_bucket,
+  tas.raw_rank_score,
+  percentile_cont(0.75) within group (order by tas.raw_rank_score) over () as p75_score,
+  um.displayname as top_owner_name,
+  um.quality_score as top_owner_quality
+from top_and_sample tas
+left join user_metrics um on um.id = tas.top_owneruserid
+order by tas.raw_rank_score desc nulls last, tas.question_views desc
+limit 200;

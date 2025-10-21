@@ -1,0 +1,154 @@
+WITH
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        substr(p.Title, 1, 50) AS title_snippet,
+        ARRAY_LENGTH(
+          STRING_TO_ARRAY(substr(p.Tags, 2, length(p.Tags) - 2), '><')
+        , 1) AS tag_count
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '90 days'
+),
+UserStats AS (
+    SELECT
+        u.Id        AS user_id,
+        u.DisplayName,
+        COUNT(rq.Id)                                 AS recent_q_count,
+        SUM(CASE WHEN rq.Score > 0 THEN 1 ELSE 0 END) AS positive_q_count,
+        COALESCE(AVG(rq.Score), 0)                    AS avg_q_score,
+        COALESCE(u.Location, '(unknown)')            AS location,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC)      AS rep_rank
+    FROM Users u
+    LEFT JOIN RecentQuestions rq
+      ON rq.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation
+),
+TagStats AS (
+    SELECT
+        p.Id   AS question_id,
+        t     AS tag,
+        COUNT(*) OVER (PARTITION BY t) AS tag_usage
+    FROM Posts p
+    CROSS JOIN LATERAL
+      unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS t
+    WHERE p.PostTypeId = 1
+),
+DuplicatePairs AS (
+    SELECT
+        pl.PostId   AS question_id,
+        lt.Name     AS link_type,
+        COUNT(*)    AS link_count
+    FROM PostLinks pl
+    JOIN LinkTypes lt
+      ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId, lt.Name
+),
+ClosedReasons AS (
+    SELECT
+        p.Id        AS question_id,
+        p.Title,
+        crt.Name    AS close_reason
+    FROM Posts p
+    JOIN PostHistory ph
+      ON ph.PostId = p.Id
+     AND ph.PostHistoryTypeId = 10
+    JOIN CloseReasonTypes crt
+      ON crt.Id = CAST(ph.Comment AS int)
+)
+/* Main header SELECT: combine all CTEs with full outer joins,
+   correlated subquery for comment count, NULL‐logic and calculations */
+SELECT
+    rq.Id                     AS question_id,
+    us.DisplayName            AS owner_name,
+    ts.tag                    AS tag,
+    dp.link_count,
+    cr.close_reason,
+    (
+      SELECT COUNT(*) 
+      FROM Comments c 
+      WHERE c.PostId = rq.Id
+    )                         AS comment_count,
+    CASE 
+      WHEN rq.ViewCount > 0 
+      THEN (rq.Score::numeric) / rq.ViewCount 
+      ELSE NULL 
+    END                        AS score_to_view_ratio,
+    CASE 
+      WHEN dp.link_count >= 1 
+      THEN TRUE 
+      ELSE FALSE 
+    END                        AS has_links
+FROM RecentQuestions rq
+FULL OUTER JOIN UserStats us
+  ON us.user_id = rq.OwnerUserId
+FULL OUTER JOIN TagStats ts
+  ON ts.question_id = rq.Id
+FULL OUTER JOIN DuplicatePairs dp
+  ON dp.question_id = rq.Id
+FULL OUTER JOIN ClosedReasons cr
+  ON cr.question_id = rq.Id
+WHERE (us.Reputation > 1000 OR us.Reputation IS NULL)
+  AND rq.Score > COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.PostTypeId = 1)
+      , 0)
+  AND (ts.tag IS NOT NULL OR dp.link_count IS NOT NULL)
+
+UNION ALL
+
+SELECT
+    p.Id,
+    p.OwnerUserId,
+    NULL,
+    NULL,
+    NULL,
+    (
+      SELECT COUNT(*) 
+      FROM Comments c 
+      WHERE c.PostId = p.Id
+    ),
+    CASE 
+      WHEN p.ViewCount > 0 
+      THEN (p.Score::numeric) / p.ViewCount 
+      ELSE NULL 
+    END,
+    FALSE
+FROM Posts p
+WHERE p.PostTypeId = 2
+  AND p.Score < 0
+
+INTERSECT
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    'USER' AS tag,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE u.DownVotes > u.UpVotes
+
+EXCEPT
+
+SELECT
+    v.PostId,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Votes v
+WHERE v.VoteTypeId = (
+    SELECT Id FROM VoteTypes WHERE Name = 'Spam'
+);

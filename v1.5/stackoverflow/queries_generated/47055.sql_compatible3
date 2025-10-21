@@ -1,0 +1,129 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.Score) as avg_score
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers_in_tag,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_answer_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    JOIN Posts q ON p.ParentId = q.Id
+    JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE u.Reputation > 1000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+badge_achievements AS (
+    SELECT 
+        ue.UserId,
+        ue.TagName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as bronze_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') as gold_badge_names
+    FROM user_expertise ue
+    LEFT JOIN Badges b ON b.UserId = ue.UserId 
+        AND (b.Name = ue.TagName OR b.TagBased = true)
+    GROUP BY ue.UserId, ue.TagName
+),
+edit_activity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) as posts_edited,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.Id END) as suggested_edits
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+    GROUP BY ph.UserId
+),
+interaction_network AS (
+    SELECT 
+        p1.OwnerUserId as answerer_id,
+        p2.OwnerUserId as questioner_id,
+        COUNT(DISTINCT p1.Id) as interactions,
+        AVG(p1.Score) as avg_interaction_score,
+        COUNT(DISTINCT CASE WHEN p1.Id = p2.AcceptedAnswerId THEN p1.Id END) as accepted_interactions
+    FROM Posts p1
+    JOIN Posts p2 ON p1.ParentId = p2.Id
+    WHERE p1.PostTypeId = 2 
+        AND p2.PostTypeId = 1
+        AND p1.OwnerUserId IS NOT NULL
+        AND p2.OwnerUserId IS NOT NULL
+        AND p1.OwnerUserId != p2.OwnerUserId
+    GROUP BY p1.OwnerUserId, p2.OwnerUserId
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_PART('hour', CreationDate) as hour_of_day,
+        DATE_PART('dow', CreationDate) as day_of_week,
+        PostTypeId,
+        COUNT(*) as post_count,
+        AVG(Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) as median_score,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Score) as p90_score
+    FROM Posts
+    WHERE CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+        AND Score IS NOT NULL
+    GROUP BY DATE_PART('hour', CreationDate), DATE_PART('dow', CreationDate), PostTypeId
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.total_score,
+    ue.avg_answer_score,
+    ue.accepted_answers,
+    ROUND(100.0 * ue.accepted_answers / NULLIF(ue.answers_in_tag, 0), 2) as acceptance_rate,
+    ue.tag_rank,
+    th.question_count as tag_question_volume,
+    th.avg_score as tag_avg_question_score,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.gold_badge_names,
+    COALESCE(ea.posts_edited, 0) as recent_edits,
+    COALESCE(ea.suggested_edits, 0) as suggested_edits,
+    COUNT(DISTINCT inn.questioner_id) as unique_questioners_helped,
+    SUM(inn.interactions) as total_help_interactions,
+    AVG(inn.avg_interaction_score) as avg_help_score,
+    SUM(inn.accepted_interactions) as total_accepted_from_help,
+    MAX(tp.avg_score) FILTER (WHERE tp.PostTypeId = 2) as peak_hour_answer_score,
+    STRING_AGG(DISTINCT 
+        CASE WHEN tp.PostTypeId = 2 AND tp.avg_score > 5 
+        THEN CAST(tp.hour_of_day AS TEXT) 
+        END, ', ' ORDER BY CAST(tp.hour_of_day AS TEXT)
+    ) as high_scoring_answer_hours
+FROM user_expertise ue
+JOIN tag_hierarchy th ON th.TagName = ue.TagName
+LEFT JOIN badge_achievements ba ON ba.UserId = ue.UserId AND ba.TagName = ue.TagName
+LEFT JOIN edit_activity ea ON ea.UserId = ue.UserId
+LEFT JOIN interaction_network inn ON inn.answerer_id = ue.UserId
+LEFT JOIN temporal_patterns tp ON tp.PostTypeId = 2
+WHERE ue.tag_rank <= 10
+    AND th.question_count >= 100
+GROUP BY 
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.TagName, ue.answers_in_tag,
+    ue.total_score, ue.avg_answer_score, ue.accepted_answers, ue.tag_rank,
+    th.question_count, th.avg_score, ba.gold_badges, ba.silver_badges,
+    ba.bronze_badges, ba.gold_badge_names, ea.posts_edited, ea.suggested_edits
+HAVING COUNT(DISTINCT inn.questioner_id) > 10
+ORDER BY ue.total_score DESC, ue.accepted_answers DESC
+LIMIT 100;

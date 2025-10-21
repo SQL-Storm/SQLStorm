@@ -1,0 +1,65 @@
+WITH Q AS (
+  SELECT
+    p.Id AS PostId,
+    'Question' AS PostTypeName,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    COALESCE(s.UpVotes, 0) AS UpVotes,
+    COALESCE(s.DownVotes, 0) AS DownVotes,
+    s.LastVoteDate,
+    COALESCE(p.LastEditorDisplayName, 'Unknown') AS LastEditorDisplayName,
+    p.LastActivityDate,
+    CASE WHEN p.Tags IS NULL THEN 0 ELSE (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '<', ''))) END AS TagCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinOwner,
+    (p.Score + 0.8 * LOG(1.0 + CAST(p.ViewCount AS double precision)) + 1.5 * COALESCE(s.UpVotes, 0) - 0.75 * COALESCE(s.DownVotes, 0)) AS WeightedScore,
+    LOWER(RAWTOHEX(SYS_HASH('MD5', p.Title))) AS TitleHash,
+    COALESCE((SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = p.Id), 0) AS LatestCommentScore
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(CreationDate) AS LastVoteDate
+    FROM Votes
+    GROUP BY PostId
+  ) s ON s.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+A AS (
+  SELECT
+    p.Id AS PostId,
+    'Answer' AS PostTypeName,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    COALESCE(s.UpVotes, 0) AS UpVotes,
+    COALESCE(s.DownVotes, 0) AS DownVotes,
+    s.LastVoteDate,
+    COALESCE(p.LastEditorDisplayName, 'Unknown') AS LastEditorDisplayName,
+    p.LastActivityDate,
+    CASE WHEN p.Tags IS NULL THEN 0 ELSE (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '<', ''))) END AS TagCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinOwner,
+    (p.Score + 0.8 * LOG(1.0 + CAST(p.ViewCount AS double precision)) + 1.5 * COALESCE(s.UpVotes, 0) - 0.75 * COALESCE(s.DownVotes, 0)) AS WeightedScore,
+    LOWER(RAWTOHEX(SYS_HASH('MD5', p.Title))) AS TitleHash,
+    COALESCE((SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = p.Id), 0) AS LatestCommentScore
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(CreationDate) AS LastVoteDate
+    FROM Votes
+    GROUP BY PostId
+  ) s ON s.PostId = p.Id
+  WHERE p.PostTypeId = 2
+)
+SELECT *
+FROM Q
+UNION ALL
+SELECT *
+FROM A
+ORDER BY WeightedScore DESC
+OFFSET 0 ROWS FETCH NEXT 300 ROWS ONLY;

@@ -1,0 +1,75 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(u.DisplayName, 'Deleted User') AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, u.DisplayName
+),
+PostWithTags AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerDisplayName,
+        rp.CommentCount,
+        STRING_AGG(t.TagName, ', ') AS Tags
+    FROM 
+        RankedPosts rp
+    LEFT JOIN 
+        UNNEST(string_to_array(rp.Tags, ',')) AS tag ON TRUE
+    LEFT JOIN 
+        Tags t ON tag = t.TagName
+    WHERE 
+        rp.rn = 1
+    GROUP BY 
+        rp.PostId, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.CommentCount
+),
+PostScores AS (
+    SELECT
+        pw.PostId,
+        (SELECT AVG(vt.BountyAmount) FROM Votes v LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id WHERE v.PostId = pw.PostId) AS AverageBounty,
+        pw.Score + COALESCE(AVG(vt.BountyAmount), 0) AS AdjustedScore
+    FROM 
+        PostWithTags pw
+    LEFT JOIN 
+        Votes v ON pw.PostId = v.PostId
+    LEFT JOIN 
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY 
+        pw.PostId, pw.Score
+)
+SELECT 
+    ps.PostId,
+    ps.Title,
+    ps.CreationDate,
+    ps.Score,
+    ps.ViewCount,
+    ps.OwnerDisplayName,
+    ps.CommentCount,
+    pt.Tags,
+    ps.AdjustedScore
+FROM 
+    PostScores ps
+JOIN 
+    PostWithTags pt ON ps.PostId = pt.PostId
+WHERE 
+    ps.AdjustedScore IS NOT NULL AND ps.AdjustedScore > 0
+ORDER BY 
+    ps.AdjustedScore DESC
+LIMIT 10;

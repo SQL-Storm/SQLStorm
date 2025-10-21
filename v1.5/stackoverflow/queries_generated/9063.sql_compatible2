@@ -1,0 +1,97 @@
+WITH recent_posts AS (
+    SELECT
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.score DESC) AS rn
+    FROM posts p
+    WHERE p.creationdate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30 days'
+),
+user_badges AS (
+    SELECT
+        u.id AS userid,
+        COUNT(*) FILTER (WHERE b.class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.class = 3) AS bronze_badges
+    FROM users u
+    LEFT JOIN badges b ON b.userid = u.id
+    GROUP BY u.id
+)
+SELECT
+    u.displayname,
+    u.reputation,
+    COALESCE(ub.gold_badges, 0)
+      + COALESCE(ub.silver_badges, 0)
+      + COALESCE(ub.bronze_badges, 0) AS total_badges,
+    rp.id AS post_id,
+    rp.posttypeid,
+    rp.creationdate,
+    p.title,
+    p.tags,
+    COUNT(c.id) AS comment_count,
+    AVG(
+      (SELECT COUNT(*) FROM votes v WHERE v.postid = p.id AND v.votetypeid = 2)
+    ) OVER (PARTITION BY rp.owneruserid) AS avg_upvotes_per_user,
+    CASE
+        WHEN p.score < 0 THEN 'Negative'
+        WHEN p.score = 0 THEN 'Neutral'
+        ELSE 'Positive'
+    END AS score_category,
+    CONCAT(SUBSTRING(p.title FROM 1 FOR 20), '...') AS short_title
+FROM recent_posts rp
+JOIN users u ON u.id = rp.owneruserid
+LEFT JOIN user_badges ub ON ub.userid = u.id
+LEFT JOIN posts p ON p.id = rp.id
+LEFT JOIN comments c
+  ON c.postid = p.id
+ AND c.creationdate BETWEEN rp.creationdate - INTERVAL '7 days'
+                         AND rp.creationdate + INTERVAL '7 days'
+WHERE EXISTS (
+    SELECT 1
+    FROM tags t
+    WHERE t.wikipostid = p.id
+      AND t.tagname ILIKE '%sql%'
+)
+  AND rp.rn = 1
+GROUP BY
+    u.displayname,
+    u.reputation,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    rp.id,
+    rp.posttypeid,
+    rp.creationdate,
+    p.title,
+    p.tags,
+    p.score
+HAVING
+    COUNT(c.id) > (
+        SELECT AVG(ct.commentcnt)
+        FROM (
+            SELECT COUNT(*) AS commentcnt
+            FROM comments
+            WHERE postid = p.id
+            GROUP BY userid
+        ) ct
+    )
+
+UNION ALL
+
+SELECT
+    'SUMMARY'       AS displayname,
+    NULL AS reputation,
+    NULL AS total_badges,
+    NULL AS post_id,
+    NULL AS posttypeid,
+    NULL AS creationdate,
+    NULL AS title,
+    NULL AS tags,
+    NULL AS comment_count,
+    NULL AS avg_upvotes_per_user,
+    NULL AS score_category,
+    NULL AS short_title
+
+ORDER BY displayname, reputation DESC
+LIMIT 100;

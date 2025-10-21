@@ -1,0 +1,140 @@
+WITH
+RecentPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.CommentCount
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+),
+CommentCounts AS (
+  SELECT c.PostId, COUNT(*) AS CommentCount
+  FROM Comments c
+  GROUP BY c.PostId
+),
+OwnerStats AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(bd.BadgeCount, 0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId
+  ) bd ON bd.UserId = u.Id
+),
+TagHierarchy AS (
+  -- explode tag string on a per-post basis and collect tag metadata
+  SELECT
+    rp.Id AS PostId,
+    TRIM(tg.TagName) AS TagName
+  FROM RecentPosts rp
+  CROSS JOIN LATERAL UNNEST(
+    CASE
+      WHEN rp.Tags IS NULL THEN ARRAY[]::text[]
+      ELSE string_to_array(substr(rp.Tags, 2, length(rp.Tags) - 2), '><')
+    END
+  ) AS tg(TagName)
+),
+PostScoreRank AS (
+  SELECT
+    rp.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY rp.PostTypeId
+      ORDER BY (rp.Score::double precision) + 0.5 * NULLIF(rp.ViewCount, 0) DESC,
+               rp.LastActivityDate DESC,
+               rp.CreationDate DESC
+    ) AS RankWithinType
+  FROM RecentPosts rp
+),
+Aggregated AS (
+  SELECT
+    prs.Id,
+    prs.Title,
+    prs.PostTypeId,
+    prs.CreationDate,
+    prs.LastActivityDate,
+    prs.Score,
+    prs.ViewCount,
+    prs.Tags,
+    cc.CommentCount,
+    os.DisplayName AS OwnerDisplayName,
+    os.Reputation AS OwnerReputation,
+    os.BadgeCount AS OwnerBadgeCount,
+    prs.AcceptedAnswerId,
+    prs.ParentId,
+    prs.ContentLicense,
+    prs.LastEditorDisplayName
+  FROM PostScoreRank prs
+  LEFT JOIN CommentCounts cc ON prs.Id = cc.PostId
+  LEFT JOIN OwnerStats os ON prs.OwnerUserId = os.Id
+),
+TagSummary AS (
+  SELECT
+    a.Id,
+    a.Title,
+    a.PostTypeId,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.Tags,
+    a.CommentCount,
+    a.OwnerDisplayName,
+    a.OwnerReputation,
+    a.OwnerBadgeCount,
+    a.AcceptedAnswerId,
+    a.ParentId,
+    a.ContentLicense,
+    a.LastEditorDisplayName,
+    ARRAY_AGG(DISTINCT tg.TagName) AS TagSet
+  FROM Aggregated a
+  LEFT JOIN TagHierarchy tg ON a.Id = tg.PostId
+  GROUP BY
+    a.Id, a.Title, a.PostTypeId, a.CreationDate, a.LastActivityDate,
+    a.Score, a.ViewCount, a.Tags, a.CommentCount,
+    a.OwnerDisplayName, a.OwnerReputation, a.OwnerBadgeCount,
+    a.AcceptedAnswerId, a.ParentId, a.ContentLicense, a.LastEditorDisplayName
+)
+SELECT
+  ts.Id,
+  ts.Title,
+  ts.PostTypeId,
+  ts.CreationDate,
+  ts.LastActivityDate,
+  ts.Score,
+  ts.ViewCount,
+  ts.CommentCount,
+  ts.OwnerDisplayName AS OwnerName,
+  ts.OwnerReputation,
+  ts.OwnerBadgeCount,
+  ts.AcceptedAnswerId,
+  ts.ParentId,
+  ts.ContentLicense,
+  ts.LastEditorDisplayName,
+  ts.TagSet,
+  -- computed metrics with NULL-safe expressions
+  (ts.Score::double precision / NULLIF(ts.ViewCount, 0)) AS ScorePerView,
+  (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ts.CreationDate)) / 3600.0) AS HoursSinceCreation,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ts.Id AND v.VoteTypeId IN (2, 6)) AS UpOrCloseVotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ts.Id AND v.VoteTypeId IN (3, 10)) AS DownVotes,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ts.Id) AS TotalComments,
+  (SELECT ARRAY_AGG(ustr.DisplayName) FROM Votes v
+     JOIN Users ustr ON v.UserId = ustr.Id
+     WHERE v.PostId = ts.Id AND v.VoteTypeId = 8
+  ) AS BountyNominees
+FROM TagSummary ts
+ORDER BY ts.CreationDate DESC, ts.Score DESC
+LIMIT 500;

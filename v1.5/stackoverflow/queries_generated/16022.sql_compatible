@@ -1,0 +1,129 @@
+WITH user_activity_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+    EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) AS account_age_years,
+    CASE 
+      WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 
+      THEN UPPER(SUBSTRING(u.Location, 1, 20))
+      ELSE 'UNKNOWN'
+    END AS normalized_location,
+    ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS yearly_rep_rank,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation) AS rep_percentile
+  FROM Users u
+  WHERE u.Reputation > 1000
+    AND u.LastAccessDate > u.CreationDate + INTERVAL '30 days'
+),
+post_engagement AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    COALESCE(p.AnswerCount, 0) AS answer_count,
+    CASE 
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+      ELSE 0 
+    END AS has_accepted_answer,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS upvote_count,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS downvote_count,
+    COALESCE(LENGTH(p.Body), 0) / NULLIF(COALESCE(p.CommentCount, 0), 0) AS body_to_comment_ratio,
+    EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 3600.0 AS activity_duration_hours,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS rolling_avg_score
+  FROM Posts p
+  WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+    AND p.PostTypeId IN (1, 2)
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+),
+badge_achievements AS (
+  SELECT 
+    b.UserId,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+    STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') AS gold_badge_names,
+    MAX(b.Date) AS latest_badge_date
+  FROM Badges b
+  WHERE b.TagBased = 0
+  GROUP BY b.UserId
+  HAVING COUNT(CASE WHEN b.Class = 1 THEN 1 END) > 0
+),
+tag_expertise AS (
+  SELECT 
+    p.OwnerUserId,
+    UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name,
+    COUNT(*) AS tag_post_count,
+    AVG(p.Score) AS avg_tag_score,
+    DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS tag_rank
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, tag_name
+)
+SELECT 
+  uam.DisplayName,
+  uam.Reputation,
+  uam.normalized_location,
+  uam.account_age_years,
+  uam.yearly_rep_rank,
+  ROUND(uam.rep_percentile::numeric, 4) AS reputation_percentile,
+  COUNT(DISTINCT pe.post_id) AS total_posts,
+  ROUND(AVG(pe.Score)::numeric, 2) AS avg_post_score,
+  ROUND(AVG(NULLIF(pe.ViewCount, 0))::numeric, 2) AS avg_views,
+  SUM(pe.has_accepted_answer) AS accepted_answers_count,
+  COALESCE(ba.gold_badges, 0) AS gold_badges,
+  COALESCE(ba.silver_badges, 0) AS silver_badges,
+  COALESCE(ba.bronze_badges, 0) AS bronze_badges,
+  COALESCE(SUBSTRING(ba.gold_badge_names, 1, 100), 'None') AS top_gold_badges,
+  (SELECT STRING_AGG(te.tag_name, ', ')
+   FROM tag_expertise te 
+   WHERE te.OwnerUserId = uam.Id AND te.tag_rank <= 3
+   GROUP BY te.OwnerUserId) AS top_tags,
+  ROUND(AVG(pe.body_to_comment_ratio)::numeric, 2) AS avg_body_comment_ratio,
+  MAX(pe.activity_duration_hours) AS max_activity_duration_hours,
+  ROUND(AVG(pe.rolling_avg_score)::numeric, 2) AS avg_rolling_score,
+  COUNT(DISTINCT pl.RelatedPostId) AS linked_posts_count,
+  (SELECT COUNT(*) 
+   FROM Comments c 
+   WHERE c.UserId = uam.Id 
+     AND c.Score > 5) AS high_score_comments,
+  CASE 
+    WHEN uam.Reputation > 100000 THEN 'Elite'
+    WHEN uam.Reputation > 50000 THEN 'Expert'
+    WHEN uam.Reputation > 10000 THEN 'Advanced'
+    ELSE 'Intermediate'
+  END AS user_tier,
+  COALESCE((SELECT MAX(v.CreationDate) 
+            FROM Votes v 
+            INNER JOIN Posts p2 ON v.PostId = p2.Id 
+            WHERE p2.OwnerUserId = uam.Id AND v.VoteTypeId = 2), uam.CreationDate) AS last_upvote_received
+FROM user_activity_metrics uam
+INNER JOIN post_engagement pe ON uam.Id = pe.OwnerUserId
+LEFT OUTER JOIN badge_achievements ba ON uam.Id = ba.UserId
+LEFT OUTER JOIN PostLinks pl ON pe.post_id = pl.PostId AND pl.LinkTypeId = 1
+WHERE pe.Score IS NOT NULL
+  AND (pe.downvote_count = 0 OR pe.upvote_count / NULLIF(pe.downvote_count, 0) > 3)
+  AND uam.net_votes > 100
+  AND EXISTS (
+    SELECT 1 
+    FROM Posts p3 
+    WHERE p3.OwnerUserId = uam.Id 
+      AND p3.PostTypeId = 2 
+      AND p3.Id = p3.ParentId + 1
+      OR p3.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p3.PostTypeId)
+  )
+GROUP BY uam.Id, uam.DisplayName, uam.Reputation, uam.normalized_location, 
+         uam.account_age_years, uam.yearly_rep_rank, uam.rep_percentile, uam.CreationDate,
+         ba.gold_badges, ba.silver_badges, ba.bronze_badges, ba.gold_badge_names
+HAVING COUNT(DISTINCT pe.post_id) >= 10
+   AND AVG(pe.Score) > 5
+   AND (COALESCE(ba.gold_badges, 0) + COALESCE(ba.silver_badges, 0)) > 0
+ORDER BY uam.Reputation DESC, COUNT(DISTINCT pe.post_id) DESC, avg_post_score DESC
+LIMIT 500;

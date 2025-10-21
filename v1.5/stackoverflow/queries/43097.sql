@@ -1,0 +1,53 @@
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+QuestionPostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+),
+TopUserQuestions AS (
+    SELECT 
+        qpd.OwnerUserId,
+        AVG(qpd.Score) AS AvgScore,
+        SUM(qpd.ViewCount) AS TotalViewCount,
+        COUNT(qpd.PostId) AS TotalQuestions,
+        MAX(qpd.Score) AS MaxScore
+    FROM QuestionPostDetails qpd
+    WHERE qpd.rn <= 10
+    GROUP BY qpd.OwnerUserId
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    tuq.AvgScore,
+    tuq.TotalViewCount,
+    tuq.TotalQuestions,
+    tuq.MaxScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS TotalAnswers
+FROM Users u
+JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN TopUserQuestions tuq ON u.Id = tuq.OwnerUserId
+WHERE u.Reputation > 1000
+ORDER BY COALESCE(tuq.AvgScore, 0) DESC, COALESCE(ubc.GoldBadges, 0) DESC
+LIMIT 100;

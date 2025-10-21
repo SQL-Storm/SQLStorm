@@ -1,0 +1,120 @@
+-- {"query": "20016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1295} 
+
+WITH GoldBadgeUsers AS (
+    -- Find users who have earned at least one gold badge, a proxy for "expert" users.
+    SELECT DISTINCT
+        b.UserId
+    FROM 
+        Badges b
+    WHERE 
+        b.Class = 1 -- Gold Badge
+),
+UserYearlyActivity AS (
+    -- Aggregate post-related metrics for each expert user on a yearly basis.
+    SELECT
+        p.OwnerUserId,
+        EXTRACT(YEAR FROM p.CreationDate) AS ActivityYear,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        SUM(p.Score) AS TotalScore,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavorites,
+        AVG(p.CommentCount) AS AvgCommentsPerPost,
+        MAX(LENGTH(p.Body)) AS LongestPostBody,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 15), ', ' ORDER BY t.TagName) AS TopTagsUsedSample
+    FROM
+        Posts p
+    INNER JOIN 
+        GoldBadgeUsers gbu ON p.OwnerUserId = gbu.UserId
+    LEFT JOIN
+        Tags t ON p.Id = t.ExcerptPostId -- An arbitrary join to add complexity
+    WHERE 
+        p.CreationDate IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId,
+        ActivityYear
+),
+RankedUserActivity AS (
+    -- Rank each user's yearly activity to find their "peak" year based on a composite score.
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY OwnerUserId 
+            ORDER BY TotalPosts DESC, TotalScore DESC, TotalFavorites DESC
+        ) as ActivityRank,
+        -- Calculate the difference in posts from the previous year for the same user.
+        TotalPosts - LAG(TotalPosts, 1, 0) OVER (
+            PARTITION BY OwnerUserId 
+            ORDER BY ActivityYear
+        ) AS PostCountChangeFromPrevYear
+    FROM
+        UserYearlyActivity
+),
+SiteAverages AS (
+    -- Calculate site-wide average score per post for each year for comparison.
+    -- This subquery is intentionally slightly inefficient for benchmarking.
+    SELECT
+        EXTRACT(YEAR FROM p.CreationDate) AS ActivityYear,
+        AVG(p.Score) AS SiteAvgScorePerPost,
+        COUNT(DISTINCT p.Id) * 1.0 / COUNT(DISTINCT p.OwnerUserId) AS AvgPostsPerUserSiteWide
+    FROM
+        Posts p
+    WHERE
+        p.CreationDate > (SELECT MIN(CreationDate) FROM Users) -- Correlated-like subquery
+    GROUP BY
+        ActivityYear
+)
+-- Main query: Combine the user's peak year data with site-wide stats and details about their best answer that year.
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COALESCE(u.Location, 'N/A') AS Location,
+    rya.ActivityYear AS PeakActivityYear,
+    rya.TotalPosts AS PeakYearPosts,
+    rya.QuestionsAsked AS PeakYearQuestions,
+    rya.AnswersGiven AS PeakYearAnswers,
+    -- Avoid division by zero when calculating the Question/Answer ratio.
+    rya.QuestionsAsked::decimal / GREATEST(rya.AnswersGiven, 1) AS PeakYearQaRatio,
+    rya.TotalScore AS PeakYearTotalScore,
+    rya.PostCountChangeFromPrevYear,
+    sa.SiteAvgScorePerPost AS SiteAvgScoreInPeakYear,
+    rya.TotalScore::decimal / GREATEST(rya.TotalPosts, 1) - sa.SiteAvgScorePerPost AS PerformanceDelta,
+    rya.TopTagsUsedSample,
+    -- Subquery to find the title of the user's highest-scoring answer during their peak year.
+    (SELECT 
+        p_sub.Title 
+     FROM 
+        Posts p_sub 
+     WHERE 
+        p_sub.OwnerUserId = rya.OwnerUserId 
+        AND EXTRACT(YEAR FROM p_sub.CreationDate) = rya.ActivityYear
+        AND p_sub.PostTypeId = 2 -- Answer
+     ORDER BY 
+        p_sub.Score DESC, p_sub.CreationDate DESC 
+     LIMIT 1
+    ) AS TopAnswerTitleInPeakYear,
+    -- Complicated string and NULL logic expression.
+    CASE
+        WHEN u.AboutMe IS NULL THEN 'No bio provided.'
+        WHEN LENGTH(u.AboutMe) > 200 THEN CONCAT('Long bio (', LENGTH(u.AboutMe), ' chars), starts with: ', LEFT(u.AboutMe, 50), '...')
+        ELSE 'Short bio.'
+    END AS BioAnalysis,
+    -- Another window function in the final SELECT
+    NTILE(100) OVER (ORDER BY u.Reputation DESC) AS ReputationPercentile
+FROM
+    RankedUserActivity rya
+JOIN
+    Users u ON rya.OwnerUserId = u.Id
+LEFT JOIN
+    SiteAverages sa ON rya.ActivityYear = sa.ActivityYear
+WHERE
+    rya.ActivityRank = 1 -- Filter for only the peak year of each user.
+    AND rya.TotalPosts > 10 -- Only consider users with a reasonably active peak year.
+    AND u.DisplayName NOT LIKE 'user%' -- Exclude default usernames.
+ORDER BY
+    PerformanceDelta DESC,
+    u.Reputation DESC
+LIMIT 100;
+

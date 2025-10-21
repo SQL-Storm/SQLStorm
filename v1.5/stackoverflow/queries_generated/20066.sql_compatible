@@ -1,0 +1,112 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS TotalQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS TotalAnswers
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 75000 AND u.CreationDate < TIMESTAMP '2015-01-01 00:00:00'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 10
+),
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS QuestionCreationDate,
+        p.Tags,
+        aa.OwnerUserId AS AcceptedAnswerUserId,
+        aa.CreationDate AS AcceptedAnswerDate,
+        (EXTRACT(EPOCH FROM (CAST(aa.CreationDate AS TIMESTAMP) - CAST(p.CreationDate AS TIMESTAMP))) / 60.0) AS MinsToAcceptedAnswer,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM
+        Posts p
+    JOIN
+        UserActivity ua ON p.OwnerUserId = ua.UserId
+    LEFT JOIN
+        Posts aa ON p.AcceptedAnswerId = aa.Id
+    WHERE
+        p.PostTypeId = 1 -- Questions only
+        AND p.ClosedDate IS NULL
+        AND p.DeletionDate IS NULL
+),
+PostEditHistory AS (
+    SELECT
+        PostId,
+        COUNT(*) AS EditCount,
+        COUNT(DISTINCT UserId) AS DistinctEditors,
+        MAX(CreationDate) AS LastEditDate
+    FROM
+        PostHistory
+    WHERE
+        PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+    GROUP BY
+        PostId
+)
+SELECT
+    ua.DisplayName AS AuthorName,
+    ua.Reputation AS AuthorReputation,
+    qs.Title AS QuestionTitle,
+    qs.Score AS QuestionScore,
+    qs.ViewCount,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM UNNEST(string_to_array(substring(qs.Tags, 2, length(qs.Tags)-2), '><')) AS tag(t_name)
+        JOIN Tags t ON t.TagName = tag.t_name
+    ) AS TagNames,
+    CASE
+        WHEN qs.Score > 1000 THEN 'Viral'
+        WHEN qs.Score > 200 AND qs.FavoriteCount > 50 THEN 'Highly Valued'
+        WHEN qs.AnswerCount = 0 AND qs.CreationDate < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year' THEN 'Unloved'
+        ELSE 'Standard'
+    END AS QuestionCategory,
+    COALESCE(peh.EditCount, 0) AS EditCount,
+    qs.MinsToAcceptedAnswer,
+    ans_user.DisplayName AS AnswererDisplayName,
+    ans_user.Reputation AS AnswererReputation,
+    (qs.Score * 0.4 + qs.ViewCount * 0.1 + COALESCE(qs.FavoriteCount, 0) * 0.5) / (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - qs.QuestionCreationDate)) / 86400.0) AS NormalizedImpactScore,
+    AVG(qs.Score) OVER (PARTITION BY ua.UserId) AS AvgScoreForTopQuestions,
+    LAG(qs.QuestionCreationDate, 1) OVER (PARTITION BY ua.UserId ORDER BY qs.QuestionCreationDate) AS PrevTopQuestionDate,
+    LOWER(SUBSTRING(REGEXP_REPLACE(qs.Body, '<[^>]+>', '', 'g') FROM 1 FOR 200)) || '...' AS BodySnippet
+FROM
+    QuestionStats qs
+JOIN
+    UserActivity ua ON qs.OwnerUserId = ua.UserId
+LEFT JOIN
+    PostEditHistory peh ON qs.QuestionId = peh.PostId
+LEFT JOIN
+    Users ans_user ON qs.AcceptedAnswerUserId = ans_user.Id
+WHERE
+    qs.rn <= 5 -- Top 5 questions per power user
+    AND qs.AnswerCount > (
+        SELECT AVG(p_inner.AnswerCount)
+        FROM Posts p_inner
+        WHERE p_inner.OwnerUserId = qs.OwnerUserId AND p_inner.PostTypeId = 1 AND p_inner.AnswerCount IS NOT NULL
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Comments c
+        WHERE c.PostId = qs.QuestionId AND c.Score > 5
+    )
+ORDER BY
+    AuthorReputation DESC,
+    NormalizedImpactScore DESC
+LIMIT 500;

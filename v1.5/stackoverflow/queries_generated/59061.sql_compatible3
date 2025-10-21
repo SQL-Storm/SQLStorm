@@ -1,0 +1,59 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestions,
+    COUNT(DISTINCT b.Id) as BadgesEarned,
+    COUNT(DISTINCT v.Id) as VotesCast,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT ph.Id) as PostHistoryEntries,
+    COUNT(DISTINCT pl.Id) as PostLinksCreated,
+    STRING_AGG(DISTINCT t.TagName, ', ') as TagsUsed,
+    MAX(p.CreationDate) as LastPostDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    AVG(p.Score) as AvgPostScore,
+    MAX(p.Score) as MaxPostScore,
+    SUM(p.ViewCount) as TotalViews,
+    SUM(p.FavoriteCount) as TotalFavorites,
+    COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedPosts,
+    COUNT(DISTINCT CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as CommunityOwnedPosts,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 THEN p.Id END) as QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.CommentCount > 0 THEN p.Id END) as PostsWithComments,
+    COUNT(DISTINCT CASE WHEN p.Title IS NOT NULL AND LENGTH(p.Title) > 0 THEN p.Id END) as PostsHavingTitle,
+    COUNT(DISTINCT CASE WHEN p.Body IS NOT NULL AND LENGTH(p.Body) > 0 THEN p.Id END) as PostsHavingBody,
+    COUNT(DISTINCT CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN p.Id END) as PostsHavingTags,
+    AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400) as AvgDaysSinceCreation,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) as ModerationActions,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (35, 36) THEN ph.Id END) as MigrationEvents,
+    AVG(p.ViewCount) as AvgViewsPerPost,
+    AVG(p.FavoriteCount) as AvgFavoritesPerPost,
+    AVG(p.AnswerCount) as AvgAnswersPerQuestion,
+    AVG(p.CommentCount) as AvgCommentsPerPost,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as Bookmarks,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) as BountyStarts,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 9 THEN v.Id END) as BountyCloses,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId OR u.Id = p.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId OR u.Id = ph.LastEditorUserId
+LEFT JOIN PostLinks pl ON u.Id = pl.Id
+LEFT JOIN (
+    SELECT PostId, UNNEST(string_to_array(Tags, '><')) as TagName
+    FROM Posts
+    WHERE Tags IS NOT NULL AND Tags != ''
+) t ON p.Id = t.PostId
+WHERE u.CreationDate >= DATE '2008-01-01' AND u.CreationDate < DATE '2023-01-01'
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY TotalPosts DESC, u.Reputation DESC, u.LastAccessDate DESC
+LIMIT 10000;

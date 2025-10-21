@@ -1,0 +1,63 @@
+SELECT 
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.Tags,
+    u.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    up_votes.VoteCount AS UpVotesCountForUser,
+    down_votes.VoteCount AS DownVotesCountForUser,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountTotal,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id) AS TotalVotes,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 1) AS PostLinkedToCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS ReferredAsDuplicateCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) AS PostHistoryCount,
+    ARRAY_AGG(t.TagName) AS TagsList,
+    bh.Name AS LastPostHistoryType,
+    bh.CreationDate AS LastHistoryChangeDate
+FROM 
+    Posts p
+JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    (SELECT PostId, COUNT(*) AS VoteCount FROM Votes WHERE VoteTypeId = 2 GROUP BY PostId) AS up_votes ON p.Id = up_votes.PostId
+LEFT JOIN 
+    (SELECT PostId, COUNT(*) AS VoteCount FROM Votes WHERE VoteTypeId = 3 GROUP BY PostId) AS down_votes ON p.Id = down_votes.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN 
+    Tags t ON t.TagName IN (
+        SELECT CAST(tagname AS VARCHAR)
+        FROM (
+            SELECT CAST(value AS VARCHAR) AS tagname
+            FROM UNNEST(p.Tags) AS t2(value)
+        ) AS s
+    )
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT PostId, MAX(CreationDate) AS LastHistoryChangeDate FROM PostHistory GROUP BY PostId) AS bh ON p.Id = bh.PostId
+WHERE 
+    p.PostTypeId IN (1,2)
+GROUP BY 
+    p.PostTypeId, pt.Name, p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Body, p.Tags, u.OwnerUserId, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, up_votes.VoteCount, down_votes.VoteCount, bh.Name, bh.CreationDate;

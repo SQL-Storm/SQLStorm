@@ -1,0 +1,128 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS ReputationRank,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY u.Id) AS TotalPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2) AND p.DeletedDate IS NULL
+    WHERE u.Reputation > 100 AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '365 days'
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(accepted.VoteTypeId, 0) AS HasAcceptedAnswer,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+        AVG(p.Score) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate)) AS MonthlyAvgScore,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'High Traffic'
+            WHEN p.ViewCount > 1000 THEN 'Medium Traffic'
+            ELSE 'Low Traffic'
+        END AS TrafficCategory
+    FROM Posts p
+    LEFT JOIN (
+        SELECT DISTINCT v.PostId, v.VoteTypeId
+        FROM Votes v
+        WHERE v.VoteTypeId = 1
+    ) accepted ON accepted.PostId = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1 
+        AND p.DeletedDate IS NULL 
+        AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+TopContributors AS (
+    SELECT 
+        au.UserId,
+        au.ReputationRank,
+        STRING_AGG(DISTINCT SUBSTRING(pt.Name FROM 1 FOR 20), ', ') AS UserPostTypes,
+        COUNT(DISTINCT qs.QuestionId) FILTER (WHERE qs.TrafficCategory = 'High Traffic') AS HighTrafficQuestions,
+        SUM(COALESCE(qs.AnswerCount, 0)) AS TotalAnswersAcrossQuestions
+    FROM ActiveUsers au
+    LEFT JOIN QuestionStats qs ON qs.OwnerUserId = au.UserId
+    LEFT JOIN Posts pt ON pt.OwnerUserId = au.UserId AND pt.PostTypeId IN (1, 2)
+    GROUP BY au.UserId, au.ReputationRank
+    HAVING COUNT(DISTINCT qs.QuestionId) >= 5
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS BadgeClassStr
+    FROM Badges b
+    WHERE b.Date > cast('2024-10-01' as date) - INTERVAL '1 year'
+)
+SELECT 
+    tc.UserId,
+    u.DisplayName,
+    u.Location,
+    tc.ReputationRank,
+    tc.UserPostTypes,
+    tc.HighTrafficQuestions,
+    tc.TotalAnswersAcrossQuestions,
+    COALESCE(ba.BadgeClassStr, 'None') AS MostRecentBadgeClass,
+    COUNT(DISTINCT pl.RelatedPostId) AS OutboundLinks,
+    -- Complex string manipulation for tags
+    STRING_AGG(
+        DISTINCT CASE 
+            WHEN POSITION('>' IN qs.Tags) > 0 THEN 
+                SUBSTRING(qs.Tags FROM 1 FOR POSITION('>' IN qs.Tags) - 1)
+            ELSE qs.Tags 
+        END, 
+        ' | '
+    ) AS AggregatedQuestionTags,
+    -- NULL logic with calculations
+    CASE 
+        WHEN tc.HighTrafficQuestions IS NULL OR tc.HighTrafficQuestions = 0 THEN 0
+        ELSE ROUND(
+            (CAST(tc.TotalAnswersAcrossQuestions AS numeric) / NULLIF(tc.HighTrafficQuestions, 0)) * 
+            (au.Reputation / 1000.0), 2
+        )
+    END AS EngagementScore,
+    -- Correlated subquery for vote comparison
+    (SELECT AVG(v2.BountyAmount) 
+     FROM Votes v2 
+     WHERE v2.UserId = tc.UserId AND v2.BountyAmount > 0
+       AND v2.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months') AS AvgRecentBounty
+FROM TopContributors tc
+INNER JOIN ActiveUsers au ON au.UserId = tc.UserId
+INNER JOIN Users u ON u.Id = tc.UserId
+LEFT JOIN QuestionStats qs ON qs.OwnerUserId = tc.UserId 
+    AND qs.CreationDate = (
+        SELECT MAX(qs2.CreationDate) 
+        FROM QuestionStats qs2 
+        WHERE qs2.OwnerUserId = tc.UserId
+    )
+LEFT JOIN BadgeAchievements ba ON ba.UserId = tc.UserId AND ba.RecentBadgeRank = 1
+LEFT JOIN PostLinks pl ON pl.PostId IN (
+    SELECT q.QuestionId FROM QuestionStats q WHERE q.OwnerUserId = tc.UserId
+) AND pl.LinkTypeId = 1
+WHERE tc.ReputationRank <= 100
+    AND (u.Location IS NULL OR u.Location NOT LIKE '%spam%')
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.UserId = tc.UserId 
+          AND v.VoteTypeId = 3  -- Downvotes
+          AND v.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+        GROUP BY v.UserId 
+        HAVING COUNT(*) > 50
+    )
+GROUP BY 
+    tc.UserId, u.DisplayName, u.Location, tc.ReputationRank, 
+    tc.UserPostTypes, tc.HighTrafficQuestions, tc.TotalAnswersAcrossQuestions,
+    ba.BadgeClassStr, au.Reputation
+HAVING COUNT(DISTINCT qs.QuestionId) > 0 OR tc.HighTrafficQuestions > 0
+ORDER BY tc.ReputationRank, EngagementScore DESC NULLS LAST
+LIMIT 50;

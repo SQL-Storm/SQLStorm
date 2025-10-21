@@ -1,0 +1,104 @@
+-- {"query": "12085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 958} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) OVER (PARTITION BY P.Id) AS DownVotes,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (2, 5, 24) THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS EditCount,
+        COUNT(DISTINCT T.TagName) OVER (PARTITION BY P.Id) AS TagCount
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN 
+        unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '"><')) T(TagName) ON true
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostTagStats AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.Tags,
+        STRING_AGG(T.TagName, ', ') WITHIN GROUP (ORDER BY T.Count DESC) AS PopularTags,
+        AVG(T.Count) OVER (PARTITION BY P.Id) AS AvgTagCount
+    FROM 
+        Posts P
+    JOIN 
+        unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '"><')) T(TagName) ON true
+    JOIN 
+        Tags TG ON T.TagName = TG.TagName
+    WHERE 
+        P.PostTypeId = 1
+    GROUP BY 
+        P.Id, P.PostTypeId, P.Title, P.Tags
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.Title,
+    RP.Tags,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.EditCount,
+    RP.TagCount,
+    TU.DisplayName AS TopUser,
+    TU.Reputation,
+    TU.GoldBadges,
+    TU.SilverBadges,
+    TU.BronzeBadges,
+    TU.UserRank,
+    PTS.PopularTags,
+    PTS.AvgTagCount
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+JOIN 
+    PostTagStats PTS ON RP.Id = PTS.Id
+WHERE 
+    RP.PostRank <= 10
+    AND TU.UserRank <= 10
+ORDER BY 
+    RP.Score DESC, RP.CreationDate;

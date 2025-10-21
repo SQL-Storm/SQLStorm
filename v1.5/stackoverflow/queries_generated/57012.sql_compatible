@@ -1,0 +1,97 @@
+WITH RECURSIVE RecursiveUserHierarchy AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.AccountId,
+        1 AS Level
+    FROM
+        Users u
+    WHERE
+        u.Reputation > 1000
+    UNION ALL
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.AccountId,
+        ruh.Level + 1 AS Level
+    FROM
+        Users u
+    INNER JOIN
+        RecursiveUserHierarchy ruh ON u.AccountId = ruh.UserId
+    WHERE
+        u.Reputation > 500
+),
+BadgeDistribution AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS TotalQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Posts p
+    GROUP BY
+        p.OwnerUserId
+)
+SELECT
+    ruh.UserId,
+    ruh.DisplayName,
+    ruh.Reputation,
+    ruh.LastAccessDate,
+    ruh.Level,
+    bd.TotalBadges,
+    bd.GoldBadges,
+    bd.SilverBadges,
+    bd.BronzeBadges,
+    upa.TotalPosts,
+    upa.TotalQuestions,
+    upa.TotalAnswers,
+    upa.TotalScore,
+    upa.LastPostDate
+FROM
+    RecursiveUserHierarchy ruh
+LEFT JOIN
+    BadgeDistribution bd ON ruh.UserId = bd.UserId
+LEFT JOIN
+    UserPostActivity upa ON ruh.UserId = upa.OwnerUserId
+WHERE
+    ruh.Level <= 5
+GROUP BY
+    ruh.UserId,
+    ruh.DisplayName,
+    ruh.Reputation,
+    ruh.LastAccessDate,
+    ruh.Level,
+    bd.TotalBadges,
+    bd.GoldBadges,
+    bd.SilverBadges,
+    bd.BronzeBadges,
+    upa.TotalPosts,
+    upa.TotalQuestions,
+    upa.TotalAnswers,
+    upa.TotalScore,
+    upa.LastPostDate
+ORDER BY
+    ruh.Reputation DESC,
+    ruh.Level ASC,
+    ruh.LastAccessDate DESC
+LIMIT 100;

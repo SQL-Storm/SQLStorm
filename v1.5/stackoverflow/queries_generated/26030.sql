@@ -1,0 +1,68 @@
+-- {"query": "26030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 674} 
+
+WITH TopUsers AS (
+  SELECT u.Id, u.DisplayName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+TopTags AS (
+  SELECT t.TagName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Tags t
+  JOIN Posts p ON t.Id = (SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(p.Tags, '><')))
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+  GROUP BY t.TagName
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+QuestionScores AS (
+  SELECT p.Id, p.Score, ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS RowNum
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+AnswerScores AS (
+  SELECT p.Id, p.Score, ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS RowNum
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+VoteDistribution AS (
+  SELECT v.PostId, v.VoteTypeId, COUNT(DISTINCT v.Id) AS VoteCount
+  FROM Votes v
+  GROUP BY v.PostId, v.VoteTypeId
+)
+SELECT 
+  u.DisplayName, 
+  u.Reputation, 
+  p.Title, 
+  p.Score, 
+  p.ViewCount, 
+  p.AnswerCount, 
+  p.CommentCount, 
+  t.TagName, 
+  tu.PostCount AS TopUserPostCount, 
+  tt.PostCount AS TopTagPostCount, 
+  qs.RowNum AS QuestionScoreRowNum, 
+  ascore.RowNum AS AnswerScoreRowNum, 
+  vd.VoteCount, 
+  CASE 
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Open'
+  END AS PostStatus,
+  CASE 
+    WHEN p.Score > 10 AND p.ViewCount > 1000 THEN 'High Score High View'
+    WHEN p.Score > 10 AND p.ViewCount <= 1000 THEN 'High Score Low View'
+    WHEN p.Score <= 10 AND p.ViewCount > 1000 THEN 'Low Score High View'
+    ELSE 'Low Score Low View'
+  END AS PostCategory
+FROM Users u
+JOIN Posts p ON u.Id = p.OwnerUserId
+JOIN Tags t ON t.Id = (SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(p.Tags, '><')))
+LEFT JOIN TopUsers tu ON u.Id = tu.Id
+LEFT JOIN TopTags tt ON t.TagName = tt.TagName
+LEFT JOIN QuestionScores qs ON p.Id = qs.Id
+LEFT JOIN AnswerScores ascore ON p.Id = ascore.Id
+LEFT JOIN VoteDistribution vd ON p.Id = vd.PostId AND vd.VoteTypeId = 2
+WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.ViewCount > 1000
+ORDER BY p.Score DESC, p.ViewCount DESC;

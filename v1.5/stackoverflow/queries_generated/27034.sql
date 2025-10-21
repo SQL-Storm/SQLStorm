@@ -1,0 +1,144 @@
+-- {"query": "27034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1600} 
+
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.DisplayName,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NetVotesGiven,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC) AS UserRank
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.DisplayName
+),
+HighActivityUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        LastPostDate,
+        TotalBadges,
+        TotalUpVotesGiven,
+        TotalDownVotesGiven,
+        NetVotesGiven,
+        UserRank
+    FROM
+        UserActivity
+    WHERE
+        UserRank <= 100
+),
+PopularTags AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TagCount,
+        COUNT(PT.Tags) AS RelatedPosts,
+        SUM(CASE WHEN PT.PostTypeId = 1 THEN 1 ELSE 0 END) AS RelatedQuestions,
+        SUM(CASE WHEN PT.PostTypeId = 2 THEN 1 ELSE 0 END) AS RelatedAnswers,
+        MAX(PT.CreationDate) AS LastPostDate
+    FROM
+        Tags T
+    LEFT JOIN
+        Posts PT ON T.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(PT.Tags FROM 2 FOR LENGTH(PT.Tags) - 2), ''><''))
+    GROUP BY
+        T.Id, T.TagName, T.Count
+),
+TagActivity AS (
+    SELECT
+        PT.Id AS PostId,
+        PT.PostTypeId,
+        PT.CreationDate,
+        PT.Score,
+        PT.ViewCount,
+        PT.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        PT.LastActivityDate,
+        PT.Title,
+        T.TagName,
+        ROW_NUMBER() OVER (PARTITION BY PT.Id ORDER BY PT.CreationDate DESC) AS TagRank
+    FROM
+        Posts PT
+    JOIN
+        HighActivityUsers U ON PT.OwnerUserId = U.UserId
+    JOIN
+        PopularTags T ON T.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(PT.Tags FROM 2 FOR LENGTH(PT.Tags) - 2), ''><''))
+    WHERE
+        PT.PostTypeId IN (1, 2)
+        AND PT.CreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '6 months'
+        AND (PT.Score IS NOT NULL AND PT.Score > 0 OR PT.ViewCount > 1000)
+),
+UserTagInteractions AS (
+    SELECT
+        U.UserId,
+        U.DisplayName,
+        TA.PostId,
+        TA.TagName,
+        PT.Title AS PostTitle,
+        PT.Score AS PostScore,
+        PT.ViewCount AS PostViewCount,
+        PT.CreationDate AS PostCreationDate,
+        TA.TagRank,
+        ROW_NUMBER() OVER (PARTITION BY U.UserId, TA.TagName ORDER BY PT.CreationDate DESC) AS UserTagRank
+    FROM
+        HighActivityUsers U
+    JOIN
+        TagActivity TA ON U.UserId = TA.OwnerUserId
+    JOIN
+        Posts PT ON TA.PostId = PT.Id
+    WHERE
+        TA.TagRank <= 10
+)
+SELECT
+    UTI.UserId,
+    UTI.DisplayName,
+    UTI.PostId,
+    UTI.TagName,
+    UTI.PostTitle,
+    UTI.PostScore,
+    UTI.PostViewCount,
+    UTI.PostCreationDate,
+    UTI.UserTagRank,
+    CASE
+        WHEN T.IsModeratorOnly THEN 'Moderator'
+        WHEN T.IsRequired THEN 'Required'
+        ELSE 'General'
+    END AS TagCategory,
+    COALESCE(PH.Comment, 'No Comment') AS LatestPostHistoryComment,
+    PH.CreationDate AS LatestPostHistoryDate,
+    LINK.RelatedPostId AS RelatedPostId,
+    LT.Name AS LinkTypeName
+FROM
+    UserTagInteractions UTI
+JOIN
+    Tags T ON UTI.TagName = T.TagName
+LEFT JOIN
+    PostHistory PH ON UTI.PostId = PH.PostId
+                   AND PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+                   AND PH.CreationDate = (
+                       SELECT MAX(PH2.CreationDate)
+                       FROM PostHistory PH2
+                       WHERE PH2.PostId = UTI.PostId
+                            AND PH2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+                   )
+LEFT JOIN
+    PostLinks LINK ON UTI.PostId = LINK.PostId AND LINK.LinkTypeId = 1
+LEFT JOIN
+	LinkTypes LT ON LINK.LinkTypeId = LT.Id;
+    

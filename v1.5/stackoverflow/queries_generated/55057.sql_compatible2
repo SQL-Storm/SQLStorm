@@ -1,0 +1,133 @@
+WITH RECURSIVE
+    /* 1. Expand post tags into one row per tag */
+    post_tags AS (
+        SELECT
+            p.Id               AS PostId,
+            p.PostTypeId,
+            p.OwnerUserId,
+            p.Score            AS PostScore,
+            p.CreationDate,
+            unnest(string_to_array(
+                substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'
+            ))                 AS TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1               -- only questions
+          AND p.Tags IS NOT NULL
+    ),
+
+    /* 2. Gather vote aggregates per post */
+    post_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            COUNT(*)                                     AS TotalVotes,
+            MAX(v.CreationDate)                         AS LastVoteDate
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ),
+
+    /* 3. Latest accepted answer per question (if any) */
+    accepted_answers AS (
+        SELECT
+            q.Id                         AS QuestionId,
+            a.Id                         AS AcceptedAnswerId,
+            a.Score                      AS AnswerScore,
+            a.OwnerUserId                AS AnswerOwnerId,
+            a.CreationDate               AS AnswerCreated,
+            ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS rn
+        FROM Posts q
+        JOIN Posts a ON a.Id = q.AcceptedAnswerId
+        WHERE q.PostTypeId = 1
+          AND a.PostTypeId = 2
+    ),
+
+    /* 4. Reputation stats for users involved in questions and answers */
+    user_stats AS (
+        SELECT
+            u.Id                AS UserId,
+            u.Reputation,
+            u.CreationDate     AS UserSince,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score END)       AS QuestionScoreSum,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END)       AS AnswerScoreSum
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.Reputation, u.CreationDate
+    ),
+
+    /* 5. Badge aggregation per user (gold/silver/bronze counts) */
+    badge_counts AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*)                                      AS TotalBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* 6. Historic close reasons for questions (latest only) */
+    latest_close AS (
+        SELECT DISTINCT ON (ph.PostId)
+            ph.PostId,
+            CAST(ph.Comment AS integer)               AS CloseReasonId,
+            ph.CreationDate               AS ClosedOn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10   -- Post Closed
+        ORDER BY ph.PostId, ph.CreationDate DESC
+    ),
+
+    /* 7. Assemble per‑tag performance metrics */
+    tag_metrics AS (
+        SELECT
+            pt.TagName,
+            COUNT(DISTINCT pt.PostId)                     AS QuestionCount,
+            AVG(pt.PostScore)                             AS AvgQuestionScore,
+            SUM(COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0)) AS NetVotes,
+            MAX(pv.LastVoteDate)                         AS MostRecentVote,
+            COUNT(DISTINCT u.Id)                         AS UniqueAskers,
+            AVG(u.Reputation)                            AS AvgAskerReputation,
+            SUM(bc.GoldBadges)                           AS GoldBadgesEarned,
+            SUM(bc.SilverBadges)                         AS SilverBadgesEarned,
+            SUM(bc.BronzeBadges)                         AS BronzeBadgesEarned,
+            COUNT(DISTINCT lc.PostId) FILTER (WHERE lc.CloseReasonId IS NOT NULL) AS ClosedQuestions
+        FROM post_tags pt
+        LEFT JOIN post_votes pv      ON pv.PostId = pt.PostId
+        LEFT JOIN Users u            ON u.Id = pt.OwnerUserId
+        LEFT JOIN badge_counts bc    ON bc.UserId = pt.OwnerUserId
+        LEFT JOIN latest_close lc   ON lc.PostId = pt.PostId
+        GROUP BY pt.TagName
+    ),
+
+    /* 8. Rank tags by a composite score */
+    ranked_tags AS (
+        SELECT
+            tm.*,
+            ROW_NUMBER() OVER (ORDER BY
+                (tm.QuestionCount * 0.4) +
+                (tm.AvgQuestionScore * 0.2) +
+                (tm.NetVotes * 0.3) +
+                (tm.GoldBadgesEarned * 0.1) DESC) AS RankByComposite
+        FROM tag_metrics tm
+    )
+
+SELECT
+    rt.RankByComposite,
+    rt.TagName,
+    rt.QuestionCount,
+    rt.AvgQuestionScore,
+    rt.NetVotes,
+    rt.MostRecentVote,
+    rt.UniqueAskers,
+    rt.AvgAskerReputation,
+    rt.GoldBadgesEarned,
+    rt.SilverBadgesEarned,
+    rt.BronzeBadgesEarned,
+    rt.ClosedQuestions
+FROM ranked_tags rt
+WHERE rt.RankByComposite <= 50           -- top‑50 tags for the benchmark run
+ORDER BY rt.RankByComposite;

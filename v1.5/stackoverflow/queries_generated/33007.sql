@@ -1,0 +1,118 @@
+-- {"query": "33007.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 848} 
+WITH post_activity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ContentLicense,
+        -- Count of votes for each post
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS VoteCount,
+        -- Count of edits from PostHistory of specific types
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,24,25,31,33,34,35,36,37,38,50,52,53,66)) AS EditCount
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1,2)
+),
+user_metrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        u.Location,
+        u.EmailHash,
+        -- Total questions asked
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        -- Total answers provided
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        -- Badges count
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM
+        Users u
+),
+aggregated AS (
+    SELECT
+        pa.PostId,
+        pa.PostTypeId,
+        pa.PostCreationDate,
+        pa.LastActivityDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.Title,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.AcceptedAnswerId,
+        pa.ContentLicense,
+        pa.VoteCount,
+        pa.EditCount,
+        um.Reputation,
+        um.UserCreationDate,
+        um.LastAccessDate,
+        um.Views,
+        um.UpVotes,
+        um.DownVotes,
+        um.GoldBadges,
+        um.SilverBadges,
+        um.BronzeBadges
+    FROM
+        post_activity pa
+    LEFT JOIN
+        user_metrics um ON pa.OwnerUserId = um.UserId
+)
+SELECT
+    -- Basic Post Info
+    PostId,
+    CASE WHEN PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+    Title,
+    Tags,
+    -- User info
+    OwnerUserId,
+    Reputation,
+    UserCreationDate,
+    LastAccessDate,
+    Views AS UserViews,
+    UpVotes,
+    DownVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    -- Post stats
+    PostCreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    VoteCount,
+    EditCount,
+    AcceptedAnswerId,
+    ContentLicense
+FROM
+    aggregated
+WHERE
+    -- Filter for recent activity in last 180 days
+    LastActivityDate >= NOW() - INTERVAL '180 days'
+ORDER BY
+    LastActivityDate DESC
+LIMIT 1000;

@@ -1,0 +1,43 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+    MAX(p.LastActivityDate) AS LastActiveQuestionDate,
+    STRING_AGG(DISTINCT t.TagName, ',') AS TopTags
+FROM
+    Users u
+LEFT JOIN
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    (
+        SELECT
+            DISTINCT
+            REPLACE(REPLACE(tag, '><', ','), '<', '') AS TagName
+        FROM
+            (
+                SELECT unnest(string_to_array(p.Tags, '><')) AS tag
+                FROM Posts p
+            ) s
+    ) AS t ON p.Id IS NOT NULL
+LEFT JOIN
+    PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN
+    Posts tpost ON tpost.Id = pl.RelatedPostId
+WHERE
+    p.PostTypeId = 1
+    AND u.AccountId IS NOT NULL
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > DATE '2024-10-01' - INTERVAL '2 years')
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation
+HAVING
+    COUNT(DISTINCT p.Id) > 0
+ORDER BY
+    u.Reputation DESC,
+    MAX(p.LastActivityDate) DESC
+LIMIT 100;

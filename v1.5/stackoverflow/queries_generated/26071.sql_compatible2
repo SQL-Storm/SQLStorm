@@ -1,0 +1,74 @@
+WITH TopPosts AS (
+  SELECT 
+    P.Id,
+    P.Title,
+    P.Score,
+    P.ViewCount,
+    P.Tags,
+    P.AcceptedAnswerId,
+    U.DisplayName AS OwnerDisplayName,
+    U.Reputation AS OwnerReputation,
+    ROW_NUMBER() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS RowNum
+  FROM Posts P
+  JOIN Users U ON P.OwnerUserId = U.Id
+  WHERE P.PostTypeId = 1 AND P.Score > 0
+),
+TopUsers AS (
+  SELECT 
+    U.Id, 
+    U.DisplayName, 
+    U.Reputation, 
+    COUNT(DISTINCT P.Id) AS PostCount,
+    SUM(P.Score) AS TotalScore,
+    ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, COUNT(DISTINCT P.Id) DESC) AS RowNum
+  FROM Users U
+  JOIN Posts P ON U.Id = P.OwnerUserId
+  WHERE P.PostTypeId = 1 AND P.Score > 0
+  GROUP BY U.Id, U.DisplayName, U.Reputation
+),
+QuestionAnswers AS (
+  SELECT 
+    P.Id, 
+    P.ParentId, 
+    P.Score, 
+    P.OwnerUserId, 
+    U.DisplayName AS OwnerDisplayName, 
+    U.Reputation AS OwnerReputation
+  FROM Posts P
+  JOIN Users U ON P.OwnerUserId = U.Id
+  WHERE P.PostTypeId = 2
+),
+AnswerRanks AS (
+  SELECT 
+    P.Id, 
+    P.ParentId,
+    P.Score, 
+    DENSE_RANK() OVER (PARTITION BY P.ParentId ORDER BY P.Score DESC) AS AnswerRank
+  FROM QuestionAnswers P
+)
+SELECT 
+  TP.Id, 
+  TP.Title, 
+  TP.Score, 
+  TP.ViewCount, 
+  TP.Tags, 
+  TP.AcceptedAnswerId, 
+  TP.OwnerDisplayName, 
+  TP.OwnerReputation,
+  TU.DisplayName AS TopUserDisplayName, 
+  TU.Reputation AS TopUserReputation,
+  TU.PostCount, 
+  TU.TotalScore,
+  AR.Score AS AnswerScore,
+  AR.AnswerRank,
+  V.VoteTypeId,
+  VH.PostHistoryTypeId,
+  VH.Text
+FROM TopPosts TP
+LEFT JOIN TopUsers TU ON TP.OwnerUserId = TU.Id AND TU.RowNum = 1
+LEFT JOIN QuestionAnswers QA ON TP.Id = QA.ParentId
+LEFT JOIN AnswerRanks AR ON QA.Id = AR.Id
+LEFT JOIN Votes V ON TP.Id = V.PostId AND V.VoteTypeId = 2
+LEFT JOIN PostHistory VH ON TP.Id = VH.PostId AND VH.PostHistoryTypeId = 10
+WHERE TP.RowNum <= 10
+  AND AR.AnswerRank = 1;

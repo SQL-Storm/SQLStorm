@@ -1,0 +1,46 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(DISTINCT v.Id) AS TotalVotes,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+  AVG(COALESCE(p.Score, 0)) OVER () AS AvgPostScore,
+  COUNT(CASE WHEN c.Id IS NOT NULL THEN 1 END) AS CommentCount,
+  MAX(th.CreationDate) AS LastActivityDate,
+  STRING_AGG(DISTINCT t.TagName, ',' ) AS Tags
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN PostHistory th ON th.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      t2.TagName
+    FROM
+      UNNEST(
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+      ) AS t2
+  ) AS t ON TRUE
+WHERE
+  p.PostTypeId IN (1, 2, 5)
+  AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.OwnerUserId,
+  u.DisplayName
+ORDER BY
+  TotalVotes DESC,
+  LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,128 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        SUM(p.ViewCount) as TotalViews,
+        AVG(p.Score) as AvgScore
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '%>'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as AcceptedAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        STDDEV(p.Score) as ScoreStdDev
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    CROSS JOIN LATERAL string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><') as tag_array(tag)
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+badge_correlation AS (
+    SELECT 
+        b.Name as BadgeName,
+        b.Class,
+        AVG(u.Reputation) as AvgReputation,
+        COUNT(DISTINCT b.UserId) as UserCount,
+        ARRAY_AGG(DISTINCT u.Location ORDER BY u.Reputation DESC) FILTER (WHERE u.Location IS NOT NULL) as TopLocations
+    FROM Badges b
+    INNER JOIN Users u ON u.Id = b.UserId
+    WHERE b.Date >= cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY b.Name, b.Class
+),
+temporal_patterns AS (
+    SELECT 
+        EXTRACT(HOUR FROM p.CreationDate) as HourOfDay,
+        EXTRACT(DOW FROM p.CreationDate) as DayOfWeek,
+        COUNT(*) as PostCount,
+        AVG(p.Score) as AvgScore,
+        AVG(p.ViewCount) as AvgViews,
+        AVG(p.AnswerCount) as AvgAnswers,
+        AVG(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as AcceptanceRate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY EXTRACT(HOUR FROM p.CreationDate), EXTRACT(DOW FROM p.CreationDate)
+),
+edit_complexity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        COUNT(*) as TotalEdits,
+        MAX(LENGTH(ph.Text)) - MIN(LENGTH(ph.Text)) as MaxTextChange,
+        ARRAY_AGG(ph.PostHistoryTypeId ORDER BY ph.CreationDate) as EditSequence
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2,5,8)
+    GROUP BY ph.PostId
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ue.AvgAnswerScore,
+    ue.AcceptedAnswers,
+    ue.MedianScore,
+    ue.ScoreStdDev,
+    th.QuestionCount as TagQuestionCount,
+    th.TotalViews as TagTotalViews,
+    th.AvgScore as TagAvgScore,
+    bc.BadgeName as TopBadge,
+    bc.Class as BadgeClass,
+    tp.HourOfDay as PeakHour,
+    tp.DayOfWeek as PeakDay,
+    tp.AvgViews as PeakHourViews,
+    ec.UniqueEditors,
+    ec.TotalEdits,
+    ec.MaxTextChange,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = ue.UserId 
+            AND c.Score > 5), 0
+    ) as HighScoreComments,
+    RANK() OVER (PARTITION BY ue.TagName ORDER BY ue.TotalScore DESC) as TagRank,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation * LOG(ue.AnswerCount + 1) * (ue.AcceptedAnswers::FLOAT / NULLIF(ue.AnswerCount, 0)) DESC) as GlobalExpertiseRank,
+    NTILE(100) OVER (ORDER BY ue.TotalScore) as ScorePercentile,
+    LAG(ue.TotalScore, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.TotalScore DESC) as NextHigherScore,
+    LEAD(ue.TotalScore, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.TotalScore DESC) as NextLowerScore
+FROM user_expertise ue
+INNER JOIN tag_hierarchy th ON th.TagName = ue.TagName
+CROSS JOIN LATERAL (
+    SELECT bc.BadgeName, bc.Class
+    FROM badge_correlation bc
+    ORDER BY bc.AvgReputation DESC
+    LIMIT 1
+) bc
+CROSS JOIN LATERAL (
+    SELECT tp.HourOfDay, tp.DayOfWeek, tp.AvgViews
+    FROM temporal_patterns tp
+    ORDER BY tp.PostCount DESC
+    LIMIT 1
+) tp
+LEFT JOIN LATERAL (
+    SELECT ec.*
+    FROM edit_complexity ec
+    INNER JOIN Posts p ON p.Id = ec.PostId
+    WHERE p.OwnerUserId = ue.UserId
+    ORDER BY ec.TotalEdits DESC
+    LIMIT 1
+) ec ON true
+WHERE ue.TotalScore > 100
+    AND th.QuestionCount > 1000
+ORDER BY GlobalExpertiseRank, TagRank
+LIMIT 500;

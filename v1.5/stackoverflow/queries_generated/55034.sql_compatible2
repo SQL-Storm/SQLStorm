@@ -1,0 +1,138 @@
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId
+    FROM Posts p
+    WHERE p.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+
+user_posts AS (
+    SELECT
+        u.Id                                      AS UserId,
+        u.DisplayName,
+        COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 1) AS QuestionCount,
+        COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(rp.Score),0)                 AS TotalScore
+    FROM Users u
+    LEFT JOIN recent_posts rp
+        ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+
+user_votes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Votes v
+    GROUP BY v.UserId
+),
+
+user_badges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+tag_activity AS (
+    SELECT
+        u.Id      AS UserId,
+        t.TagName,
+        COUNT(*)  AS TagUsage
+    FROM Users u
+    JOIN Posts p
+        ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS split_tag(tag_raw)
+    JOIN Tags t
+        ON t.TagName = split_tag.tag_raw
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, t.TagName
+),
+
+top_tags AS (
+    SELECT
+        UserId,
+        array_agg(TagName ORDER BY TagUsage DESC) AS Top5Tags
+    FROM tag_activity
+    GROUP BY UserId
+),
+
+post_history_json AS (
+    SELECT
+        ph.PostId,
+        (ph.Text::jsonb)->>'closeReasonId' AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+
+combined AS (
+    SELECT
+        up.UserId,
+        up.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalScore,
+        uv.UpVotesGiven,
+        uv.DownVotesGiven,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        tt.Top5Tags,
+        phc.CloseReasonId
+    FROM user_posts up
+    LEFT JOIN user_votes uv
+        ON up.UserId = uv.UserId
+    LEFT JOIN user_badges ub
+        ON up.UserId = ub.UserId
+    LEFT JOIN top_tags tt
+        ON up.UserId = tt.UserId
+    LEFT JOIN (
+        SELECT DISTINCT ON (phc.PostId) phc.PostId, phc.CloseReasonId
+        FROM post_history_json phc
+        ORDER BY phc.PostId, phc.CloseReasonId DESC
+    ) phc
+        ON phc.PostId = (
+            SELECT p.Id
+            FROM Posts p
+            WHERE p.OwnerUserId = up.UserId
+              AND p.PostTypeId = 1
+            ORDER BY p.CreationDate DESC
+            LIMIT 1
+        )
+)
+
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.TotalScore,
+    COALESCE(c.UpVotesGiven,0)   AS UpVotesGiven,
+    COALESCE(c.DownVotesGiven,0) AS DownVotesGiven,
+    COALESCE(c.GoldBadges,0)     AS GoldBadges,
+    COALESCE(c.SilverBadges,0)   AS SilverBadges,
+    COALESCE(c.BronzeBadges,0)   AS BronzeBadges,
+    c.Top5Tags,
+    COALESCE(c.CloseReasonId,0) AS LastCloseReasonId,
+    (c.TotalScore * 0.4
+     + c.QuestionCount * 0.3
+     + c.AnswerCount * 0.2
+     + COALESCE(c.GoldBadges,0)   * 5
+     + COALESCE(c.SilverBadges,0) * 3
+     + COALESCE(c.BronzeBadges,0) * 1
+     + COALESCE(c.UpVotesGiven,0) * 0.05
+     - COALESCE(c.DownVotesGiven,0) * 0.10) AS ActivityScore
+FROM combined c
+ORDER BY ActivityScore DESC
+LIMIT 100;

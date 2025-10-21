@@ -1,0 +1,51 @@
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.OwnerUserId, p.ParentId, p.AcceptedAnswerId, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, 
+         u.Reputation, u.CreationDate AS UserCreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, 
+         bt.Name AS PostTypeName, 
+         ct.Name AS CloseReasonName, 
+         vt.Name AS VoteTypeName,
+         CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+         CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community' ELSE 'User' END AS OwnerType,
+         DATEDIFF('day', p.CreationDate, TIMESTAMP '1970-01-01 00:00:00') AS PostAgeDays,
+         DATEDIFF('day', u.CreationDate, TIMESTAMP '1970-01-01 00:00:00') AS UserAgeDays,
+         DATEDIFF('day', u.LastAccessDate, TIMESTAMP '1970-01-01 00:00:00') AS UserLastAccessDays,
+         SUBSTRING(p.Tags, 1, POSITION('><' IN p.Tags) - 1) AS MainTag,
+         (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+         (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes bt ON p.PostTypeId = bt.Id
+  LEFT JOIN CloseReasonTypes ct ON CAST(p.Comment AS INTEGER) = ct.Id
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE p.CreationDate >= TIMESTAMP '2015-01-01' AND p.CreationDate < TIMESTAMP '2021-01-01'
+)
+SELECT 
+  MainTag,
+  PostTypeName,
+  PostStatus,
+  OwnerType,
+  AVG(PostAgeDays) AS AvgPostAgeDays,
+  AVG(UserAgeDays) AS AvgUserAgeDays,
+  AVG(UserLastAccessDays) AS AvgUserLastAccessDays,
+  AVG(Score) AS AvgScore,
+  AVG(ViewCount) AS AvgViewCount, 
+  AVG(AnswerCount) AS AvgAnswerCount,
+  AVG(CommentCount) AS AvgCommentCount,
+  AVG(FavoriteCount) AS AvgFavoriteCount,
+  AVG(Reputation) AS AvgReputation,
+  AVG(Views) AS AvgUserViews,
+  AVG(UpVotes) AS AvgUserUpVotes,
+  AVG(DownVotes) AS AvgUserDownVotes,
+  AVG(EditCount) AS AvgEditCount,
+  AVG(CommentCount) AS AvgCommentCount,
+  AVG(UpVoteCount) AS AvgUpVoteCount,
+  AVG(DownVoteCount) AS AvgDownVoteCount,
+  AVG(DuplicateCount) AS AvgDuplicateCount
+FROM cte
+GROUP BY MainTag, PostTypeName, PostStatus, OwnerType
+ORDER BY AvgPostAgeDays DESC;

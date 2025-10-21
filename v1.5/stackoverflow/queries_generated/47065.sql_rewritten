@@ -1,0 +1,151 @@
+-- {"query": "47065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 149110, "output_tokens": 131971} 
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(t.TagName AS VARCHAR(1000)) AS tag_path,
+        1 AS level
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        CAST(th.tag_path || ' -> ' || t2.TagName AS VARCHAR(1000)),
+        th.level + 1
+    FROM Tags t2
+    INNER JOIN tag_hierarchy th ON t2.Count < th.Count
+    WHERE th.level < 3 AND t2.Count > 5000
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN p.Id END) AS AcceptedAnswers,
+        STRING_AGG(DISTINCT substring(p.Tags, 2, length(p.Tags)-2), ', ') AS ExpertiseTags,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV(p.Score) AS ScoreStdDev,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts q ON p.ParentId = q.Id AND p.PostTypeId = 2
+    WHERE u.Reputation > 1000
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+post_quality_metrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN CAST(p.Score AS FLOAT) / p.ViewCount 
+            ELSE 0 
+        END AS ScorePerView,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN CAST(p.Score AS FLOAT) / p.AnswerCount 
+            ELSE p.Score 
+        END AS ScorePerAnswer,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS WasEdited,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp)) - p.CreationDate))/3600 AS HoursToClose,
+        EXTRACT(EPOCH FROM (MIN(a.CreationDate) - p.CreationDate))/60 AS MinutesToFirstAnswer,
+        EXTRACT(EPOCH FROM (MAX(a.CreationDate) - p.CreationDate))/3600 AS HoursToLastAnswer
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+        AND p.Score > 0
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CreationDate
+),
+badge_patterns AS (
+    SELECT 
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(DISTINCT b.UserId) AS UniqueRecipients,
+        AVG(u.Reputation) AS AvgRecipientReputation,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY u.Reputation) AS Q1Reputation,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY u.Reputation) AS Q3Reputation,
+        COUNT(*) AS TotalAwarded,
+        MIN(b.Date) AS FirstAwarded,
+        MAX(b.Date) AS LastAwarded,
+        COUNT(*) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS AwardedLast30Days,
+        COUNT(*) FILTER (WHERE b.TagBased = '1') AS TagBasedCount,
+        STRING_AGG(DISTINCT u.Location, ' | ' ORDER BY u.Reputation DESC) FILTER (WHERE u.Location IS NOT NULL) AS TopLocations
+    FROM Badges b
+    INNER JOIN Users u ON b.UserId = u.Id
+    GROUP BY b.Name, b.Class
+    HAVING COUNT(*) >= 100
+),
+voting_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', v.CreationDate) AS VoteMonth,
+        vt.Name AS VoteType,
+        COUNT(*) AS VoteCount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        COUNT(DISTINCT v.PostId) AS UniquePosts,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.BountyAmount) AS TotalBountyAmount,
+        STDDEV(p.Score) AS PostScoreStdDev
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+    GROUP BY DATE_TRUNC('month', v.CreationDate), vt.Name
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.TotalScore,
+    ROUND(ue.AvgScore::NUMERIC, 2) AS AvgScore,
+    ue.Questions,
+    ue.Answers,
+    ue.AcceptedAnswers,
+    ROUND(CASE WHEN ue.Answers > 0 THEN ue.AcceptedAnswers::FLOAT / ue.Answers * 100 ELSE 0 END, 2) AS AcceptanceRate,
+    LEFT(ue.ExpertiseTags, 200) AS TopTags,
+    COUNT(DISTINCT bp.BadgeName) AS UniqueBadges,
+    SUM(CASE WHEN bp.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN bp.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN bp.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(pqm.Score) AS MaxQuestionScore,
+    AVG(pqm.ScorePerView) AS AvgScorePerView,
+    COUNT(DISTINCT pqm.Id) AS QualityQuestions,
+    SUM(pqm.ViewCount) AS TotalViews,
+    AVG(pqm.MinutesToFirstAnswer) AS AvgMinutesToFirstAnswer,
+    STRING_AGG(DISTINCT th.TagName, ', ' ORDER BY th.Count DESC) AS RelatedPopularTags
+FROM user_expertise ue
+LEFT JOIN Posts p ON ue.UserId = p.OwnerUserId
+LEFT JOIN post_quality_metrics pqm ON p.Id = pqm.Id
+LEFT JOIN Badges b ON ue.UserId = b.UserId
+LEFT JOIN badge_patterns bp ON b.Name = bp.BadgeName
+LEFT JOIN tag_hierarchy th ON p.Tags LIKE '%<' || th.TagName || '>%'
+WHERE ue.Reputation > 5000
+    AND ue.TotalScore > 100
+GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, ue.TotalPosts, 
+         ue.TotalScore, ue.AvgScore, ue.Questions, ue.Answers, 
+         ue.AcceptedAnswers, ue.ExpertiseTags
+HAVING COUNT(DISTINCT bp.BadgeName) > 5
+ORDER BY ue.Reputation DESC, ue.TotalScore DESC
+LIMIT 100;

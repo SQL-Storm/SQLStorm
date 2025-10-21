@@ -1,0 +1,117 @@
+-- {"query": "36.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 833} 
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+recent_answers AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.CreationDate AS AnswerDate,
+    a.Score AS AnswerScore,
+    a.OwnerUserId AS AnswerOwner
+  FROM Posts a
+  WHERE a.PostTypeId = 2 -- answers
+    AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+tag_activity AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.Count > 0
+    AND t.IsModeratorOnly = 0
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.EmailHash
+  FROM Users u
+  WHERE u.Reputation >= 1000
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+),
+edge_cases AS (
+  SELECT
+    ph.Id AS HistId,
+    ph.PostId,
+    ph.UserId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.Text,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,16,17,18,19,20)
+)
+SELECT
+  q.PostId,
+  q.Title AS QuestionTitle,
+  q.Tags,
+  q.CreationDate AS QuestionCreated,
+  q.Score AS QuestionScore,
+  q.ViewCount AS QuestionViews,
+  q.AnswerCount AS UndeletedAnswerCount,
+  a.AnswerId,
+  a.AnswerDate,
+  a.AnswerScore,
+  u.UserId AS QuestionOwnerId,
+  u.DisplayName AS QuestionOwnerName,
+  fu.UserId AS AnswerOwnerId,
+  fu.DisplayName AS AnswerOwnerName,
+  v.VoteTypeId,
+  vt.Name AS VoteTypeName,
+  r.TagName,
+  r.Count AS TagCount,
+  top.Reputation AS TopUserReputation,
+  top.UserId AS TopUserId,
+  latest_action.CreationDate AS LastModeratorActionDate,
+  latest_action.Text AS LastModeratorActionComment
+FROM recent_questions q
+LEFT JOIN recent_answers a ON a.QuestionId = q.PostId
+LEFT JOIN top_users u ON u.UserId = q.OwnerUserId
+LEFT JOIN top_users fu ON fu.UserId = a.AnswerOwner
+LEFT JOIN recent_votes v ON v.PostId = q.PostId
+LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+LEFT JOIN edge_cases ec ON ec.PostId = q.PostId
+LEFT JOIN tag_activity r ON TRUE
+LEFT JOIN (
+  SELECT
+    v1.PostId,
+    MAX(v1.CreationDate) AS CreationDate
+  FROM recent_votes v1
+  WHERE v1.VoteTypeId IN (16,8,9) -- moderator/booster style events
+  GROUP BY v1.PostId
+) latest_action ON latest_action.PostId = q.PostId
+ORDER BY q.CreationDate DESC, q.Score DESC
+LIMIT 100;

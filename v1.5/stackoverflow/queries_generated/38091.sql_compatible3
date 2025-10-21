@@ -1,0 +1,201 @@
+with recent_q as (
+  select p.Id as QuestionId,
+         p.CreationDate as QuestionCreationDate,
+         p.OwnerUserId as AskerId,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.Tags
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+), answers as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+), first_answer as (
+  select a.QuestionId,
+         min(a.AnswerCreationDate) as FirstAnswerDate
+  from answers a
+  group by a.QuestionId
+), accepted as (
+  select q.Id as QuestionId,
+         q.AcceptedAnswerId
+  from Posts q
+  where q.PostTypeId = 1
+    and q.AcceptedAnswerId is not null
+), votes_q as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Votes v
+  group by v.PostId
+), votes_a as (
+  select v.PostId as AnswerId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesA,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesA
+  from Votes v
+  group by v.PostId
+), comment_counts as (
+  select c.PostId,
+         count(*) as CommentCount,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+), tag_expanded as (
+  select rq.QuestionId,
+         unnest(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) as tag
+  from recent_q rq
+  where rq.Tags is not null
+), tag_rank as (
+  select te.tag,
+         count(*) as TagQuestionCount,
+         row_number() over (order by count(*) desc, te.tag) as TagRank
+  from tag_expanded te
+  group by te.tag
+), asker as (
+  select u.Id,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         u.Views as UserViews,
+         u.UpVotes as UserUpVotes,
+         u.DownVotes as UserDownVotes
+  from Users u
+), badges_agg as (
+  select b.UserId,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges,
+         count(*) as TotalBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+), dupe_links as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+         count(*) filter (where pl.LinkTypeId = 1) as RelatedLinks
+  from PostLinks pl
+  group by pl.PostId
+), closures as (
+  select ph.PostId as QuestionId,
+         min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedDate,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+         count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents
+  from PostHistory ph
+  group by ph.PostId
+), hot_bumps as (
+  select ph.PostId as QuestionId,
+         count(*) filter (where ph.PostHistoryTypeId in (50,52)) as AttentionEvents
+  from PostHistory ph
+  group by ph.PostId
+), answer_stats as (
+  select a.QuestionId,
+         count(*) as AnswerCount,
+         avg(a.Score) as AvgAnswerScore,
+         max(a.Score) as MaxAnswerScore,
+         min(a.Score) as MinAnswerScore
+  from answers a
+  group by a.QuestionId
+), accepted_answer_stats as (
+  select ac.QuestionId,
+         a.Score as AcceptedAnswerScore,
+         coalesce(va.UpVotesA,0) as AcceptedAnswerUpVotes,
+         coalesce(va.DownVotesA,0) as AcceptedAnswerDownVotes
+  from accepted ac
+  join Posts a on a.Id = ac.AcceptedAnswerId
+  left join votes_a va on va.AnswerId = a.Id
+), response_time as (
+  select rq.QuestionId,
+         fa.FirstAnswerDate,
+         (extract(epoch from (fa.FirstAnswerDate - rq.QuestionCreationDate)) / 60.0) as MinutesToFirstAnswer
+  from recent_q rq
+  left join first_answer fa on fa.QuestionId = rq.QuestionId
+), quality_score as (
+  select rq.QuestionId,
+         (coalesce(vq.UpVotes,0) - coalesce(vq.DownVotes,0)) as UpDownScore,
+         coalesce(rq.ViewCount,0) * 0.0005 as ViewWeight,
+         coalesce(asg.AvgAnswerScore,0) * 1.5 as AvgAnswerWeight,
+         case when eas.AcceptedAnswerScore is not null then 2 else 0 end as AcceptedWeight,
+         - least(coalesce(cl.CloseEvents,0), 3) * 1.0 as CloseWeight,
+         + coalesce(hb.AttentionEvents,0) * 0.5 as AttentionWeight,
+         - case when rt.MinutesToFirstAnswer is null then 1 else least(rt.MinutesToFirstAnswer/60.0, 5) end as FirstAnswerPenalty,
+         (coalesce(vq.UpVotes,0) - coalesce(vq.DownVotes,0)) + coalesce(rq.ViewCount,0) * 0.0005 + coalesce(asg.AvgAnswerScore,0) * 1.5 + (case when eas.AcceptedAnswerScore is not null then 2 else 0 end) - least(coalesce(cl.CloseEvents,0), 3) * 1.0 + coalesce(hb.AttentionEvents,0) * 0.5 - case when rt.MinutesToFirstAnswer is null then 1 else least(rt.MinutesToFirstAnswer/60.0, 5) end as CompositeQualityScore
+  from recent_q rq
+  left join votes_q vq on vq.QuestionId = rq.QuestionId
+  left join answer_stats asg on asg.QuestionId = rq.QuestionId
+  left join accepted_answer_stats eas on eas.QuestionId = rq.QuestionId
+  left join closures cl on cl.QuestionId = rq.QuestionId
+  left join hot_bumps hb on hb.QuestionId = rq.QuestionId
+  left join response_time rt on rt.QuestionId = rq.QuestionId
+), tag_focus as (
+  select te.QuestionId,
+         te.tag,
+         tr.TagRank,
+         tr.TagQuestionCount
+  from tag_expanded te
+  join tag_rank tr on tr.tag = te.tag
+  where tr.TagRank <= 100
+), tag_agg as (
+  select tf.QuestionId,
+         array_agg(tf.tag order by tf.TagRank) as TopTags,
+         min(tf.TagRank) as BestTagRank,
+         sum(tf.TagQuestionCount) as TagCoverage
+  from tag_focus tf
+  group by tf.QuestionId
+)
+select
+  rq.QuestionId,
+  rq.QuestionCreationDate,
+  rq.QuestionScore,
+  rq.ViewCount,
+  rq.Tags,
+  coalesce(vq.UpVotes,0) as QUpVotes,
+  coalesce(vq.DownVotes,0) as QDownVotes,
+  coalesce(vq.Favorites,0) as QFavorites,
+  coalesce(cc.CommentCount,0) as QCommentCount,
+  cc.LastCommentDate as QLastCommentDate,
+  coalesce(asg.AnswerCount,0) as AnswerCount,
+  asg.AvgAnswerScore,
+  eas.AcceptedAnswerScore,
+  eas.AcceptedAnswerUpVotes,
+  eas.AcceptedAnswerDownVotes,
+  rt.FirstAnswerDate,
+  rt.MinutesToFirstAnswer,
+  cl.FirstClosedDate,
+  cl.LastReopenedDate,
+  coalesce(cl.CloseEvents,0) as CloseEvents,
+  coalesce(cl.ReopenEvents,0) as ReopenEvents,
+  coalesce(dl.DuplicateLinks,0) as DuplicateLinks,
+  coalesce(dl.RelatedLinks,0) as RelatedLinks,
+  hb.AttentionEvents,
+  ta.TopTags,
+  ta.BestTagRank,
+  ta.TagCoverage,
+  u.Id as AskerId,
+  u.Reputation as AskerReputation,
+  u.UserViews as AskerProfileViews,
+  coalesce(ba.TotalBadges,0) as AskerTotalBadges,
+  ba.GoldBadges,
+  ba.SilverBadges,
+  ba.BronzeBadges,
+  qs.CompositeQualityScore
+from recent_q rq
+left join votes_q vq on vq.QuestionId = rq.QuestionId
+left join comment_counts cc on cc.PostId = rq.QuestionId
+left join answer_stats asg on asg.QuestionId = rq.QuestionId
+left join accepted_answer_stats eas on eas.QuestionId = rq.QuestionId
+left join response_time rt on rt.QuestionId = rq.QuestionId
+left join closures cl on cl.QuestionId = rq.QuestionId
+left join dupe_links dl on dl.QuestionId = rq.QuestionId
+left join hot_bumps hb on hb.QuestionId = rq.QuestionId
+left join tag_agg ta on ta.QuestionId = rq.QuestionId
+left join Users u on u.Id = rq.AskerId
+left join badges_agg ba on ba.UserId = rq.AskerId
+left join quality_score qs on qs.QuestionId = rq.QuestionId
+order by qs.CompositeQualityScore desc nulls last, rq.ViewCount desc nulls last, rq.QuestionCreationDate desc
+limit 500;

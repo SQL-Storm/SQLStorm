@@ -1,0 +1,105 @@
+WITH RECURSIVE UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopQuestionsByPeriod AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        EXTRACT(YEAR FROM p.CreationDate) AS Year,
+        EXTRACT(QUARTER FROM p.CreationDate) AS Quarter,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM p.CreationDate), EXTRACT(QUARTER FROM p.CreationDate)
+            ORDER BY p.Score DESC, p.ViewCount DESC
+        ) AS QuarterRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+),
+AnswerQualityMetrics AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.CreationDate AS QuestionDate,
+        (EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600) AS HoursToAnswer,
+        COUNT(DISTINCT c.Id) AS AnswerComments,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE a.PostTypeId = 2
+      AND a.Score >= 0
+      AND a.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId
+),
+TagPopularityTrends AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TotalCount,
+        COUNT(DISTINCT p.Id) AS RecentPostCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 50
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.PostCount,
+    uem.CommentCount,
+    uem.BadgeCount,
+    ROUND(CAST(uem.AvgPostScore AS NUMERIC), 2) AS AvgPostScore,
+    COUNT(DISTINCT tq.Id) AS TopQuestions,
+    COUNT(DISTINCT aqm.AnswerId) AS QualityAnswers,
+    SUM(CASE WHEN aqm.IsAccepted = 1 THEN 1 ELSE 0 END) AS AcceptedAnswers,
+    ROUND(AVG(aqm.HoursToAnswer) * 1.0, 2) AS AvgHoursToAnswer,
+    STRING_AGG(DISTINCT tpt.TagName, ', ' ORDER BY tpt.TagName) AS TopTags,
+    MAX(tpt.AvgScore) AS BestTagAvgScore,
+    ROUND((uem.Reputation / NULLIF(uem.PostCount, 0)) , 2) AS ReputationPerPost,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesReceived,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 8) AS BountiesOffered
+FROM UserEngagementMetrics uem
+LEFT JOIN TopQuestionsByPeriod tq ON uem.Id = tq.OwnerUserId AND tq.QuarterRank <= 10
+LEFT JOIN AnswerQualityMetrics aqm ON uem.Id = aqm.AnswererUserId AND aqm.AnswerScore >= 5
+LEFT JOIN Posts p ON uem.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+LEFT JOIN TagPopularityTrends tpt ON p.Tags LIKE '%<' || tpt.TagName || '>%' AND tpt.RecentPostCount >= 100
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE uem.Reputation > 1000
+GROUP BY 
+    uem.Id, uem.DisplayName, uem.Reputation, uem.PostCount, uem.CommentCount, uem.BadgeCount, uem.AvgPostScore
+HAVING COUNT(DISTINCT aqm.AnswerId) > 3
+ORDER BY uem.Reputation DESC, QualityAnswers DESC, AcceptedAnswers DESC
+LIMIT 100;

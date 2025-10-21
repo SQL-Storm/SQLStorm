@@ -1,0 +1,90 @@
+-- {"query": "246.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8972} 
+WITH
+UserBase AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.WebsiteUrl,
+    u.AboutMe
+  FROM Users u
+),
+PostStats AS (
+  SELECT OwnerUserId,
+         COUNT(*) AS PostCount,
+         SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         AVG(Score) AS AvgScore
+  FROM Posts
+  GROUP BY OwnerUserId
+),
+LastActivity AS (
+  SELECT OwnerUserId, MAX(LastActivityDate) AS LastActivityDate
+  FROM Posts
+  GROUP BY OwnerUserId
+),
+BadgeStats AS (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+VoteStats AS (
+  SELECT UserId, COUNT(*) AS UpVotesLast90
+  FROM Votes
+  WHERE VoteTypeId = 2 AND CreationDate > (cast('2024-10-01' as date) - INTERVAL '90 days')
+  GROUP BY UserId
+),
+EditStats AS (
+  SELECT UserId, COUNT(*) AS Edits
+  FROM PostHistory
+  GROUP BY UserId
+),
+CommentStats AS (
+  SELECT UserId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY UserId
+),
+Final AS (
+  SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    COALESCE(ps.PostCount, 0) AS PostCount,
+    COALESCE(ps.QuestionCount, 0) AS QuestionCount,
+    COALESCE(ps.AnswerCount, 0) AS AnswerCount,
+    COALESCE(ps.AvgScore, 0) AS AvgScore,
+    COALESCE(la.LastActivityDate, ub.LastAccessDate) AS LastActivityDate,
+    COALESCE(bs.BadgeCount, 0) AS BadgeCount,
+    COALESCE(vs.UpVotesLast90, 0) AS UpVotesLast90,
+    COALESCE(es.Edits, 0) AS Edits,
+    COALESCE(cs.CommentCount, 0) AS CommentCount,
+    (SELECT p.Title
+       FROM Posts p
+       WHERE p.OwnerUserId = ub.UserId AND p.PostTypeId = 1
+       ORDER BY p.LastActivityDate DESC NULLS LAST
+       LIMIT 1) AS LastQuestionTitle,
+    CONCAT(ub.DisplayName, ' (#', ub.UserId, ')') AS UserHandle
+  FROM UserBase ub
+  LEFT JOIN PostStats ps ON ps.OwnerUserId = ub.UserId
+  LEFT JOIN LastActivity la ON la.OwnerUserId = ub.UserId
+  LEFT JOIN BadgeStats bs ON bs.UserId = ub.UserId
+  LEFT JOIN VoteStats vs ON vs.UserId = ub.UserId
+  LEFT JOIN EditStats es ON es.UserId = ub.UserId
+  LEFT JOIN CommentStats cs ON cs.UserId = ub.UserId
+)
+SELECT *
+FROM Final
+UNION ALL
+SELECT *
+FROM Final
+WHERE LastActivityDate IS NULL
+ORDER BY Reputation DESC NULLS LAST, PostCount DESC
+LIMIT 100;

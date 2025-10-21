@@ -1,0 +1,97 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    JOIN tag_hierarchy th ON t.Id != th.Id
+    JOIN Posts p1 ON p1.Tags LIKE '%<' || t.TagName || '>%'
+    JOIN Posts p2 ON p2.Tags LIKE '%<' || th.TagName || '>%'
+        AND p1.Id = p2.Id
+    WHERE th.Level < 3
+        AND p1.PostTypeId = 1
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as AcceptedAnswers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON p.ParentId = q.Id
+    JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PrevEditTime,
+        ph.CreationDate,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as NextEditTime,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, DATE(ph.CreationDate) ORDER BY ph.CreationDate) as DailyEditNum
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ue.AcceptedAnswers,
+    ROUND((CASE WHEN ue.AnswerCount = 0 THEN 0 ELSE ue.AcceptedAnswers * 1.0 / ue.AnswerCount END) * 100, 2) as AcceptanceRate,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1 AND b.TagBased = true AND b.Name = ue.TagName) as GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2 AND b.TagBased = true AND b.Name = ue.TagName) as SilverBadges,
+    COUNT(DISTINCT ep.PostId) as EditedPosts,
+    AVG(EXTRACT(EPOCH FROM (ep.CreationDate - ep.PrevEditTime))/3600) FILTER (WHERE ep.PrevEditTime IS NOT NULL) as AvgHoursBetweenEdits,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 8) as BountiesStarted,
+    SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) as TotalBountyAmount,
+    COUNT(DISTINCT pl.RelatedPostId) as LinkedAnswers,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.Score >= 5) as HighScoredComments,
+    STRING_AGG(DISTINCT th.TagName, ', ' ORDER BY th.TagName) FILTER (WHERE th.Level = 2) as RelatedTags
+FROM user_expertise ue
+LEFT JOIN Badges b ON b.UserId = ue.UserId
+LEFT JOIN edit_patterns ep ON ep.UserId = ue.UserId
+LEFT JOIN Votes v ON v.UserId = ue.UserId
+LEFT JOIN Posts ans ON ans.OwnerUserId = ue.UserId AND ans.PostTypeId = 2
+LEFT JOIN PostLinks pl ON pl.PostId = ans.Id
+LEFT JOIN Comments c ON c.UserId = ue.UserId
+LEFT JOIN tag_hierarchy th ON th.TagName = ue.TagName
+WHERE ue.TagRank <= 10
+GROUP BY 
+    ue.DisplayName,
+    ue.TagName,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ue.AcceptedAnswers,
+    ue.AvgScore
+HAVING COUNT(DISTINCT b.Id) > 0
+ORDER BY 
+    ue.TagName,
+    ue.TotalScore DESC,
+    AcceptanceRate DESC
+LIMIT 100;

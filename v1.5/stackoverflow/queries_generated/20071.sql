@@ -1,0 +1,88 @@
+-- {"query": "20071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1053} 
+
+WITH UserActivitySummary AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+    SUM(p.Score) AS TotalScore,
+    SUM(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1) AS TotalFavorites,
+    MAX(p.CreationDate) AS LastPostDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') WITHIN GROUP (ORDER BY t.Count DESC) AS TopTags
+  FROM Posts p
+  LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.OwnerUserId IS NOT NULL
+    AND p.CreationDate > (SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY CreationDate) FROM Posts)
+  GROUP BY p.OwnerUserId
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+RankedAnswers AS (
+  SELECT
+    Id,
+    ParentId,
+    OwnerUserId,
+    Score,
+    Body,
+    CreationDate,
+    DENSE_RANK() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC, CreationDate DESC) AS AnswerRank
+  FROM Posts
+  WHERE PostTypeId = 2
+    AND DeletionDate IS NULL
+),
+UserReputationHistory AS (
+  SELECT
+    v.UserId,
+    DATE_TRUNC('year', v.CreationDate) AS VoteYear,
+    SUM(CASE
+        WHEN v.VoteTypeId = 2 THEN 10 -- Upvote
+        WHEN v.VoteTypeId = 1 THEN 15 -- Accepted
+        WHEN v.VoteTypeId = 3 THEN -2 -- Downvote
+        ELSE 0
+    END) AS YearlyReputationChange,
+    LAG(SUM(CASE
+        WHEN v.VoteTypeId = 2 THEN 10
+        WHEN v.VoteTypeId = 1 THEN 15
+        WHEN v.VoteTypeId = 3 THEN -2
+        ELSE 0
+    END), 1, 0) OVER (PARTITION BY v.UserId ORDER BY DATE_TRUNC('year', v.CreationDate)) AS PreviousYearReputationChange
+  FROM Votes v
+  WHERE v.UserId IS NOT NULL
+  GROUP BY v.UserId, DATE_TRUNC('year', v.CreationDate)
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  uas.TotalQuestions,
+  uas.TotalAnswers,
+  uas.TotalScore,
+  uas.TotalFavorites,
+  q.Title AS BestAnswerQuestionTitle,
+  ra.Score AS BestAnswerScore,
+  LENGTH(ra.Body) AS BestAnswerBodyLength,
+  -- Correlated subquery to find number of edits on the user's best answer
+  (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ra.Id AND ph.PostHistoryTypeId IN (5, 8)) AS BestAnswerEditCount,
+  urh.YearlyReputationChange,
+  -- Complex calculation for engagement growth
+  CASE
+    WHEN urh.PreviousYearReputationChange > 0
+    THEN (urh.YearlyReputationChange - urh.PreviousYearReputationChange) * 100.0 / urh.PreviousYearReputationChange
+    ELSE NULL
+  END AS ReputationGrowthPercentage,
+  -- Complicated string expression
+  COALESCE(u.Location, 'Unknown') || ' (Account Age: ' || EXTRACT(YEAR FROM AGE(NOW(), u.CreationDate)) || ' years)' AS UserLocationAndAge,
+  uas.TopTags
+FROM Users u
+JOIN UserActivitySummary uas ON u.Id = uas.OwnerUserId
+LEFT JOIN RankedAnswers ra ON uas.OwnerUserId = ra.OwnerUserId AND ra.AnswerRank = 1
+LEFT JOIN Posts q ON ra.ParentId = q.Id
+LEFT JOIN UserReputationHistory urh ON u.Id = urh.UserId AND urh.VoteYear = DATE_TRUNC('year', uas.LastPostDate)
+WHERE u.Reputation > (
+    SELECT AVG(Reputation) + STDDEV(Reputation) FROM Users
+  )
+  AND u.Id NOT IN (SELECT b.UserId FROM Badges b WHERE b.Name = 'Strunk & White')
+  AND (uas.TotalQuestions > uas.TotalAnswers * 0.1 OR uas.TotalFavorites > 100)
+ORDER BY
+  u.Reputation DESC,
+  ReputationGrowthPercentage DESC NULLS LAST
+LIMIT 200;

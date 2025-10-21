@@ -1,0 +1,61 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(p.Score) AS TotalPostScore,
+        COALESCE(SUM(b.Class), 0) AS TotalBadgeWeight,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        p.OwnerUserId,
+        TRIM(BOTH '<>' FROM
+            CONCAT_WS('',
+                UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+            )
+        ) AS TagName,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId,
+        TRIM(BOTH '<>' FROM
+            CONCAT_WS('',
+                UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+            )
+        )
+),
+MaxTagPerUser AS (
+    SELECT
+        OwnerUserId,
+        TagName,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagCount DESC) AS rn
+    FROM TopTags
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalPostScore,
+    ua.TotalBadgeWeight,
+    ua.FirstPostDate,
+    ua.LastPostDate,
+    (CAST((EXTRACT(EPOCH FROM (ua.LastPostDate - ua.FirstPostDate)) / 86400.0) AS DOUBLE PRECISION)) AS DaysActive,
+    mt.TagName AS MostUsedTag,
+    mt.TagCount AS TagFrequency,
+    RANK() OVER (ORDER BY ua.TotalPostScore DESC) AS UserRankByScore,
+    RANK() OVER (ORDER BY ua.TotalPosts DESC) AS UserRankByPostCount
+FROM UserActivity ua
+LEFT JOIN MaxTagPerUser mt ON mt.OwnerUserId = ua.UserId AND mt.rn = 1
+WHERE ua.TotalPosts >= 10
+ORDER BY ua.TotalPostScore DESC, ua.TotalPosts DESC
+LIMIT 100;

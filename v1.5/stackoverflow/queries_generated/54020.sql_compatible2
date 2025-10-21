@@ -1,0 +1,69 @@
+WITH
+    question_tags AS (
+        SELECT
+            q.Id AS QuestionId,
+            q.CreationDate AS QuestionDate,
+            q.Score,
+            t.TagName
+        FROM
+            Posts q
+            JOIN PostTypes pt ON q.PostTypeId = pt.Id
+            JOIN LATERAL (
+                SELECT unnest(
+                    string_to_array(
+                        substring(q.Tags, 2, length(q.Tags) - 2),
+                        '><'
+                    )
+                ) AS TagName
+            ) t ON true
+        WHERE pt.Name = 'Question'
+    ),
+    first_answer AS (
+        SELECT
+            a.ParentId AS QuestionId,
+            MIN(a.CreationDate) AS FirstAnswerDate
+        FROM
+            Posts a
+            JOIN PostTypes pt ON a.PostTypeId = pt.Id
+        WHERE pt.Name = 'Answer'
+        GROUP BY a.ParentId
+    ),
+    duplicate_links AS (
+        SELECT
+            pl.PostId AS QuestionId,
+            COUNT(*) AS DuplicateCount
+        FROM
+            PostLinks pl
+            JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+        WHERE lt.Name = 'Duplicate'
+        GROUP BY pl.PostId
+    ),
+    vote_counts AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM
+            Votes v
+        GROUP BY v.PostId
+    )
+SELECT
+    qt.TagName,
+    COUNT(DISTINCT qt.QuestionId)                          AS TotalQuestions,
+    SUM(qt.Score)                                          AS SumScore,
+    AVG(qt.Score)                                          AS AvgScore,
+    SUM(vc.UpVotes)                                        AS TotalUpVotes,
+    SUM(vc.DownVotes)                                      AS TotalDownVotes,
+    AVG(EXTRACT(EPOCH FROM (fa.FirstAnswerDate - qt.QuestionDate))) AS AvgSecondsToFirstAnswer,
+    COALESCE(dup.DuplicateCount, 0)                        AS DuplicateAnswerCount,
+    MAX(qt.QuestionDate)                                   AS LatestQuestion
+FROM
+    question_tags qt
+    LEFT JOIN first_answer fa ON fa.QuestionId = qt.QuestionId
+    LEFT JOIN duplicate_links dup ON dup.QuestionId = qt.QuestionId
+    LEFT JOIN vote_counts vc ON vc.PostId = qt.QuestionId
+GROUP BY
+    qt.TagName
+ORDER BY
+    TotalQuestions DESC
+LIMIT 10;

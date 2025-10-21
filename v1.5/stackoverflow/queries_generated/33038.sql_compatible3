@@ -1,0 +1,37 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(p.Id) AS TotalQuestions,
+    AVG(p.Score) AS AverageQuestionScore,
+    MAX(p.CreationDate) AS LastQuestionDate,
+    COUNT(c.Id) AS TotalComments,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    STRING_AGG(DISTINCT t.TagName, ',') AS TagsUsed
+FROM
+    Users AS u
+LEFT JOIN
+    Posts AS p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN
+    Comments AS c ON u.Id = c.UserId
+LEFT JOIN
+    Posts AS q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+LEFT JOIN
+    Votes AS v ON q.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN
+    Badges AS b ON u.Id = b.UserId
+LEFT JOIN
+    (
+        SELECT DISTINCT pt.PostId, pt.TagId
+        FROM PostTags AS pt
+    ) AS pt ON p.Id = pt.PostId
+LEFT JOIN
+    Tags AS t ON pt.TagId = t.Id
+WHERE
+    u.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+GROUP BY
+    u.Id, u.DisplayName
+ORDER BY
+    TotalQuestions DESC
+LIMIT 100;

@@ -1,0 +1,108 @@
+-- {"query": "133.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1717} 
+WITH
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.AccountId,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+    FROM Users u
+    WHERE u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+UserPostAggregate AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.LastActivityDate) AS LastActivityDate
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+UserVoteAggregate AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        SUM(v.BountyAmount) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+BadgeInfo AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(CASE WHEN b.TagBased THEN 'TagBadge:' || b.Name ELSE 'Badge:' || b.Name END, ';') AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagEngagement AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        STRING_AGG(t.TagName, ',') AS TagsUsedRecently
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS TagName
+    ) AS t ON true
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY p.OwnerUserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ua.FirstPostDate,
+        ua.LastActivityDate,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ua.TotalViews,
+        va.UpVotes,
+        va.DownVotes,
+        va.TotalBounty,
+        bi.GoldBadges,
+        bi.SilverBadges,
+        bi.BronzeBadges,
+        bi.BadgeList,
+        te.TagsUsedRecently,
+        ROW_NUMBER() OVER (
+            ORDER BY u.Reputation DESC, ua.TotalScore DESC NULLS LAST, va.UpVotes DESC NULLS LAST
+        ) AS rank
+    FROM ActiveUsers u
+    LEFT JOIN UserPostAggregate ua ON ua.UserId = u.Id
+    LEFT JOIN UserVoteAggregate va ON va.UserId = u.Id
+    LEFT JOIN BadgeInfo bi ON bi.UserId = u.Id
+    LEFT JOIN TagEngagement te ON te.UserId = u.Id
+)
+SELECT
+    ra.UserId,
+    ra.DisplayName AS UserName,
+    ra.Reputation,
+    ra.FirstPostDate,
+    ra.LastActivityDate,
+    ra.QuestionCount,
+    ra.AnswerCount,
+    ra.TotalScore,
+    ra.TotalViews,
+    ra.UpVotes,
+    ra.DownVotes,
+    ra.TotalBounty,
+    ra.GoldBadges,
+    ra.SilverBadges,
+    ra.BronzeBadges,
+    ra.BadgeList,
+    ra.TagsUsedRecently
+FROM RecentActivity ra
+WHERE ra.rank <= 100
+ORDER BY ra.Reputation DESC NULLS LAST, ra.rank ASC
+;

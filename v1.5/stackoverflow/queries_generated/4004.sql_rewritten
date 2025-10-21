@@ -1,0 +1,217 @@
+-- {"query": "4004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1970} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        u.Id as UserId,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.ViewCount DESC) as TagPostRank
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    left join Users u on p.OwnerUserId = u.Id
+    where t.IsModeratorOnly = 0 and p.Id is not null
+),
+FilteredTopPosts as (
+    select TagId, TagName, PostId, Score, ViewCount, UserId, Reputation
+    from RecursiveTagCounts
+    where TagPostRank <= 5
+),
+UserBadges as (
+    select
+        UserId,
+        Name,
+        Class,
+        count(*) over (partition by UserId, Class) as BadgeCountPerClass,
+        row_number() over (partition by UserId order by Class asc, Name asc) as BadgeRowNum
+    from Badges
+    where Date > cast('2024-10-01' as date) - interval '365 day'
+),
+UserBadgeSummary as (
+    select
+        UserId,
+        max(case when Class = 1 then BadgeCountPerClass else 0 end) as GoldBadgeCount,
+        max(case when Class = 2 then BadgeCountPerClass else 0 end) as SilverBadgeCount,
+        max(case when Class = 3 then BadgeCountPerClass else 0 end) as BronzeBadgeCount,
+        string_agg(distinct Name, ', ' order by Name) filter (where BadgeRowNum <= 5) as TopBadges
+    from UserBadges
+    group by UserId
+),
+PostCommentsAggregate as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.Score is null then 0 else c.Score end) as TotalCommentScore,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, 'anonymous'), ', ' order by c.CreationDate desc) filter (where row_number() over (partition by c.PostId order by c.CreationDate desc) <= 3) as LatestCommenters
+    from Comments c
+    group by c.PostId
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinkCount,
+        count(*) filter (where lt.Name = 'Linked') as LinkedLinkCount,
+        count(*) as TotalLinkCount
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+RankedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.ViewCount,
+        a.CreationDate,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+AnswerAggregates as (
+    select
+        QuestionId,
+        count(*) as AnswerCount,
+        max(Score) as MaxAnswerScore,
+        sum(Score) as TotalAnswerScore,
+        count(*) filter (where AnswerRank = 1) as HasTopAnswer
+    from RankedAnswers
+    group by QuestionId
+),
+ComplexPosts as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        coalesce(ub.GoldBadgeCount,0) as OwnerGoldBadges,
+        coalesce(ub.SilverBadgeCount,0) as OwnerSilverBadges,
+        coalesce(ub.BronzeBadgeCount,0) as OwnerBronzeBadges,
+        ub.TopBadges,
+        pca.CommentCount,
+        pca.TotalCommentScore,
+        pca.LastCommentDate,
+        pca.LatestCommenters,
+        pls.DuplicateLinkCount,
+        pls.LinkedLinkCount,
+        pls.TotalLinkCount,
+        aa.AnswerCount,
+        aa.MaxAnswerScore,
+        aa.TotalAnswerScore,
+        aa.HasTopAnswer,
+        case 
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as PostStatus,
+        -- Complex string expression to extract tags and count length of tag strings
+        array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), 1) as TagCount,
+        length(p.Body) as BodyLength,
+        coalesce(p.Score * 1.0 / nullif(p.ViewCount,0), 0) as ScoreToViewRatio,
+        lag(p.Score) over (order by p.Score desc) as PrevScore,
+        lead(p.Score) over (order by p.Score desc) as NextScore
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeSummary ub on ub.UserId = u.Id
+    left join PostCommentsAggregate pca on pca.PostId = p.Id
+    left join PostLinkSummary pls on pls.PostId = p.Id
+    left join AnswerAggregates aa on aa.QuestionId = p.Id
+    where p.PostTypeId = 1
+),
+TopUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionsPosted,
+        count(distinct a.Id) as AnswersPosted,
+        count(distinct b.Id) as BadgesEarned,
+        max(p.CreationDate) as LastQuestionDate,
+        max(a.CreationDate) as LastAnswerDate,
+        max(b.Date) as LastBadgeDate,
+        coalesce(sum(p.Score), 0) as TotalQuestionScore,
+        coalesce(sum(a.Score), 0) as TotalAnswerScore,
+        coalesce(sum(vt.UpVotes), 0) as TotalUpVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.PostId in (
+            select p2.Id from Posts p2 where p2.OwnerUserId = u.Id
+        ) and v.VoteTypeId = 2 on true
+    left join (
+        select UserId, count(*) as UpVotes from Votes where VoteTypeId = 2 group by UserId
+    ) vt on vt.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct p.Id) + count(distinct a.Id) > 10
+)
+select 
+    cp.PostId,
+    cp.Title,
+    cp.CreationDate,
+    cp.Score,
+    cp.ViewCount,
+    cp.Tags,
+    cp.OwnerName,
+    cp.OwnerGoldBadges,
+    cp.OwnerSilverBadges,
+    cp.OwnerBronzeBadges,
+    cp.TopBadges,
+    cp.CommentCount,
+    cp.TotalCommentScore,
+    cp.LastCommentDate,
+    cp.LatestCommenters,
+    cp.DuplicateLinkCount,
+    cp.LinkedLinkCount,
+    cp.TotalLinkCount,
+    cp.AnswerCount,
+    cp.MaxAnswerScore,
+    cp.TotalAnswerScore,
+    cp.HasTopAnswer,
+    cp.PostStatus,
+    cp.TagCount,
+    cp.BodyLength,
+    cp.ScoreToViewRatio,
+    cp.PrevScore,
+    cp.NextScore,
+    tua.QuestionsPosted,
+    tua.AnswersPosted,
+    tua.BadgesEarned,
+    tua.LastQuestionDate,
+    tua.LastAnswerDate,
+    tua.LastBadgeDate,
+    tua.TotalQuestionScore,
+    tua.TotalAnswerScore,
+    tua.TotalUpVotes
+from ComplexPosts cp
+left join TopUserActivity tua on tua.UserId = (select OwnerUserId from Posts where Id = cp.PostId)
+where 
+    cp.TagCount > 3
+    and cp.PostStatus != 'Closed'
+    and (
+        cp.ScoreToViewRatio > 0.01
+        or cp.AnswerCount > 5
+        or cp.CommentCount > 2
+    )
+union
+select
+    p.Id as PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName as OwnerName,
+    0, 0, 0, '', 0,0,null,'',0,0,0,0,0,'Open',0,0,0,null,null,0,0,0,0,null,null,null,null,0,0,0,0
+from Posts p
+left join Users u on p.OwnerUserId = u.Id
+where p.PostTypeId = 1 and p.Score < 0
+order by Score desc nulls last, ViewCount desc nulls last
+limit 100;

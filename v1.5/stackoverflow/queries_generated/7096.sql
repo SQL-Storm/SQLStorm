@@ -1,0 +1,196 @@
+-- {"query": "7096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1917} 
+with
+-- Top contributors by combined score and activity, with dampening for age
+user_scores as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    count(p.id) filter (where p.posttypeid = 1) as questions_posted,
+    count(p.id) filter (where p.posttypeid = 2) as answers_posted,
+    coalesce(sum(p.score),0) as posts_score,
+    coalesce(sum(case when p.posttypeid in (1,2) then greatest(p.score,0) end),0) * 1.0
+      / nullif(date_part('epoch', now() - u.creationdate)/86400 + 30,0) as activity_dampened,
+    row_number() over (order by coalesce(sum(p.score),0) desc, u.reputation desc) as rn
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+-- Recent hot questions with tag exploded
+question_tags as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.owneruserid,
+    tag
+  from posts q
+  cross join lateral (
+    select unnest(string_to_array(substring(q.tags,2,length(q.tags)-2), '><')) as tag
+  ) t
+  where q.posttypeid = 1
+),
+-- For each question, compute rich metrics: unique commenters, median comment score, top answer gap, duplicate links
+question_metrics as (
+  select
+    qt.question_id,
+    qt.title,
+    qt.creationdate,
+    qt.tag,
+    qt.score,
+    qt.viewcount,
+    qt.answercount,
+    coalesce(c.unique_commenters,0) as unique_commenters,
+    coalesce(c.avg_comment_score,0) as avg_comment_score,
+    coalesce(a.best_answer_score,0) as best_answer_score,
+    coalesce(a.second_best_answer_score,0) as second_best_answer_score,
+    coalesce(a.best_answer_score,0) - coalesce(a.second_best_answer_score,0) as top_answer_gap,
+    coalesce(pl.duplicate_count,0) as duplicates_count,
+    case
+      when qt.creationdate > now() - interval '7 days' then 'week'
+      when qt.creationdate > now() - interval '30 days' then 'month'
+      else 'older'
+    end as recency_bucket
+  from question_tags qt
+  left join lateral (
+    select
+      count(distinct coalesce(com.userId, -1)) as unique_commenters,
+      avg(coalesce(com.score,0)) as avg_comment_score
+    from comments com
+    where com.postid = qt.question_id
+  ) c on true
+  left join lateral (
+    select
+      max(a.score) filter (where a.posttypeid = 2) as best_answer_score,
+      ( -- second best
+        select max(a2.score) from posts a2 where a2.parentid = qt.question_id and a2.id <> (select max(a3.id) filter (where a3.posttypeid=2) from posts a3 where a3.parentid = qt.question_id order by a3.score desc)
+      ) as second_best_answer_score
+    from posts a
+    where a.parentid = qt.question_id
+  ) a on true
+  left join lateral (
+    select count(*) filter (where pl.linktypeid = 3) as duplicate_count
+    from postlinks pl
+    where pl.postid = qt.question_id
+  ) pl on true
+),
+-- Recent activity windowed ranking and moving averages
+ranked_questions as (
+  select
+    qm.*,
+    dense_rank() over (partition by qm.tag order by qm.score desc, qm.viewcount desc) as tag_rank,
+    rank() over (order by qm.score desc nulls last) as global_rank,
+    avg(qm.score) over (partition by qm.tag order by qm.creationdate rows between 50 preceding and current row) as rolling_tag_score_avg,
+    avg(qm.viewcount) over (partition by qm.tag order by qm.creationdate rows between 50 preceding and current row) as rolling_tag_view_avg
+  from question_metrics qm
+),
+-- Select top users and correlate with their answers' performance
+top_users as (
+  select user_id, displayname, reputation
+  from user_scores
+  where rn <= 100
+),
+user_answer_stats as (
+  select
+    tu.user_id,
+    count(a.id) as answers_given,
+    avg(a.score) as avg_answer_score,
+    sum(case when a.id = p.acceptedanswerid then 1 else 0 end) as accepted_count,
+    max(a.score) as best_answer_score,
+    percentile_cont(0.5) within group (order by a.score) as median_answer_score
+  from top_users tu
+  left join posts a on a.posttypeid = 2 and a.owneruserid = tu.user_id
+  left join posts p on p.id = a.parentid
+  group by tu.user_id
+),
+-- Complex set: questions with no accepted answer but with high answer scores (potential oversight)
+unaccepted_but_high_answers as (
+  select q.id as question_id, q.title, q.creationdate, q.score as qscore,
+    (select max(a.score) from posts a where a.parentid = q.id) as max_answer_score,
+    (select count(*) from posts a where a.parentid = q.id and a.score >= greatest(5, q.score/2)) as strong_answer_count
+  from posts q
+  where q.posttypeid = 1 and q.acceptedanswerid is null and q.answercount > 0
+),
+-- Combine everything with unions to force planner variety
+final_pool as (
+  select
+    rq.question_id,
+    rq.title,
+    rq.tag,
+    rq.creationdate,
+    rq.score,
+    rq.viewcount,
+    rq.answercount,
+    rq.unique_commenters,
+    rq.avg_comment_score,
+    rq.best_answer_score,
+    rq.second_best_answer_score,
+    rq.top_answer_gap,
+    rq.duplicates_count,
+    rq.recency_bucket,
+    rq.tag_rank,
+    rq.global_rank,
+    rq.rolling_tag_score_avg,
+    rq.rolling_tag_view_avg,
+    tu.user_id,
+    tu.displayname as top_contributor,
+    uas.answers_given,
+    uas.avg_answer_score,
+    uas.accepted_count
+  from ranked_questions rq
+  left join top_users tu on tu.user_id = rq.owneruserid
+  left join user_answer_stats uas on uas.user_id = tu.user_id
+
+  union all
+
+  select
+    ubha.question_id,
+    ubha.title,
+    null as tag,
+    ubha.creationdate,
+    ubha.qscore as score,
+    null as viewcount,
+    null as answercount,
+    null as unique_commenters,
+    null as avg_comment_score,
+    ubha.max_answer_score as best_answer_score,
+    null as second_best_answer_score,
+    null as top_answer_gap,
+    null as duplicates_count,
+    case when ubha.creationdate > now() - interval '30 days' then 'recent_unaccepted' else 'old_unaccepted' end as recency_bucket,
+    null,null,null,null,
+    null,null,null
+  from unaccepted_but_high_answers ubha
+  where ubha.max_answer_score >= 10
+
+  union all
+
+  select
+    null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null
+) -- end final_pool
+select
+  fp.*,
+  -- compute a synthetic quality score mixing metrics with null-aware math
+  (coalesce(fp.score,0) * 1.5
+   + coalesce(fp.best_answer_score,0) * 2
+   + coalesce(fp.avg_comment_score,0) * 1.2
+   + coalesce(fp.rolling_tag_score_avg,0) * 0.8
+   - coalesce(fp.duplicates_count,0) * 3
+   + coalesce(fp.answers_given,0) * 0.5
+  ) / nullif(1 +
+    greatest(0, date_part('epoch', now() - coalesce(fp.creationdate, now()))/86400)/365.0
+  ,0) as synthetic_quality_score,
+  -- a diagnostic composite text field to exercise string ops and null logic
+  (
+    coalesce(fp.tag,'[no-tag]') || ' | ' ||
+    coalesce(fp.title, '[no-title]') || ' | owner:' || coalesce(fp.top_contributor,'[anon]') ||
+    ' | recency=' || coalesce(fp.recency_bucket,'[unknown]') ||
+    ' | gap=' || coalesce(fp.top_answer_gap::text,'0')
+  ) as diagnostic
+from final_pool fp
+where not (fp.question_id is null and fp.title is null and fp.tag is null)
+order by synthetic_quality_score desc nulls last
+limit 500;

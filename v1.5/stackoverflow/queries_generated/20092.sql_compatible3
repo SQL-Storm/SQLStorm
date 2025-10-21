@@ -1,0 +1,138 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 3600.0 AS ActiveHours,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1) AS TotalFavoriteCount,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.AboutMe IS NOT NULL AND u.WebsiteUrl LIKE '%.org'
+    GROUP BY
+        u.Id
+    HAVING
+        COUNT(DISTINCT p.Id) > 10 AND COUNT(DISTINCT b.Id) > 5
+),
+RankedUserActivity AS (
+    SELECT
+        *,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS ReputationDecile,
+        DENSE_RANK() OVER (ORDER BY GoldBadges DESC, TotalBadges DESC) AS BadgeRank,
+        AVG(TotalPostScore) OVER (PARTITION BY NTILE(10) OVER (ORDER BY Reputation DESC)) AS AvgScoreInRepDecile
+    FROM
+        UserActivitySummary
+    WHERE
+        ActiveHours > 24
+),
+QuestionAnalysis AS (
+    SELECT
+        q.OwnerUserId,
+        AVG(q.AnswerCount) AS AvgAnswerCount,
+        MAX(q.Score) AS MaxQuestionScore,
+        MIN((EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 60.0)) AS MinsToFirstAnswer,
+        SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(q.Id) AS AcceptanceRate
+    FROM
+        Posts q
+    LEFT JOIN
+        Posts a ON q.Id = a.ParentId
+    WHERE
+        q.PostTypeId = 1
+        AND q.OwnerUserId IN (SELECT UserId FROM RankedUserActivity WHERE ReputationDecile <= 2)
+    GROUP BY
+        q.OwnerUserId
+),
+UserContributions AS (
+    (
+    SELECT
+        rua.UserId,
+        'Top Tier' AS Category,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.TotalPosts,
+        rua.Answers
+    FROM
+        RankedUserActivity rua
+    WHERE
+        rua.ReputationDecile = 1 AND rua.BadgeRank <= 50
+    )
+    UNION ALL
+    (
+    SELECT
+        rua.UserId,
+        'Mid Tier' AS Category,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.TotalPosts,
+        rua.Answers
+    FROM
+        RankedUserActivity rua
+    WHERE
+        rua.ReputationDecile BETWEEN 4 AND 6
+        AND rua.UserId % 2 = 0
+    )
+)
+SELECT
+    uc.Category,
+    uc.DisplayName || ' @ ' || COALESCE((SELECT Location FROM Users WHERE Id = uc.UserId), 'Unknown Location') AS UserHandle,
+    uc.Reputation,
+    rua.AvgScoreInRepDecile,
+    qa.AcceptanceRate,
+    qa.MinsToFirstAnswer,
+    (
+        SELECT
+            STRING_AGG(t.TagName, ', ')
+        FROM
+            Posts p_tags
+        CROSS JOIN
+            UNNEST(string_to_array(substring(p_tags.Tags, 2, length(p_tags.Tags)-2), '><')) AS t(TagName)
+        WHERE
+            p_tags.OwnerUserId = uc.UserId AND p_tags.PostTypeId = 1
+            AND p_tags.Score = qa.MaxQuestionScore
+        LIMIT 1
+    ) AS TagsOfBestQuestion,
+    (
+        SELECT
+            COUNT(DISTINCT ph.UserId)
+        FROM
+            PostHistory ph
+        JOIN
+            Posts p_hist ON ph.PostId = p_hist.Id
+        WHERE
+            p_hist.OwnerUserId = uc.UserId
+            AND ph.PostHistoryTypeId IN (5, 8)
+            AND ph.UserId != uc.UserId
+    ) AS DistinctEditorsOfPosts,
+    CASE
+        WHEN qa.AvgAnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId=1) THEN 'Helpful Questioner'
+        WHEN qa.AvgAnswerCount IS NULL THEN 'No Questions Analyzed'
+        ELSE 'Needs More Answers'
+    END AS QuestionerProfile
+FROM
+    UserContributions uc
+JOIN
+    RankedUserActivity rua ON uc.UserId = rua.UserId
+LEFT JOIN
+    QuestionAnalysis qa ON uc.UserId = qa.OwnerUserId
+WHERE
+    uc.Reputation > rua.AvgScoreInRepDecile
+    AND EXISTS (
+        SELECT 1
+        FROM Comments c
+        WHERE c.UserId = uc.UserId
+        AND c.Score > 10
+    )
+ORDER BY
+    uc.Category, uc.Reputation DESC, qa.AcceptanceRate DESC NULLS LAST
+LIMIT 200;

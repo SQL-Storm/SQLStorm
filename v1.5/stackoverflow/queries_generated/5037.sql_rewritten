@@ -1,0 +1,93 @@
+-- {"query": "5037.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 939} 
+WITH
+TopActiveUsers AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS PostsCount,
+    SUM(p.Score) AS TotalScore,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(p.Score) DESC) AS UserRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+RecentComments AS (
+  SELECT
+    c.*,
+    DENSE_RANK() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS CommentRank
+  FROM Comments c
+  WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 day'
+),
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserTagDiversity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    COUNT(DISTINCT TRIM(tag)) AS DistinctTags
+  FROM Posts p
+    CROSS JOIN LATERAL UNNEST(
+      string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')
+    ) AS tag
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId
+),
+QuestionClosureLag AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.OwnerUserId,
+    p.CreationDate,
+    ph.CreationDate AS CloseDate,
+    EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate)) / 3600 AS HoursUntilClose,
+    crt.Name AS CloseReason
+  FROM Posts p
+  LEFT JOIN PostHistory ph 
+    ON ph.PostId = p.Id 
+    AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes crt 
+    ON crt.Id::TEXT = ph.Comment
+  WHERE p.PostTypeId = 1
+    AND ph.CreationDate IS NOT NULL
+),
+LinkedAndDuplicate AS (
+  SELECT
+    pl.PostId,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS NumLinked,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS NumDuplicates
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+)
+SELECT 
+  u.UserId,
+  u.DisplayName,
+  u.PostsCount,
+  u.TotalScore,
+  bs.GoldBadges,
+  bs.SilverBadges,
+  bs.BronzeBadges,
+  COALESCE(td.DistinctTags, 0) AS DistinctTags,
+  AVG(qcl.HoursUntilClose) FILTER (WHERE qcl.HoursUntilClose IS NOT NULL) AS AvgCloseLagHours,
+  COUNT(qcl.QuestionId) FILTER (WHERE qcl.HoursUntilClose < 24) AS QuestionsClosedWithin24h,
+  SUM(la.NumLinked) AS TotalLinkedQuestions,
+  SUM(la.NumDuplicates) AS TotalDuplicateQuestions,
+  STRING_AGG(DISTINCT qcl.CloseReason, ', ') FILTER (WHERE qcl.CloseReason IS NOT NULL) AS CloseReasons,
+  MAX(rc.Text) AS RecentCommentSnippet
+FROM TopActiveUsers u
+LEFT JOIN BadgeSummary bs ON bs.UserId = u.UserId
+LEFT JOIN UserTagDiversity td ON td.UserId = u.UserId
+LEFT JOIN QuestionClosureLag qcl ON qcl.OwnerUserId = u.UserId
+LEFT JOIN LinkedAndDuplicate la ON la.PostId = qcl.QuestionId
+LEFT JOIN RecentComments rc ON rc.PostId = qcl.QuestionId AND rc.CommentRank = 1
+GROUP BY 
+  u.UserId, u.DisplayName, u.PostsCount, u.TotalScore, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, td.DistinctTags
+HAVING COUNT(qcl.QuestionId) > 0
+ORDER BY u.UserRank
+LIMIT 25;

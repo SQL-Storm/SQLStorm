@@ -1,0 +1,44 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id AS PostId, 
+        P.Title, 
+        P.Score, 
+        P.CreationDate, 
+        U.DisplayName AS OwnerName, 
+        COUNT(C.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        P.PostTypeId = 1 AND 
+        P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    GROUP BY 
+        P.Id, P.Title, P.Score, P.CreationDate, U.DisplayName, P.OwnerUserId
+),
+TopPosts AS (
+    SELECT 
+        PostId, Title, Score, CreationDate, OwnerName, CommentCount
+    FROM 
+        RankedPosts
+    WHERE 
+        PostRank <= 5
+)
+SELECT 
+    T.OwnerName, 
+    COUNT(*) AS TotalTopPosts, 
+    AVG(T.Score) AS AverageScore,
+    SUM(T.CommentCount) AS TotalComments
+FROM 
+    TopPosts T
+JOIN 
+    Users U ON T.OwnerName = U.DisplayName
+WHERE 
+    U.Reputation > 1000
+GROUP BY 
+    T.OwnerName
+ORDER BY 
+    TotalTopPosts DESC, AverageScore DESC;

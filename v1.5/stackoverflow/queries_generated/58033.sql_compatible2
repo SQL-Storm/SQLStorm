@@ -1,0 +1,65 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2, 3, 5)
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class IN (1, 2, 3)
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01' AND u.LastAccessDate >= TIMESTAMP '2023-01-01'
+    GROUP BY u.Id
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ViewCount,
+        ph.CreationDate AS LastEditDate,
+        COUNT(ph.Id) OVER (PARTITION BY p.Id) AS EditHistoryCount,
+        STRING_AGG(DISTINCT CAST(ph.PostHistoryTypeId AS TEXT), ', ') AS HistoryTypes,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) OVER () AS InitialBodyEdits
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.CreationDate BETWEEN TIMESTAMP '2020-01-01' AND TIMESTAMP '2024-01-01'
+      AND EXISTS (
+          SELECT 1
+          FROM (
+              SELECT TRIM(value) AS tag
+              FROM STRING_TO_ARRAY(REPLACE(REPLACE(p.Tags, '<', ''), '>', ','), ',')
+          ) AS taglist(tag)
+          WHERE taglist.tag IN ('sql', 'performance')
+      )
+)
+SELECT 
+    u.UserId,
+    u.ReputationRank,
+    pa.PostId,
+    pa.EditHistoryCount,
+    pa.HistoryTypes,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = pa.PostId AND VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM PostLinks WHERE PostId = pa.PostId AND LinkTypeId = 3) AS DuplicateLinks,
+    COALESCE((SELECT SUM(BountyAmount) FROM Votes WHERE UserId = u.UserId AND VoteTypeId = 8), 0) AS TotalBounty,
+    ARRAY_AGG(DISTINCT b.Name) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    PERCENT_RANK() OVER (ORDER BY (u.TotalPosts + u.TotalComments) DESC) AS ActivityPercentile
+FROM UserStats u
+JOIN PostActivity pa ON pa.OwnerUserId = u.UserId
+LEFT JOIN Badges b ON b.UserId = u.UserId
+WHERE u.Reputation > 1000
+  AND pa.EditHistoryCount > 5
+  AND pa.InitialBodyEdits > 0
+GROUP BY 
+    u.UserId, u.ReputationRank, pa.PostId, pa.EditHistoryCount, pa.HistoryTypes, u.TotalPosts, u.TotalComments
+HAVING COUNT(DISTINCT pa.PostId) < 100
+ORDER BY u.ReputationRank, ActivityPercentile DESC, TotalBounty DESC
+LIMIT 500;

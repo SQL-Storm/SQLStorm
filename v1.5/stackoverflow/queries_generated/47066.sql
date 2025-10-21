@@ -1,0 +1,162 @@
+-- {"query": "47066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 151404, "output_tokens": 134309} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        1 as level,
+        ARRAY[t.TagName] as tag_path
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.TagName,
+        t2.Count,
+        th.level + 1,
+        th.tag_path || t2.TagName
+    FROM Tags t2
+    CROSS JOIN tag_hierarchy th
+    WHERE t2.Count BETWEEN 1000 AND 10000
+        AND NOT (t2.TagName = ANY(th.tag_path))
+        AND th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as question_tags,
+        COUNT(DISTINCT p.Id) as questions_asked,
+        COALESCE(SUM(p.Score), 0) as total_question_score,
+        COUNT(DISTINCT a.Id) as answers_given,
+        COALESCE(SUM(a.Score), 0) as total_answer_score,
+        COUNT(DISTINCT CASE WHEN a.Id = q.AcceptedAnswerId THEN a.Id END) as accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) as median_answer_score,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as reputation_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < NOW() - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, p.Tags
+),
+post_quality_metrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.Score > 100 THEN 'Excellent'
+            WHEN p.Score > 50 THEN 'Very Good'
+            WHEN p.Score > 10 THEN 'Good'
+            WHEN p.Score > 0 THEN 'Average'
+            ELSE 'Below Average'
+        END as quality_tier,
+        COUNT(DISTINCT c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN ph.Id END) as negative_actions,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, NOW()) - p.CreationDate))/86400 as days_until_closed,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as user_post_rank
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate > NOW() - INTERVAL '2 years'
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.ClosedDate
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Id) as total_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as bronze_badges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) as unique_tag_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY b.Name) as gold_badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+temporal_analysis AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as month,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) as questions_per_month,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) as answers_per_month,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) as avg_question_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) as avg_answer_score,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.ViewCount) FILTER (WHERE p.PostTypeId = 1) as p95_views,
+        COUNT(DISTINCT p.OwnerUserId) as active_users,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(DISTINCT p.Id), 0) as close_rate
+    FROM Posts p
+    WHERE p.CreationDate > NOW() - INTERVAL '3 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.reputation_rank,
+    ue.questions_asked,
+    ue.total_question_score,
+    ue.answers_given,
+    ue.total_answer_score,
+    ue.accepted_answers,
+    ue.median_answer_score,
+    ba.total_badges,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.unique_tag_badges,
+    ba.gold_badge_names,
+    COUNT(DISTINCT pqm.PostId) as quality_posts,
+    AVG(pqm.Score) as avg_post_score,
+    SUM(pqm.ViewCount) as total_views,
+    AVG(pqm.comment_count) as avg_comments_per_post,
+    AVG(pqm.edit_count) as avg_edits_per_post,
+    SUM(pqm.upvotes) as total_upvotes_received,
+    SUM(pqm.downvotes) as total_downvotes_received,
+    AVG(pqm.days_until_closed) FILTER (WHERE pqm.days_until_closed IS NOT NULL) as avg_days_to_closure,
+    COUNT(DISTINCT th.TagName) as related_tags,
+    MAX(ta.avg_question_score) as peak_month_question_score,
+    MAX(ta.avg_answer_score) as peak_month_answer_score,
+    CORR(pqm.Score, pqm.ViewCount) as score_view_correlation,
+    REGR_SLOPE(pqm.Score, EXTRACT(EPOCH FROM (NOW() - pqm.CreationDate))/86400) as score_trend
+FROM user_expertise ue
+LEFT JOIN badge_achievements ba ON ue.UserId = ba.UserId
+LEFT JOIN post_quality_metrics pqm ON ue.UserId = pqm.OwnerUserId
+LEFT JOIN tag_hierarchy th ON th.TagName = ANY(ue.question_tags)
+CROSS JOIN temporal_analysis ta
+WHERE ue.reputation_rank <= 1000
+    AND pqm.user_post_rank <= 10
+GROUP BY 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.reputation_rank,
+    ue.questions_asked,
+    ue.total_question_score,
+    ue.answers_given,
+    ue.total_answer_score,
+    ue.accepted_answers,
+    ue.median_answer_score,
+    ba.total_badges,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.unique_tag_badges,
+    ba.gold_badge_names
+HAVING COUNT(DISTINCT pqm.PostId) > 5
+    AND AVG(pqm.Score) > 1
+ORDER BY 
+    ue.Reputation DESC,
+    (ue.total_answer_score + ue.total_question_score) DESC,
+    ba.gold_badges DESC
+LIMIT 100;

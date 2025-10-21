@@ -1,0 +1,47 @@
+WITH user_tag_activity AS (
+    SELECT 
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.Votes) AS TotalVotes
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT 
+            PostId, 
+            COUNT(Id) AS Votes 
+        FROM Votes 
+        WHERE VoteTypeId IN (2, 3) 
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substr(p."Tags", 2, char_length(p."Tags") - 2), '><')) AS TagName
+    ) AS tag_arr
+    JOIN 
+        Tags t ON t.TagName = tag_arr.TagName
+    WHERE 
+        p.PostTypeId = 1
+        AND u.Reputation > 1000
+    GROUP BY 
+        u.Id, t.TagName
+    HAVING 
+        COUNT(p.Id) > 5
+)
+SELECT 
+    UserId,
+    TagName,
+    PostCount,
+    AvgPostScore,
+    TotalVotes,
+    RANK() OVER (PARTITION BY TagName ORDER BY PostCount DESC) AS TagRank
+FROM 
+    user_tag_activity
+WHERE 
+    AvgPostScore > 3
+ORDER BY 
+    TotalVotes DESC, 
+    PostCount DESC
+LIMIT 250;

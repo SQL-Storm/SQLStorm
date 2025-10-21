@@ -1,0 +1,228 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.TagName] AS AncestorTags,
+        1 AS Level
+    FROM Tags t
+    WHERE (t.IsRequired = 0 OR t.IsRequired IS NULL)
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.AncestorTags || t2.TagName,
+        r.Level + 1
+    FROM Tags t2
+    JOIN TagHierarchy r ON t2.Id < r.Id AND NOT t2.TagName = ANY(r.AncestorTags)
+    WHERE r.Level < 3
+), UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS TotalBadgeTypes
+    FROM Badges b
+    GROUP BY b.UserId
+), PostActivityStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews,
+        SUM(p.FavoriteCount) AS TotalFavorites,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId, p.PostTypeId
+), UserPostWindow AS (
+    SELECT
+        p.*,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS ScoreRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 AND p.PostTypeId IN (1, 2)
+), LatestCloseReasons AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    ORDER BY ph.PostId, ph.CreationDate DESC
+), UserCommentStats AS (
+    SELECT
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommented,
+        COUNT(*) FILTER (WHERE c.CreationDate > DATE '2024-10-01' - INTERVAL '30 days') AS RecentComments
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+), UserReputationBins AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        CASE
+            WHEN u.Reputation >= 100000 THEN '100k+'
+            WHEN u.Reputation >= 50000 THEN '50k-99k'
+            WHEN u.Reputation >= 10000 THEN '10k-49k'
+            WHEN u.Reputation >= 1000 THEN '1k-9k'
+            ELSE '<1k'
+        END AS ReputationBin
+    FROM Users u
+), UserAggregate AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ua.TotalBadgeTypes,
+        COALESCE(paq.PostCount, 0) AS QuestionCount,
+        COALESCE(paa.PostCount, 0) AS AnswerCount,
+        COALESCE(paq.TotalScore, 0) AS QuestionScoreSum,
+        COALESCE(paa.TotalScore, 0) AS AnswerScoreSum,
+        COALESCE(ucs.CommentCount, 0) AS CommentCount,
+        COALESCE(ucs.AvgCommentLength, 0) AS AvgCommentLength,
+        ur.ReputationBin,
+        u.Location,
+        u.AboutMe,
+        u.WebsiteUrl
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+    LEFT JOIN PostActivityStats paq ON paq.OwnerUserId = u.Id AND paq.PostTypeId = 1
+    LEFT JOIN PostActivityStats paa ON paa.OwnerUserId = u.Id AND paa.PostTypeId = 2
+    LEFT JOIN UserCommentStats ucs ON ucs.UserId = u.Id
+    LEFT JOIN UserReputationBins ur ON ur.UserId = u.Id
+), HighActivityPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.CreationDate,
+        COALESCE(plcount.NumLinked, 0) AS NumLinkedPosts,
+        ROUND(COALESCE(p.Score, 0) / NULLIF(p.ViewCount, 0) * 1000, 2) AS ScoreToViewThousand,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS NumLinked
+        FROM PostLinks
+        GROUP BY PostId
+    ) plcount ON plcount.PostId = p.Id
+    WHERE p.PostTypeId = 1
+), CombinedQuestionsAndTags AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        UNNEST(string_to_array(
+            REGEXP_REPLACE(COALESCE(p.Tags, ''), '[<>]', ' ', 'g')
+            , ' ')) AS SingleTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.GoldBadges,
+    UA.SilverBadges,
+    UA.BronzeBadges,
+    UA.TotalBadgeTypes,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.QuestionScoreSum,
+    UA.AnswerScoreSum,
+    UA.CommentCount,
+    UA.AvgCommentLength,
+    UA.ReputationBin,
+    UA.Location,
+    UA.WebsiteUrl,
+    COALESCE(HAP.HighestScore, 0) AS HighestQuestionScore,
+    COALESCE(HAP.MostViewedTitle, '' ) AS MostViewedQuestionTitle,
+    COALESCE(LCR.CloseReasonName, 'N/A') AS LastCloseReason,
+    COALESCE(SUM(phc.EditCount), 0) AS TotalEdits,
+    CASE
+        WHEN UA.AboutMe IS NOT NULL AND LENGTH(TRIM(UA.AboutMe)) > 0
+            THEN LEFT(REGEXP_REPLACE(UA.AboutMe, '\\s+', ' ', 'g'), 100) || '...'
+        ELSE '[No AboutMe Provided]'
+    END AS AboutMeSnippet,
+    AVG(CASE WHEN upw.ScoreRank <= 3 THEN upw.Score ELSE NULL END) AS AvgTop3Scores,
+    MAX(upw.Score) AS MaxPostScore,
+    COUNT(DISTINCT upw.Id) FILTER (WHERE upw.Score > COALESCE(upw.PrevScore, 0)) AS PostsWithImprovedScore,
+    SUM(HAP.HasAcceptedAnswer) OVER (PARTITION BY UA.UserId) AS AcceptedAnswerCount,
+    ARRAY(
+        SELECT DISTINCT ct.TagName
+        FROM CombinedQuestionsAndTags ct
+        JOIN Posts p2 ON p2.Id = ct.Id AND p2.OwnerUserId = UA.UserId
+        WHERE ct.SingleTag IS NOT NULL
+    ) AS UserTags
+FROM UserAggregate UA
+LEFT JOIN LATERAL (
+    SELECT
+        MAX(hap.Score) AS HighestScore,
+        MAX(hap.ViewCount) AS MaxViews,
+        MAX(hap.Title) FILTER (WHERE hap.ViewCount = (SELECT MAX(ViewCount) FROM HighActivityPosts WHERE OwnerUserId = UA.UserId)) AS MostViewedTitle
+    FROM HighActivityPosts hap
+    WHERE hap.OwnerUserId = UA.UserId
+) HAP ON TRUE
+LEFT JOIN LatestCloseReasons LCR ON LCR.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = UA.UserId AND p.PostTypeId = 1
+)
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) AS EditCount
+    FROM PostHistory phc
+    WHERE phc.UserId = UA.UserId
+) phc ON TRUE
+LEFT JOIN UserPostWindow upw ON upw.OwnerUserId = UA.UserId
+GROUP BY
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.GoldBadges,
+    UA.SilverBadges,
+    UA.BronzeBadges,
+    UA.TotalBadgeTypes,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.QuestionScoreSum,
+    UA.AnswerScoreSum,
+    UA.CommentCount,
+    UA.AvgCommentLength,
+    UA.ReputationBin,
+    UA.Location,
+    UA.WebsiteUrl,
+    UA.AboutMe,
+    HAP.HighestScore,
+    HAP.MostViewedTitle,
+    LCR.CloseReasonName
+HAVING
+    UA.QuestionCount > 5
+    AND UA.Reputation > 1000
+ORDER BY
+    UA.Reputation DESC,
+    AVG(CASE WHEN upw.ScoreRank <= 3 THEN upw.Score ELSE NULL END) DESC NULLS LAST
+LIMIT 50;

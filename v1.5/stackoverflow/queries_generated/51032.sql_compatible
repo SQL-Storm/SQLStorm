@@ -1,0 +1,119 @@
+WITH top_users AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS question_count,
+        AVG(p.Score) AS avg_question_score,
+        COUNT(DISTINCT CASE WHEN pt.Id = 2 THEN p.Id END) AS answer_count,
+        AVG(CASE WHEN pt.Id = 2 THEN p.Score END) AS avg_answer_score,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        SUM(v.BountyAmount) AS total_bounties_awarded,
+        COUNT(DISTINCT vl.PostId) AS upvoted_posts_count
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8 AND v.BountyAmount > 0
+    LEFT JOIN Votes vl ON u.Id = vl.UserId AND vl.VoteTypeId = 2
+    WHERE u.Reputation >= 1000
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+active_tags AS (
+    SELECT 
+        t.Id AS tag_id,
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) AS active_questions,
+        AVG(p.Score) AS avg_tag_score,
+        MAX(p.CreationDate) AS latest_question_date,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_questions
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    WHERE t.Count > 50
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+high_impact_posts AS (
+    SELECT 
+        p.Id AS post_id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        u.Reputation AS owner_reputation,
+        COUNT(DISTINCT c.Id) AS total_comments,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(DISTINCT ph.Id) AS edit_count,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS upvote_count,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS downvote_count
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (4,5,6,24)  -- Edits and applied suggestions
+    LEFT JOIN Votes v ON p.Id = v.PostId 
+        AND v.VoteTypeId IN (2,3)  -- Upvotes and downvotes
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE p.PostTypeId = 1  -- Questions only
+        AND p.Score >= 5
+        AND p.ViewCount >= 1000
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY p.Id, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CommentCount, p.FavoriteCount, p.CreationDate, p.Tags, u.Reputation
+)
+SELECT 
+    tu.user_id,
+    tu.Reputation AS user_reputation,
+    tu.question_count,
+    tu.answer_count,
+    tu.badge_count,
+    tu.avg_question_score,
+    tu.avg_answer_score,
+    at.tag_id,
+    at.TagName AS popular_tag,
+    at.active_questions,
+    at.avg_tag_score,
+    hp.post_id,
+    hp.Score AS question_score,
+    hp.ViewCount,
+    hp.AnswerCount,
+    hp.avg_comment_score,
+    hp.upvote_count,
+    hp.edit_count,
+    ROW_NUMBER() OVER (
+        PARTITION BY tu.user_id 
+        ORDER BY COALESCE(hp.ViewCount, 0) DESC, hp.Score DESC
+    ) AS question_rank_by_user,
+    RANK() OVER (
+        ORDER BY tu.Reputation DESC, tu.question_count DESC
+    ) AS user_rank,
+    DENSE_RANK() OVER (
+        ORDER BY at.active_questions DESC, at.avg_tag_score DESC
+    ) AS tag_popularity_rank,
+    COUNT(*) OVER (PARTITION BY at.tag_id) AS questions_per_tag,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY hp.Score) OVER (
+        PARTITION BY EXTRACT(MONTH FROM hp.CreationDate)
+    ) AS monthly_median_score,
+    CORR(tu.Reputation, hp.Score) OVER () AS reputation_score_correlation
+FROM top_users tu
+CROSS JOIN active_tags at
+INNER JOIN high_impact_posts hp ON (
+    tu.user_id = hp.owner_reputation / 100  -- Approximate matching for performance
+    OR hp.Tags LIKE '%' || at.TagName || '%'
+)
+LEFT JOIN PostLinks pl ON hp.post_id = pl.PostId 
+    AND pl.LinkTypeId = 3  -- Duplicate links
+WHERE hp.ViewCount > (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY ViewCount) 
+    FROM Posts 
+    WHERE PostTypeId = 1
+)
+ORDER BY tu.Reputation DESC, at.active_questions DESC, hp.ViewCount DESC
+LIMIT 1000;

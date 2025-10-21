@@ -1,0 +1,95 @@
+WITH ActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(P.Id) AS TotalPosts,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        STRING_AGG(T.TagName, ', ') AS FavoriteTags
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN
+        (
+            SELECT DISTINCT P.Id AS Id, T.TagName
+            FROM Posts P
+            JOIN Tags T ON P.Tags LIKE CONCAT('%<', T.TagName, '>%')
+        ) AS PT ON P.Id = PT.Id
+    WHERE
+        U.LastAccessDate >= (DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) - INTERVAL '1 month')
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate
+),
+ProlificPosters AS (
+    SELECT
+        P.OwnerUserId,
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(V.Id) AS VoteCount,
+        LAG(P.Score, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostScore,
+        LEAD(P.Score, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostScore,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS PostRank
+    FROM
+        Posts P
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= (DATE_TRUNC('year', CAST('2024-10-01' AS DATE)) - INTERVAL '1 year')
+)
+SELECT
+    AU.UserId,
+    AU.Reputation,
+    AU.CreationDate,
+    AU.TotalPosts,
+    AU.LastPostDate,
+    AU.TotalBadges,
+    AU.FavoriteTags,
+    PP.PostId,
+    PT.Name AS PostType,
+    PP.CreationDate AS PostCreationDate,
+    PP.PostScore,
+    PP.ViewCount,
+    PP.CommentCount,
+    PP.VoteCount,
+    PP.PrevPostScore,
+    PP.NextPostScore,
+    PP.PostRank,
+    COALESCE(
+        CASE
+            WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+            WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+            WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+            WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+            ELSE NULL
+        END,
+        'Active'
+    ) AS PostStatus,
+    PH.CreationDate AS HistoryDate,
+    PH.UserId AS HistoryUserId,
+    PH.Text AS HistoryText
+FROM
+    ActiveUsers AU
+JOIN
+    ProlificPosters PP ON AU.UserId = PP.OwnerUserId
+JOIN
+    PostTypes PT ON PP.PostTypeId = PT.Id
+LEFT JOIN
+    PostHistory PH ON PP.PostId = PH.PostId AND PH.PostHistoryTypeId IN (10, 11, 12, 13)
+WHERE
+    AU.TotalPosts > 10
+    AND AU.TotalBadges > 5
+    AND PP.PostRank <= 5
+ORDER BY
+    AU.Reputation DESC,
+    PP.PostScore DESC;

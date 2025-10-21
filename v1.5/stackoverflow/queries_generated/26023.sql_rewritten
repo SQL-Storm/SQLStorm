@@ -1,0 +1,82 @@
+-- {"query": "26023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 473} 
+WITH TopUsers AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    COUNT(DISTINCT p.Id) AS PostCount,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+  FROM 
+    Users u
+  LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation
+),
+TopPosts AS (
+  SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1
+),
+PostHistorySummary AS (
+  SELECT 
+    ph.PostId, 
+    COUNT(DISTINCT ph.PostHistoryTypeId) AS HistoryCount,
+    MAX(ph.CreationDate) AS LatestHistoryDate
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+),
+QuestionTags AS (
+  SELECT 
+    p.Id, 
+    STRING_AGG(t.TagName, ', ') AS Tags
+  FROM 
+    Posts p
+  LEFT JOIN 
+    PostTags pt ON p.Id = pt.PostId
+  LEFT JOIN 
+    Tags t ON pt.TagId = t.Id
+  WHERE 
+    p.PostTypeId = 1
+  GROUP BY 
+    p.Id
+)
+SELECT 
+  tu.DisplayName, 
+  tu.Reputation, 
+  tu.PostCount, 
+  tu.ReputationRank,
+  tp.Title, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.AnswerCount, 
+  tp.ScoreRank,
+  phs.HistoryCount, 
+  phs.LatestHistoryDate,
+  qt.Tags
+FROM 
+  TopUsers tu
+LEFT JOIN 
+  TopPosts tp ON tu.Id = tp.OwnerUserId
+LEFT JOIN 
+  PostHistorySummary phs ON tp.Id = phs.PostId
+LEFT JOIN 
+  QuestionTags qt ON tp.Id = qt.Id
+WHERE 
+  tu.ReputationRank <= 10
+  AND tp.ScoreRank <= 10
+ORDER BY 
+  tu.Reputation DESC, 
+  tp.Score DESC;

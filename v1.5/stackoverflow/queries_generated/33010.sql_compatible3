@@ -1,0 +1,61 @@
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS total_posts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+    AVG(p.Score) AS average_score,
+    SUM(p.ViewCount) AS total_views,
+    COUNT(DISTINCT c.Id) AS total_comments,
+    AVG(c.Score) AS average_comment_score,
+    COUNT(DISTINCT v.Id) AS total_votes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes,
+    COUNT(DISTINCT b.Id) AS badges_count,
+    COUNT(DISTINCT pf.RelatedPostId) AS linked_posts,
+    COUNT(DISTINCT pl.Id) AS post_links,
+    COUNT(DISTINCT tt.Id) AS tag_count,
+    COUNT(DISTINCT CASE WHEN t.IsModeratorOnly THEN t.Id END) AS moderator_only_tags,
+    COUNT(DISTINCT CASE WHEN t.IsRequired THEN t.Id END) AS required_tags,
+    MAX(p.CreationDate) AS last_post_date,
+    MAX(c.CreationDate) AS last_comment_date,
+    MAX(p.LastActivityDate) AS last_activity_date
+FROM
+    Users AS u
+LEFT JOIN
+    Posts AS p ON u.Id = p.OwnerUserId
+LEFT JOIN
+    Comments AS c ON p.Id = c.PostId
+LEFT JOIN
+    Votes AS v ON p.Id = v.PostId
+LEFT JOIN
+    Badges AS b ON u.Id = b.UserId
+LEFT JOIN
+    PostLinks AS pl ON p.Id = pl.PostId
+LEFT JOIN
+    PostLinks AS pl2 ON p.Id = pl2.RelatedPostId
+LEFT JOIN
+    PostTags AS pt ON p.Id = pt.PostId
+LEFT JOIN
+    Tags AS t ON pt.TagId = t.Id
+LEFT JOIN
+    LinkTypes AS lt ON COALESCE(pl.LinkTypeId, pl2.LinkTypeId) = lt.Id
+LEFT JOIN
+    PostLinks AS pf ON p.Id = pf.PostId AND lt.Name = 'Related'
+LEFT JOIN
+    PostHistory AS ph ON p.Id = ph.PostId
+LEFT JOIN
+    PostHistoryType AS pht ON ph.PostHistoryTypeId = pht.Id
+WHERE
+    u.Reputation >= 1000
+    AND u.CreationDate >= DATE '2020-01-01'
+    AND p.PostTypeId IN (1, 2)
+    AND (ph.PostHistoryTypeId IS NULL OR ph.PostHistoryTypeId NOT IN (50, 52, 53))
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+ORDER BY
+    total_posts DESC,
+    last_post_date DESC
+LIMIT 100;

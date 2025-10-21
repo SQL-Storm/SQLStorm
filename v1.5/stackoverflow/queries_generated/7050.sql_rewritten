@@ -1,0 +1,240 @@
+-- {"query": "7050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2306} 
+with
+-- top users by composite activity score
+UserScores as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    coalesce(b.BadgeScore,0) as BadgeScore,
+    coalesce(p.PostScore,0) as PostScore,
+    coalesce(c.CommentScore,0) as CommentScore,
+    -- composite: reputation weighted + badges + recent activity boost
+    (u.Reputation * 0.6
+     + coalesce(b.BadgeScore,0) * 50
+     + coalesce(p.PostScore,0) * 1.2
+     + coalesce(c.CommentScore,0) * 0.5
+     + case when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 200 else 0 end
+    ) as ActivityScore
+  from Users u
+  left join (
+    select UserId, sum(case when Class=1 then 10 when Class=2 then 4 else 1 end) as BadgeScore
+    from Badges
+    group by UserId
+  ) b on b.UserId = u.Id
+  left join (
+    select OwnerUserId,
+           sum(case when PostTypeId=1 then 3 when PostTypeId=2 then 2 else 0 end * coalesce(Score,0)) as PostScore
+    from Posts
+    where OwnerUserId is not null
+    group by OwnerUserId
+  ) p on p.OwnerUserId = u.Id
+  left join (
+    select UserId, count(*) as CommentScore from Comments where UserId is not null group by UserId
+  ) c on c.UserId = u.Id
+),
+TopUsers as (
+  select *, row_number() over (order by ActivityScore desc) as rn
+  from UserScores
+  where ActivityScore is not null
+),
+-- recent hot questions with tag explosion parsing
+QuestionsWithTags as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.Tags,
+    -- approximate tag count: count occurrences of '><' + 1 when tags not null
+    case when p.Tags is null then 0
+         else greatest(1, length(p.Tags) - length(replace(p.Tags,'><','')) + 1) end as TagCount,
+    -- extract first tag (between < and >)
+    substring(p.Tags from '<([^>]+)>') as FirstTag
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- tag popularity over last year
+TagStats as (
+  select
+    t.TagName,
+    coalesce(sum(case when q.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' then 1 else 0 end),0) as QuestionsLastYear,
+    coalesce(sum(q.ViewCount),0) as TotalViews,
+    coalesce(max(q.Score),0) as TopScore
+  from Tags t
+  left join QuestionsWithTags q on q.Tags like '%' || '<' || t.TagName || '>' || '%'
+  group by t.TagName
+),
+-- posts that link to each question and their relationship types
+LinkDetails as (
+  select
+    pl.RelatedPostId as QuestionId,
+    pl.PostId as LinkingPostId,
+    pl.LinkTypeId,
+    lt.Name as LinkTypeName,
+    lp.Score as LinkingPostScore,
+    lp.PostTypeId as LinkingPostType
+  from PostLinks pl
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  left join Posts lp on lp.Id = pl.PostId
+  where pl.RelatedPostId is not null
+),
+-- compute per-question enriched metrics including correlated subquery for median answer score
+QuestionMetrics as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.TagCount,
+    q.FirstTag,
+    ts.QuestionsLastYear,
+    ts.TotalViews as TagTotalViews,
+    ts.TopScore as TagTopScore,
+    coalesce(lk.LinkInCount,0) as InboundLinks,
+    coalesce(lk.DuplicateCount,0) as DuplicateLinks,
+    -- average score of answers
+    (select avg(coalesce(a.Score,0)) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as AvgAnswerScore,
+    -- median answer score via ordered array (DBs with array_agg and percentile_disc)
+    (select percentile_disc(0.5) within group (order by coalesce(a.Score,0))
+     from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as MedianAnswerScore,
+    -- accepted answer presence and its score
+    (select a.Score from Posts a where a.Id = q.AcceptedAnswerId) as AcceptedAnswerScore,
+    -- last meaningful comment (non-empty, non-generic) using correlated subquery
+    (select c2.Text from Comments c2
+     where c2.PostId = q.Id and c2.Text is not null and trim(c2.Text) <> ''
+     order by c2.CreationDate desc limit 1) as LastCommentText,
+    -- identify suspicious null/ghost owners
+    case when q.OwnerUserId is null then 1 else 0 end as IsOrphan
+  from QuestionsWithTags q
+  left join TagStats ts on ts.TagName = q.FirstTag
+  left join (
+    select ld.QuestionId,
+           sum(case when ld.LinkTypeId = 1 then 1 else 0 end) as LinkInCount,
+           sum(case when ld.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount
+    from LinkDetails ld
+    group by ld.QuestionId
+  ) lk on lk.QuestionId = q.Id
+),
+-- window functions to rank candidate questions per top user affinity
+UserQuestionAffinity as (
+  select
+    tu.UserId,
+    qm.QuestionId,
+    qm.Title,
+    qm.CreationDate,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.TagCount,
+    qm.FirstTag,
+    tu.ActivityScore,
+    -- affinity heuristic: recentness, tag popularity, inbound links, and user's activity
+    (tu.ActivityScore * 0.0005
+     + coalesce(qm.TagTotalViews,0) * 0.00001
+     + coalesce(qm.InboundLinks,0) * 0.2
+     + (case when qm.AcceptedAnswerScore is not null then 1 else 0 end) * 5
+     + (case when qm.AnswerCount = 0 then 3 else 0 end) -- unanswered bump
+     - (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qm.CreationDate))/86400) * 0.1 -- age penalty per day
+    ) as AffinityScore,
+    row_number() over (partition by tu.UserId order by
+       (tu.ActivityScore * 0.0005
+        + coalesce(qm.TagTotalViews,0) * 0.00001
+        + coalesce(qm.InboundLinks,0) * 0.2
+        + (case when qm.AcceptedAnswerScore is not null then 1 else 0 end) * 5
+        + (case when qm.AnswerCount = 0 then 3 else 0 end)
+        - (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qm.CreationDate))/86400) * 0.1) desc
+    ) as rn
+  from TopUsers tu
+  cross join QuestionMetrics qm
+  where tu.rn <= 50 -- limit to top 50 users for benchmark scale
+),
+-- pick top 5 candidate questions per user
+TopCandidatesPerUser as (
+  select * from UserQuestionAffinity where rn <= 5
+),
+-- collate final report with set operators to include orphan questions union with top candidates
+OrphanQuestions as (
+  select qm.QuestionId, qm.Title, qm.CreationDate, qm.QuestionScore, qm.ViewCount, 'orphan' as Reason
+  from QuestionMetrics qm
+  where qm.IsOrphan = 1
+),
+FinalCandidates as (
+  select
+    tc.UserId,
+    u.DisplayName,
+    tc.QuestionId,
+    tc.Title,
+    tc.CreationDate,
+    tc.QuestionScore,
+    tc.ViewCount,
+    tc.AnswerCount,
+    tc.TagCount,
+    tc.FirstTag,
+    round(tc.AffinityScore::numeric,4) as AffinityScore,
+    case when qm.AcceptedAnswerScore is not null then 'accepted' else 'no-accepted' end as AcceptedFlag,
+    qm.LastCommentText,
+    qm.MedianAnswerScore
+  from TopCandidatesPerUser tc
+  join Users u on u.Id = tc.UserId
+  left join QuestionMetrics qm on qm.QuestionId = tc.QuestionId
+),
+-- union with orphans for coverage, de-dup later
+Unioned as (
+  select
+    fc.UserId,
+    fc.DisplayName,
+    fc.QuestionId,
+    fc.Title,
+    fc.CreationDate,
+    fc.QuestionScore,
+    fc.ViewCount,
+    fc.AnswerCount,
+    fc.TagCount,
+    fc.FirstTag,
+    fc.AffinityScore,
+    fc.AcceptedFlag,
+    fc.LastCommentText,
+    fc.MedianAnswerScore,
+    null::varchar as Reason
+  from FinalCandidates fc
+  union
+  select
+    null as UserId,
+    null as DisplayName,
+    o.QuestionId,
+    o.Title,
+    o.CreationDate,
+    o.QuestionScore,
+    o.ViewCount,
+    null as AnswerCount,
+    null as TagCount,
+    null as FirstTag,
+    null::numeric as AffinityScore,
+    null as AcceptedFlag,
+    null as LastCommentText,
+    null::int as MedianAnswerScore,
+    o.Reason
+  from OrphanQuestions o
+)
+select
+  uco.*,
+  -- show contextual string expression combining fields with null logic
+  coalesce(uco.DisplayName, 'Community') || ' -> ' ||
+  coalesce(uco.FirstTag, 'no-tag') || ' | score:' || coalesce(uco.QuestionScore::text, '0') ||
+  case when uco.AcceptedFlag = 'accepted' then ' [has-accepted]' else '' end
+  as ContextSummary
+from Unioned uco
+order by
+  -- order: prioritized by AffinityScore desc, then orphans last by Reason
+  case when uco.Reason = 'orphan' then 1 else 0 end,
+  coalesce(uco.AffinityScore, -999999) desc,
+  uco.QuestionScore desc,
+  uco.ViewCount desc
+limit 500;

@@ -1,0 +1,106 @@
+-- {"query": "51048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1145} 
+
+WITH popular_tags AS (
+    SELECT t.TagName, COUNT(p.Id) as post_count
+    FROM Tags t
+    JOIN Posts p ON string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') @> ARRAY[t.TagName::text]::text[]
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+active_users AS (
+    SELECT u.Id, u.Reputation, u.UpVotes
+    FROM Users u
+    JOIN (
+        SELECT OwnerUserId, COUNT(*) as post_count
+        FROM Posts
+        WHERE OwnerUserId > 0 AND PostTypeId IN (1, 2) AND CreationDate >= NOW() - INTERVAL '6 months'
+        GROUP BY OwnerUserId
+        HAVING COUNT(*) >= 10
+    ) recent_posts ON u.Id = recent_posts.OwnerUserId
+),
+user_tag_activity AS (
+    SELECT au.Id as user_id, pt.TagName, COUNT(p.Id) as activity_count,
+           AVG(p.Score) as avg_score, SUM(p.ViewCount) as total_views
+    FROM active_users au
+    JOIN Posts p ON p.OwnerUserId = au.Id AND p.PostTypeId = 1
+    JOIN popular_tags pt ON string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') @> ARRAY[pt.TagName::text]::text[]
+    WHERE p.CreationDate >= NOW() - INTERVAL '3 months'
+    GROUP BY au.Id, pt.TagName
+),
+engagement_metrics AS (
+    SELECT uta.user_id, uta.TagName,
+           uta.activity_count,
+           uta.avg_score,
+           uta.total_views,
+           COALESCE(b.gold_count, 0) as gold_badges,
+           COALESCE(b.silver_count, 0) as silver_badges,
+           COALESCE(v.upvote_count, 0) as received_upvotes,
+           COALESCE(c.comment_count, 0) as comment_activity
+    FROM user_tag_activity uta
+    LEFT JOIN (
+        SELECT UserId, SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) as gold_count,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) as silver_count
+        FROM Badges
+        GROUP BY UserId
+    ) b ON uta.user_id = b.UserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) as upvote_count
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) v ON EXISTS (
+        SELECT 1 FROM Posts p2 WHERE p2.Id = v.PostId AND p2.OwnerUserId = uta.user_id
+        AND string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><') @> ARRAY[uta.TagName::text]::text[]
+    )
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) as comment_count
+        FROM Comments c
+        JOIN Posts p ON c.PostId = p.Id
+        WHERE p.CreationDate >= NOW() - INTERVAL '3 months'
+           AND string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') @> ARRAY[uta.TagName::text]::text[]
+        GROUP BY UserId
+    ) c ON uta.user_id = c.UserId
+    WHERE uta.activity_count >= 3
+),
+influencer_ranking AS (
+    SELECT em.*,
+           (em.received_upvotes * 2 + em.total_views / 1000 + em.gold_badges * 50 + em.avg_score * 10 + em.comment_activity) as influence_score,
+           au.Reputation as user_reputation,
+           DENSE_RANK() OVER (PARTITION BY em.TagName ORDER BY 
+               (em.received_upvotes * 2 + em.total_views / 1000 + em.gold_badges * 50 + em.avg_score * 10 + em.comment_activity) DESC
+           ) as tag_rank
+    FROM engagement_metrics em
+    JOIN active_users au ON em.user_id = au.Id
+    WHERE em.total_views > 5000 OR em.received_upvotes > 20
+)
+SELECT 
+    ir.TagName,
+    ir.user_id,
+    u.DisplayName as user_name,
+    ir.user_reputation,
+    ir.activity_count,
+    ir.avg_score,
+    ir.total_views,
+    ir.received_upvotes,
+    ir.gold_badges,
+    ir.silver_badges,
+    ir.comment_activity,
+    ROUND(ir.influence_score, 2) as influence_score,
+    ir.tag_rank,
+    (
+        SELECT STRING_AGG(DISTINCT pt2.Name, ', ')
+        FROM PostTypes pt2
+        WHERE pt2.Id IN (SELECT DISTINCT p.PostTypeId FROM Posts p WHERE p.OwnerUserId = ir.user_id)
+    ) as post_types,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        JOIN Posts p ON pl.RelatedPostId = p.Id
+        WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ir.user_id)
+           AND pl.LinkTypeId = 1
+    ) as outbound_links
+FROM influencer_ranking ir
+JOIN Users u ON ir.user_id = u.Id
+WHERE ir.tag_rank <= 5
+ORDER BY ir.TagName, ir.influence_score DESC;

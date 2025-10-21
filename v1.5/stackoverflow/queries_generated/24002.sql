@@ -1,0 +1,125 @@
+-- {"query": "24002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1751} 
+
+WITH
+  -- base questions with aggregated tag list
+  qt AS (
+    SELECT
+      p.id,
+      p.title,
+      p.owneruserid,
+      p.score,
+      p.viewcount,
+      p.creationdate,
+      (SELECT string_agg(tag, ',')
+       FROM unnest(
+            string_to_array(
+              substring(p.tags, 2, length(p.tags)-2), '><')) AS tag) AS tag_list
+    FROM Posts p
+    WHERE p.posttypeid = 1
+  ),
+  -- tag frequency across all questions
+  tag_counts AS (
+    SELECT
+      tag,
+      count(*) AS question_count
+    FROM (
+      SELECT unnest(
+               string_to_array(
+                 substring(tags, 2, length(tags)-2), '><')) AS tag
+      FROM Posts
+      WHERE posttypeid = 1
+    ) sub
+    GROUP BY tag
+    ORDER BY question_count DESC
+  ),
+  -- top tags by frequency
+  top_tags AS (
+    SELECT
+      tag,
+      row_number() OVER (ORDER BY question_count DESC) AS rn,
+      question_count
+    FROM tag_counts
+  ),
+  -- user activity summary
+  user_stats AS (
+    SELECT
+      u.id AS userid,
+      u.reputation,
+      u.viewcount AS user_views,
+      COALESCE((SELECT count(*) FROM Posts p WHERE p.owneruserid = u.id), 0) AS post_count,
+      COALESCE((SELECT avg(p.score) FROM Posts p WHERE p.owneruserid = u.id), 0) AS avg_score,
+      COALESCE((SELECT sum(v.band) FROM Votes v WHERE v.userid = u.id), 0) AS votes_sum
+    FROM Users u
+  ),
+  -- links (joined with type names)
+  links_summary AS (
+    SELECT
+      l.postid,
+      l.relatedpostid,
+      l.linktypeid,
+      lt.name AS link_type,
+      CASE WHEN l.linktypeid = 3 THEN 1 ELSE 0 END AS is_duplicate
+    FROM PostLinks l
+    JOIN LinkTypes lt ON l.linktypeid = lt.id
+  ),
+  -- aggregated close vote info per post
+  recent_closes AS (
+    SELECT
+      ph.postid,
+      COUNT(*) AS close_votes,
+      MAX(json_extract_path_text(ph.text, 'CloseReasonId', '0')) AS close_reason
+    FROM PostHistory ph
+    WHERE ph.posthistorytypeid = 10
+    GROUP BY ph.postid
+  ),
+  -- accepted answer details
+  accepted_info AS (
+    SELECT
+      q.id AS question_id,
+      a.id AS answer_id,
+      a.score AS answer_score,
+      a.creationdate AS answer_creation,
+      a.owneruserid AS answer_userid,
+      (SELECT displayname FROM Users u WHERE u.id = a.owneruserid) AS answer_user
+    FROM Posts q
+    JOIN Posts a ON a.id = q.acceptedanswerid
+    WHERE q.posttypeid = 1
+      AND a.posttypeid = 2
+  )
+SELECT
+  qt.id,
+  qt.title,
+  qt.score,
+  qt.viewcount,
+  qt.creationdate,
+  qt.tag_list,
+  t.question_count AS q_count_by_tag,
+  u.reputation,
+  u.user_views,
+  u.post_count,
+  u.avg_score,
+  u.votes_sum,
+  l.link_type,
+  l.is_duplicate,
+  rc.close_votes,
+  rc.close_reason,
+  ai.answer_score,
+  ai.answer_user
+FROM qt
+INNER JOIN top_tags t
+  ON instr(qt.tag_list, t.tag) > 0
+  AND t.rn <= 3
+LEFT JOIN user_stats u
+  ON u.userid = qt.owneruserid
+LEFT JOIN links_summary l
+  ON l.postid = qt.id
+LEFT JOIN recent_closes rc
+  ON rc.postid = qt.id
+LEFT JOIN accepted_info ai
+  ON ai.question_id = qt.id
+WHERE u.reputation > 1000
+  AND qt.score >= 5
+  AND l.linktypeid IS NOT NULL
+  AND qt.creationdate > now() - interval '30 days'
+ORDER BY qt.score DESC, qt.viewcount DESC
+FETCH FIRST 100 ROWS ONLY;

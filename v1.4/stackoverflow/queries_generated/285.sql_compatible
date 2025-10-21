@@ -1,0 +1,97 @@
+WITH
+user_base AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS total_posts,
+    (SELECT COALESCE(SUM(p.Score),0) FROM Posts p WHERE p.OwnerUserId = u.Id) AS total_score,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS badge_count,
+    u.Location
+  FROM Users u
+  WHERE u.Reputation > 1000 OR u.Location IS NOT NULL
+),
+per_user_tags AS (
+  SELECT p.OwnerUserId AS UserId,
+         unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  FROM Posts p
+  WHERE p.Tags IS NOT NULL
+),
+top_tags AS (
+  SELECT UserId, string_agg(tag, ',') AS top_tags
+  FROM per_user_tags
+  GROUP BY UserId
+),
+recent_activity AS (
+  SELECT UserId, COUNT(*) AS recent_posts_7d
+  FROM Posts
+  WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days'
+  GROUP BY UserId
+),
+combined AS (
+  SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.total_posts,
+    ub.total_score,
+    COALESCE(ra.recent_posts_7d, 0) AS recent_posts_7d,
+    ub.badge_count,
+    COALESCE(t.top_tags, '') AS top_tags
+  FROM user_base ub
+  LEFT JOIN recent_activity ra ON ra.UserId = ub.UserId
+  LEFT JOIN top_tags t ON t.UserId = ub.UserId
+),
+final_reputation AS (
+  SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.total_posts,
+    c.total_score,
+    c.recent_posts_7d,
+    c.badge_count,
+    c.top_tags
+  FROM combined c
+  ORDER BY c.Reputation DESC
+  LIMIT 150
+),
+final_activity AS (
+  SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.total_posts,
+    c.total_score,
+    c.recent_posts_7d,
+    c.badge_count,
+    c.top_tags
+  FROM combined c
+  ORDER BY c.recent_posts_7d DESC
+  LIMIT 150
+)
+SELECT
+  'Reputation' AS category,
+  fr.UserId,
+  fr.DisplayName,
+  fr.Reputation,
+  fr.total_posts,
+  fr.total_score,
+  fr.recent_posts_7d,
+  fr.badge_count,
+  fr.top_tags
+FROM final_reputation fr
+UNION ALL
+SELECT
+  'Activity' AS category,
+  fa.UserId,
+  fa.DisplayName,
+  fa.Reputation,
+  fa.total_posts,
+  fa.total_score,
+  fa.recent_posts_7d,
+  fa.badge_count,
+  fa.top_tags
+FROM final_activity fa
+ORDER BY category, Reputation DESC NULLS LAST
+LIMIT 300;

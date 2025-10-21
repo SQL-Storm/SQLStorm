@@ -1,0 +1,65 @@
+WITH TagExp AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(both '<>' FROM tag.tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '\"><')) AS tag(tag)
+),
+VoteAgg AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes
+    FROM Votes
+    GROUP BY PostId
+),
+RevCnt AS (
+    SELECT
+        PostId,
+        COUNT(*) AS RevisionCount
+    FROM PostHistory
+    GROUP BY PostId
+),
+Base AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        u.Id AS OwnerId,
+        u.Reputation,
+        u.DisplayName,
+        u.AccountId,
+        COALESCE(va.UpVotes, 0) AS UpVotes,
+        COALESCE(va.DownVotes, 0) AS DownVotes,
+        COALESCE(va.FavoriteVotes, 0) AS FavoriteVotes,
+        COALESCE(rc.RevisionCount, 0) AS RevisionCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN VoteAgg va ON p.Id = va.PostId
+    LEFT JOIN RevCnt rc ON p.Id = rc.PostId
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    b.PostId,
+    b.Title,
+    b.Score,
+    b.UpVotes,
+    b.DownVotes,
+    b.FavoriteVotes,
+    b.RevisionCount,
+    b.ViewCount,
+    b.Reputation AS OwnerReputation,
+    b.DisplayName AS OwnerDisplayName,
+    t.TagName,
+    COUNT(*) OVER (PARTITION BY t.TagName) AS PostsPerTag,
+    ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY b.Score DESC) AS RankInTag,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY b.Score) OVER (PARTITION BY t.TagName) AS TagScoreTop75
+FROM Base b
+JOIN TagExp t ON b.PostId = t.PostId
+ORDER BY b.Score DESC, t.TagName
+LIMIT 5000;

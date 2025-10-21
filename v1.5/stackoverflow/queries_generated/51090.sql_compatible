@@ -1,0 +1,129 @@
+WITH question_engagement AS (
+    SELECT 
+        p.Id AS question_id,
+        p.Title,
+        p.Score AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Reputation AS owner_reputation,
+        u.UpVotes AS owner_upvotes,
+        COUNT(DISTINCT v.Id) AS total_votes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+        AVG(CAST(v.CreationDate AS TIMESTAMP)) AS avg_vote_time,
+        COUNT(DISTINCT a.Id) AS answer_count_actual,
+        SUM(CASE WHEN a.Score > 0 THEN a.Score ELSE 0 END) AS total_answer_score,
+        COUNT(DISTINCT c.Id) AS total_comments,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(DISTINCT b.Id) AS owner_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(DISTINCT pl.Id) AS outbound_links,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS duplicate_links,
+        COUNT(DISTINCT ph.Id) AS history_events,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))) / 3600 AS avg_hours_to_event
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2 AND a.Score >= 0
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+    WHERE p.PostTypeId = 1 
+      AND p.DeletionDate IS NULL
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+      AND p.ViewCount > 100
+      AND p.AnswerCount > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.Reputation, u.UpVotes
+    HAVING COUNT(DISTINCT v.Id) > 5 
+       AND AVG(c.Score) IS NOT NULL
+),
+high_engagement_questions AS (
+    SELECT 
+        question_id,
+        Title,
+        question_score,
+        owner_reputation,
+        total_votes,
+        total_answer_score,
+        owner_badges,
+        gold_badges,
+        (total_votes * question_score * LOG(owner_reputation + 1)) AS engagement_score
+    FROM question_engagement
+    WHERE total_answer_score > 50
+      AND owner_reputation > 1000
+      AND gold_badges + silver_badges > 5
+),
+tag_popularity AS (
+    SELECT 
+        t.Id AS tag_id,
+        t.TagName,
+        t.Count AS tag_usage_count,
+        p.Id AS excerpt_post_id,
+        AVG(qe.total_answer_score) AS avg_engagement_for_tag,
+        COUNT(DISTINCT qe.question_id) AS questions_with_tag,
+        SUM(qe.engagement_score) AS total_engagement_for_tag
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    LEFT JOIN Posts q ON q.PostTypeId = 1 AND q.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN high_engagement_questions qe ON q.Id = qe.question_id
+    WHERE t.Count > 100
+    GROUP BY t.Id, t.TagName, t.Count, p.Id
+    HAVING COUNT(DISTINCT qe.question_id) > 10
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.question_id) AS questions_answered,
+        AVG(q.total_answer_score) AS avg_answer_quality,
+        SUM(q.total_votes) AS total_user_impact,
+        ROW_NUMBER() OVER (PARTITION BY tp.Name ORDER BY AVG(q.total_answer_score) DESC) AS expertise_rank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS reputation_quintile
+    FROM Users u
+    INNER JOIN Posts ans ON u.Id = ans.OwnerUserId AND ans.PostTypeId = 2
+    INNER JOIN high_engagement_questions q ON ans.ParentId = q.question_id
+    INNER JOIN PostTypes pt ON pt.Id = q.question_id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT q.question_id) > 5
+)
+SELECT 
+    heq.Title AS top_question_title,
+    heq.question_score,
+    heq.owner_reputation,
+    heq.total_votes,
+    heq.total_answer_score,
+    heq.gold_badges,
+    heq.engagement_score,
+    tp.tag_name AS popular_tag,
+    tp.tag_usage_count,
+    tp.avg_engagement_for_tag,
+    tp.questions_with_tag,
+    ue.display_name AS top_expert,
+    ue.reputation,
+    ue.avg_answer_quality,
+    ue.expertise_rank,
+    ue.reputation_quintile,
+    (heq.engagement_score * tp.avg_engagement_for_tag / NULLIF(ue.reputation, 0)) AS normalized_impact_score,
+    RANK() OVER (ORDER BY (heq.engagement_score * tp.avg_engagement_for_tag / NULLIF(ue.reputation, 0)) DESC) AS overall_benchmark_rank,
+    PERCENT_RANK() OVER (ORDER BY heq.total_answer_score DESC) AS answer_quality_percentile
+FROM high_engagement_questions heq
+INNER JOIN Posts q ON heq.question_id = q.Id
+INNER JOIN tag_popularity tp ON q.Tags LIKE '%' || tp.tag_name || '%'
+INNER JOIN user_expertise ue ON ue.user_id = (
+    SELECT a.OwnerUserId 
+    FROM Posts a 
+    WHERE a.ParentId = heq.question_id 
+      AND a.Score = (SELECT MAX(a2.Score) FROM Posts a2 WHERE a2.ParentId = heq.question_id)
+    LIMIT 1
+)
+WHERE heq.engagement_score > 10000
+  AND tp.questions_with_tag > 50
+  AND ue.expertise_rank <= 10
+ORDER BY overall_benchmark_rank ASC
+LIMIT 100;

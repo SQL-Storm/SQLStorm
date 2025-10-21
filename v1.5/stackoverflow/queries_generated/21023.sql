@@ -1,0 +1,101 @@
+-- {"query": "21023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1306} 
+
+WITH active_users AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+question_stats AS (
+    SELECT p.Id as post_id, p.OwnerUserId, p.CreationDate,
+           p.Score, p.ViewCount, p.AnswerCount,
+           COALESCE(p.CommentCount, 0) as comment_count,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+           AVG(p.Score) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate)) as monthly_avg_score,
+           COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) as edit_count
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (4, 5, 6) -- title/body/tags edits
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.Score > 0
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount
+    HAVING COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) = 0 -- Not closed
+),
+top_interactions AS (
+    SELECT qs.post_id, qs.OwnerUserId, 
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as downvotes,
+           SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) as accepted_count,
+           COUNT(DISTINCT c.Id) as comment_count,
+           STRING_AGG(
+               CASE 
+                   WHEN pl.LinkTypeId = 1 THEN 'Linked: ' || COALESCE(rp.Title, 'Unknown')
+                   WHEN pl.LinkTypeId = 3 THEN 'Duplicate: ' || COALESCE(rp.Title, 'Unknown')
+                   ELSE 'Other: ' || pl.LinkTypeId::text 
+               END, 
+               '; ' ORDER BY pl.CreationDate
+           ) as link_descriptions
+    FROM question_stats qs
+    LEFT JOIN Votes v ON qs.post_id = v.PostId 
+        AND v.VoteTypeId IN (1, 2, 3)
+    LEFT JOIN Comments c ON qs.post_id = c.PostId 
+        AND c.Score >= 0
+        AND LENGTH(TRIM(c.Text)) > 10
+    LEFT JOIN PostLinks pl ON qs.post_id = pl.PostId
+    LEFT JOIN Posts rp ON pl.RelatedPostId = rp.Id
+    WHERE qs.AnswerCount > 0
+    GROUP BY qs.post_id, qs.OwnerUserId
+    HAVING SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) + 5
+),
+badge_analysis AS (
+    SELECT au.Id as user_id, au.DisplayName,
+           COUNT(b.Id) as total_badges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as silver_badges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as bronze_badges,
+           MAX(b.Date) as latest_badge_date,
+           AVG(EXTRACT(DAY FROM (b.Date - u.CreationDate))) as avg_days_to_badge
+    FROM active_users au
+    JOIN Users u ON au.Id = u.Id
+    LEFT JOIN Badges b ON au.Id = b.UserId
+        AND b.Date >= u.CreationDate
+    WHERE b.TagBased IS NOT NULL  -- Handles NULL logic
+    GROUP BY au.Id, au.DisplayName, u.CreationDate
+)
+SELECT 
+    au.DisplayName as user_name,
+    au.rep_rank,
+    COALESCE(ti.upvotes, 0) as total_upvotes,
+    COALESCE(ti.downvotes, 0) as total_downvotes,
+    COALESCE(qs.edit_count, 0) as total_edits,
+    ba.total_badges,
+    ba.gold_badges,
+    (COALESCE(ti.upvotes, 0) * 1.0 / NULLIF(COALESCE(ti.downvotes, 0), 0)) as upvote_ratio,
+    CASE 
+        WHEN ba.gold_badges > 0 THEN 'Elite'
+        WHEN ba.silver_badges > 5 THEN 'Veteran'
+        WHEN ba.total_badges > 10 THEN 'Active'
+        ELSE 'Novice'
+    END as user_tier,
+    SUBSTRING(
+        COALESCE(ti.link_descriptions, 
+                 'No significant links; tags: ' || 
+                 COALESCE(qs.post_id::text, 'N/A')), 
+        1, 100
+    ) as interaction_summary,
+    RANK() OVER (
+        ORDER BY (COALESCE(ti.upvotes, 0) + COALESCE(qs.edit_count, 0) * 2 + ba.gold_badges * 10) DESC
+    ) as overall_engagement_rank
+FROM active_users au
+LEFT JOIN question_stats qs ON au.Id = qs.OwnerUserId
+LEFT JOIN top_interactions ti ON qs.post_id = ti.post_id
+LEFT JOIN badge_analysis ba ON au.Id = ba.user_id
+WHERE au.rep_rank <= 100  -- Top 100 users
+  AND (ti.upvotes > 50 OR ba.gold_badges > 0 OR qs.edit_count > 20)
+  AND (ba.latest_badge_date IS NULL OR ba.latest_badge_date >= CURRENT_DATE - INTERVAL '6 months')
+ORDER BY overall_engagement_rank
+LIMIT 50;

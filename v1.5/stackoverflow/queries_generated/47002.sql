@@ -1,0 +1,134 @@
+-- {"query": "47002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 4588, "output_tokens": 3677} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        CAST(t.TagName AS varchar(1000)) as tag_path,
+        0 as depth
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th.direct_questions,
+        CAST(th.tag_path || ' -> ' || t2.TagName AS varchar(1000)),
+        th.depth + 1
+    FROM tag_hierarchy th
+    CROSS JOIN Tags t2
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    INNER JOIN Posts p2 ON p2.Tags LIKE '%<' || t2.TagName || '>%'
+        AND p1.Id = p2.Id
+    WHERE th.depth < 2
+        AND t2.Id != th.Id
+        AND t2.Count > 500
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        STRING_AGG(DISTINCT substring(p.Tags, 2, position('>' IN substring(p.Tags, 2)) - 1), ', ') as primary_tags,
+        COUNT(DISTINCT p.Id) as total_answers,
+        AVG(p.Score) as avg_answer_score,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) as accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        STDDEV(p.Score) as score_variance
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    LEFT JOIN Posts q ON q.Id = p.ParentId
+    WHERE u.Reputation > 10000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+question_complexity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        LENGTH(p.Body) as body_length,
+        (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '<', ''))) as tag_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        EXTRACT(EPOCH FROM (COALESCE(pa.first_answer_time, NOW()) - p.CreationDate))/3600 as hours_to_first_answer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Resolved'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as status
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT MIN(CreationDate) as first_answer_time
+        FROM Posts 
+        WHERE ParentId = p.Id AND PostTypeId = 2
+    ) pa ON true
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate > NOW() - INTERVAL '2 years'
+        AND p.ViewCount > 100
+    GROUP BY p.Id, p.Title, p.CreationDate, p.ViewCount, p.Body, p.Tags, 
+             p.ClosedDate, p.AcceptedAnswerId, p.AnswerCount, pa.first_answer_time
+),
+badge_sequences AS (
+    SELECT 
+        b1.UserId,
+        b1.Name as first_badge,
+        b2.Name as second_badge,
+        b3.Name as third_badge,
+        EXTRACT(EPOCH FROM (b2.Date - b1.Date))/86400 as days_between_1_2,
+        EXTRACT(EPOCH FROM (b3.Date - b2.Date))/86400 as days_between_2_3,
+        COUNT(*) OVER (PARTITION BY b1.UserId, b1.Name) as badge_frequency
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b2.UserId = b1.UserId 
+        AND b2.Date > b1.Date 
+        AND b2.Date < b1.Date + INTERVAL '30 days'
+    INNER JOIN Badges b3 ON b3.UserId = b2.UserId 
+        AND b3.Date > b2.Date 
+        AND b3.Date < b2.Date + INTERVAL '30 days'
+    WHERE b1.Class = 3 AND b2.Class IN (2,3) AND b3.Class IN (1,2)
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.total_answers,
+    ue.avg_answer_score,
+    ue.accepted_answers,
+    ue.median_score,
+    ue.primary_tags,
+    COUNT(DISTINCT qc.Id) as complex_questions_answered,
+    AVG(qc.body_length) as avg_question_complexity,
+    AVG(qc.hours_to_first_answer) as avg_response_time,
+    STRING_AGG(DISTINCT th.tag_path, ' | ' ORDER BY th.direct_questions DESC) FILTER (WHERE th.depth > 0) as related_tag_paths,
+    COUNT(DISTINCT bs.first_badge || '->' || bs.second_badge || '->' || bs.third_badge) as unique_badge_progressions,
+    AVG(bs.days_between_1_2 + bs.days_between_2_3) as avg_badge_progression_days,
+    SUM(CASE WHEN qc.status = 'Resolved' THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(DISTINCT qc.Id), 0) as resolution_rate,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY qc.ViewCount) as p90_view_count
+FROM user_expertise ue
+CROSS JOIN question_complexity qc
+LEFT JOIN Posts a ON a.OwnerUserId = ue.UserId 
+    AND a.PostTypeId = 2 
+    AND a.ParentId = qc.Id
+LEFT JOIN tag_hierarchy th ON qc.Id IN (
+    SELECT Id FROM Posts WHERE Tags LIKE '%<' || th.TagName || '>%'
+)
+LEFT JOIN badge_sequences bs ON bs.UserId = ue.UserId
+WHERE a.Id IS NOT NULL
+GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, ue.total_answers, 
+         ue.avg_answer_score, ue.accepted_answers, ue.median_score, ue.primary_tags
+HAVING COUNT(DISTINCT qc.Id) > 10
+ORDER BY ue.Reputation DESC, resolution_rate DESC
+LIMIT 100;

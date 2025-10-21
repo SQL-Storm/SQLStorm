@@ -1,0 +1,34 @@
+SELECT p.Id,
+       p.Title,
+       p.Score,
+       p.ViewCount,
+       (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+       (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+       (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS IsDuplicate,
+       u.DisplayName,
+       u.Reputation,
+       (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+       (SELECT ARRAY_AGG(tag)
+        FROM (
+            SELECT tag
+            FROM UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+            WHERE tag IS NOT NULL
+        ) AS t) AS TagArray,
+       (SELECT AVG(EXTRACT(EPOCH FROM ph.CreationDate))
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 5, 6)) AS AvgEditDate
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT ParentId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+) a ON p.Id = a.ParentId
+WHERE p.PostTypeId = 1
+  AND p.Score > 10
+ORDER BY p.Score DESC, p.ViewCount DESC, a.AnswerCount DESC NULLS LAST
+LIMIT 100;

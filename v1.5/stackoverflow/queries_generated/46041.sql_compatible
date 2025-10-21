@@ -1,0 +1,128 @@
+WITH top_answerers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as answer_count,
+    AVG(p.Score) as avg_score,
+    SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) as accepted_count
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Posts q ON p.ParentId = q.Id
+  WHERE p.PostTypeId = 2 
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING COUNT(DISTINCT p.Id) >= 10
+),
+tag_expertise AS (
+  SELECT 
+    ta.Id as user_id,
+    string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><') as tag_array,
+    COUNT(*) as posts_in_tags
+  FROM top_answerers ta
+  JOIN Posts answers ON ta.Id = answers.OwnerUserId AND answers.PostTypeId = 2
+  JOIN Posts p ON answers.ParentId = p.Id
+  WHERE p.Tags IS NOT NULL
+  GROUP BY ta.Id, p.Tags
+),
+expanded_tags AS (
+  SELECT 
+    te.user_id,
+    unnest(te.tag_array) as tag_name,
+    te.posts_in_tags
+  FROM tag_expertise te
+),
+user_tag_stats AS (
+  SELECT 
+    et.user_id,
+    et.tag_name,
+    COUNT(*) as tag_answer_count,
+    t.Count as total_tag_questions
+  FROM expanded_tags et
+  JOIN Tags t ON et.tag_name = t.TagName
+  GROUP BY et.user_id, et.tag_name, t.Count
+  HAVING COUNT(*) >= 5
+),
+question_metrics AS (
+  SELECT 
+    p.Id as question_id,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(v.upvote_count, 0) as upvotes,
+    COALESCE(v.downvote_count, 0) as downvotes,
+    COALESCE(b.bookmark_count, 0) as bookmarks,
+    EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - p.CreationDate)) / 3600 as hours_open
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, 
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as upvote_count,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as downvote_count
+    FROM Votes 
+    GROUP BY PostId
+  ) v ON p.Id = v.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) as bookmark_count
+    FROM Votes
+    WHERE VoteTypeId = 5
+    GROUP BY PostId
+  ) b ON p.Id = b.PostId
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months'
+),
+answer_response_times AS (
+  SELECT 
+    ans.ParentId as question_id,
+    ans.Id as answer_id,
+    ans.OwnerUserId as answerer_id,
+    EXTRACT(EPOCH FROM (ans.CreationDate - q.CreationDate)) / 60 as response_minutes,
+    ans.Score as answer_score,
+    CASE WHEN q.AcceptedAnswerId = ans.Id THEN 1 ELSE 0 END as is_accepted,
+    ROW_NUMBER() OVER (PARTITION BY ans.ParentId ORDER BY ans.CreationDate) as answer_order
+  FROM Posts ans
+  JOIN Posts q ON ans.ParentId = q.Id
+  WHERE ans.PostTypeId = 2
+    AND q.PostTypeId = 1
+    AND ans.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months'
+)
+SELECT 
+  ta.DisplayName,
+  ta.Reputation,
+  ta.answer_count,
+  ROUND(CAST(ta.avg_score AS NUMERIC), 2) as avg_answer_score,
+  ta.accepted_count,
+  ROUND(100.0 * ta.accepted_count / NULLIF(ta.answer_count, 0), 2) as acceptance_rate,
+  COUNT(DISTINCT uts.tag_name) as expertise_tag_count,
+  STRING_AGG(DISTINCT uts.tag_name, ', ' ORDER BY uts.tag_name) FILTER (WHERE tag_rank <= 5) as top_tags,
+  ROUND(AVG(art.response_minutes)::NUMERIC, 2) as avg_response_time_minutes,
+  ROUND(AVG(CASE WHEN art.answer_order = 1 THEN art.answer_score END)::NUMERIC, 2) as avg_first_answer_score,
+  COUNT(DISTINCT CASE WHEN art.is_accepted = 1 AND art.answer_order = 1 THEN art.answer_id END) as first_answer_accepted_count,
+  ROUND(AVG(qm.ViewCount)::NUMERIC, 0) as avg_question_views_answered,
+  COUNT(DISTINCT pl.Id) as related_post_links,
+  COUNT(DISTINCT c.Id) as comments_on_answers,
+  ROUND(AVG(badge_counts.gold_badges)::NUMERIC, 1) as avg_gold_badges,
+  SUM(CASE WHEN qm.Score >= 10 THEN 1 ELSE 0 END) as high_score_questions_answered
+FROM top_answerers ta
+LEFT JOIN (
+  SELECT user_id, tag_name, tag_answer_count,
+         ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY tag_answer_count DESC) as tag_rank
+  FROM user_tag_stats
+) uts ON ta.Id = uts.user_id
+LEFT JOIN answer_response_times art ON ta.Id = art.answerer_id
+LEFT JOIN Posts answers ON ta.Id = answers.OwnerUserId AND answers.PostTypeId = 2
+LEFT JOIN question_metrics qm ON answers.ParentId = qm.question_id
+LEFT JOIN PostLinks pl ON answers.Id = pl.PostId
+LEFT JOIN Comments c ON answers.Id = c.PostId
+LEFT JOIN (
+  SELECT UserId, 
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) as gold_badges
+  FROM Badges
+  GROUP BY UserId
+) badge_counts ON ta.Id = badge_counts.UserId
+WHERE ta.answer_count >= 15
+GROUP BY ta.Id, ta.DisplayName, ta.Reputation, ta.answer_count, ta.avg_score, ta.accepted_count
+HAVING COUNT(DISTINCT uts.tag_name) >= 3
+ORDER BY ta.accepted_count DESC, ta.avg_score DESC
+LIMIT 100;

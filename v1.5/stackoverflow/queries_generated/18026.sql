@@ -1,0 +1,119 @@
+-- {"query": "18026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1021} 
+
+WITH
+  HighReputationUsers AS (
+    SELECT
+      Id,
+      DisplayName,
+      Reputation,
+      CreationDate,
+      ROW_NUMBER() OVER (ORDER BY Reputation DESC, CreationDate ASC) as rn
+    FROM Users
+    WHERE Reputation > 10000
+  ),
+  FrequentAnswerers AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS AnswerCount
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      pt.Name = 'Answer' AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+    HAVING
+      COUNT(p.Id) > 50
+  ),
+  TopQuestions AS (
+    SELECT
+      Id,
+      Title,
+      OwnerUserId,
+      CreationDate,
+      Score,
+      AnswerCount,
+      ROW_NUMBER() OVER (ORDER BY Score DESC, AnswerCount DESC, CreationDate DESC) as rn
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND Score > 100
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS PostsOwned,
+      COUNT(DISTINCT c.Id) AS CommentsMade,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    WHERE
+      u.CreationDate >= '2020-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS VoteCount
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate >= '2021-01-01'
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score
+    HAVING
+      COUNT(DISTINCT c.Id) > 5 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 20
+  )
+SELECT
+  hr.DisplayName AS HighRepUser,
+  fa.AnswerCount AS FrequentAnswerCount,
+  tq.Title AS TopQuestionTitle,
+  ua.PostsOwned,
+  ua.CommentsMade,
+  ua.UpVotesReceived,
+  pe.PostId AS EngagedPostId,
+  pe.VoteCount AS PostVoteCount,
+  CASE
+    WHEN pe.Score > 50 THEN 'High Score'
+    WHEN pe.Score > 10 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  COALESCE(hr.CreationDate, '1970-01-01') AS UserCreationDate,
+  LENGTH(hr.AboutMe) AS AboutMeLength,
+  UPPER(SUBSTRING(ua.DisplayName FROM 1 FOR 3)) AS DisplayNamePrefix
+FROM HighReputationUsers hr
+FULL OUTER JOIN FrequentAnswerers fa
+  ON hr.Id = fa.OwnerUserId
+LEFT JOIN TopQuestions tq
+  ON hr.Id = tq.OwnerUserId
+LEFT JOIN UserActivity ua
+  ON hr.Id = ua.UserId
+LEFT JOIN PostEngagement pe
+  ON hr.Id = pe.OwnerUserId
+WHERE
+  hr.rn <= 10 AND (fa.AnswerCount IS NULL OR fa.AnswerCount > 100) AND (tq.Score IS NULL OR tq.Score > 200)
+ORDER BY
+  hr.Reputation DESC,
+  fa.AnswerCount DESC NULLS LAST,
+  tq.Score DESC NULLS LAST,
+  ua.UpVotesReceived DESC,
+  pe.VoteCount DESC;

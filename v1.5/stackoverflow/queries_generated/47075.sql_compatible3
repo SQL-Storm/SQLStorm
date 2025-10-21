@@ -1,0 +1,128 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS question_count,
+        1 AS level
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+      AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        SUM(p.Score) AS total_score_in_tag,
+        AVG(p.Score) AS avg_score_in_tag,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS rank_in_tag
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+      AND p.Score > 0
+      AND u.Reputation > 5000
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+question_quality AS (
+    SELECT 
+        p.Id AS question_id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS has_accepted,
+        COALESCE(NULLIF(p.ViewCount, 0) / NULLIF(p.AnswerCount, 0), 0) AS views_per_answer,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS tag_list,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS edit_count,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 52 THEN 1 ELSE 0 END) AS was_hot_network
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+      AND p.Score >= 5
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.FavoriteCount, p.CreationDate, p.AcceptedAnswerId
+),
+badge_analysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.TagBased = TRUE) AS tag_badges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Date DESC) FILTER (WHERE b.Class = 1) AS gold_badge_names
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY b.UserId
+),
+voting_patterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_given,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_given,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS bounties_started,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) AS total_bounty_offered,
+        DATE_TRUNC('month', v.CreationDate) AS vote_month
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+      AND v.UserId IS NOT NULL
+    GROUP BY v.UserId, DATE_TRUNC('month', v.CreationDate)
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName AS expertise_tag,
+    ue.answers_in_tag,
+    ue.avg_score_in_tag,
+    ue.rank_in_tag,
+    COUNT(DISTINCT qq.question_id) AS quality_questions_asked,
+    AVG(qq.Score) AS avg_question_score,
+    AVG(qq.views_per_answer) AS avg_views_per_answer,
+    SUM(qq.was_hot_network) AS hot_network_questions,
+    COALESCE(ba.gold_badges, 0) AS gold_badges,
+    COALESCE(ba.silver_badges, 0) AS silver_badges,
+    COALESCE(ba.tag_badges, 0) AS tag_specific_badges,
+    COALESCE(ba.gold_badge_names, 'None') AS gold_achievements,
+    COALESCE(AVG(vp.upvotes_given), 0) AS avg_monthly_upvotes,
+    COALESCE(SUM(vp.bounties_started), 0) AS bounties_offered,
+    COALESCE(SUM(vp.total_bounty_offered), 0) AS total_bounty_amount,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qq.Score) AS median_question_score,
+    STDDEV(qq.Score) AS question_score_stddev
+FROM user_expertise ue
+LEFT JOIN question_quality qq ON qq.OwnerUserId = ue.user_id
+LEFT JOIN badge_analysis ba ON ba.UserId = ue.user_id
+LEFT JOIN voting_patterns vp ON vp.UserId = ue.user_id
+WHERE ue.rank_in_tag <= 100
+GROUP BY 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.avg_score_in_tag,
+    ue.rank_in_tag,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.tag_badges,
+    ba.gold_badge_names
+HAVING COUNT(DISTINCT qq.question_id) > 0
+ORDER BY 
+    ue.avg_score_in_tag DESC,
+    ue.Reputation DESC,
+    gold_badges DESC
+LIMIT 500;

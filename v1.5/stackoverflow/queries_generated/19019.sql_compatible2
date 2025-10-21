@@ -1,0 +1,172 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesReceived,
+        u.DownVotes AS TotalDownVotesReceived,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.LastActivityDate,
+        q.ClosedDate,
+        a.Score AS AcceptedAnswerScore,
+        COUNT(DISTINCT ans.Id) OVER (PARTITION BY q.Id) FILTER (WHERE ans.PostTypeId = 2) AS ActualAnswerCount,
+        AVG(ans.Score) OVER (PARTITION BY q.Id) FILTER (WHERE ans.PostTypeId = 2) AS AverageAnswerScore,
+        NULLIF(SUM(CASE WHEN v_ans.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY q.Id), 0) /
+        NULLIF(COUNT(v_ans.Id) OVER (PARTITION BY q.Id), 0) AS AnswerUpvoteRatio,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM q.CreationDate) ORDER BY q.ViewCount DESC, q.Score DESC) AS ViewScoreRankByYear,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.LastActivityDate)) / 3600 AS HoursSinceLastActivity,
+        LAG(q.CreationDate, 1) OVER (ORDER BY q.CreationDate) AS PreviousQuestionCreationDate
+    FROM Posts AS q
+    LEFT JOIN Posts AS a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+    LEFT JOIN Posts AS ans ON q.Id = ans.ParentId AND ans.PostTypeId = 2
+    LEFT JOIN Votes AS v_ans ON ans.Id = v_ans.PostId
+    WHERE q.PostTypeId = 1
+),
+PostEditHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        SUM(CASE WHEN pht.Name LIKE '%Body%' THEN 1 ELSE 0 END) AS BodyEditEvents,
+        SUM(CASE WHEN pht.Name LIKE '%Tags%' THEN 1 ELSE 0 END) AS TagEditEvents,
+        SUM(CASE WHEN pht.Name LIKE '%Closed%' OR pht.Name LIKE '%Reopened%' THEN 1 ELSE 0 END) AS ClosureReopenEvents,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MIN(ph.CreationDate) AS FirstHistoryEventDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        COALESCE(
+            EXTRACT(DAY FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))),
+            0
+        ) AS DaysBetweenFirstAndLastHistory
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+    GROUP BY ph.PostId
+),
+DuplicateLinkInfo AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS NumberOfDuplicateLinks,
+        EXISTS (
+            SELECT 1
+            FROM Posts AS dup_p
+            LEFT JOIN LATERAL (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(dup_p.Tags, 2, LENGTH(dup_p.Tags) - 2), '><')) AS TagName
+            ) AS t ON TRUE
+            WHERE dup_p.Id = pl.RelatedPostId
+              AND dup_p.Score > 50
+              AND t.TagName IN ('sql', 'database', 'performance-tuning')
+        ) AS HasHighScoringRelevantDuplicate,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS DuplicateTagsSummary
+    FROM PostLinks AS pl
+    JOIN LinkTypes AS lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts AS p_rel ON pl.RelatedPostId = p_rel.Id
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p_rel.Tags, 2, LENGTH(p_rel.Tags) - 2), '><')) AS TagName
+    ) AS t ON p_rel.Tags IS NOT NULL
+    WHERE lt.Name = 'Duplicate'
+    GROUP BY pl.PostId
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.TotalPostsCreated,
+    uas.TotalCommentsMade,
+    uas.GoldBadgesCount,
+    uas.SilverBadgesCount,
+    uas.BronzeBadgesCount,
+    qp.QuestionId,
+    qp.QuestionTitle,
+    qp.QuestionCreationDate,
+    qp.QuestionScore,
+    COALESCE(qp.ViewCount, 0) AS QuestionViewCount,
+    qp.ActualAnswerCount,
+    COALESCE(qp.AverageAnswerScore, 0.0) AS AverageAnswerScoreOfAnswers,
+    COALESCE(qp.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+    COALESCE(qp.AnswerUpvoteRatio, 0.0) AS AnswersUpvoteRatio,
+    peh.UniqueEditors,
+    peh.BodyEditEvents,
+    peh.TagEditEvents,
+    peh.ClosureReopenEvents,
+    peh.LastEditDate AS LastHistoryEditDate,
+    peh.DaysBetweenFirstAndLastHistory,
+    peh.WasMigratedAway,
+    COALESCE(dli.NumberOfDuplicateLinks, 0) AS NumberOfDuplicateLinks,
+    dli.HasHighScoringRelevantDuplicate,
+    dli.DuplicateTagsSummary,
+    qp.ViewScoreRankByYear,
+    qp.HoursSinceLastActivity,
+    EXTRACT(DAY FROM (qp.QuestionCreationDate - qp.PreviousQuestionCreationDate)) AS DaysSincePreviousQuestion,
+    CASE
+        WHEN uas.Reputation > 20000 AND uas.GoldBadgesCount >= 5 AND qp.QuestionScore > 100 THEN 'Legendary Questioner'
+        WHEN uas.Reputation > 10000 AND qp.ActualAnswerCount > 10 AND qp.AverageAnswerScore > 5 THEN 'Expert Authority'
+        WHEN peh.UniqueEditors > 5 AND peh.ClosureReopenEvents > 0 THEN 'Highly Debated Question'
+        WHEN qp.QuestionTitle ILIKE '%performance%' AND qp.QuestionScore > 20 THEN 'Performance Hotspot'
+        ELSE 'General Interest'
+    END AS QuestionCategory,
+    COALESCE(
+        SUBSTRING(
+            STRING_AGG(t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL ORDER BY t.TagName)
+        FROM 1 FOR 
+            CASE WHEN LENGTH(STRING_AGG(t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL ORDER BY t.TagName)) > 100 THEN 100 
+                 ELSE LENGTH(STRING_AGG(t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL ORDER BY t.TagName)) END
+        ),
+    'No Specific Tags') AS TopQuestionTagsSnippet,
+    (uas.TotalUpVotesReceived - uas.TotalDownVotesReceived) AS NetVotesReceived,
+    NULLIF(uas.TotalUpVotesReceived, 0) / NULLIF(CAST(uas.TotalDownVotesReceived AS NUMERIC), 0) AS UpvoteDownvoteRatioReceived
+FROM UserActivitySummary AS uas
+JOIN QuestionPerformance AS qp ON uas.UserId = qp.QuestionOwnerId
+LEFT JOIN PostEditHistoryDetails AS peh ON qp.QuestionId = peh.PostId
+LEFT JOIN DuplicateLinkInfo AS dli ON qp.QuestionId = dli.PostId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(qp.Tags, 2, LENGTH(qp.Tags) - 2), '><')) AS TagName
+) AS t ON qp.Tags IS NOT NULL
+WHERE
+    uas.Reputation > 2500
+    AND qp.QuestionScore > 5
+    AND qp.ViewCount > 100
+    AND qp.ActualAnswerCount >= 1
+    AND (qp.QuestionTitle ILIKE '%sql%' OR qp.Tags LIKE '%<database>%' OR qp.Tags LIKE '%<query>%')
+    AND qp.HoursSinceLastActivity < 720
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_close
+        WHERE ph_close.PostId = qp.QuestionId
+          AND ph_close.PostHistoryTypeId IN (10, 12)
+          AND ph_close.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    )
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.UserCreationDate, uas.TotalPostsCreated,
+    uas.TotalCommentsMade, uas.GoldBadgesCount, uas.SilverBadgesCount, uas.BronzeBadgesCount,
+    uas.TotalUpVotesReceived, uas.TotalDownVotesReceived,
+    qp.QuestionId, qp.QuestionTitle, qp.QuestionCreationDate, qp.QuestionScore, qp.ViewCount,
+    qp.ActualAnswerCount, qp.AverageAnswerScore, qp.AcceptedAnswerScore, qp.AnswerUpvoteRatio,
+    peh.UniqueEditors, peh.BodyEditEvents, peh.TagEditEvents, peh.ClosureReopenEvents,
+    peh.LastEditDate, peh.DaysBetweenFirstAndLastHistory, peh.WasMigratedAway,
+    dli.NumberOfDuplicateLinks, dli.HasHighScoringRelevantDuplicate, dli.DuplicateTagsSummary,
+    qp.ViewScoreRankByYear, qp.HoursSinceLastActivity, qp.PreviousQuestionCreationDate
+ORDER BY
+    (uas.Reputation * 0.4) + (qp.QuestionScore * 0.3) + (COALESCE(qp.AverageAnswerScore, 0) * 0.2) + (uas.GoldBadgesCount * 10) DESC,
+    qp.LastActivityDate DESC
+LIMIT 500;

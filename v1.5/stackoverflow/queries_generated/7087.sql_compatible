@@ -1,0 +1,217 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    COALESCE(p.Score,0) AS Score,
+    COALESCE(p.ViewCount,0) AS Views,
+    p.Tags,
+    p.AnswerCount,
+    p.ClosedDate,
+    regexp_split_to_table(
+      CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN substring(p.Tags FROM 2 FOR char_length(p.Tags)-2) ELSE NULL END,
+      '><'
+    ) AS Tag
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+     OR p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+PostStats AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.Id IS NOT NULL) AS CommentCountReal,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS VoteBalance,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    MAX(v.CreationDate) AS LastVoteDate,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.UserId END) AS FavoritesByDistinctUsers
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+UserRepChange AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 10 WHEN v.VoteTypeId = 3 THEN -2 WHEN v.VoteTypeId = 1 THEN 15 ELSE 0 END) AS RepDeltaApprox,
+    COUNT(DISTINCT v.Id) AS VotesReceived,
+    MAX(v.CreationDate) AS LastVoteForUser
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(DISTINCT v.Id) >= 10
+),
+TagSummary AS (
+  SELECT
+    COALESCE(t_trim, '(none)') AS TagName,
+    COUNT(DISTINCT ra.PostId) FILTER (WHERE ra.PostTypeId = 1) AS QuestionCount,
+    SUM(ra.Score) FILTER (WHERE ra.PostTypeId = 1) AS TotalQuestionScore,
+    SUM(ra.Views) FILTER (WHERE ra.PostTypeId = 1) AS TotalQuestionViews,
+    AVG(ra.AnswerCount) FILTER (WHERE ra.PostTypeId = 1) AS AvgAnswerCount,
+    SUM(ps.VoteCount) AS TotalVotesOnTaggedPosts
+  FROM RecentActivity ra
+  LEFT JOIN PostStats ps ON ps.PostId = ra.PostId
+  CROSS JOIN LATERAL (
+    SELECT CASE WHEN ra.Tag IS NULL THEN NULL ELSE trim(ra.Tag) END AS t_trim
+  ) tt
+  LEFT JOIN Tags t ON tt.t_trim IS NOT NULL AND lower(t.TagName) = lower(tt.t_trim)
+  GROUP BY coalesce(t_trim, '(none)')
+  HAVING COUNT(DISTINCT ra.PostId) > 5
+),
+DupGraph AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, 1 AS depth, ARRAY[pl.PostId, pl.RelatedPostId] AS path
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '10 years'
+  UNION ALL
+  SELECT dg.PostId, pl.RelatedPostId, pl.LinkTypeId, dg.depth + 1,
+         CASE WHEN pl.RelatedPostId = ANY(dg.path) THEN dg.path ELSE dg.path || pl.RelatedPostId END
+  FROM DupGraph dg
+  JOIN PostLinks pl ON pl.PostId = dg.RelatedPostId
+  WHERE NOT (pl.RelatedPostId = ANY(dg.path)) AND dg.depth < 6
+),
+BestAnswerPerQuestion AS (
+  SELECT *
+  FROM (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId,
+      a.CreationDate,
+      a.Score,
+      ps.CommentCountReal,
+      ps.VoteBalance,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY (CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) DESC, a.Score DESC, ps.VoteCount DESC, a.CreationDate ASC) AS rn,
+      RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS score_rank,
+      COALESCE(q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+      (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = a.Id AND c2.CreationDate >= a.CreationDate) AS CommentsAfterCreation
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    LEFT JOIN PostStats ps ON ps.PostId = a.Id
+    WHERE a.PostTypeId = 2
+  ) s
+  WHERE rn = 1
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years') AS RecentBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years') AS RecentBadgeScore,
+    GREATEST(0, EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) / 86400) AS DaysSinceLastAccess,
+    COALESCE(ur.RepDeltaApprox,0) AS RepDeltaApprox,
+    (COALESCE(ur.RepDeltaApprox,0)::numeric / NULLIF(1 + GREATEST(0, u.Reputation),0)) AS RepMomentum,
+    CASE WHEN u.ProfileImageUrl IS NOT NULL THEN 1 ELSE 0 END AS HasAvatar,
+    CASE WHEN u.AboutMe IS NOT NULL THEN length(u.AboutMe) ELSE 0 END AS AboutLen
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN UserRepChange ur ON ur.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, ur.RepDeltaApprox, u.ProfileImageUrl, u.AboutMe
+),
+Candidates AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.ParentId,
+    ra.Title,
+    ra.Tag,
+    COALESCE(ps.CommentCountReal,0) AS CommentCountReal,
+    COALESCE(ps.VoteBalance,0) AS VoteBalance,
+    COALESCE(ps.VoteCount,0) AS VoteCount,
+    COALESCE(bs.AnswerId, -1) AS BestAnswerId,
+    COALESCE(bs.score_rank, 999) AS BestAnswerScoreRank,
+    COALESCE(dg.depth, 0) AS DupDepth,
+    COALESCE(ts.TotalQuestionScore,0) AS TagTotalScore,
+    COALESCE(ts.TotalQuestionViews,0) AS TagTotalViews,
+    COALESCE(ue.Reputation,0) AS OwnerReputation,
+    COALESCE(ue.RecentBadges,0) AS OwnerRecentBadges,
+    COALESCE(ue.RepMomentum,0) AS OwnerRepMomentum,
+    (
+      LEAST(1.0, GREATEST(0.0, EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - ra.LastActivityDate)) / (86400*30)) ) * -0.5
+      + (CASE WHEN ra.Score >= 0 THEN LOG(1 + ABS(ra.Score)) ELSE -LOG(1 + ABS(ra.Score)) END) * 0.35
+      + (LOG(1 + COALESCE(ra.Views,0)) / 10.0) * 0.2
+      + (COALESCE(ps.VoteCount,0) / GREATEST(1, NULLIF(ra.AnswerCount,0))) * 0.05
+      + (COALESCE(ts.TotalQuestionViews,0) / GREATEST(1, ts.QuestionCount)) / 1000.0
+      + (COALESCE(ue.RepMomentum,0) / 100.0)
+      - (CASE WHEN ra.ClosedDate IS NOT NULL THEN 1.0 ELSE 0.0 END) * 2.0
+    ) AS HotnessScore,
+    lower(coalesce(regexp_replace(ra.Title, '[^a-z0-9 ]','', 'g'), '')) AS TitleFingerprint,
+    coalesce(string_agg(distinct coalesce(ra.Tag, '(none)'), '|' ORDER BY coalesce(ra.Tag,'') NULLS LAST) OVER (PARTITION BY COALESCE(ra.Title,'') ), '(none)') AS TagUnionPerTitle
+  FROM RecentActivity ra
+  LEFT JOIN PostStats ps ON ps.PostId = ra.PostId
+  LEFT JOIN BestAnswerPerQuestion bs ON bs.QuestionId = ra.PostId
+  LEFT JOIN (
+    SELECT PostId, MAX(depth) AS depth FROM DupGraph GROUP BY PostId
+  ) dg ON dg.PostId = ra.PostId
+  LEFT JOIN TagSummary ts ON lower(ts.TagName) = lower(coalesce(ra.Tag,'(none)')) 
+  LEFT JOIN UserEngagement ue ON ue.UserId = ra.OwnerUserId
+)
+SELECT DISTINCT ON (c.HotnessBucket, c.Tag)
+  c.PostId,
+  c.PostTypeId,
+  c.ParentId,
+  c.Title,
+  c.Tag,
+  c.CommentCountReal,
+  c.VoteBalance,
+  c.VoteCount,
+  c.BestAnswerId,
+  c.BestAnswerScoreRank,
+  c.DupDepth,
+  ROUND(c.HotnessScore::numeric, 6) AS HotnessScore,
+  c.TitleFingerprint,
+  c.TagUnionPerTitle,
+  CASE
+    WHEN c.HotnessScore > 2.5 THEN 'critical'
+    WHEN c.HotnessScore > 1.0 THEN 'hot'
+    WHEN c.HotnessScore > 0.0 THEN 'warm'
+    WHEN c.HotnessScore > -1.0 THEN 'cold'
+    ELSE 'stale'
+  END AS HotnessLabel,
+  CASE
+    WHEN c.HotnessScore > 2.5 THEN 4
+    WHEN c.HotnessScore > 1.0 THEN 3
+    WHEN c.HotnessScore > 0.0 THEN 2
+    WHEN c.HotnessScore > -1.0 THEN 1
+    ELSE 0
+  END AS HotnessBucket
+FROM Candidates c
+WHERE
+  (
+    (c.HotnessScore >= 0.5 AND c.DupDepth < 2 AND c.BestAnswerId = -1 AND c.PostTypeId = 1 AND c.CommentCountReal >= 0)
+    OR
+    (c.DupDepth >= 2 AND c.BestAnswerScoreRank > 5)
+    OR
+    (c.OwnerReputation > 5000 AND c.HotnessScore > 0)
+  )
+  AND (c.Tag IS NOT NULL OR c.PostTypeId = 2)
+ORDER BY HotnessBucket DESC, c.Tag NULLS LAST, c.HotnessScore DESC, c.VoteCount DESC
+UNION
+SELECT
+  p.Id AS PostId,
+  p.PostTypeId,
+  p.ParentId,
+  p.Title,
+  NULL::text AS Tag,
+  COALESCE(ps.CommentCountReal,0) AS CommentCountReal,
+  COALESCE(ps.VoteBalance,0) AS VoteBalance,
+  COALESCE(ps.VoteCount,0) AS VoteCount,
+  -1 AS BestAnswerId,
+  999 AS BestAnswerScoreRank,
+  0 AS DupDepth,
+  ROUND( (random() * 2 - 1)::numeric, 6) AS HotnessScore,
+  lower(coalesce(regexp_replace(p.Title, '[^a-z0-9 ]','', 'g'), '')) AS TitleFingerprint,
+  '(none)' AS TagUnionPerTitle,
+  'random' AS HotnessLabel,
+  0 AS HotnessBucket
+FROM Posts p
+LEFT JOIN PostStats ps ON ps.PostId = p.Id
+WHERE p.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '10 years'
+ORDER BY random()
+LIMIT 25;

@@ -1,0 +1,132 @@
+WITH RecentUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) AS RecentPosts,
+        COUNT(c.Id) AS TotalComments,
+        MAX(p.LastActivityDate) AS LastActive
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(b.Id) AS BadgeCount,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS BadgeNames
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+VoteAnalysis AS (
+    SELECT
+        v.PostId,
+        COUNT(*) AS TotalVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+PostQuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        aw.AcceptedAnswerId,
+        ac.Score AS AcceptedAnswerScore,
+        ac.CreationDate AS AnswerCreationDate,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS TagNames
+    FROM Posts p
+    LEFT JOIN Posts aw ON p.Id = aw.ParentId AND aw.PostTypeId = 2
+    LEFT JOIN Votes ac ON aw.Id = ac.PostId AND ac.VoteTypeId = 1
+    LEFT JOIN Tags t ON p.Tags IS NOT NULL AND t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, aw.AcceptedAnswerId, ac.Score, ac.CreationDate
+),
+ActivityScore AS (
+    SELECT
+        p.Id AS PostId,
+        p.Score + COALESCE(v.TotalVotes, 0) + COALESCE(ac.Score, 0) AS CalculatedScore,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RecencyRank
+    FROM Posts p
+    LEFT JOIN VoteAnalysis v ON p.Id = v.PostId
+    LEFT JOIN Votes ac ON p.Id = ac.PostId AND ac.VoteTypeId = 1
+),
+TopPosts AS (
+    SELECT
+        ps.PostId,
+        ps.Title,
+        ps.Tags,
+        ps.CreationDate,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        v.UpVotes,
+        v.DownVotes,
+        v.TotalVotes,
+        a.CalculatedScore,
+        ROW_NUMBER() OVER (ORDER BY a.CalculatedScore DESC, ps.CreationDate ASC) AS Rank
+    FROM PostQuestionDetails ps
+    LEFT JOIN VoteAnalysis v ON ps.QuestionId = ps.QuestionId
+    LEFT JOIN ActivityScore a ON ps.QuestionId = a.PostId
+    WHERE a.RecencyRank <= 100
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.RecentPosts,
+    ru.TotalComments,
+    ru.LastActive,
+    bs.BadgeCount,
+    bs.BadgeNames,
+    ta.TotalPostVotes,
+    ta.UpVotes,
+    ta.DownVotes,
+    tp.Title AS TopPostTitle,
+    tp.CreationDate AS PostCreationDate,
+    tp.AnswerCount,
+    tp.CommentCount,
+    tp.FavoriteCount,
+    tp.Tags AS PostTags,
+    tp.TagNames,
+    tp.AcceptedAnswerId,
+    tp.AcceptedAnswerScore,
+    tp.AnswerCreationDate
+FROM RecentUserActivity ru
+LEFT JOIN BadgeSummary bs ON ru.UserId = bs.UserId
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        SUM(v.TotalVotes) AS TotalPostVotes,
+        SUM(v.UpVotes) AS UpVotes,
+        SUM(v.DownVotes) AS DownVotes
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            v.TotalVotes,
+            v.UpVotes,
+            v.DownVotes
+        FROM Posts p
+        LEFT JOIN VoteAnalysis v ON p.Id = v.PostId
+        WHERE p.PostTypeId = 1
+    ) v
+    GROUP BY p.OwnerUserId
+) ta ON ru.UserId = ta.OwnerUserId
+LEFT JOIN TopPosts tp ON ru.UserId = (
+    SELECT OwnerUserId
+    FROM Posts
+    WHERE Id = tp.PostId
+    LIMIT 1
+)
+WHERE ru.Reputation > 1000
+ORDER BY ru.Reputation DESC, ru.LastActive DESC
+LIMIT 50;

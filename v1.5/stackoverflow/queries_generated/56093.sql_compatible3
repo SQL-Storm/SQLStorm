@@ -1,0 +1,48 @@
+WITH top_10_tags AS (
+    SELECT T1.TagName, COUNT(*) AS num_posts
+    FROM Tags T1
+    JOIN PostTags T2 ON T1.Id = T2.TagId
+    GROUP BY T1.TagName
+    ORDER BY num_posts DESC
+    LIMIT 10
+),
+top_users AS (
+    SELECT U1.Id, U1.DisplayName, COUNT(*) AS num_posts
+    FROM Users U1
+    JOIN Posts P1 ON U1.Id = P1.OwnerUserId
+    GROUP BY U1.Id, U1.DisplayName
+    ORDER BY num_posts DESC
+    LIMIT 10
+),
+post_history_counts AS (
+    SELECT PHT1.PostId, COUNT(*) AS num_history
+    FROM PostHistory PHT1
+    GROUP BY PHT1.PostId
+),
+post_link_counts AS (
+    SELECT PL1.PostId, COUNT(*) AS num_links
+    FROM PostLinks PL1
+    GROUP BY PL1.PostId
+)
+SELECT 
+    P1.Id, 
+    P1.Title, 
+    P1.Score, 
+    P1.ViewCount, 
+    P1.AnswerCount, 
+    P1.CommentCount, 
+    P1.FavoriteCount, 
+    PHC1.num_history, 
+    PLC1.num_links, 
+    T1.TagName, 
+    U1.DisplayName
+FROM Posts P1
+JOIN post_history_counts PHC1 ON P1.Id = PHC1.PostId
+JOIN post_link_counts PLC1 ON P1.Id = PLC1.PostId
+JOIN PostTags PT1 ON P1.Id = PT1.PostId
+JOIN Tags T1 ON PT1.TagId = T1.Id
+JOIN Users U1 ON P1.OwnerUserId = U1.Id
+WHERE T1.TagName IN (SELECT TagName FROM top_10_tags)
+AND U1.Id IN (SELECT Id FROM top_users)
+ORDER BY P1.Score DESC, P1.ViewCount DESC
+LIMIT 100;

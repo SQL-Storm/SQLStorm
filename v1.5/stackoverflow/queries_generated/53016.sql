@@ -1,0 +1,109 @@
+-- {"query": "53016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2646, "output_tokens": 920} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT v.Id) AS TotalVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentStats AS (
+    SELECT 
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.UserId
+),
+TagEngagement AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(p.Id) AS PostsInTag,
+        SUM(p.Score) AS ScoreInTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+TopTagsPerUser AS (
+    SELECT 
+        UserId,
+        Tag,
+        PostsInTag,
+        ScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY ScoreInTag DESC) AS TagRank
+    FROM TagEngagement
+),
+UserTopTag AS (
+    SELECT 
+        UserId,
+        Tag AS TopTag,
+        PostsInTag AS TopTagPosts,
+        ScoreInTag AS TopTagScore
+    FROM TopTagsPerUser
+    WHERE TagRank = 1
+),
+PostHistoryStats AS (
+    SELECT 
+        ph.UserId,
+        COUNT(ph.Id) AS Edits,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenActions
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT 
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.Questions,
+    ua.Answers,
+    ua.AvgPostScore,
+    ua.TotalViews,
+    ua.TotalVotesReceived,
+    ua.Upvotes,
+    ua.Downvotes,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.LatestBadgeDate,
+    cs.TotalComments,
+    cs.AvgCommentScore,
+    utt.TopTag,
+    utt.TopTagPosts,
+    utt.TopTagScore,
+    phs.Edits,
+    phs.CloseReopenActions,
+    RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ua.AvgPostScore) OVER () AS MedianAvgScore
+FROM UserActivity ua
+LEFT JOIN BadgeStats bs ON bs.UserId = ua.UserId
+LEFT JOIN CommentStats cs ON cs.UserId = ua.UserId
+LEFT JOIN UserTopTag utt ON utt.UserId = ua.UserId
+LEFT JOIN PostHistoryStats phs ON phs.UserId = ua.UserId
+WHERE ua.TotalPosts > 10
+ORDER BY ua.Reputation DESC
+LIMIT 1000;

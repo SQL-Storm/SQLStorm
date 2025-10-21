@@ -1,0 +1,192 @@
+-- {"query": "19032.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2468} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(C.Id) AS TotalComments,
+        AVG(C.Score) AS AverageCommentScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate)) / (60 * 60 * 24))::int AS AccountAgeDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1) AS TagCount,
+        CASE
+            WHEN P.Score >= 100 THEN 'High'
+            WHEN P.Score >= 20 THEN 'Medium'
+            ELSE 'Low'
+        END AS PostScoreCategory,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.LastActivityDate)) / (60 * 60 * 24))::int AS DaysSinceLastActivity,
+        -- Correlated subquery for last editor's reputation
+        (SELECT U.Reputation FROM Users U WHERE U.Id = P.LastEditorUserId) AS LastEditorReputation,
+        -- Subquery for average score of answers to this question
+        (SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS AverageAnswerScore,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 10) AS CloseVoteCount,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 11) AS ReopenVoteCount,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS LastClosedDateFromHistory
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.OwnerUserId, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate, P.Tags, P.AcceptedAnswerId, P.LastActivityDate, P.LastEditorUserId
+),
+UserActivityTimelineWithLagLead AS (
+    SELECT
+        ActorUserId,
+        ActivityType,
+        ActivityId,
+        ActivityDate,
+        LAG(ActivityDate, 1) OVER (PARTITION BY ActorUserId ORDER BY ActivityDate) AS PrevActivityDate,
+        LEAD(ActivityDate, 1) OVER (PARTITION BY ActorUserId ORDER BY ActivityDate) AS NextActivityDate
+    FROM (
+        SELECT
+            P.OwnerUserId AS ActorUserId,
+            'Post' AS ActivityType,
+            P.Id AS ActivityId,
+            P.CreationDate AS ActivityDate
+        FROM Posts P
+        WHERE P.OwnerUserId IS NOT NULL
+        UNION ALL
+        SELECT
+            C.UserId AS ActorUserId,
+            'Comment' AS ActivityType,
+            C.Id AS ActivityId,
+            C.CreationDate AS ActivityDate
+        FROM Comments C
+        WHERE C.UserId IS NOT NULL
+    ) AS AllUserActivities
+),
+MostFrequentCloseReasonPerPost AS (
+    SELECT
+        PH.PostId,
+        CR.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY COUNT(CR.Name) DESC, CR.Name) AS rn
+    FROM PostHistory PH
+    JOIN CloseReasonTypes CR ON PH.Comment = CR.Id::varchar
+    WHERE PH.PostHistoryTypeId = 10
+    GROUP BY PH.PostId, CR.Name
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.AccountAgeDays,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalPostScore,
+    UAS.TotalComments,
+    UAS.AverageCommentScore,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    PDE.PostId,
+    PDE.PostTypeId,
+    PDE.PostCreationDate,
+    PDE.PostScore,
+    PDE.ViewCount,
+    PDE.AnswerCount,
+    PDE.CommentCount,
+    PDE.FavoriteCount,
+    PDE.TagCount,
+    PDE.PostScoreCategory,
+    PDE.HasAcceptedAnswer,
+    PDE.DaysSinceLastActivity,
+    PDE.LastEditorReputation,
+    PDE.AverageAnswerScore,
+    PDE.EditCount,
+    PDE.CloseVoteCount,
+    PDE.ReopenVoteCount,
+    -- Window functions applied on the final result set
+    ROW_NUMBER() OVER (PARTITION BY UAS.UserId ORDER BY PDE.PostScore DESC, PDE.PostCreationDate DESC) AS UserPostRank,
+    RANK() OVER (PARTITION BY PDE.PostTypeId ORDER BY PDE.PostScore DESC) AS PostTypeScoreRank,
+    UAT.PrevActivityDate AS PostSpecificPrevActivityDate, -- Lag of *any* activity for the user before this post
+    UAT.NextActivityDate AS PostSpecificNextActivityDate, -- Lead of *any* activity for the user after this post
+    AVG(PDE.PostScore) OVER (PARTITION BY UAS.UserId) AS AvgUserPostScore,
+    SUM(PDE.ViewCount) OVER (PARTITION BY UAS.UserId ORDER BY PDE.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalUserViews,
+    -- String manipulations and NULL logic
+    COALESCE(UAS.DisplayName, 'Anonymous') || ' (' || COALESCE(U.Location, 'Unknown Location') || ')' AS UserLocationInfo,
+    NULLIF(PDE.PostScore, 0) AS NonZeroPostScore,
+    CASE
+        WHEN PDE.ClosedDate IS NOT NULL AND PDE.CommunityOwnedDate IS NOT NULL THEN 'Closed & CommunityOwned'
+        WHEN PDE.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PDE.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        WHEN PDE.FavoriteCount > 50 AND PDE.AverageAnswerScore > 10 AND PDE.PostTypeId = 1 THEN 'Highly Engaged Question'
+        WHEN PDE.ViewCount > 10000 OR PDE.PostScore > 50 THEN 'HighVisibility'
+        WHEN PDE.PostScore < 0 THEN 'NegativeScore'
+        ELSE 'Standard'
+    END AS PostStatusClassification,
+    MFR.CloseReasonName,
+    -- Additional logic combining post history and linked posts
+    CASE
+        WHEN PDE.CloseVoteCount > 0 AND EXISTS (
+            SELECT 1 FROM PostLinks PL WHERE PL.PostId = PDE.PostId AND PL.LinkTypeId = 3 -- Duplicate
+        ) THEN 'Closed & Duplicated'
+        WHEN PDE.EditCount > 5 AND PDE.PostScore < 0 AND PDE.DaysSinceLastActivity > 365 THEN 'Stale & Controversial'
+        ELSE 'Normal'
+    END AS PostControversyFlag,
+    -- Correlated Subquery demonstrating existence check for a related post with high score
+    EXISTS (
+        SELECT 1
+        FROM Posts RelatedP
+        JOIN PostLinks PL ON RelatedP.Id = PL.RelatedPostId
+        WHERE PL.PostId = PDE.PostId
+        AND RelatedP.Score > PDE.PostScore * 2
+        AND RelatedP.PostTypeId = PDE.PostTypeId
+    ) AS HasMuchHigherScoredRelatedPost
+FROM UserActivitySummary UAS
+INNER JOIN Users U ON UAS.UserId = U.Id
+LEFT JOIN PostDetailsExtended PDE ON UAS.UserId = PDE.OwnerUserId
+LEFT JOIN UserActivityTimelineWithLagLead UAT ON UAS.UserId = UAT.ActorUserId
+    AND UAT.ActivityType = 'Post' AND UAT.ActivityId = PDE.PostId
+LEFT JOIN MostFrequentCloseReasonPerPost MFR ON PDE.PostId = MFR.PostId AND MFR.rn = 1
+WHERE
+    UAS.TotalPosts > 0
+    AND UAS.Reputation > 1000
+    AND PDE.PostId IS NOT NULL
+    AND (
+        PDE.DaysSinceLastActivity < 365
+        OR PDE.PostScore > 10
+        OR UAS.GoldBadges > 0
+        OR (PDE.CloseVoteCount > 0 AND PDE.ReopenVoteCount > 0)
+    )
+    AND (U.Location IS NOT NULL OR UAS.AverageCommentScore IS NOT NULL)
+ORDER BY
+    UAS.Reputation DESC,
+    UAT.PrevActivityDate DESC NULLS LAST,
+    PDE.PostScore DESC,
+    UAS.LastPostDate DESC;

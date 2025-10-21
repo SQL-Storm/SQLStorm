@@ -1,0 +1,107 @@
+WITH AnswerStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(vs.Score) OVER (PARTITION BY p.Id) AS AvgVoteScore,
+        MAX(vv.Score) OVER (PARTITION BY p.Id) AS MaxDownVoteScore,
+        COUNT(DISTINCT u.Id) AS UniqueVoters
+    FROM
+        Posts p
+        LEFT JOIN Comments c ON c.PostId = p.Id
+        LEFT JOIN Votes vs ON vs.PostId = p.Id AND vs.VoteTypeId IN (2, 3)
+        LEFT JOIN Votes vv ON vv.PostId = p.Id AND vv.VoteTypeId = 3
+        LEFT JOIN Users u ON u.Id = vs.UserId
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.Id
+), TagAnalysis AS (
+    SELECT
+        t.TagName,
+        COUNT(*) AS TagCount,
+        AVG(CAST(t.Count AS DOUBLE PRECISION)) AS AvgPostCount,
+        MAX(t.Count) AS MaxPostCount,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.TagName) AS TagNamesList
+    FROM
+        Tags t
+        LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY
+        t.TagName
+), UserReputationScore AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS DownVotesReceived,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY u.Id) AS PostsCount,
+        COUNT(DISTINCT bc.Id) OVER (PARTITION BY u.Id) AS BadgesCount
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        LEFT JOIN Badges bc ON bc.UserId = u.Id
+    WHERE
+        u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+)
+SELECT
+    us.UserId,
+    us.Reputation,
+    us.PostsCount,
+    us.BadgesCount,
+    ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS UserTags,
+    ans.CommentCount,
+    ans.AvgVoteScore,
+    ans.MaxDownVoteScore,
+    ans.UniqueVoters,
+    STRING_AGG(DISTINCT CAST(pl.LinkTypeId AS TEXT) ORDER BY pl.LinkTypeId, ';') AS LinkTypeIds,
+    CASE
+        WHEN EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) > 365*24*3600 THEN TRUE
+        ELSE FALSE
+    END AS UserActiveStatus,
+    CASE
+        WHEN u.Location ILIKE '%Remote%' OR u.Location IS NULL THEN 'Remote or Unknown'
+        ELSE u.Location
+    END AS LocationCategory,
+    TOPIC_DETAILS.ExtractTopicCount,
+    TOTAL_TIME.OverallHours
+FROM
+    UserReputationScore us
+    LEFT JOIN Users u ON u.Id = us.UserId
+    LEFT JOIN AnswersStats ans ON ans.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.PostTypeId = 2
+    )
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = us.UserId AND p2.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT
+            COUNT(DISTINCT unnest(string_to_array(p2.Tags, '><'))) AS ExtractTopicCount
+        FROM
+            Posts
+        WHERE
+            p2.Id = Posts.Id
+    ) AS TOPIC_DETAILS ON TRUE
+    LEFT JOIN (
+        SELECT
+            SUM(EXTRACT(EPOCH FROM (pl.CreationDate - TIMESTAMP '2024-10-01 12:34:56')))/3600 AS OverallHours
+        FROM
+            PostLinks pl
+        WHERE
+            pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    ) AS TOTAL_TIME ON TRUE
+    LEFT JOIN PostLinks pl ON pl.PostId = p2.Id
+WHERE
+    u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+GROUP BY
+    us.UserId,
+    us.Reputation,
+    ans.CommentCount,
+    ans.AvgVoteScore,
+    ans.MaxDownVoteScore,
+    ans.UniqueVoters,
+    u.LastAccessDate,
+    u.CreationDate,
+    u.Location,
+    TOPIC_DETAILS.ExtractTopicCount,
+    TOTAL_TIME.OverallHours
+ORDER BY
+    us.Reputation DESC,
+    UserTags DESC;

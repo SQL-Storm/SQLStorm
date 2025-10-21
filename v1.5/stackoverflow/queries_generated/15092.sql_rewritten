@@ -1,0 +1,56 @@
+-- {"query": "15092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 217155, "output_tokens": 64054} 
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        AVG(CASE WHEN b.Class = 1 THEN 1.0 ELSE 0 END) AS GoldBadgeRatio,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostContributionRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+PostInteractionAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER () AS MedianScore
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.TotalBadges,
+    pia.PostId,
+    pia.Title,
+    pia.Score,
+    pia.VoteCount,
+    ubs.PostContributionRank,
+    CASE 
+        WHEN pia.Score > pia.MedianScore THEN 'Above Median'
+        ELSE 'Below Median'
+    END AS ScoreCategory,
+    COALESCE(pia.UpVotes, 0) AS NormalizedUpVotes,
+    ROUND(ubs.GoldBadgeRatio * 100, 2) AS GoldBadgePercentage
+FROM UserBadgeStats ubs
+JOIN PostInteractionAnalysis pia ON ubs.UserId = (
+    SELECT p.OwnerUserId 
+    FROM Posts p 
+    WHERE p.Id = pia.PostId
+)
+WHERE ubs.TotalBadges > 5
+    AND pia.VoteCount > 10
+    AND (ubs.LatestBadgeDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+ORDER BY ubs.TotalBadges DESC, pia.Score DESC
+LIMIT 100;

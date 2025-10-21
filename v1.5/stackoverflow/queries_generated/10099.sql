@@ -1,0 +1,46 @@
+-- {"query": "10099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 462} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScores,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(CASE WHEN b.Id IS NOT NULL THEN b.Date ELSE NULL END) AS LastBadgeEarned,
+    MAX(CASE WHEN v.PostId IS NOT NULL THEN v.CreationDate ELSE NULL END) AS LastVote,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags,
+    AVG(p.AnswerCount) AS AvgAnswersPerQuestion
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    (SELECT 
+         pt.Id, 
+         STRING_AGG(tt.TagName, ', ') AS TagNames
+     FROM 
+         Posts pt
+     JOIN 
+         Tags tt ON pt.Id = tt.ExcerptPostId
+     GROUP BY 
+         pt.Id) t ON p.Id = t.Id
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATEADD(year, -5, GETDATE())
+GROUP BY 
+    u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalViews DESC, 
+    TotalScores DESC
+LIMIT 100;

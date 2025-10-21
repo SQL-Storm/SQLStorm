@@ -1,0 +1,156 @@
+WITH RECURSIVE user_engagement_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+        EXTRACT(YEAR FROM u.CreationDate) AS join_year,
+        CASE 
+            WHEN u.Location IS NULL OR LENGTH(TRIM(u.Location)) = 0 THEN 'Unknown'
+            WHEN LOWER(u.Location) LIKE '%united states%' OR LOWER(u.Location) LIKE '%usa%' THEN 'USA'
+            WHEN LOWER(u.Location) LIKE '%united kingdom%' OR LOWER(u.Location) LIKE '%uk%' THEN 'UK'
+            ELSE SUBSTRING(u.Location FROM 1 FOR 20)
+        END AS location_normalized
+    FROM Users u
+    WHERE u.Reputation > 100
+),
+post_activity_analysis AS (
+    SELECT 
+        p.Id AS post_id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS favorites,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS has_accepted_answer,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS post_rank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS avg_user_post_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS user_post_count,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC NULLS LAST) AS view_rank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= DATE '2020-01-01'
+        AND p.OwnerUserId IS NOT NULL
+),
+badge_aggregates AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY CASE WHEN b.Class = 1 THEN b.Name END) AS gold_badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS bounties_started,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS total_bounty_amount,
+        MAX(v.CreationDate) AS last_vote_date
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5, 8)
+    GROUP BY v.PostId
+),
+comment_engagement AS (
+    SELECT 
+        c.PostId,
+        COUNT(DISTINCT c.UserId) AS unique_commenters,
+        AVG(c.Score) AS avg_comment_score,
+        MAX(LENGTH(c.Text)) AS max_comment_length
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.PostId
+),
+tag_extraction AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL THEN 
+                ARRAY_LENGTH(string_to_array(substring(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS tag_count
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.location_normalized,
+    uem.join_year,
+    paa.user_post_count,
+    ROUND(paa.avg_user_post_score, 2) AS avg_score,
+    COALESCE(ba.gold_badges, 0) AS gold,
+    COALESCE(ba.silver_badges, 0) AS silver,
+    COALESCE(ba.bronze_badges, 0) AS bronze,
+    ba.gold_badge_names,
+    SUM(COALESCE(vp.upvotes, 0)) AS total_upvotes,
+    SUM(COALESCE(vp.downvotes, 0)) AS total_downvotes,
+    SUM(COALESCE(vp.total_bounty_amount, 0)) AS total_bounties_received,
+    AVG(COALESCE(ce.unique_commenters, 0)) AS avg_unique_commenters_per_post,
+    MAX(paa.ViewCount) AS max_post_views,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY paa.Score) AS median_post_score,
+    COUNT(DISTINCT CASE WHEN paa.has_accepted_answer = 1 THEN paa.post_id END) AS questions_with_accepted_answers,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = uem.Id 
+         AND p2.PostTypeId = 2 
+         AND EXISTS (
+             SELECT 1 FROM Posts parent 
+             WHERE parent.Id = p2.ParentId 
+                 AND parent.AcceptedAnswerId = p2.Id
+         )
+    ) AS accepted_answers_given,
+    CASE 
+        WHEN uem.Reputation > 10000 AND COALESCE(ba.gold_badges, 0) >= 5 THEN 'Elite'
+        WHEN uem.Reputation > 5000 AND COALESCE(ba.gold_badges, 0) >= 2 THEN 'Advanced'
+        WHEN uem.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS user_tier,
+    AVG(te.tag_count) AS avg_tags_per_question
+FROM user_engagement_metrics uem
+INNER JOIN post_activity_analysis paa ON uem.Id = paa.OwnerUserId
+LEFT OUTER JOIN badge_aggregates ba ON uem.Id = ba.UserId
+LEFT OUTER JOIN vote_patterns vp ON paa.post_id = vp.PostId
+LEFT OUTER JOIN comment_engagement ce ON paa.post_id = ce.PostId
+LEFT OUTER JOIN tag_extraction te ON paa.post_id = te.post_id
+WHERE paa.post_rank <= 10
+    AND (ba.gold_badges IS NULL OR ba.gold_badges > 0)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = paa.post_id 
+            AND ph.PostHistoryTypeId = 10 
+            AND ph.CreationDate < DATE '2021-01-01'
+    )
+GROUP BY 
+    uem.Id,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.location_normalized,
+    uem.join_year,
+    paa.user_post_count,
+    paa.avg_user_post_score,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.gold_badge_names
+HAVING 
+    COUNT(DISTINCT paa.post_id) >= 3
+    AND SUM(COALESCE(vp.upvotes, 0)) > SUM(COALESCE(vp.downvotes, 0)) * 2
+ORDER BY 
+    COALESCE(ba.gold_badges, 0) DESC,
+    uem.Reputation DESC,
+    total_upvotes DESC
+LIMIT 100;

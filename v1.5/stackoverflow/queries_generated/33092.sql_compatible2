@@ -1,0 +1,46 @@
+SELECT
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(*) AS TotalPosts,
+    AVG(p.Score) AS AvgScore,
+    SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AnsweredQuestions,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(DISTINCT u.Id) AS UniqueAuthors,
+    MAX(p.CreationDate) AS MostRecentPost,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    AVG(c.Score) AS AvgCommentScore,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotes,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotes,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 10) AS TotalDeletions,
+    COUNT(DISTINCT bl.RelatedPostId) AS TotalLinkedPosts,
+    ARRAY_AGG(DISTINCT COALESCE(tt.Name, '')) AS LinkTypesUsed,
+    COUNT(DISTINCT t.Id) AS UniqueTags,
+    COUNT(DISTINCT b.Id) AS UniqueBadges,
+    (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation >= 1000) AS HighReputationUsers
+FROM
+    Posts p
+JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    PostLinks bl ON bl.PostId = p.Id
+LEFT JOIN
+    LinkTypes lt ON bl.LinkTypeId = lt.Id
+LEFT JOIN
+    Posts t ON p.Tags @> CAST(ARRAY[CAST(t.TagName AS TEXT)] AS TEXT[])
+LEFT JOIN
+    Badges b ON b.UserId = p.OwnerUserId
+LEFT JOIN
+    TagTags tt ON t.TagName = tt.TagName
+WHERE
+    p.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+GROUP BY
+    p.PostTypeId, pt.Name
+ORDER BY
+    TotalPosts DESC
+LIMIT 10;

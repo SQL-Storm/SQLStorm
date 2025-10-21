@@ -1,0 +1,198 @@
+WITH
+TopUsers AS (
+  SELECT u.Id AS UserId, u.Reputation, u.CreationDate, u.DisplayName,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+         COUNT(DISTINCT c.Id) AS Comments,
+         MAX(p.LastActivityDate) AS LastPostActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id
+  ORDER BY u.Reputation DESC
+  LIMIT 200
+),
+TagStats AS (
+  SELECT t.TagName,
+         t.Id AS TagId,
+         t.Count AS TagCount,
+         COALESCE(sum_q.QuestionCount,0) AS Questions,
+         COALESCE(sum_a.AnswerCount,0) AS Answers,
+         CASE WHEN COALESCE(sum_q.QuestionCount,0) = 0 THEN NULL
+              ELSE ROUND(COALESCE(sum_a.AnswerCount,0) * 1.0 / sum_q.QuestionCount, 3) END AS AnswerToQuestionRatio,
+         COALESCE(sum_views.Views,0) AS TotalViews
+  FROM Tags t
+  LEFT JOIN (
+    SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS TagName, count(*) AS QuestionCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY 1
+  ) sum_q ON sum_q.TagName = t.TagName
+  LEFT JOIN (
+    SELECT unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS TagName, count(a.Id) AS AnswerCount
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY 1
+  ) sum_a ON sum_a.TagName = t.TagName
+  LEFT JOIN (
+    SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS TagName, SUM(p.ViewCount) AS Views
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY 1
+  ) sum_views ON sum_views.TagName = t.TagName
+  WHERE t.Count > 100
+),
+PostScores AS (
+  SELECT p.Id AS PostId,
+         p.PostTypeId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.AcceptedAnswerId,
+         COALESCE(v.UpVotes,0) AS UpVotes,
+         COALESCE(v.DownVotes,0) AS DownVotes,
+         CASE
+           WHEN p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN 1.5
+           WHEN p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' THEN 1.2
+           ELSE 1.0
+         END AS RecencyWeight,
+         (
+           (CAST(GREATEST(p.Score,0) AS numeric) * 2.5)
+           + (CAST(LEAST(p.ViewCount,100000) AS numeric) / 1000)
+           + (CAST(LEAST(p.AnswerCount,50) AS numeric) * 3)
+           + (CAST(LEAST(p.CommentCount,200) AS numeric) * 1.2)
+           + (CAST(LEAST(p.FavoriteCount,500) AS numeric) * 4)
+           + (CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 20 ELSE 0 END)
+           + ((COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) * 2)
+         ) * CASE
+               WHEN p.PostTypeId = 1 THEN 1.1
+               WHEN p.PostTypeId = 2 THEN 0.9
+               ELSE 0.5
+             END
+         AS RawEngagementScore
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+PostTagMap AS (
+  SELECT p.Id AS PostId, trim(tg) AS TagName
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS tg
+  ) x
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+TagTopPosts AS (
+  SELECT ts.TagName, ts.TagId, ts.TagCount, ts.AnswerToQuestionRatio, ts.TotalViews,
+         pt.PostId, ps.Title, ps.RawEngagementScore,
+         ROW_NUMBER() OVER (PARTITION BY ts.TagName ORDER BY ps.RawEngagementScore DESC NULLS LAST) AS RankWithinTag
+  FROM TagStats ts
+  JOIN PostTagMap pt ON pt.TagName = ts.TagName
+  JOIN PostScores ps ON ps.PostId = pt.PostId
+  WHERE ps.RawEngagementScore IS NOT NULL
+),
+OwnerStats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS UserQuestions,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS UserAnswers,
+         SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+         AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+         MAX(p.CreationDate) AS LatestPost
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+EditChurn AS (
+  SELECT ph.PostId,
+         COUNT(*) AS Revisions,
+         MIN(ph.CreationDate) AS FirstRev,
+         MAX(ph.CreationDate) AS LastRev,
+         (EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 3600)::numeric AS HoursSpan,
+         ROUND(COUNT(*)::numeric / NULLIF(GREATEST(EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))),1),0),6) AS RevsPerSecond
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY ph.PostId
+  HAVING COUNT(*) >= 5
+),
+Final AS (
+  SELECT tt.TagName,
+         tt.TagCount,
+         tt.AnswerToQuestionRatio,
+         tt.TotalViews,
+         tt.PostId,
+         tt.Title,
+         ROUND(tt.RawEngagementScore,3) AS EngagementScore,
+         o.UserId,
+         o.DisplayName AS OwnerName,
+         o.UserQuestions,
+         o.UserAnswers,
+         ROUND(CAST(o.AvgPostScore AS numeric),3) AS AvgPostScore,
+         COALESCE(ec.Revisions,0) AS Revisions,
+         COALESCE(ec.HoursSpan,0) AS HoursSpan,
+         COALESCE(pl_dup.DupCount,0) AS DuplicateLinksOut,
+         COALESCE(pl_in.DupInCount,0) AS DuplicateLinksIn
+  FROM TagTopPosts tt
+  LEFT JOIN Posts p ON p.Id = tt.PostId
+  LEFT JOIN OwnerStats o ON o.UserId = p.OwnerUserId
+  LEFT JOIN EditChurn ec ON ec.PostId = tt.PostId
+  LEFT JOIN (
+    SELECT pl.PostId, COUNT(*) AS DupCount FROM PostLinks pl WHERE pl.LinkTypeId = 3 GROUP BY pl.PostId
+  ) pl_dup ON pl_dup.PostId = tt.PostId
+  LEFT JOIN (
+    SELECT pl.RelatedPostId AS PostId, COUNT(*) AS DupInCount FROM PostLinks pl WHERE pl.LinkTypeId = 3 GROUP BY pl.RelatedPostId
+  ) pl_in ON pl_in.PostId = tt.PostId
+  WHERE tt.RankWithinTag <= 3
+),
+Selected AS (
+  SELECT
+    f.TagName,
+    f.TagCount,
+    f.AnswerToQuestionRatio,
+    f.TotalViews,
+    f.PostId,
+    f.Title,
+    CAST(f.EngagementScore AS numeric) AS EngagementScore,
+    f.OwnerName,
+    f.UserQuestions,
+    f.UserAnswers,
+    ROUND(CAST(f.AvgPostScore AS numeric),3) AS AvgPostScore,
+    COALESCE(f.Revisions,0) AS RevisionsLast2Years,
+    COALESCE(f.HoursSpan,0) AS RevisionHoursSpan,
+    f.DuplicateLinksOut,
+    f.DuplicateLinksIn,
+    RANK() OVER (ORDER BY (f.EngagementScore * (1 + COALESCE(f.AnswerToQuestionRatio,0)) * LOG(GREATEST(f.TagCount,10))) DESC) AS GlobalTagPostRank
+  FROM Final f
+)
+SELECT
+  s.TagName,
+  s.TagCount,
+  s.AnswerToQuestionRatio,
+  s.TotalViews,
+  s.PostId,
+  s.Title,
+  CAST(s.EngagementScore AS numeric) AS EngagementScore,
+  s.OwnerName,
+  s.UserQuestions,
+  s.UserAnswers,
+  ROUND(CAST(s.AvgPostScore AS numeric),3) AS AvgPostScore,
+  COALESCE(s.Revisions,0) AS RevisionsLast2Years,
+  COALESCE(s.RevisionHoursSpan,0) AS RevisionHoursSpan,
+  s.DuplicateLinksOut,
+  s.DuplicateLinksIn,
+  RANK() OVER (ORDER BY (s.EngagementScore * (1 + COALESCE(s.AnswerToQuestionRatio,0)) * LOG(GREATEST(s.TagCount,10))) DESC) AS GlobalTagPostRank
+FROM Selected s
+ORDER BY GlobalTagPostRank, s.TagName, s.EngagementScore DESC
+LIMIT 500;

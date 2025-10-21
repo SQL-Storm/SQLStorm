@@ -1,0 +1,90 @@
+-- {"query": "50061.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 995} 
+
+WITH TaggedQuestions AS (
+    -- 1. Identify all questions from a specific year with a high-volume tag and positive score.
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId AS QuestionOwnerId,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.FavoriteCount
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 -- 1 = Question
+      AND p.Tags LIKE '%<sql>%'
+      AND p.Score > 0
+      AND p.CreationDate >= '2021-01-01' AND p.CreationDate < '2022-01-01'
+      AND p.AnswerCount > 1
+),
+Answerers AS (
+    -- 2. Find users who answered these questions and calculate their stats for those answers.
+    SELECT
+        a.OwnerUserId,
+        q.QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        (a.CreationDate - p_q.CreationDate) AS TimeToAnswer
+    FROM Posts AS a
+    JOIN TaggedQuestions AS q ON a.ParentId = q.QuestionId
+    JOIN Posts AS p_q ON q.QuestionId = p_q.Id
+    WHERE a.PostTypeId = 2 -- 2 = Answer
+      AND a.OwnerUserId IS NOT NULL
+),
+UserAggregatedStats AS (
+    -- 3. Aggregate stats per user: count of answers, avg score, avg time to answer.
+    SELECT
+        ans.OwnerUserId,
+        COUNT(DISTINCT ans.AnswerId) AS TotalAnswers,
+        AVG(ans.AnswerScore) AS AverageAnswerScore,
+        AVG(EXTRACT(EPOCH FROM ans.TimeToAnswer)) AS AvgSecondsToAnswer,
+        SUM(ans.AnswerScore) AS TotalScoreContribution
+    FROM Answerers AS ans
+    GROUP BY ans.OwnerUserId
+    HAVING COUNT(DISTINCT ans.AnswerId) > 5 -- Only consider users with more than 5 answers in this tag/year
+),
+UserRank AS (
+    -- 4. Rank users based on their contribution and join with user details and badge counts.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        s.TotalAnswers,
+        s.AverageAnswerScore,
+        s.AvgSecondsToAnswer,
+        s.TotalScoreContribution,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY s.TotalScoreContribution DESC, s.AverageAnswerScore DESC) as Rank
+    FROM UserAggregatedStats AS s
+    JOIN Users AS u ON s.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+)
+-- 5. Final selection and further analysis.
+-- Find the top 100 ranked users and join with their most recent activity (last answer, last comment).
+SELECT
+    ur.Rank,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.TotalAnswers,
+    ur.AverageAnswerScore,
+    ur.AvgSecondsToAnswer / 3600 AS AvgHoursToAnswer,
+    ur.TotalScoreContribution,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    (ur.GoldBadges * 10 + ur.SilverBadges * 5 + ur.BronzeBadges) AS BadgeScore,
+    latest_post.LastActivityDate AS LastPostActivity,
+    latest_comment.LastCommentDate
+FROM UserRank AS ur
+OUTER APPLY (
+    SELECT MAX(p.LastActivityDate) AS LastActivityDate
+    FROM Posts p
+    WHERE p.OwnerUserId = ur.UserId
+) AS latest_post
+OUTER APPLY (
+    SELECT MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId = ur.UserId
+) AS latest_comment
+WHERE ur.Rank <= 100
+ORDER BY ur.Rank;

@@ -1,0 +1,96 @@
+-- {"query": "6032.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 806} 
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.Body,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '30 days'
+),
+tag_analytics AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(p.ViewCount) AS AvgViews,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.CommentCount) AS TotalComments
+  FROM recent_questions rq
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(rq.Tags, 2, length(rq.Tags)-2), '><')) AS TagName
+  ) AS t
+  JOIN Posts p ON p.Id = rq.PostId
+  JOIN Tags tg ON tg.TagName = t.TagName
+  WHERE tg.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT rq.PostId) AS QsIn30d,
+    SUM(rq.ViewCount) AS ViewsFromQs30d,
+    MAX(rq.LastActivityDate) AS LastActiveQuestion
+  FROM Users u
+  LEFT JOIN Posts rq ON rq.OwnerUserId = u.Id AND rq.PostTypeId = 1
+  WHERE u.Id IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+complex_metrics AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.CreationDate,
+    rq.LastActivityDate,
+    rq.ViewCount,
+    rq.Score,
+    rq.OwnerUserId,
+    rq.Tags,
+    rq.Body,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rq.PostId) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rq.PostId AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rq.PostId AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT STRING_AGG(CONCAT(vt.Name, ':', v.BountyAmount), '|') 
+       FROM Votes v JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+       WHERE v.PostId = rq.PostId AND v.VoteTypeId IN (2,3)) AS UpDownSummary,
+    (SELECT ARRAY_AGG(tg.TagName)
+       FROM Tags tg
+       JOIN unnest(string_to_array(substr(rq.Tags, 2, length(rq.Tags)-2), '><')) AS TagName ON tg.TagName = TagName.TagName
+       WHERE tg.IsModeratorOnly = 0) AS TagList
+  FROM recent_questions rq
+)
+SELECT
+  cm.PostId,
+  cm.Title,
+  cm.CreationDate,
+  cm.LastActivityDate,
+  cm.ViewCount,
+  cm.Score,
+  cm.OwnerUserId,
+  cm.Body,
+  cm.CommentCount,
+  cm.UpVotes,
+  cm.DownVotes,
+  ua.UserId AS TopContributorUserId,
+  ua.DisplayName AS TopContributorName,
+  ua.Reputation AS TopContributorRep,
+  ca.TagList,
+  ta.QuestionCount AS TaggedQuestionCount,
+  ta.AvgViews AS TaggedAvgViews,
+  ta.AvgScore AS TaggedAvgScore,
+  ta.TotalComments AS TaggedTotalComments
+FROM complex_metrics cm
+LEFT JOIN user_activity ua ON cm.OwnerUserId = ua.UserId
+LEFT JOIN tag_analytics ta ON true
+ORDER BY cm.CreationDate DESC
+LIMIT 100;

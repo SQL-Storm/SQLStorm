@@ -1,0 +1,75 @@
+WITH UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(P.CreationDate) AS LastPostDate
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        U.Reputation > 1000 AND P.CreationDate > (DATE '2024-10-01' - INTERVAL '1 year')
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.Tags,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS Rank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 10
+),
+UserBadges AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    UA.DisplayName,
+    UA.Reputation,
+    UA.PostCount,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    TQ.Title AS TopQuestionTitle,
+    TQ.Score AS TopQuestionScore,
+    STRING_AGG(DISTINCT T.TagName, ', ') FILTER (WHERE T.TagName IS NOT NULL) AS TopTags,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    AVG(V.BountyAmount) OVER (PARTITION BY UA.Id) AS AvgBounty
+FROM 
+    UserActivity UA
+LEFT JOIN 
+    TopQuestions TQ ON UA.Id = TQ.OwnerUserId AND TQ.Rank = 1
+LEFT JOIN 
+    UserBadges UB ON UA.Id = UB.UserId
+LEFT JOIN 
+    Posts P ON UA.Id = P.OwnerUserId
+LEFT JOIN 
+    Tags T ON P.Tags LIKE CONCAT('%<', T.TagName, '>%')
+LEFT JOIN 
+    Votes V ON P.Id = V.PostId AND V.VoteTypeId = 8
+WHERE 
+    UA.LastPostDate > (DATE '2024-10-01' - INTERVAL '6 months')
+    AND COALESCE(TQ.Score, 0) > 20
+GROUP BY 
+    UA.Id, UA.DisplayName, UA.Reputation, UA.PostCount, UA.QuestionCount, UA.AnswerCount, 
+    TQ.Title, TQ.Score, UB.GoldBadges, UB.SilverBadges, UB.BronzeBadges
+ORDER BY 
+    UA.Reputation DESC, TQ.Score DESC;

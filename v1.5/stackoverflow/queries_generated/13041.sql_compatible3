@@ -1,0 +1,70 @@
+WITH TopUserScores AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        RANK() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS UserRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2) AND 
+        p.CreationDate > (DATE '2024-10-01' - INTERVAL '1 year')
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+RecentActivity AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS ActivityCount
+    FROM
+        PostHistory ph
+    WHERE
+        ph.CreationDate > (DATE '2024-10-01' - INTERVAL '1 month')
+    GROUP BY
+        ph.PostId
+),
+FinalResults AS (
+    SELECT 
+        tus.Id,
+        tus.DisplayName,
+        tus.TotalScore,
+        ra.ActivityCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY tus.UserRank ORDER BY COALESCE(ra.ActivityCount, 0) DESC) AS RankWithinTier
+    FROM
+        TopUserScores AS tus
+    LEFT JOIN
+        -- Map tus.Id to the corresponding Post's OwnerUserId via Post
+        RecentActivity AS ra ON tus.Id = (
+            SELECT p.OwnerUserId 
+            FROM Posts p
+            WHERE p.Id = ra.PostId
+            LIMIT 1
+        )
+    LEFT JOIN
+        Badges AS b ON tus.Id = b.UserId AND b.Class = 1
+    WHERE
+        tus.UserRank <= 100
+    GROUP BY
+        tus.Id, tus.DisplayName, tus.TotalScore, ra.ActivityCount
+)
+SELECT 
+    fr.Id,
+    fr.DisplayName,
+    fr.TotalScore,
+    COALESCE(fr.ActivityCount, 0) AS RecentActivity,
+    COALESCE(fr.GoldBadges, 0) AS GoldBadges,
+    fr.RankWithinTier,
+    CASE 
+        WHEN fr.GoldBadges > 0 THEN 'High Achiever'
+        WHEN fr.ActivityCount > 50 THEN 'Active Contributor'
+        ELSE 'Regular User'
+    END AS UserCategory
+FROM
+    FinalResults AS fr
+WHERE
+    fr.RankWithinTier <= 10
+ORDER BY
+    fr.TotalScore DESC, fr.RecentActivity DESC;

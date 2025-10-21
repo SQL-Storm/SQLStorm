@@ -1,0 +1,50 @@
+-- {"query": "13009.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 565} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+    FROM Users u
+    WHERE u.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '3 months'
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.PostTypeId = 1 AND p.CreationDate > CURRENT_TIMESTAMP - INTERVAL '1 year'
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount
+),
+TopContributors AS (
+    SELECT
+        q.OwnerUserId,
+        COUNT(q.Id) AS QuestionsPosted,
+        AVG(q.Score) AS AvgQuestionScore,
+        SUM(CASE WHEN q.ViewCount > 1000 THEN 1 ELSE 0 END) AS HighViewQuestions
+    FROM QuestionMetrics q
+    GROUP BY q.OwnerUserId
+    HAVING COUNT(q.Id) > 5
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    tc.QuestionsPosted,
+    tc.AvgQuestionScore,
+    tc.HighViewQuestions,
+    COALESCE(b.BadgeCount, 0) AS BadgeCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN LENGTH(ph.Text) ELSE 0 END) AS TotalInitialBodyLength
+FROM ActiveUsers au
+JOIN TopContributors tc ON au.Id = tc.OwnerUserId
+LEFT JOIN Badges b ON au.Id = b.UserId AND b.Class = 1
+LEFT JOIN PostHistory ph ON au.Id = ph.UserId AND ph.PostHistoryTypeId = 2
+WHERE au.Rank <= 100
+GROUP BY au.DisplayName, au.Reputation, tc.QuestionsPosted, tc.AvgQuestionScore, tc.HighViewQuestions, b.BadgeCount
+ORDER BY au.Reputation DESC, tc.QuestionsPosted DESC;

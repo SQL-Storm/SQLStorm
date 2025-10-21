@@ -1,0 +1,110 @@
+WITH 
+-- 1. Compute a composite score for each user
+user_composite AS (
+    SELECT 
+        u.Id                     AS user_id,
+        u.DisplayName            AS display_name,
+        u.Reputation,
+        u.UpVotes - u.DownVotes  AS vote_balance,
+        COALESCE(g.gold_cnt,0) * 100
+        + COALESCE(s.silver_cnt,0) * 50
+        + COALESCE(b.bronze_cnt,0) * 10 AS badge_points,
+        (u.Reputation 
+         + (u.UpVotes - u.DownVotes) 
+         + COALESCE(g.gold_cnt,0) * 100
+         + COALESCE(s.silver_cnt,0) * 50
+         + COALESCE(b.bronze_cnt,0) * 10) AS total_score
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS gold_cnt
+        FROM Badges 
+        WHERE Class = 1 
+        GROUP BY UserId
+    ) g ON g.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS silver_cnt
+        FROM Badges 
+        WHERE Class = 2 
+        GROUP BY UserId
+    ) s ON s.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS bronze_cnt
+        FROM Badges 
+        WHERE Class = 3 
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+),
+
+-- 2. Take the top 100 users by the composite score
+top_users AS (
+    SELECT *
+    FROM user_composite
+    ORDER BY total_score DESC
+    LIMIT 100
+),
+
+-- 3. Aggregate post activity per user
+user_posts AS (
+    SELECT 
+        p.OwnerUserId               AS user_id,
+        COUNT(*)                    AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answers,
+        AVG(p.Score)                AS avg_post_score,
+        MAX(p.CreationDate)         AS last_post_date
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    GROUP BY p.OwnerUserId
+),
+
+-- 4. Extract tag usage per user
+user_tag_usage AS (
+    SELECT 
+        p.OwnerUserId AS user_id,
+        tag           AS tag_name,
+        COUNT(*)      AS tag_count
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT REGEXP_SPLIT_TO_TABLE(REGEXP_REPLACE(p.Tags, '^<|>$', '', 'g'), '><') AS tag
+    ) AS t
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId = 1                     -- only questions have tags
+    GROUP BY p.OwnerUserId, tag
+),
+
+-- 5. For each top user, keep the three most used tags
+user_top_tags AS (
+    SELECT 
+        uta.user_id,
+        uta.tag_name,
+        uta.tag_count,
+        ROW_NUMBER() OVER (PARTITION BY uta.user_id ORDER BY uta.tag_count DESC) AS rn
+    FROM user_tag_usage uta
+    WHERE uta.user_id IN (SELECT user_id FROM top_users)
+)
+SELECT 
+    tu.user_id,
+    tu.display_name,
+    tu.Reputation AS reputation,
+    tu.vote_balance,
+    tu.badge_points,
+    tu.total_score,
+    COALESCE(up.total_posts,0)            AS total_posts,
+    COALESCE(up.questions,0)              AS question_count,
+    COALESCE(up.answers,0)                AS answer_count,
+    ROUND(COALESCE(up.avg_post_score,0),2) AS avg_post_score,
+    up.last_post_date,
+    STRING_AGG(DISTINCT (utt.tag_name || '(' || utt.tag_count || ')'), ', '
+        ORDER BY utt.tag_count DESC) AS top_3_tags
+FROM top_users tu
+LEFT JOIN user_posts up      ON up.user_id = tu.user_id
+LEFT JOIN (
+    SELECT user_id, tag_name, tag_count
+    FROM user_top_tags
+) utt ON utt.user_id = tu.user_id
+GROUP BY 
+    tu.user_id, tu.display_name, tu.Reputation, tu.vote_balance,
+    tu.badge_points, tu.total_score,
+    up.total_posts, up.questions, up.answers, up.avg_post_score, up.last_post_date
+ORDER BY tu.total_score DESC;

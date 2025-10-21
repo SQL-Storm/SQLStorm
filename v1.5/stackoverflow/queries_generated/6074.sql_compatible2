@@ -1,0 +1,167 @@
+WITH
+RecentPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+Enriched AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.ParentId,
+    rp.AcceptedAnswerId,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    b.Date AS BadgeDate,
+    b.TagBased
+  FROM RecentPosts rp
+  LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+),
+UserEngagement AS (
+  SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    CreationDate AS UserCreationDate,
+    LastAccessDate,
+    SUM(CASE WHEN CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 1 ELSE 0 END) OVER (PARTITION BY UserId) AS TotalPosts30,
+    SUM(CASE WHEN LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 1 ELSE 0 END) OVER (PARTITION BY UserId) AS ActivePosts30,
+    SUM(CASE WHEN LastEditDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 1 ELSE 0 END) OVER (PARTITION BY UserId) AS Edits30
+  FROM Enriched
+),
+PostLinksAgg AS (
+  SELECT
+    rp.PostId,
+    COUNT(pl.Id) AS LinkCount,
+    SUM(CASE WHEN lt.Id = 3 THEN 1 ELSE 0 END) AS DuplicateLinks
+  FROM RecentPosts rp
+  LEFT JOIN PostLinks pl ON rp.PostId = pl.PostId
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY rp.PostId
+),
+TagAndContent AS (
+  SELECT
+    rp.PostId,
+    CASE WHEN rp.Tags IS NOT NULL AND rp.Tags <> '' THEN 1 ELSE 0 END AS HasTags,
+    CASE WHEN rp.Body IS NOT NULL AND LENGTH(rp.Body) > 0 THEN 1 ELSE 0 END AS HasBody,
+    CASE WHEN rp.Title IS NOT NULL AND LENGTH(rp.Title) > 0 THEN 1 ELSE 0 END AS HasTitle,
+    (CASE WHEN rp.Tags IS NOT NULL AND rp.Tags <> '' THEN 1 ELSE 0 END
+     + CASE WHEN rp.Body IS NOT NULL AND LENGTH(rp.Body) > 0 THEN 1 ELSE 0 END) AS TagBodyScore
+  FROM RecentPosts rp
+),
+Unionized AS (
+  SELECT
+    UserId,
+    PostId,
+    PostTypeId,
+    Title,
+    Tags,
+    CreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    CommentCount,
+    AnswerCount,
+    FavoriteCount,
+    Body,
+    ParentId,
+    AcceptedAnswerId,
+    UserDisplayName AS DisplayNameAlias,
+    Reputation
+  FROM Enriched
+  UNION ALL
+  SELECT
+    UserId,
+    PostId,
+    PostTypeId,
+    Title,
+    Tags,
+    CreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    CommentCount,
+    AnswerCount,
+    FavoriteCount,
+    Body,
+    ParentId,
+    AcceptedAnswerId,
+    DisplayName,
+    Reputation
+  FROM UserEngagement
+  LIMIT 10000
+)
+SELECT
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.UserCreationDate,
+  u.LastAccessDate,
+  e.PostId,
+  e.PostTypeId,
+  e.Title,
+  e.Tags,
+  e.CreationDate,
+  e.LastActivityDate,
+  e.Score,
+  e.ViewCount,
+  e.CommentCount,
+  e.AnswerCount,
+  e.FavoriteCount,
+  e.Body,
+  e.ParentId,
+  e.AcceptedAnswerId,
+  bl.LinkCount,
+  bl.DuplicateLinks,
+  tg.HasTags,
+  tg.HasBody,
+  tg.HasTitle,
+  tg.TagBodyScore,
+  ug.TotalPosts30,
+  ug.ActivePosts30,
+  ug.Edits30
+FROM Unionized e
+LEFT JOIN PostLinksAgg bl ON e.PostId = bl.PostId
+LEFT JOIN TagAndContent tg ON e.PostId = tg.PostId
+LEFT JOIN UserEngagement ug ON e.UserId = ug.UserId
+ORDER BY e.LastActivityDate DESC
+LIMIT 500;

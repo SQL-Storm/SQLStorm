@@ -1,0 +1,106 @@
+-- {"query": "25094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1734} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation,0)                     AS Reputation,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1      -- UpMod
+                WHEN v.VoteTypeId = 3 THEN -1     -- DownMod
+                ELSE 0
+            END)                                      AS VoteScore,
+        MAX(p.CreationDate)                         AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Votes v    ON v.UserId = u.Id
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *,
+           ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC, VoteScore DESC) AS rn
+    FROM UserStats
+    WHERE Reputation > 1000
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                                    AS QuestionCount,
+        SUM(p.Score)                                   AS TotalScore,
+        ROUND(AVG(p.ViewCount)::numeric,2)             AS AvgViews,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') 
+            FILTER (WHERE u.Id IS NOT NULL)           AS ActiveUsers
+    FROM Tags t
+    JOIN Posts p 
+        ON p.PostTypeId = 1                                -- only questions
+       AND p.Tags LIKE CONCAT('%<',t.TagName,'>%')
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50
+),
+Combined AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.VoteScore,
+        tu.LastPostDate,
+        ts.TagName,
+        ts.QuestionCount,
+        ts.TotalScore,
+        ts.AvgViews,
+        ts.ActiveUsers
+    FROM TopUsers tu
+    LEFT JOIN LATERAL (
+        SELECT t.TagName, t.QuestionCount, t.TotalScore, t.AvgViews, t.ActiveUsers
+        FROM TagStats t
+        ORDER BY t.TotalScore DESC
+        LIMIT 1
+    ) ts ON true
+    WHERE tu.rn <= 10
+)
+SELECT
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.VoteScore,
+    TO_CHAR(c.LastPostDate,'YYYY-MM-DD') AS LastPost,
+    COALESCE(c.TagName,'N/A')               AS TopTag,
+    c.QuestionCount,
+    c.TotalScore,
+    c.AvgViews,
+    CASE 
+        WHEN c.ActiveUsers IS NULL THEN 'None'
+        ELSE c.ActiveUsers
+    END                                     AS ActiveUsersList
+FROM Combined c
+ORDER BY c.Reputation DESC, c.GoldBadges DESC, c.VoteScore DESC
+
+UNION ALL
+
+SELECT
+    NULL                                   AS Id,
+    '--- Summary ---'                      AS DisplayName,
+    NULL                                   AS Reputation,
+    NULL                                   AS GoldBadges,
+    NULL                                   AS SilverBadges,
+    NULL                                   AS BronzeBadges,
+    SUM(VoteScore) OVER ()                 AS VoteScore,
+    NULL                                   AS LastPost,
+    NULL                                   AS TopTag,
+    NULL                                   AS QuestionCount,
+    NULL                                   AS TotalScore,
+    NULL                                   AS AvgViews,
+    NULL                                   AS ActiveUsersList
+FROM Combined
+LIMIT 11;

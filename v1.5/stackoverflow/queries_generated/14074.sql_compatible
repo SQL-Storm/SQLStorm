@@ -1,0 +1,83 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.ParentId, 
+        p.OwnerUserId, 
+        p.LastActivityDate, 
+        p.ViewCount,
+        CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END AS AnswerCount,
+        CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId ELSE NULL END AS AcceptedAnswerId,
+        CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END AS AnswerScore,
+        CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END AS QuestionScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        COALESCE(u.UpVotes, 0) AS OwnerUpVotes,
+        COALESCE(u.DownVotes, 0) AS OwnerDownVotes,
+        COALESCE(b.Name, '') AS OwnerBadges,
+        COALESCE(b.Class, 0) AS OwnerBadgeClass,
+        COALESCE(b.TagBased, 0) AS OwnerBadgeTagBased,
+        COALESCE(b.Date, p.CreationDate) AS OwnerBadgeDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+),
+comments AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(c.Score) AS CommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+),
+votes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    GROUP BY v.PostId
+),
+links AS (
+    SELECT
+        l.PostId,
+        COUNT(CASE WHEN l.LinkTypeId = 1 THEN 1 END) AS LinkedCount,
+        COUNT(CASE WHEN l.LinkTypeId = 3 THEN 1 END) AS DuplicateCount
+    FROM PostLinks l
+    GROUP BY l.PostId
+)
+SELECT
+    c.Id,
+    c.PostTypeId,
+    c.ParentId,
+    c.OwnerUserId,
+    c.LastActivityDate,
+    c.ViewCount,
+    c.AnswerCount,
+    c.AcceptedAnswerId,
+    c.AnswerScore,
+    c.QuestionScore,
+    c.IsClosed,
+    c.IsCommunityOwned,
+    c.OwnerReputation,
+    c.OwnerUpVotes,
+    c.OwnerDownVotes,
+    c.OwnerBadges,
+    c.OwnerBadgeClass,
+    c.OwnerBadgeTagBased,
+    c.OwnerBadgeDate,
+    COALESCE(comments.CommentCount, 0) AS CommentCount,
+    COALESCE(comments.CommentScore, 0) AS CommentScore,
+    COALESCE(votes.UpVotes, 0) AS UpVotes,
+    COALESCE(votes.DownVotes, 0) AS DownVotes,
+    COALESCE(votes.Favorites, 0) AS Favorites,
+    COALESCE(links.LinkedCount, 0) AS LinkedCount,
+    COALESCE(links.DuplicateCount, 0) AS DuplicateCount
+FROM cte c
+LEFT JOIN comments ON c.Id = comments.PostId
+LEFT JOIN votes ON c.Id = votes.PostId
+LEFT JOIN links ON c.Id = links.PostId
+ORDER BY c.LastActivityDate DESC
+LIMIT 100;

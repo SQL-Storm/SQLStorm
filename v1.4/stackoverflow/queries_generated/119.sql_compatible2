@@ -1,0 +1,72 @@
+WITH UserPostStats AS (
+  SELECT u.Id AS UserId,
+         COUNT(p.Id) AS PostCount,
+         COALESCE(SUM(p.Score), 0) AS ScoreSum,
+         MAX(p.LastActivityDate) AS LastActivity
+  FROM Users AS u
+  LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+TagUsage AS (
+  SELECT t.TagName AS Tag, COUNT(*) AS TagCount
+  FROM Posts AS p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS TagName
+  ) AS TagSplit
+  JOIN Tags AS t ON t.TagName = TagSplit.TagName
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+RecentVotes AS (
+  SELECT p.Id AS PostId, COUNT(v.Id) AS VoteCount
+  FROM Posts AS p
+  LEFT JOIN Votes AS v ON v.PostId = p.Id
+  WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+  GROUP BY p.Id
+),
+TopPosts AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate
+  FROM Posts AS p
+  WHERE p.PostTypeId = 1
+),
+TopPostsRanked AS (
+  SELECT tp.Id,
+         tp.Title,
+         tp.OwnerUserId,
+         tp.Score,
+         tp.ViewCount,
+         tp.CreationDate,
+         ROW_NUMBER() OVER (ORDER BY tp.Score DESC, tp.ViewCount DESC, tp.CreationDate DESC) AS rn
+  FROM TopPosts AS tp
+)
+SELECT
+  COALESCE(u.DisplayName, CAST(u.Id AS VARCHAR(20))) AS UserDisplayName,
+  u.Reputation,
+  ups.PostCount AS UserPostCount,
+  ups.ScoreSum AS UserScoreSum,
+  ups.LastActivity AS LastUserActivity,
+  tu.Tag AS TopTagUsed,
+  tpRank.Score AS TopPostScore,
+  rv.VoteCount AS RecentPostVotes
+FROM Users AS u
+LEFT JOIN UserPostStats AS ups ON ups.UserId = u.Id
+LEFT JOIN (
+  SELECT TagUsage.Tag, TagUsage.TagCount
+  FROM TagUsage
+  ORDER BY TagUsage.TagCount DESC
+  LIMIT 1
+) AS tu ON TRUE
+LEFT JOIN (
+  SELECT tpr.Id, tpr.Score
+  FROM TopPostsRanked AS tpr
+  WHERE tpr.OwnerUserId = u.Id
+  ORDER BY tpr.Score DESC
+  LIMIT 1
+) AS tpRank ON TRUE
+LEFT JOIN RecentVotes AS rv ON rv.PostId IN (
+  SELECT p.Id
+  FROM Posts AS p
+  WHERE p.OwnerUserId = u.Id
+)
+ORDER BY u.Reputation DESC, u.CreationDate ASC
+LIMIT 100;

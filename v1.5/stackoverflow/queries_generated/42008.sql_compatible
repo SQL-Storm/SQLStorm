@@ -1,0 +1,22 @@
+SELECT DISTINCT U.DisplayName,
+                P.Title,
+                COUNT(V.Id) AS VoteCount,
+                COUNT(C.Id) AS CommentCount,
+                COUNT(DISTINCT T.TagName) AS TagCount
+FROM Users U
+JOIN Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+LEFT JOIN Comments C ON P.Id = C.PostId
+LEFT JOIN (
+    SELECT P2.Id AS Id, T.TagName
+    FROM Posts P2
+    CROSS JOIN LATERAL (
+        SELECT TRIM(value) AS TagName
+        FROM UNNEST(string_to_array(substr(P2.Tags, 2, length(P2.Tags) - 2), '><')) AS value
+    ) AS T
+) AS T ON P.Id = T.Id
+WHERE P.PostTypeId = 1
+GROUP BY U.DisplayName, P.Title
+HAVING COUNT(V.Id) > 0 OR COUNT(C.Id) > 0
+ORDER BY VoteCount DESC, CommentCount DESC, TagCount DESC
+LIMIT 100;

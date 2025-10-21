@@ -1,0 +1,95 @@
+-- {"query": "50077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1093} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.FavoriteCount) AS TotalFavorites,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.CreationDate > (NOW() - INTERVAL '5 year')
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) > 50 AND SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) > 10
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionResponseMetrics AS (
+    SELECT
+        q.OwnerUserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgSecondsToAccept,
+        COUNT(DISTINCT a.OwnerUserId) AS DistinctHelpers
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        COUNT(DISTINCT v.Id) AS UpvotesGiven
+    FROM Comments c
+    LEFT JOIN Votes v ON c.UserId = v.UserId AND v.VoteTypeId = 2 -- UpMod
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC, uas.TotalScore DESC) AS GlobalRank,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    (uas.TotalAnswers::decimal / NULLIF(uas.TotalQuestions, 0)) AS AnswerQuestionRatio,
+    uas.TotalScore / uas.TotalPosts::decimal AS AvgScorePerPost,
+    uas.TotalQuestionViews,
+    ubr.GoldBadges,
+    ubr.SilverBadges,
+    ubr.BronzeBadges,
+    (ubr.LastBadgeDate - ubr.FirstBadgeDate) AS BadgeCollectionPeriod,
+    qrm.AvgSecondsToAccept / 3600.0 AS AvgHoursToAcceptedAnswer,
+    qrm.DistinctHelpers,
+    ue.TotalComments,
+    ue.UpvotesGiven,
+    -- Composite Engagement Score
+    (
+        LOG(u.Reputation + 1) * 10 +
+        uas.TotalScore * 0.05 +
+        uas.TotalFavorites * 0.2 +
+        ubr.GoldBadges * 100 +
+        ubr.SilverBadges * 20 +
+        ubr.BronzeBadges * 5 +
+        ue.UpvotesGiven * 0.1 -
+        (qrm.AvgSecondsToAccept / 3600.0)
+    ) AS EngagementScore
+FROM Users u
+JOIN UserActivitySummary uas ON u.Id = uas.OwnerUserId
+JOIN UserBadgeRanks ubr ON u.Id = ubr.UserId
+LEFT JOIN QuestionResponseMetrics qrm ON u.Id = qrm.OwnerUserId
+LEFT JOIN UserEngagement ue ON u.Id = ue.UserId
+WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000)
+AND u.UpVotes > u.DownVotes * 5
+AND u.Id IN (
+    SELECT OwnerUserId FROM Posts
+    WHERE PostTypeId = 1 AND Tags LIKE '%<sql>%'
+    INTERSECT
+    SELECT OwnerUserId FROM Posts
+    WHERE PostTypeId = 1 AND Tags LIKE '%<performance>%'
+)
+ORDER BY EngagementScore DESC, GlobalRank ASC
+LIMIT 250;

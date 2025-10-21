@@ -1,0 +1,53 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class AS BadgeClass,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.CreationDate AS LastRevisionDate,
+    ph.Comment,
+    v.VoteTypeId,
+    AVG(v.BountyAmount) AS AvgBountyPerPost
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         Id, 
+         UserId, 
+         MAX(CreationDate) AS LastAccessDate
+     FROM 
+         PostHistory
+     GROUP BY 
+         Id, UserId) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (SELECT 
+         Id, 
+         UserId, 
+         BadgeClass, 
+         Date
+     FROM 
+         Badges
+     WHERE 
+         TagBased = FALSE) b ON u.Id = b.UserId
+RIGHT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Tags t ON POSITION(t.TagName IN p.Tags) > 0
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.DisplayName, u.Reputation, b.Class, ph.RevisionGUID, ph.CreationDate, ph.Comment, v.VoteTypeId, t.TagName, p.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AVG(p.Score) DESC, 
+    AVG(p.ViewCount) DESC
+LIMIT 100;

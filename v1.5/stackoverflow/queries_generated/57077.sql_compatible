@@ -1,0 +1,105 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS QuestionViewCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.ViewCount ELSE 0 END) AS AnswerViewCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS AnswerScore,
+        MAX(P.LastActivityDate) AS LastPostActivity
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        P.Title,
+        P.AnswerCount,
+        P.CommentCount,
+        P.Tags,
+        COUNT(C.Id) AS TotalComments,
+        COUNT(V.Id) AS TotalVotes,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM
+        Posts P
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.OwnerUserId, P.LastActivityDate, P.Title, P.AnswerCount, P.CommentCount, P.Tags
+),
+TagAnalysis AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TagCount,
+        EXTRACT(YEAR FROM P.CreationDate) AS Year,
+        COUNT(P.Id) AS PostsPerYear,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueAuthorsPerYear
+    FROM
+        Tags T
+    JOIN
+        Posts P ON P.Tags LIKE '%<' || T.TagName || '>%'
+    GROUP BY
+        T.Id, T.TagName, T.Count, EXTRACT(YEAR FROM P.CreationDate)
+)
+SELECT
+    UA.UserId,
+    UA.Reputation,
+    UA.UserCreationDate,
+    UA.LastAccessDate,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.QuestionViewCount,
+    UA.AnswerViewCount,
+    UA.QuestionScore,
+    UA.AnswerScore,
+    UA.LastPostActivity,
+    PA.PostId,
+    PA.PostTypeId,
+    PA.PostCreationDate,
+    PA.Score AS PostScore,
+    PA.ViewCount AS PostViewCount,
+    PA.TotalComments,
+    PA.TotalVotes,
+    PA.TotalUpVotes,
+    PA.TotalDownVotes,
+    TA.TagId,
+    TA.TagName,
+    TA.TagCount,
+    TA.Year,
+    TA.PostsPerYear,
+    TA.UniqueAuthorsPerYear
+FROM
+    UserActivity UA
+JOIN
+    PostAnalysis PA ON UA.UserId = PA.OwnerUserId
+JOIN
+    TagAnalysis TA ON PA.Tags LIKE '%<' || TA.TagName || '>%'
+WHERE
+    UA.TotalPosts > 10
+    AND PA.PostCreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    AND TA.PostsPerYear > 50
+ORDER BY
+    UA.Reputation DESC,
+    PA.PostScore DESC,
+    TA.PostsPerYear DESC
+LIMIT 100;

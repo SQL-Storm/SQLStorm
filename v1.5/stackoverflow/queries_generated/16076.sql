@@ -1,0 +1,175 @@
+-- {"query": "16076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 179795, "output_tokens": 166936} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+            EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS MonthsActive,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) AS ReputationPercentile
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate >= '2015-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        CASE 
+            WHEN q.AcceptedAnswerId = a.Id THEN 1
+            ELSE 0
+        END AS IsAccepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToAnswer,
+        LAG(a.Score) OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS PreviousAnswerScore,
+        AVG(a.Score) OVER (PARTITION BY q.Id) AS AvgAnswerScoreForQuestion,
+        DENSE_RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankByScore
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1
+        AND a.PostTypeId = 2
+        AND q.ClosedDate IS NULL
+        AND q.CreationDate >= '2018-01-01'
+        AND q.ViewCount > 100
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUseCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAskers,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::FLOAT / 
+            NULLIF(COUNT(DISTINCT p.Id), 0) AS AcceptanceRate
+    FROM Tags t
+    INNER JOIN Posts p ON '<' || t.TagName || '>' = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1
+        AND t.Count > 500
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+ComplexAggregation AS (
+    SELECT 
+        uem.Id AS UserId,
+        uem.DisplayName,
+        uem.Reputation,
+        uem.ReputationRank,
+        uem.GoldBadges + uem.SilverBadges + uem.BronzeBadges AS TotalBadges,
+        COALESCE(qstats.QuestionCount, 0) AS QuestionsAsked,
+        COALESCE(astats.AnswersGiven, 0) AS AnswersGiven,
+        COALESCE(astats.AcceptedAnswers, 0) AS AcceptedAnswers,
+        COALESCE(astats.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(vstats.TotalUpvotes, 0) AS TotalUpvotes,
+        COALESCE(cstats.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN uem.MonthsActive > 0 THEN 
+                (COALESCE(qstats.QuestionCount, 0) + COALESCE(astats.AnswersGiven, 0))::FLOAT / uem.MonthsActive
+            ELSE 0
+        END AS PostsPerMonth,
+        (SELECT STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName)
+         FROM QuestionAnswerStats qas2
+         INNER JOIN Posts p2 ON qas2.QuestionId = p2.Id
+         CROSS JOIN LATERAL unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><')) AS tag
+         INNER JOIN Tags tp ON tp.TagName = tag
+         WHERE qas2.AnswerOwnerId = uem.Id
+         LIMIT 5) AS TopAnswerTags
+    FROM UserEngagementMetrics uem
+    LEFT JOIN LATERAL (
+        SELECT 
+            COUNT(*) AS QuestionCount,
+            AVG(Score) AS AvgQuestionScore
+        FROM Posts p
+        WHERE p.OwnerUserId = uem.Id 
+            AND p.PostTypeId = 1
+    ) qstats ON true
+    LEFT JOIN LATERAL (
+        SELECT 
+            COUNT(*) AS AnswersGiven,
+            SUM(CASE WHEN qas.IsAccepted = 1 THEN 1 ELSE 0 END) AS AcceptedAnswers,
+            AVG(qas.AnswerScore) AS AvgAnswerScore,
+            AVG(qas.HoursToAnswer) AS AvgHoursToAnswer
+        FROM QuestionAnswerStats qas
+        WHERE qas.AnswerOwnerId = uem.Id
+    ) astats ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS TotalUpvotes
+        FROM Votes v
+        INNER JOIN Posts p ON v.PostId = p.Id
+        WHERE p.OwnerUserId = uem.Id
+            AND v.VoteTypeId = 2
+    ) vstats ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS CommentCount
+        FROM Comments c
+        WHERE c.UserId = uem.Id
+            AND c.Score >= 0
+    ) cstats ON true
+    WHERE uem.ReputationPercentile >= 0.90
+)
+SELECT 
+    ca.DisplayName,
+    ca.Reputation,
+    ca.ReputationRank,
+    ca.TotalBadges,
+    ca.QuestionsAsked,
+    ca.AnswersGiven,
+    ca.AcceptedAnswers,
+    ROUND(ca.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+    ca.TotalUpvotes,
+    ca.CommentCount,
+    ROUND(ca.PostsPerMonth::numeric, 3) AS PostsPerMonth,
+    COALESCE(ca.TopAnswerTags, 'N/A') AS TopAnswerTags,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId)
+     FROM Posts p
+     INNER JOIN PostLinks pl ON p.Id = pl.PostId
+     WHERE p.OwnerUserId = ca.UserId
+         AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    COALESCE((SELECT tp.AvgQuestionScore
+     FROM QuestionAnswerStats qas
+     INNER JOIN Posts p ON qas.QuestionId = p.Id
+     CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+     INNER JOIN TagPerformance tp ON tp.TagName = tag
+     WHERE qas.AnswerOwnerId = ca.UserId
+         AND qas.IsAccepted = 1
+     ORDER BY tp.AvgQuestionScore DESC
+     LIMIT 1), 0) AS BestTagAvgScore,
+    CASE 
+        WHEN ca.AnswersGiven > 0 THEN 
+            ROUND((ca.AcceptedAnswers::FLOAT / ca.AnswersGiven * 100)::numeric, 2)
+        ELSE 0
+    END AS AcceptanceRatePercent
+FROM ComplexAggregation ca
+WHERE ca.AnswersGiven > 10
+    AND ca.PostsPerMonth > 0.5
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Votes v
+        INNER JOIN Posts p ON v.PostId = p.Id
+        WHERE p.OwnerUserId = ca.UserId
+            AND v.VoteTypeId IN (4, 12)
+        HAVING COUNT(*) > 5
+    )
+ORDER BY 
+    ca.Reputation * 0.4 + 
+    ca.AcceptedAnswers * 15 * 0.3 + 
+    ca.TotalUpvotes * 0.2 + 
+    ca.TotalBadges * 10 * 0.1 DESC
+LIMIT 100;

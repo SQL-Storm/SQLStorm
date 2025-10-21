@@ -1,0 +1,113 @@
+WITH UserPostMetrics AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AverageViewCount,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG((CAST((p.CreationDate - LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS NUMERIC))) AS AvgSecondsBetweenPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswerSpeed AS (
+    SELECT
+        a.OwnerUserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgSecondsToAnswer
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 AND q.PostTypeId = 1 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(*) >= 10
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT COUNT(DISTINCT t.TagName)
+         FROM Badges b2
+         JOIN Tags t ON b2.Name = t.TagName
+         WHERE b2.UserId = b.UserId AND b2.TagBased = B'1') AS UniqueTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserEngagement AS (
+    SELECT
+        v.UserId,
+        COUNT(v.Id) AS TotalVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCast,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = v.UserId) AS CommentsMade
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) AS MembershipDays,
+    upm.TotalPosts,
+    upm.AnswerCount,
+    uas.AvgSecondsToAnswer / 3600.0 AS AvgHoursToAnswer,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ue.CommentsMade,
+    (
+        LOG(u.Reputation + 1) * 10
+        + (COALESCE(upm.AnswerCount, 0) - COALESCE(upm.QuestionCount, 0)) * 2
+        + COALESCE(ubs.GoldBadges, 0) * 25
+        + COALESCE(ubs.SilverBadges, 0) * 10
+        + COALESCE(ubs.UniqueTagBadges, 0) * 5
+        + LN(COALESCE(ue.UpvotesCast, 1)) * 1.5
+        - LN(COALESCE(ue.DownvotesCast, 1))
+        - COALESCE(uas.AvgSecondsToAnswer / 86400.0, 30)
+    ) AS EngagementScore,
+    RANK() OVER (
+        ORDER BY (
+            LOG(u.Reputation + 1) * 10
+            + (COALESCE(upm.AnswerCount, 0) - COALESCE(upm.QuestionCount, 0)) * 2
+            + COALESCE(ubs.GoldBadges, 0) * 25
+            + COALESCE(ubs.SilverBadges, 0) * 10
+            + COALESCE(ubs.UniqueTagBadges, 0) * 5
+            + LN(COALESCE(ue.UpvotesCast, 1)) * 1.5
+            - LN(COALESCE(ue.DownvotesCast, 1))
+            - COALESCE(uas.AvgSecondsToAnswer / 86400.0, 30)
+        ) DESC NULLS LAST
+    ) AS EngagementRank,
+    CASE
+        WHEN u.Reputation > 100000 AND ubs.GoldBadges > 15 THEN 'Community Pillar'
+        WHEN u.Reputation > 25000 OR ubs.SilverBadges > 50 THEN 'Expert Contributor'
+        WHEN u.Reputation > 5000 THEN 'Valued Participant'
+        ELSE 'Member'
+    END AS UserTier,
+    (SELECT STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC)
+     FROM Badges b
+     WHERE b.UserId = u.Id AND b.Class = 1
+     LIMIT 3) AS RecentGoldBadges
+FROM
+    Users u
+LEFT JOIN UserPostMetrics upm ON u.Id = upm.OwnerUserId
+LEFT JOIN UserAnswerSpeed uas ON u.Id = uas.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT JOIN UserEngagement ue ON u.Id = ue.UserId
+WHERE
+    u.Reputation > 1000
+    AND u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    AND COALESCE(upm.AnswerCount, 0) > COALESCE(upm.QuestionCount, 0)
+    AND EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 11)
+    )
+    AND u.AboutMe IS NOT NULL
+    AND LENGTH(u.AboutMe) > 100
+ORDER BY
+    EngagementRank ASC, u.Reputation DESC
+LIMIT 200;

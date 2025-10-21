@@ -1,0 +1,262 @@
+with params as (
+    select 
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as end_month
+),
+months as (
+    select generate_series(p.start_month, p.end_month, interval '1 month') as month_start
+    from params p
+),
+q as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId as AskerId,
+        cast(p.CreationDate as date) as QuestionDate,
+        date_trunc('month', p.CreationDate) as QuestionMonth,
+        coalesce(p.Score,0) as QScore,
+        coalesce(p.ViewCount,0) as QViews,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select start_month from params)
+      and p.CreationDate <  (select end_month   from params) + interval '1 month'
+),
+a as (
+    select 
+        pa.Id as AnswerId,
+        pa.ParentId as QuestionId,
+        pa.OwnerUserId as AnswererId,
+        pa.CreationDate as AnswerDate,
+        coalesce(pa.Score,0) as AScore
+    from Posts pa
+    where pa.PostTypeId = 2
+      and pa.ParentId in (select QuestionId from q)
+),
+first_answer as (
+    select distinct on (QuestionId)
+        QuestionId,
+        AnswerId,
+        AnswererId,
+        AnswerDate
+    from a
+    order by QuestionId, AnswerDate
+),
+question_metrics as (
+    select
+        q.QuestionId,
+        q.QuestionMonth,
+        q.AskerId,
+        q.QScore,
+        q.QViews,
+        q.AcceptedAnswerId,
+        q.Title,
+        q.Tags,
+        fa.AnswerDate as FirstAnswerDate,
+        extract(epoch from (fa.AnswerDate - q.QuestionDate::timestamp)) / 3600.0 as HoursToFirstAnswer,
+        count(a.AnswerId) as AnswerCount,
+        avg(a.AScore::numeric) as AvgAnswerScore,
+        sum(case when a.AnswerId = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from q
+    left join a on a.QuestionId = q.QuestionId
+    left join first_answer fa on fa.QuestionId = q.QuestionId
+    group by q.QuestionId, q.QuestionMonth, q.AskerId, q.QScore, q.QViews, q.AcceptedAnswerId, q.Title, q.Tags, fa.AnswerDate, q.QuestionDate
+),
+question_tags as (
+    select
+        qm.QuestionId,
+        unnest(string_to_array(substring(qm.Tags from 2 for length(qm.Tags)-2), '><')) as TagName
+    from question_metrics qm
+    where qm.Tags is not null and qm.Tags like '<%>'
+),
+tag_meta as (
+    select qt.QuestionId, t.Id as TagId, t.TagName, t.Count as GlobalTagCount, coalesce(t.IsModeratorOnly, 0) as IsModOnly, coalesce(t.IsRequired, 0) as IsRequired
+    from question_tags qt
+    left join Tags t on lower(t.TagName) = lower(qt.TagName)
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        case 
+            when u.Reputation >= 50000 then 'Legend'
+            when u.Reputation >= 10000 then 'Expert'
+            when u.Reputation >= 2000 then 'Pro'
+            when u.Reputation >= 200 then 'Intermediate'
+            else 'Newbie'
+        end as RepBand
+    from Users u
+),
+comment_activity as (
+    select
+        q.QuestionId,
+        count(c.Id) filter (where c.CreationDate >= (select start_month from params) 
+                            and c.CreationDate < (select end_month from params) + interval '1 month') as CommentCountInWindow,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        max(c.CreationDate) as LastCommentDate
+    from q
+    left join Comments c on c.PostId = q.QuestionId
+    group by q.QuestionId
+),
+question_votes as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+    from Votes v
+    where v.PostId in (select QuestionId from q)
+    group by v.PostId
+),
+question_closure as (
+    select
+        ph.PostId as QuestionId,
+        min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as FirstClosedDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenDate,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenEvents,
+        bool_or(ph.Text like '%OriginalQuestionIds%') as HasDuplicateTargetsJson
+    from PostHistory ph
+    where ph.PostId in (select QuestionId from q)
+      and ph.PostHistoryTypeId in (10,11,35,36,52,53)
+    group by ph.PostId
+),
+question_links as (
+    select
+        pl.PostId as QuestionId,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount,
+        count(*) as TotalLinks
+    from PostLinks pl
+    where pl.PostId in (select QuestionId from q)
+    group by pl.PostId
+),
+per_tag_month as (
+    select
+        m.month_start,
+        coalesce(tm.TagName, '(untagged)') as TagName,
+        us.RepBand,
+        count(distinct qm.QuestionId) as Questions,
+        sum(qm.AnswerCount) as Answers,
+        avg(qm.HoursToFirstAnswer) as AvgHoursToFirstAnswer,
+        sum(qm.HasAcceptedAnswer) as QuestionsWithAccepted,
+        sum(coalesce(qv.UpVotes,0)) as QUpVotes,
+        sum(coalesce(qv.DownVotes,0)) as QDownVotes,
+        sum(coalesce(qv.Favorites,0)) as QFavorites,
+        sum(coalesce(qv.BountyTotal,0)) as QBounty,
+        sum(coalesce(qm.QViews,0)) as QViews,
+        sum(coalesce(qa.PositiveComments,0)) as PositiveComments,
+        sum(coalesce(ql.DuplicateCount,0)) as DuplicateLinks
+    from months m
+    left join question_metrics qm 
+        on qm.QuestionMonth = m.month_start
+    left join tag_meta tm 
+        on tm.QuestionId = qm.QuestionId
+    left join user_stats us 
+        on us.UserId = qm.AskerId
+    left join comment_activity qa 
+        on qa.QuestionId = qm.QuestionId
+    left join question_votes qv 
+        on qv.QuestionId = qm.QuestionId
+    left join question_closure qc 
+        on qc.QuestionId = qm.QuestionId
+    left join question_links ql 
+        on ql.QuestionId = qm.QuestionId
+    group by m.month_start, coalesce(tm.TagName, '(untagged)'), us.RepBand
+),
+ranked as (
+    select
+        ptm.*,
+        row_number() over (partition by ptm.month_start order by ptm.Questions desc, ptm.QViews desc) as rn_by_questions,
+        dense_rank() over (partition by ptm.month_start order by ptm.QUpVotes desc) as dr_by_upvotes,
+        percent_rank() over (partition by ptm.month_start order by ptm.AvgHoursToFirstAnswer nulls last) as pr_by_tta
+    from per_tag_month ptm
+),
+global_union as (
+    select 
+        month_start,
+        '(all-tags)' as TagName,
+        'All' as RepBand,
+        sum(Questions) as Questions,
+        sum(Answers) as Answers,
+        avg(AvgHoursToFirstAnswer) as AvgHoursToFirstAnswer,
+        sum(QuestionsWithAccepted) as QuestionsWithAccepted,
+        sum(QUpVotes) as QUpVotes,
+        sum(QDownVotes) as QDownVotes,
+        sum(QFavorites) as QFavorites,
+        sum(QBounty) as QBounty,
+        sum(QViews) as QViews,
+        sum(PositiveComments) as PositiveComments,
+        sum(DuplicateLinks) as DuplicateLinks
+    from per_tag_month
+    group by month_start
+    union all
+    select 
+        month_start, TagName, 'All' as RepBand,
+        sum(Questions), sum(Answers), avg(AvgHoursToFirstAnswer), sum(QuestionsWithAccepted),
+        sum(QUpVotes), sum(QDownVotes), sum(QFavorites), sum(QBounty), sum(QViews),
+        sum(PositiveComments), sum(DuplicateLinks)
+    from per_tag_month
+    group by month_start, TagName
+),
+final_set as (
+    select * from ranked
+    union all
+    select 
+        month_start, TagName, RepBand, Questions, Answers, AvgHoursToFirstAnswer, QuestionsWithAccepted,
+        QUpVotes, QDownVotes, QFavorites, QBounty, QViews, PositiveComments, DuplicateLinks,
+        null::int as rn_by_questions, null::int as dr_by_upvotes, null::float as pr_by_tta
+    from global_union
+),
+with_windows as (
+    select
+        fs.*,
+        sum(Questions) over (partition by TagName, RepBand order by month_start rows between 2 preceding and current row) as Questions3m,
+        sum(QViews) over (partition by TagName, RepBand order by month_start rows between 2 preceding and current row) as Views3m,
+        lag(Questions) over (partition by TagName, RepBand order by month_start) as PrevQuestions,
+        lag(QViews) over (partition by TagName, RepBand order by month_start) as PrevViews
+    from final_set fs
+)
+select
+    month_start,
+    TagName,
+    RepBand,
+    Questions,
+    Answers,
+    round(coalesce(AvgHoursToFirstAnswer, 0)::numeric, 2) as AvgHoursToFirstAnswer,
+    QuestionsWithAccepted,
+    QUpVotes,
+    QDownVotes,
+    QFavorites,
+    QBounty,
+    QViews,
+    PositiveComments,
+    DuplicateLinks,
+    rn_by_questions,
+    dr_by_upvotes,
+    round(coalesce(pr_by_tta, 0)::numeric, 4) as pr_by_tta,
+    Questions3m,
+    Views3m,
+    case 
+        when PrevQuestions is null or PrevQuestions = 0 then null
+        else round(((Questions - PrevQuestions)::numeric / nullif(PrevQuestions,0)) * 100.0, 2)
+    end as QuestionsGrowthPct,
+    case 
+        when PrevViews is null or PrevViews = 0 then null
+        else round(((QViews - PrevViews)::numeric / nullif(PrevViews,0)) * 100.0, 2)
+    end as ViewsGrowthPct,
+    case 
+        when coalesce(QUpVotes,0) - coalesce(QDownVotes,0) > 50
+         and coalesce(QFavorites,0) >= 10
+         and coalesce(QuestionsWithAccepted,0) >= (Questions/2)
+         and coalesce(AvgHoursToFirstAnswer, 1e9) < 12
+        then true else false
+    end as IsHotSegment
+from with_windows
+where month_start between (select start_month from params) and (select end_month from params)
+order by month_start desc, IsHotSegment desc, Questions desc, QViews desc, TagName, RepBand;

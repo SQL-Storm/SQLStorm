@@ -1,0 +1,138 @@
+WITH RecursiveTags AS (
+    SELECT 
+        p.Id AS PostId,
+        unnest(string_to_array(trim(both '><' from coalesce(p.Tags, '')), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+PostAnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(COALESCE(p.Score, 0)) AS AvgAnswerScore,
+        SUM(COALESCE(vt.UpVotes,0)) AS TotalAnswerUpVotes
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes v
+        WHERE v.VoteTypeId = 2
+        GROUP BY PostId
+    ) vt ON vt.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserBadgeRanks AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Badges b
+),
+UserActivityRanking AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COALESCE(SUM(v.VoteTypeScore),0) AS NetVoteScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, COALESCE(SUM(v.VoteTypeScore),0) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, 
+               SUM(
+                   CASE 
+                       WHEN VoteTypeId = 2 THEN 1 -- UpMod
+                       WHEN VoteTypeId = 3 THEN -1 -- DownMod
+                       ELSE 0 
+                   END) AS VoteTypeScore
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+ClosedQuestionDetails AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS INTEGER) ELSE NULL END) AS CloseReasonId,
+        MIN(ph.CreationDate) AS ClosedAt
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+QuestionLinkedDuplicates AS (
+    SELECT DISTINCT pl.PostId AS QuestionId, pl.RelatedPostId AS DuplicateOfId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COALESCE(pas.AnswerCount,0) AS AvgAnswers,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN (
+        SELECT rt.Tag, AVG(pas.AnswerCount) AS AnswerCount
+        FROM RecursiveTags rt
+        LEFT JOIN PostAnswerStats pas ON pas.QuestionId = rt.PostId
+        GROUP BY rt.Tag
+    ) pas ON pas.Tag = t.TagName
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    LIMIT 50
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    COALESCE(usr.DisplayName, q.OwnerDisplayName, 'Community') AS AskedBy,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    COALESCE(pas.AnswerCount, 0) AS NumberOfAnswers,
+    ROUND(COALESCE(pas.AvgAnswerScore,0),2) AS AvgAnswerScore,
+    cs.CloseReasonId,
+    crt.Name AS CloseReasonName,
+    STRING_AGG(DISTINCT t.Tag, ', ') AS Tags,
+    ua.PostsCount AS UserPosts,
+    ua.CommentsCount AS UserComments,
+    ua.NetVoteScore AS UserNetVotes,
+    ua.ActivityRank AS UserActivityRank,
+    ub.Name AS MostRecentBadge,
+    ub.Class AS BadgeClass,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.Score > 5) AS HighScoreComments,
+    MAX(c.CreationDate) AS LastCommentDate,
+    CASE 
+        WHEN q.ClosedDate IS NOT NULL THEN TRUE
+        ELSE FALSE
+    END AS IsClosed,
+    RANK() OVER (PARTITION BY COALESCE(cs.CloseReasonId,0) ORDER BY q.Score DESC, q.ViewCount DESC) AS RankWithinCloseReason,
+    COALESCE(pl.DuplicateOfId, NULL) AS DuplicateTargetId,
+    u.Reputation,
+    CONCAT(
+        CASE WHEN u.Location IS NULL THEN 'Location Unknown' ELSE u.Location END,
+        ' | ',
+        CASE WHEN u.WebsiteUrl IS NULL THEN 'No Website' ELSE u.WebsiteUrl END,
+        ' | Joined on ', TO_CHAR(u.CreationDate, 'YYYY-MM-DD')
+    ) AS UserInfo
+FROM Posts q
+LEFT JOIN PostAnswerStats pas ON pas.QuestionId = q.Id
+LEFT JOIN ClosedQuestionDetails cs ON cs.PostId = q.Id
+LEFT JOIN CloseReasonTypes crt ON crt.Id = cs.CloseReasonId
+LEFT JOIN RecursiveTags rt ON rt.PostId = q.Id
+LEFT JOIN Tags t ON t.TagName = rt.Tag
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN UserActivityRanking ua ON ua.UserId = u.Id
+LEFT JOIN UserBadgeRanks ub ON ub.UserId = u.Id AND ub.RecentBadgeRank = 1
+LEFT JOIN Comments c ON c.PostId = q.Id
+LEFT JOIN QuestionLinkedDuplicates pl ON pl.QuestionId = q.Id
+WHERE q.PostTypeId = 1
+  AND q.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+  AND (q.Score > 5 OR q.ViewCount > 1000)
+GROUP BY 
+    q.Id, q.Title, usr.DisplayName, q.OwnerDisplayName, q.CreationDate, q.Score, q.ViewCount,
+    pas.AnswerCount, pas.AvgAnswerScore, cs.CloseReasonId, crt.Name, ua.PostsCount, ua.CommentsCount,
+    ua.NetVoteScore, ua.ActivityRank, ub.Name, ub.Class, pl.DuplicateOfId, u.Reputation, u.Location, u.WebsiteUrl, u.CreationDate
+ORDER BY q.Score DESC, q.ViewCount DESC, q.CreationDate DESC
+LIMIT 100;

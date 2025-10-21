@@ -1,0 +1,148 @@
+with RecursiveBadges as (
+    select u.Id as UserId, 
+           u.DisplayName, 
+           b.Name as BadgeName, 
+           b.Class, 
+           row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+),
+RecentBadgeCounts as (
+    select UserId, 
+           count(*) filter (where Class = 1) as GoldBadges, 
+           count(*) filter (where Class = 2) as SilverBadges, 
+           count(*) filter (where Class = 3) as BronzeBadges
+    from RecursiveBadges
+    where rn <= 10
+    group by UserId
+),
+PostAggregates as (
+    select p.OwnerUserId,
+           count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+           count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+           avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+           avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+           sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+           max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserActivityWithRanks as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location,
+           coalesce(rc.GoldBadges, 0) as GoldBadges,
+           coalesce(rc.SilverBadges, 0) as SilverBadges,
+           coalesce(rc.BronzeBadges, 0) as BronzeBadges,
+           coalesce(pa.QuestionCount, 0) as QuestionCount,
+           coalesce(pa.AnswerCount, 0) as AnswerCount,
+           coalesce(pa.AvgQuestionScore, 0) as AvgQuestionScore,
+           coalesce(pa.AvgAnswerScore, 0) as AvgAnswerScore,
+           coalesce(pa.TotalQuestionViews, 0) as TotalQuestionViews,
+           pa.LastPostDate,
+           rank() over (order by u.Reputation desc) as ReputationRank,
+           dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationRepRank
+    from Users u
+    left join RecentBadgeCounts rc on u.Id = rc.UserId
+    left join PostAggregates pa on u.Id = pa.OwnerUserId
+    where u.Reputation > 1000 and u.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+),
+LatestPostComments as (
+    select c.PostId,
+           string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters,
+           max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '6 months')
+    group by c.PostId
+),
+QuestionAnswerDetails as (
+    select q.Id as QuestionId,
+           q.Title,
+           q.Tags,
+           q.CreationDate as QuestionCreation,
+           q.Score as QuestionScore,
+           q.ViewCount,
+           a.Id as AnswerId,
+           a.Score as AnswerScore,
+           a.OwnerUserId as AnswerOwnerUserId,
+           u.DisplayName as Answerer,
+           al.Commenters as AnswerCommenters,
+           al.LastCommentDate as AnswerLastCommentDate,
+           row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    left join LatestPostComments al on a.Id = al.PostId
+    where q.PostTypeId = 1 and q.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+),
+DuplicateQuestions as (
+    select pl.PostId as DuplicateQuestionId,
+           pl.RelatedPostId as OriginalQuestionId,
+           q1.Title as DuplicateTitle,
+           q2.Title as OriginalTitle
+    from PostLinks pl
+    join Posts q1 on q1.Id = pl.PostId and q1.PostTypeId = 1
+    join Posts q2 on q2.Id = pl.RelatedPostId and q2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserCloseVoteStats as (
+    select u.Id as UserId,
+           count(distinct ph.PostId) as ClosedPostsCount,
+           count(case when cast(ph.Comment as integer) = 101 then 1 end) as DuplicateCloseVotes,
+           count(case when cast(ph.Comment as integer) = 102 then 1 end) as OffTopicCloseVotes,
+           count(case when cast(ph.Comment as integer) = 103 then 1 end) as NeedsDetailCloseVotes
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId = 10
+    group by u.Id
+)
+
+select ua.Id as UserId,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.GoldBadges,
+       ua.SilverBadges,
+       ua.BronzeBadges,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.AvgQuestionScore,
+       ua.AvgAnswerScore,
+       ua.TotalQuestionViews,
+       ua.Location,
+       ua.ReputationRank,
+       ua.LocationRepRank,
+       qc.QuestionId,
+       qc.Title as QuestionTitle,
+       qc.Tags,
+       qc.QuestionCreation,
+       qc.QuestionScore,
+       qc.ViewCount,
+       qc.AnswerId,
+       qc.AnswerScore,
+       qc.Answerer,
+       qc.AnswerCommenters,
+       qc.AnswerLastCommentDate,
+       dc.DuplicateQuestionId,
+       dc.OriginalQuestionId,
+       dc.DuplicateTitle,
+       dc.OriginalTitle,
+       ucv.ClosedPostsCount,
+       ucv.DuplicateCloseVotes,
+       ucv.OffTopicCloseVotes,
+       ucv.NeedsDetailCloseVotes,
+       case 
+           when ua.QuestionCount > 0 then
+               round((ua.AvgAnswerScore / nullif(ua.AvgQuestionScore,0)) * 100, 2)
+           else null
+       end as AnswerToQuestionScoreRatio,
+       concat_ws(' | ', 
+                 substring(ua.DisplayName from 1 for 5),
+                 coalesce(substring(ua.Location from 1 for 5), 'NOLoc'),
+                 coalesce(right(qc.Tags, 10), 'NoTags')) as UserTagLocationFragment
+from UserActivityWithRanks ua
+join QuestionAnswerDetails qc on qc.AnswerOwnerUserId = ua.Id
+left join DuplicateQuestions dc on dc.DuplicateQuestionId = qc.QuestionId
+left join UserCloseVoteStats ucv on ucv.UserId = ua.Id
+where ua.ReputationRank <= 500 and qc.AnswerRank = 1
+  and (ua.GoldBadges + ua.SilverBadges + ua.BronzeBadges) > 0
+order by ua.ReputationRank, qc.QuestionCreation desc
+limit 100;

@@ -1,0 +1,87 @@
+-- {"query": "51089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1138} 
+
+WITH top_users AS (
+    SELECT u.Id AS user_id, u.Reputation, u.UpVotes, u.DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.UpVotes DESC, u.Reputation DESC) as user_rank
+    FROM Users u
+    WHERE u.UpVotes > 100 AND u.Reputation >= 5000
+    LIMIT 50
+),
+active_posts AS (
+    SELECT p.Id AS post_id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount,
+           p.AnswerCount, p.CommentCount, p.AcceptedAnswerId,
+           p.OwnerUserId, p.Tags,
+           EXTRACT(YEAR FROM p.CreationDate) as post_year,
+           ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC, p.Score DESC) as yearly_rank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND p.ViewCount > 1000
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+),
+high_interaction_posts AS (
+    SELECT ap.post_id, ap.post_year, ap.Tags,
+           COUNT(DISTINCT c.Id) as comment_count,
+           COUNT(DISTINCT v.Id) as vote_count,
+           AVG(v.BountyAmount) as avg_bounty,
+           COUNT(DISTINCT ph.Id) as history_events,
+           STRING_AGG(DISTINCT t.TagName, ',') as related_tags
+    FROM active_posts ap
+    LEFT JOIN Comments c ON c.PostId = ap.post_id AND c.Score >= 0
+    LEFT JOIN Votes v ON v.PostId = ap.post_id 
+                       AND v.VoteTypeId IN (2, 3, 8, 9)  -- UpMod, DownMod, BountyStart, BountyClose
+                       AND (v.BountyAmount IS NULL OR v.BountyAmount > 0)
+    LEFT JOIN PostHistory ph ON ph.PostId = ap.post_id 
+                             AND ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 24)  -- Edits and Close/Reopen
+                             AND ph.CreationDate >= ap.CreationDate
+    LEFT JOIN PostLinks pl ON pl.PostId = ap.post_id AND pl.LinkTypeId = 1  -- Linked posts
+    LEFT JOIN Posts related_p ON pl.RelatedPostId = related_p.Id AND related_p.Tags IS NOT NULL
+    LEFT JOIN Tags t ON POSITION(t.TagName IN ap.Tags) > 0
+    WHERE ap.yearly_rank <= 100
+    GROUP BY ap.post_id, ap.post_year, ap.Tags
+    HAVING COUNT(DISTINCT c.Id) + COUNT(DISTINCT v.Id) > 50
+),
+user_engagement AS (
+    SELECT tu.user_id, tu.user_rank, tu.Reputation,
+           COUNT(DISTINCT CASE WHEN ap.OwnerUserId = tu.user_id THEN ap.post_id END) as authored_posts,
+           COUNT(DISTINCT CASE WHEN b.UserId = tu.user_id THEN b.Id END) as badges_earned,
+           AVG(hip.vote_count) as avg_post_votes,
+           SUM(hip.comment_count) as total_comments_on_posts
+    FROM top_users tu
+    LEFT JOIN active_posts ap ON ap.OwnerUserId = tu.user_id
+    LEFT JOIN high_interaction_posts hip ON hip.post_id = ap.post_id
+    LEFT JOIN Badges b ON b.UserId = tu.user_id AND b.Date >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY tu.user_id, tu.user_rank, tu.Reputation
+),
+aggregated_insights AS (
+    SELECT 
+        hip.post_year,
+        COUNT(DISTINCT hip.post_id) as high_engagement_posts,
+        AVG(hip.vote_count) as avg_votes_per_post,
+        AVG(hip.comment_count) as avg_comments_per_post,
+        MAX(hip.vote_count) as max_votes,
+        SUM(CASE WHEN hip.avg_bounty > 0 THEN 1 ELSE 0 END) as posts_with_bounties,
+        COUNT(DISTINCT SUBSTRING(hip.related_tags FROM '^(.*?),')) as unique_top_tags,
+        ue.authored_posts,
+        ue.badges_earned,
+        CORR(ue.Reputation::float, ue.avg_post_votes::float) as reputation_vote_correlation
+    FROM high_interaction_posts hip
+    JOIN active_posts ap ON ap.post_id = hip.post_id
+    JOIN user_engagement ue ON ue.user_id = ap.OwnerUserId
+    GROUP BY hip.post_year, ue.authored_posts, ue.badges_earned
+    ORDER BY hip.post_year DESC
+)
+SELECT 
+    ai.post_year,
+    ai.high_engagement_posts,
+    ai.avg_votes_per_post,
+    ai.avg_comments_per_post,
+    ai.max_votes,
+    ai.posts_with_bounties,
+    ai.unique_top_tags,
+    ROUND(ai.reputation_vote_correlation, 4) as correlation_score,
+    RANK() OVER (ORDER BY ai.high_engagement_posts DESC, ai.avg_votes_per_post DESC) as yearly_engagement_rank,
+    (SELECT STRING_AGG(DISTINCT TagName, ', ' ORDER BY TagName) 
+     FROM Tags WHERE Count > 1000 AND ExcerptPostId IS NOT NULL 
+     LIMIT 10) as popular_tags_sample
+FROM aggregated_insights ai
+WHERE ai.high_engagement_posts > 10
+ORDER BY ai.post_year DESC, ai.yearly_engagement_rank;

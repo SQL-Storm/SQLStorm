@@ -1,0 +1,123 @@
+-- {"query": "50033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1302} 
+
+WITH PopularTags AS (
+    -- Step 1: Identify the 15 most popular tags based on their usage count.
+    SELECT
+        Id,
+        TagName
+    FROM Tags
+    ORDER BY Count DESC
+    LIMIT 15
+),
+QuestionAnswerPairs AS (
+    -- Step 2: For each popular tag, find all question-answer pairs.
+    -- This links questions (PostTypeId=1) to their answers (PostTypeId=2).
+    SELECT
+        q.Id AS QuestionId,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswererUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        pt.TagName
+    FROM Posts q
+    JOIN PopularTags pt ON q.Tags LIKE '%' || '<' || pt.TagName || '>' || '%'
+    JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 -- It's a question
+      AND a.PostTypeId = 2 -- It's an answer
+      AND a.OwnerUserId IS NOT NULL
+),
+UserTagContributions AS (
+    -- Step 3: Aggregate contribution statistics for each user per tag.
+    -- This includes answer counts, average scores, and total upvotes received.
+    SELECT
+        qap.AnswererUserId,
+        qap.TagName,
+        COUNT(DISTINCT qap.AnswerId) AS NumAnswers,
+        AVG(qap.AnswerScore) AS AvgAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        MAX(qap.AnswerCreationDate) AS LastAnswerDate
+    FROM QuestionAnswerPairs qap
+    LEFT JOIN Votes v ON qap.AnswerId = v.PostId
+    GROUP BY
+        qap.AnswererUserId,
+        qap.TagName
+),
+UserTagBadges AS (
+    -- Step 4: Count the number of Gold, Silver, and Bronze badges each user has for the popular tags.
+    SELECT
+        b.UserId,
+        pt.TagName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges b
+    JOIN PopularTags pt ON b.Name = pt.TagName
+    WHERE b.TagBased = 1
+    GROUP BY
+        b.UserId,
+        pt.TagName
+),
+CombinedUserStats AS (
+    -- Step 5: Combine user profile data, contribution stats, and badge counts into a single view.
+    -- A weighted "Contribution Score" is calculated to rank users.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        utc.TagName,
+        utc.NumAnswers,
+        utc.AvgAnswerScore,
+        utc.TotalUpvotes,
+        utc.LastAnswerDate,
+        COALESCE(utb.GoldBadges, 0) AS GoldTagBadges,
+        COALESCE(utb.SilverBadges, 0) AS SilverTagBadges,
+        -- Weighted contribution score calculation
+        (
+            (LOG(GREATEST(1, utc.NumAnswers)) * 25) +
+            (utc.AvgAnswerScore * 10) +
+            (LOG(GREATEST(1, utc.TotalUpvotes)) * 5) +
+            (LOG(GREATEST(1, u.Reputation)) * 1) +
+            (COALESCE(utb.GoldBadges, 0) * 100) +
+            (COALESCE(utb.SilverBadges, 0) * 40)
+        ) AS ContributionScore
+    FROM UserTagContributions utc
+    JOIN Users u ON utc.AnswererUserId = u.Id
+    LEFT JOIN UserTagBadges utb ON utc.AnswererUserId = utb.UserId AND utc.TagName = utb.TagName
+    WHERE u.Reputation > 1000 -- Filter for established users
+      AND utc.LastAnswerDate > (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '3 year' -- Active in the last 3 years
+)
+-- Final Step: Rank the users within each tag based on their score and select the top 5.
+-- Also, retrieve the title of their highest-voted answer for that tag.
+SELECT
+    cs.TagName,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.NumAnswers,
+    cs.AvgAnswerScore,
+    cs.TotalUpvotes,
+    cs.GoldTagBadges,
+    cs.ContributionScore,
+    p_best.Title AS BestAnswerQuestionTitle,
+    p_best.Score AS BestAnswerScore
+FROM (
+    SELECT
+        *,
+        ROW_NUMBER() OVER(PARTITION BY TagName ORDER BY ContributionScore DESC, Reputation DESC) AS Rank
+    FROM CombinedUserStats
+) AS cs
+-- Subquery to find the question title for the user's highest-scored answer in that tag
+JOIN LATERAL (
+    SELECT q_inner.Title, a_inner.Score
+    FROM Posts a_inner
+    JOIN Posts q_inner ON a_inner.ParentId = q_inner.Id
+    WHERE a_inner.OwnerUserId = cs.UserId
+      AND q_inner.Tags LIKE '%' || '<' || cs.TagName || '>' || '%'
+      AND a_inner.PostTypeId = 2
+    ORDER BY a_inner.Score DESC
+    LIMIT 1
+) p_best ON TRUE
+WHERE cs.Rank <= 5
+ORDER BY
+    cs.TagName,
+    cs.Rank;

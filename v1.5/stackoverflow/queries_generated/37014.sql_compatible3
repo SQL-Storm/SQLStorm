@@ -1,0 +1,171 @@
+WITH
+Questions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.OwnerUserId,
+    p.Tags,
+    -- normalize tags into one row per tag (array/string split in standard SQL)
+    TRIM(ELEMENT) AS Tag
+  FROM Posts p
+  CROSS JOIN (
+    SELECT
+      CAST(NULL AS VARCHAR(1)) AS Element,
+      1 AS idx
+  ) AS dummy
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+),
+QuestionAgg AS (
+  SELECT
+    q.*,
+    COALESCE(MAX(a.Score) OVER (PARTITION BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.OwnerUserId, q.Tags, q.Tag, q.AcceptedAnswerId) FILTER (WHERE a.PostTypeId = 2), 0) AS TopAnswerScore,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) END AS AcceptedAnswerSeconds,
+    COALESCE(SUM(v_count.voters) OVER (), 0) AS DistinctVoterCount,
+    COALESCE(SUM(char_length(coalesce(c.Text, ''))) OVER (),0) AS CommentsTextLengthSum
+  FROM
+    (SELECT DISTINCT Id, Title, CreationDate, Score, ViewCount, AnswerCount, CommentCount, FavoriteCount, OwnerUserId, Tags, Tag, AcceptedAnswerId
+     FROM (SELECT q1.* FROM Questions q1) AS subq
+    ) q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+      SELECT PostId, COUNT(DISTINCT UserId) AS voters
+      FROM Votes
+      WHERE UserId IS NOT NULL
+      GROUP BY PostId
+    ) v_count ON v_count.PostId = q.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+),
+OwnerFeatures AS (
+  SELECT
+    u.Id AS OwnerUserId,
+    u.Reputation,
+    u.CreationDate AS UserSince,
+    u.Views AS UserViews,
+    u.UpVotes,
+    u.DownVotes,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY
+    u.Id, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+TagTrends AS (
+  SELECT
+    Tag,
+    DATE_TRUNC('day', CreationDate) AS Day,
+    COUNT(*) AS QuestionsPerDay,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) AS MedianScorePerDay
+  FROM Questions
+  GROUP BY Tag, DATE_TRUNC('day', CreationDate)
+),
+TagSummary AS (
+  SELECT
+    Tag,
+    COUNT(*) AS TotalQuestions,
+    SUM(ViewCount) AS TotalViews,
+    AVG(Score) AS AvgScore,
+    MAX(QuestionsPerDay) AS MaxDailyQ_90d,
+    (SELECT AVG(QuestionsPerDay) FROM TagTrends tt WHERE tt.Tag = Tag AND tt.Day >= DATE_TRUNC('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')) AS AvgDaily_30d
+  FROM Questions q
+  LEFT JOIN TagTrends ts ON ts.Tag = q.Tag
+  GROUP BY Tag
+  HAVING COUNT(*) >= 50
+),
+LinkGraph AS (
+  SELECT
+    p.Id AS QuestionId,
+    COALESCE(inlinks.in_deg,0) AS InLinks,
+    COALESCE(outlinks.out_deg,0) AS OutLinks,
+    COALESCE(dup_links.dup_count,0) AS DuplicateLinks
+  FROM Posts p
+  LEFT JOIN (
+    SELECT RelatedPostId, COUNT(*) AS in_deg
+    FROM PostLinks
+    GROUP BY RelatedPostId
+  ) inlinks ON inlinks.RelatedPostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS out_deg
+    FROM PostLinks
+    GROUP BY PostId
+  ) outlinks ON outlinks.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS dup_count
+    FROM PostLinks
+    GROUP BY PostId
+  ) dup_links ON dup_links.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+Combined AS (
+  SELECT
+    qa.Id AS QuestionId,
+    qa.Title,
+    qa.CreationDate,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.FavoriteCount,
+    qa.Tag,
+    qa.TopAnswerScore,
+    qa.AcceptedAnswerSeconds,
+    qa.DistinctVoterCount,
+    qa.CommentsTextLengthSum,
+    ofe.Reputation AS OwnerReputation,
+    ofe.GoldBadges, ofe.SilverBadges, ofe.BronzeBadges,
+    lg.InLinks, lg.OutLinks, lg.DuplicateLinks,
+    ts.TotalQuestions AS TagTotalQuestions,
+    ts.TotalViews AS TagTotalViews,
+    ts.AvgScore AS TagAvgScore,
+    ts.AvgDaily_30d AS TagAvgDaily30d,
+    (qa.Score * 1.0) * LOG(GREATEST(qa.ViewCount,1) + 10) / GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - qa.CreationDate))/86400 + 1, 1) AS RecencyPopularity,
+    0 AS DOTIMESTAMP
+  FROM QuestionAgg qa
+  LEFT JOIN OwnerFeatures ofe ON ofe.OwnerUserId = qa.OwnerUserId
+  LEFT JOIN LinkGraph lg ON lg.QuestionId = qa.Id
+  LEFT JOIN TagSummary ts ON ts.Tag = qa.Tag
+),
+FinalSelection AS (
+  SELECT
+    c.*,
+    (SELECT PERCENT_RANK() OVER (ORDER BY sub.TopAnswerScore) FROM Combined sub WHERE sub.Tag = c.Tag AND sub.QuestionId = c.QuestionId) AS TopAnswerScorePercentRank,
+    CASE WHEN c.TagAvgDaily30d IS NOT NULL AND c.TagTotalQuestions IS NOT NULL THEN c.TagAvgDaily30d / GREATEST(c.TagTotalQuestions / 730.0::numeric, 1e-6) ELSE NULL END AS TagGrowthRatio,
+    (c.RecencyPopularity * (1 + LEAST(c.DistinctVoterCount::numeric / GREATEST(c.CommentCount,1), 5))) + (COALESCE(c.TopAnswerScore,0) * 2) + (COALESCE(c.OwnerReputation,0) / 1000.0) AS EngagementIndex
+  FROM Combined c
+)
+SELECT
+  QuestionId,
+  Title,
+  Tag,
+  CreationDate,
+  Score,
+  ViewCount,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  TopAnswerScore,
+  AcceptedAnswerSeconds,
+  DistinctVoterCount,
+  CommentsTextLengthSum,
+  OwnerReputation,
+  GoldBadges, SilverBadges, BronzeBadges,
+  InLinks, OutLinks, DuplicateLinks,
+  TagTotalQuestions, TagTotalViews, TagAvgScore, TagAvgDaily30d,
+  RecencyPopularity,
+  TopAnswerScorePercentRank,
+  TagGrowthRatio,
+  EngagementIndex
+FROM FinalSelection
+WHERE TagRankByRecencyPop <= 5
+  AND TagTotalQuestions IS NOT NULL
+ORDER BY Tag, EngagementIndex DESC NULLS LAST
+LIMIT 100;

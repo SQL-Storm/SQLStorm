@@ -1,0 +1,90 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName AS OwnerDisplayName,
+        P.OwnerUserId,
+        COUNT(DISTINCT V.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) AND 
+        P.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY 
+        P.Id, U.DisplayName, P.OwnerUserId
+), 
+TagStats AS (
+    SELECT 
+        T.TagName, 
+        COUNT(P.Id) AS TagUsageCount, 
+        AVG(P.Score) AS AvgPostScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    WHERE 
+        P.PostTypeId = 1
+    GROUP BY 
+        T.TagName
+), 
+UserActivity AS (
+    SELECT 
+        U.Id, 
+        U.DisplayName, 
+        COUNT(DISTINCT P.Id) AS PostCount, 
+        SUM(P.Score) AS TotalScore, 
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        U.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+    GROUP BY 
+        U.Id, U.DisplayName
+)
+SELECT 
+    RP.Id, 
+    RP.PostTypeId, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.CreationDate, 
+    RP.OwnerDisplayName, 
+    RP.VoteCount, 
+    RP.PostRank, 
+    TS.TagName, 
+    TS.TagUsageCount, 
+    TS.AvgPostScore, 
+    UA.DisplayName AS UserDisplayName, 
+    UA.PostCount, 
+    UA.TotalScore, 
+    UA.BadgeCount
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TagStats TS ON RP.Id = (
+        SELECT P2.Id
+        FROM Posts P2
+        JOIN Tags T2 ON T2.WikiPostId = P2.Id OR T2.ExcerptPostId = P2.Id
+        WHERE P2.Id = RP.Id
+        LIMIT 1
+    )
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+WHERE 
+    RP.PostRank <= 10
+ORDER BY 
+    RP.PostRank, 
+    RP.Score DESC, 
+    UA.TotalScore DESC
+LIMIT 50;

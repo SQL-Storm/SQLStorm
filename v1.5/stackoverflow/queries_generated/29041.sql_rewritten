@@ -1,0 +1,338 @@
+-- {"query": "29041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3181} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Master'
+            WHEN u.Reputation >= 50000 THEN 'Expert'
+            WHEN u.Reputation >= 10000 THEN 'Professional'
+            ELSE 'Beginner'
+        END as ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Moderately Rated'
+            WHEN p.Score > 0 THEN 'Slightly Rated'
+            ELSE 'Not Rated'
+        END as RatingLevel,
+        DATEDIFF('DAY', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysOld,
+        COALESCE(p.Tags, '') as Tags,
+        COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '') as TagList,
+        STRING_TO_ARRAY(COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ''), '><') as TagArray
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        CONCAT('Tag: ', t.TagName, ' (', t.Count, ' posts)') as TagDescription,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexPostMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CommentCount,
+        pa.AnswerCount,
+        pa.PostType,
+        pa.RatingLevel,
+        pa.DaysOld,
+        pa.TagList,
+        pa.TagArray,
+        (pa.Score * 1.0 / NULLIF(pa.ViewCount, 0)) as ScoreToViewRatio,
+        CASE 
+            WHEN pa.AnswerCount IS NOT NULL AND pa.AnswerCount > 0 THEN 
+                (pa.CommentCount * 1.0 / NULLIF(pa.AnswerCount, 0))
+            ELSE 0
+        END as CommentsPerAnswer,
+        (pa.Score + pa.ViewCount + pa.CommentCount + COALESCE(pa.AnswerCount, 0)) as TotalEngagement,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as UserPostRank,
+        RANK() OVER (ORDER BY pa.Score DESC) as OverallScoreRank,
+        DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY pa.Score) as ScorePercentile,
+        NTH_VALUE(pa.Title, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as HighestRatedPost,
+        LAG(pa.Score, 1) OVER (ORDER BY pa.Score DESC) as PreviousScore,
+        LEAD(pa.Score, 1) OVER (ORDER BY pa.Score DESC) as NextScore,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as UserAverageScore,
+        MAX(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as UserMaxScore,
+        MIN(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as UserMinScore,
+        COUNT(*) OVER (PARTITION BY pa.OwnerUserId) as UserPostCount,
+        CASE 
+            WHEN pa.Score > 100 THEN 'Elite'
+            WHEN pa.Score > 50 THEN 'Above Average'
+            WHEN pa.Score > 0 THEN 'Below Average'
+            ELSE 'Low'
+        END as PerformanceLevel
+    FROM PostAnalysis pa
+),
+CombinedAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.ReputationLevel,
+        us.ReputationRank,
+        cpm.PostId,
+        cpm.Title,
+        cpm.OwnerUserId,
+        cpm.Score,
+        cpm.ViewCount,
+        cpm.CommentCount,
+        cpm.AnswerCount,
+        cpm.PostType,
+        cpm.RatingLevel,
+        cpm.DaysOld,
+        cpm.TagList,
+        cpm.TagArray,
+        cpm.ScoreToViewRatio,
+        cpm.CommentsPerAnswer,
+        cpm.TotalEngagement,
+        cpm.UserPostRank,
+        cpm.OverallScoreRank,
+        cpm.ViewRank,
+        cpm.ScorePercentile,
+        cpm.HighestRatedPost,
+        cpm.PreviousScore,
+        cpm.NextScore,
+        cpm.UserAverageScore,
+        cpm.UserMaxScore,
+        cpm.UserMinScore,
+        cpm.UserPostCount,
+        cpm.PerformanceLevel,
+        CASE 
+            WHEN cpm.TotalEngagement > 500 THEN 'High Engagement'
+            WHEN cpm.TotalEngagement > 100 THEN 'Medium Engagement'
+            WHEN cpm.TotalEngagement > 0 THEN 'Low Engagement'
+            ELSE 'No Engagement'
+        END as EngagementLevel,
+        CASE 
+            WHEN cpm.DaysOld > 365 THEN 'Established'
+            WHEN cpm.DaysOld > 180 THEN 'Active'
+            WHEN cpm.DaysOld > 30 THEN 'Recent'
+            ELSE 'New'
+        END as ActivityLevel,
+        CASE 
+            WHEN LENGTH(cpm.TagList) > 0 THEN 
+                (SELECT COUNT(*) FROM UNNEST(cpm.TagArray) as tag)
+            ELSE 0
+        END as TagCount,
+        (SELECT STRING_AGG(tag, ', ') FROM UNNEST(cpm.TagArray) as tag) as AllTags,
+        (SELECT STRING_AGG(tag, ', ') FROM UNNEST(cpm.TagArray) as tag WHERE tag LIKE '%sql%') as SqlTags,
+        (SELECT COUNT(*) FROM UNNEST(cpm.TagArray) as tag WHERE tag LIKE '%sql%') as SqlTagCount
+    FROM UserStats us
+    INNER JOIN ComplexPostMetrics cpm ON us.UserId = cpm.OwnerUserId
+    WHERE us.PostCount > 0 AND us.Reputation > 100
+),
+FinalAggregation AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.PostCount,
+        fa.CommentCount,
+        fa.BadgeCount,
+        fa.ReputationLevel,
+        fa.ReputationRank,
+        fa.PostId,
+        fa.Title,
+        fa.Score,
+        fa.ViewCount,
+        fa.CommentCount,
+        fa.AnswerCount,
+        fa.PostType,
+        fa.RatingLevel,
+        fa.DaysOld,
+        fa.TagList,
+        fa.TagCount,
+        fa.AllTags,
+        fa.SqlTags,
+        fa.SqlTagCount,
+        fa.ScoreToViewRatio,
+        fa.CommentsPerAnswer,
+        fa.TotalEngagement,
+        fa.UserPostRank,
+        fa.OverallScoreRank,
+        fa.ViewRank,
+        fa.ScorePercentile,
+        fa.HighestRatedPost,
+        fa.PreviousScore,
+        fa.NextScore,
+        fa.UserAverageScore,
+        fa.UserMaxScore,
+        fa.UserMinScore,
+        fa.UserPostCount,
+        fa.PerformanceLevel,
+        fa.EngagementLevel,
+        fa.ActivityLevel,
+        CASE 
+            WHEN fa.SqlTagCount > 0 THEN 
+                CASE 
+                    WHEN fa.SqlTagCount >= 3 THEN 'SQL Specialist'
+                    WHEN fa.SqlTagCount >= 2 THEN 'SQL Enthusiast'
+                    ELSE 'SQL Beginner'
+                END
+            ELSE 'No SQL Tags'
+        END as SqlExpertiseLevel,
+        CASE 
+            WHEN fa.Score > 100 AND fa.ViewCount > 1000 THEN 'High Impact'
+            WHEN fa.Score > 50 AND fa.ViewCount > 500 THEN 'Medium Impact'
+            WHEN fa.Score > 0 AND fa.ViewCount > 100 THEN 'Low Impact'
+            ELSE 'No Impact'
+        END as ImpactLevel,
+        ROW_NUMBER() OVER (ORDER BY fa.Score DESC, fa.ViewCount DESC) as RankByScoreAndView,
+        DENSE_RANK() OVER (ORDER BY fa.CommentsPerAnswer DESC) as RankByCommentsPerAnswer,
+        NTILE(4) OVER (ORDER BY fa.Score) as PerformanceQuartile,
+        RANK() OVER (ORDER BY fa.TotalEngagement DESC) as EngagementRank,
+        AVG(fa.Score) OVER () as OverallAverageScore,
+        STDDEV(fa.Score) OVER () as ScoreStandardDeviation,
+        MAX(fa.DaysOld) OVER () as MaxDaysOld
+    FROM CombinedAnalysis fa
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.ReputationLevel,
+    fa.ReputationRank,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.CommentCount,
+    fa.AnswerCount,
+    fa.PostType,
+    fa.RatingLevel,
+    fa.DaysOld,
+    fa.TagList,
+    fa.TagCount,
+    fa.AllTags,
+    fa.SqlTags,
+    fa.SqlTagCount,
+    fa.ScoreToViewRatio,
+    fa.CommentsPerAnswer,
+    fa.TotalEngagement,
+    fa.UserPostRank,
+    fa.OverallScoreRank,
+    fa.ViewRank,
+    fa.ScorePercentile,
+    fa.HighestRatedPost,
+    fa.PreviousScore,
+    fa.NextScore,
+    fa.UserAverageScore,
+    fa.UserMaxScore,
+    fa.UserMinScore,
+    fa.UserPostCount,
+    fa.PerformanceLevel,
+    fa.EngagementLevel,
+    fa.ActivityLevel,
+    fa.SqlExpertiseLevel,
+    fa.ImpactLevel,
+    fa.RankByScoreAndView,
+    fa.RankByCommentsPerAnswer,
+    fa.PerformanceQuartile,
+    fa.EngagementRank,
+    fa.OverallAverageScore,
+    fa.ScoreStandardDeviation,
+    fa.MaxDaysOld,
+    CASE 
+        WHEN fa.Reputation > 50000 AND fa.PostCount > 50 THEN 'Veteran Contributor'
+        WHEN fa.Reputation > 10000 AND fa.PostCount > 20 THEN 'Experienced Contributor'
+        WHEN fa.Reputation > 1000 AND fa.PostCount > 5 THEN 'Active Contributor'
+        ELSE 'New Contributor'
+    END as ContributorStatus,
+    CASE 
+        WHEN fa.DaysOld > 365 AND fa.PostCount > 100 THEN 'Long Term Active'
+        WHEN fa.DaysOld > 180 AND fa.PostCount > 50 THEN 'Moderately Active'
+        WHEN fa.DaysOld > 30 AND fa.PostCount > 20 THEN 'Recently Active'
+        ELSE 'Newly Active'
+    END as ActivityStatus,
+    CASE 
+        WHEN fa.TagCount > 10 AND fa.SqlTagCount > 3 THEN 'Well Tagged Expert'
+        WHEN fa.TagCount > 5 AND fa.SqlTagCount > 2 THEN 'Good Tagging'
+        WHEN fa.TagCount > 0 THEN 'Basic Tagging'
+        ELSE 'No Tagging'
+    END as TaggingQuality,
+    ROUND((fa.Score * 100.0 / NULLIF(fa.OverallAverageScore, 0)), 2) as ScoreVsAveragePercent,
+    CASE 
+        WHEN fa.Score > fa.UserAverageScore THEN 'Above Average'
+        WHEN fa.Score < fa.UserAverageScore THEN 'Below Average'
+        ELSE 'Average'
+    END as ScoreVsUserAverage,
+    CASE 
+        WHEN fa.TotalEngagement > 1000 THEN 'Viral Content'
+        WHEN fa.TotalEngagement > 500 THEN 'Popular Content'
+        WHEN fa.TotalEngagement > 100 THEN 'Noticeable Content'
+        ELSE 'Regular Content'
+    END as ContentPopularity,
+    STRING_AGG(DISTINCT fa.SqlTags, ' | ') as UniqueSqlTags,
+    COUNT(*) OVER () as TotalRecords,
+    MAX(fa.UserId) OVER () as MaxUserId,
+    MIN(fa.UserId) OVER () as MinUserId
+FROM FinalAggregation fa
+WHERE fa.PostId IS NOT NULL AND fa.Title IS NOT NULL
+GROUP BY 
+    fa.UserId, fa.DisplayName, fa.Reputation, fa.PostCount, fa.CommentCount, 
+    fa.BadgeCount, fa.ReputationLevel, fa.ReputationRank, fa.PostId, fa.Title, 
+    fa.Score, fa.ViewCount, fa.CommentCount, fa.AnswerCount, fa.PostType, 
+    fa.RatingLevel, fa.DaysOld, fa.TagList, fa.TagCount, fa.AllTags, 
+    fa.SqlTags, fa.SqlTagCount, fa.ScoreToViewRatio, fa.CommentsPerAnswer, 
+    fa.TotalEngagement, fa.UserPostRank, fa.OverallScoreRank, fa.ViewRank, 
+    fa.ScorePercentile, fa.HighestRatedPost, fa.PreviousScore, fa.NextScore, 
+    fa.UserAverageScore, fa.UserMaxScore, fa.UserMinScore, fa.UserPostCount, 
+    fa.PerformanceLevel, fa.EngagementLevel, fa.ActivityLevel, fa.SqlExpertiseLevel, 
+    fa.ImpactLevel, fa.RankByScoreAndView, fa.RankByCommentsPerAnswer, 
+    fa.PerformanceQuartile, fa.EngagementRank, fa.OverallAverageScore, 
+    fa.ScoreStandardDeviation, fa.MaxDaysOld
+HAVING COUNT(fa.PostId) > 0
+ORDER BY fa.Score DESC, fa.ViewCount DESC, fa.Reputation DESC
+LIMIT 1000;

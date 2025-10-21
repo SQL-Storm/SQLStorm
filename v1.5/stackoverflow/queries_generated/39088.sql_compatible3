@@ -1,0 +1,82 @@
+WITH
+QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagScores AS (
+    SELECT
+        qt.Tag,
+        AVG(p.Score) AS AvgScore,
+        COUNT(*) AS QuestionCount
+    FROM QuestionTags qt
+    JOIN Posts p ON p.Id = qt.QuestionId
+    GROUP BY qt.Tag
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentPosts AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS PostsLast30Days,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+)
+SELECT
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationRank,
+    COALESCE(rp.PostsLast30Days, 0) AS PostsLast30Days,
+    rp.LastPostDate,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+    (
+      SELECT json_agg(
+                 json_build_object(
+                     'Tag', ts.Tag,
+                     'AvgScore', ts.AvgScore,
+                     'QuestionCount', ts.QuestionCount
+                 ) ORDER BY ts.AvgScore DESC
+             )
+      FROM (
+          SELECT
+              qt.Tag,
+              ts2.AvgScore,
+              ts2.QuestionCount
+          FROM QuestionTags qt
+          JOIN TagScores ts2 ON ts2.Tag = qt.Tag
+          JOIN Posts pq ON pq.Id = qt.QuestionId
+          WHERE pq.OwnerUserId = us.UserId
+          GROUP BY qt.Tag, ts2.AvgScore, ts2.QuestionCount
+          ORDER BY ts2.AvgScore DESC
+          LIMIT 5
+      ) AS ts
+    ) AS TopTags
+FROM UserStats us
+LEFT JOIN RecentPosts rp ON rp.UserId = us.UserId
+LEFT JOIN BadgeSummary bs ON bs.UserId = us.UserId
+ORDER BY us.ReputationRank
+LIMIT 100;

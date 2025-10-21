@@ -1,0 +1,67 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.Displayname AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+        ELSE 'Open'
+    END AS PostStatus,
+    MAX(ph.CreationDate) AS LastActivity,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ModerationEvents,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.Id END) AS EditCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TitleBodyTagEdits,
+    AVG(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN DATEDIFF(day, ph.CreationDate, CAST('2024-10-01T12:34:56' AS TIMESTAMP)) END) AS AvgModerationDays,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.Id END) AS UpDownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) AS BountyStarts,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 9 THEN v.Id END) AS BountyCloses
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT p2.Id AS PostId, t.TagName
+    FROM Posts p2
+    JOIN (
+        SELECT Id, UNNEST(string_to_array(trim(BOTH '<>' FROM Tags), '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND Tags <> ''
+    ) t ON p2.Id = t.Id
+) t ON p.Id = t.PostId
+WHERE p.CreationDate >= DATEADD(month, -6, CAST('2024-10-01T12:34:56' AS TIMESTAMP))
+    AND p.PostTypeId IN (1, 2)
+    AND (p.Score > 0 OR p.ViewCount > 100)
+GROUP BY 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.Displayname,
+    u.Reputation,
+    p.PostTypeId,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.AcceptedAnswerId
+HAVING COUNT(DISTINCT c.Id) >= 5
+    AND COUNT(DISTINCT ph.Id) >= 10
+    AND COUNT(DISTINCT v.Id) >= 3
+ORDER BY SUM(p.Score + p.ViewCount) DESC
+LIMIT 1000;

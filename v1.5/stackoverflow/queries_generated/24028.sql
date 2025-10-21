@@ -1,0 +1,87 @@
+-- {"query": "24028.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1564} 
+
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        u.Reputation,
+        u.Id AS OwnerId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        EXISTS (SELECT 1
+                FROM Votes v
+                WHERE v.PostId = p.Id
+                  AND v.VoteTypeId = 2
+                LIMIT 1) AS HasUpvote
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.AnswerCount, u.Reputation, u.Id
+), TopAnswerByQuestion AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS Rn
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+), TagDeciles AS (
+    SELECT
+        jt.tag AS TagName,
+        COUNT(*) AS TagUsage,
+        NTILE(10) OVER (ORDER BY COUNT(*) DESC) AS Decile
+    FROM Posts p
+    CROSS JOIN LATERAL jsonb_array_elements_text(
+        regexp_replace(p.Tags, '[<>]', '', 'g')::JSONB) AS jt(tag)
+    GROUP BY jt.tag
+), DuplicateLinks AS (
+    SELECT p.Id AS DuplicateOf
+    FROM PostLinks p
+    WHERE p.LinkTypeId = 3
+), CloseStatuses AS (
+    SELECT
+        ph.PostId,
+        CASE
+            WHEN ph.Text::JSONB->>'CloseReasonId' IS NOT NULL
+            THEN cr.Name
+            ELSE 'Open'
+        END AS Status
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr
+           ON ph.Text::JSONB->>'CloseReasonId' = cr.Id::text
+    WHERE ph.PostHistoryTypeId = 10
+)
+SELECT
+    rq.Id AS QuestionId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.Score,
+    rq.AnswerCount,
+    COALESCE(rq.OwnerId, -1) AS OwnerId,
+    COALESCE(rq.Reputation, 0) AS OwnerReputation,
+    rq.CommentCount,
+    rq.HasUpvote,
+    td.Decile AS TagPopularity,
+    CASE WHEN dl.DuplicateOf IS NOT NULL THEN 1 ELSE 0 END AS IsDuplicate,
+    cs.Status AS CloseStatus
+FROM RecentQuestions rq
+LEFT JOIN TopAnswerByQuestion ta
+       ON ta.ParentId = rq.Id
+      AND ta.Rn = 1
+LEFT JOIN TagDeciles td
+       ON td.TagName = ANY (REGEXP_SPLIT_TO_ARRAY(rq.Tags, '[<>]'))
+LEFT JOIN DuplicateLinks dl
+       ON dl.DuplicateOf = rq.Id
+LEFT JOIN CloseStatuses cs
+       ON cs.PostId = rq.Id
+WHERE rq.AnswerCount > 0
+  AND rq.Score > 5
+  AND (rq.Tags LIKE '%[java]%' OR rq.Tags LIKE '%[c#]%')
+ORDER BY rq.Score DESC, rq.CreationDate ASC
+LIMIT 100;

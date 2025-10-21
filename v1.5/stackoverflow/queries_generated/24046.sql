@@ -1,0 +1,132 @@
+-- {"query": "24046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3055} 
+
+/* Benchmark query – a multi‑stage calculation on StackOverflow data */
+WITH 
+/* 1. Pull all questions */
+question_posts AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CreationDate,
+           p.LastActivityDate,
+           p.OwnerUserId,
+           p.Tags
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1
+),
+
+/* 2. Extract tags from the XML‑style <tag>…</tag> string */
+tag_extracted AS (
+    SELECT qp.Id,
+           CAST((
+                SELECT t.t.value('.', 'VARCHAR(200)')
+                FROM   (SELECT CAST('<tags>' +
+                                      REPLACE(REPLACE(qp.Tags, '><', '</t><t>'),
+                                              '<', '') +
+                                    '</t></tags>' AS XML) AS x ) AS xt
+                CROSS APPLY xt.x.nodes('/tags/t') AS t(t)
+               ) AS VARCHAR(200)) AS Tag
+    FROM   question_posts qp
+),
+
+/* 3. Aggregate votes per post */
+vote_sums AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+           SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted,
+           COUNT(*)                                         AS total_votes
+    FROM   Votes v
+    GROUP  BY v.PostId
+),
+
+/* 4. Flag posts with activity in the last 30 days */
+recent_act AS (
+    SELECT qp.Id,
+           CASE WHEN qp.LastActivityDate >= DATEADD(day, -30, GETDATE())
+                THEN 1 ELSE 0 END AS active_30
+    FROM   question_posts qp
+),
+
+/* 5. Correlated sub‑query – comment count on the accepted answer */
+accepted_comments AS (
+    SELECT p.Id,
+           ISNULL(
+                ( SELECT COUNT(*)
+                  FROM   Comments c
+                  WHERE  c.PostId = p.Id
+                  AND    c.UserId = (
+                            SELECT TOP 1 va.UserId
+                            FROM   Votes va
+                            WHERE  va.PostId = p.Id
+                               AND va.VoteTypeId = 1
+                            ORDER BY va.CreationDate DESC
+                        )
+                ), 0
+           ) AS comment_cnt
+    FROM   Posts p
+    WHERE  p.AcceptedAnswerId IS NOT NULL
+),
+
+/* 6. User information */
+user_info AS (
+    SELECT u.Id,
+           u.Reputation,
+           u.DisplayName
+    FROM   Users u
+),
+
+/* 7. Final metrics – window functions, string ops, NULL handling */
+question_metrics AS (
+    SELECT qp.Id,
+           qp.Title,
+           qp.Score,
+           qp.ViewCount,
+           qp.AnswerCount,
+           vs.upvotes,
+           vs.downvotes,
+           vs.accepted,
+           vs.total_votes,
+           ra.active_30,
+           ui.Reputation     AS owner_rep,
+           ui.DisplayName    AS owner_name,
+           CASE WHEN te.Tag = 'sql' THEN 1 ELSE 0 END AS has_sql_tag,
+           AVG(qp.Score)      OVER () AS avg_score,
+           STDEV_P(qp.Score)  OVER () AS stddev_score,
+           PERCENT_RANK() OVER (ORDER BY qp.Score DESC) AS score_pct,
+           DENSE_RANK()  OVER (ORDER BY qp.Score DESC) AS score_rank,
+           SUBSTRING(qp.Title,1,20) AS title_preview
+    FROM   question_posts qp
+    LEFT JOIN vote_sums vs       ON qp.Id = vs.PostId
+    LEFT JOIN recent_act ra      ON qp.Id = ra.Id
+    LEFT JOIN user_info ui       ON qp.OwnerUserId = ui.Id
+    LEFT JOIN tag_extracted te   ON qp.Id = te.Id
+    LEFT JOIN accepted_comments ac ON qp.Id = ac.Id
+)
+
+SELECT qm.Id,
+       qm.Title,
+       qm.Score,
+       qm.ViewCount,
+       qm.AnswerCount,
+       qm.upvotes,
+       qm.downvotes,
+       qm.accepted,
+       qm.total_votes,
+       qm.active_30,
+       qm.owner_rep,
+       qm.owner_name,
+       qm.has_sql_tag,
+       qm.avg_score,
+       qm.stddev_score,
+       qm.score_pct,
+       qm.score_rank,
+       qm.title_preview
+FROM   question_metrics qm
+WHERE  qm.has_sql_tag = 1
+  AND  qm.Score > 0
+  AND  qm.total_votes > 10
+ORDER  BY qm.Score DESC
+OPTION (RECOMPILE);

@@ -1,0 +1,114 @@
+WITH RecentActiveUsers AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsLastMonth,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS NumAnswersLastMonth,
+        RANK() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC, U.Reputation DESC) AS UserActivityRank
+    FROM Users U
+    LEFT JOIN Posts P
+        ON U.Id = P.OwnerUserId
+        AND P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 0
+),
+TopTags AS (
+    SELECT 
+        T.TagName,
+        SUM(T.Count) AS TotalTagCount
+    FROM Tags T
+    WHERE T.IsModeratorOnly = 0
+    GROUP BY T.TagName
+    HAVING SUM(T.Count) > 100
+    ORDER BY SUM(T.Count) DESC
+    LIMIT 10
+),
+QuestionPostCTE AS (
+    SELECT 
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS RecentQuestionRank
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+),
+AcceptedAnswerers AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS AskerId,
+        Q.AcceptedAnswerId,
+        A.OwnerUserId AS AnswererId,
+        Q.Score AS QuestionScore,
+        A.Score AS AcceptedAnswerScore,
+        Q.Tags
+    FROM Posts Q
+    INNER JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1 
+        AND Q.AcceptedAnswerId IS NOT NULL
+)
+SELECT
+    U.UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.UserActivityRank,
+    Q.QuestionId,
+    Q.CreationDate AS QuestionCreationDate,
+    Q.Score AS QuestionScore,
+    Q.ViewCount,
+    Q.AnswerCount,
+    STRING_AGG(DISTINCT TT.TagName, ', ') AS TopTagsInQuestion,
+    CASE 
+        WHEN COALESCE(Q.Score,0) > 10 THEN 'high'
+        WHEN COALESCE(Q.Score,0) >= 0 THEN 'medium'
+        ELSE 'low'
+    END AS QuestionScoreCategory,
+    SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+    (
+        SELECT COUNT(1) 
+        FROM Comments C 
+        WHERE C.PostId = Q.QuestionId 
+          AND C.Score > 3
+    ) AS PopularComments,
+    AA.AnswererId AS AcceptedAnswererUserId,
+    U2.DisplayName AS AcceptedAnswererDisplayName,
+    AA.AcceptedAnswerScore,
+    (SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CRT.Id = CAST(MIN(CAST(PH.Comment AS INTEGER)) AS INTEGER)) AS CloseReason
+FROM RecentActiveUsers U
+JOIN QuestionPostCTE Q 
+    ON Q.OwnerUserId = U.UserId 
+    AND Q.RecentQuestionRank <= 3
+LEFT JOIN LATERAL (
+    SELECT TT.TagName
+    FROM TopTags TT
+    WHERE ',' || Q.Tags || ',' LIKE '%<' || TT.TagName || '>%'
+) TT ON TRUE
+LEFT JOIN PostHistory PH
+    ON PH.PostId = Q.QuestionId 
+    AND PH.PostHistoryTypeId = 10 -- Post Closed
+LEFT JOIN AcceptedAnswerers AA
+    ON AA.QuestionId = Q.QuestionId
+LEFT JOIN Users U2
+    ON AA.AnswererId = U2.Id
+GROUP BY 
+    U.UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.UserActivityRank,
+    Q.QuestionId,
+    Q.CreationDate,
+    Q.Score,
+    Q.ViewCount,
+    Q.AnswerCount,
+    AA.AnswererId,
+    U2.DisplayName,
+    AA.AcceptedAnswerScore
+HAVING SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) < 3
+ORDER BY U.UserActivityRank, Q.Score DESC, Q.CreationDate DESC
+LIMIT 100;

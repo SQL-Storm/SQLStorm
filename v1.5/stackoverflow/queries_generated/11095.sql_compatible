@@ -1,0 +1,88 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        p.Tags, 
+        COUNT(v.Id) AS VoteCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, p.Tags
+),
+TaggedPosts AS (
+    SELECT 
+        p.Id, 
+        p.Tags, 
+        COUNT(DISTINCT t.Id) AS TagCount
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON t.Id = ANY(string_to_array(p.Tags, ',')::int[])
+    GROUP BY 
+        p.Id, p.Tags
+),
+UserActivity AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(DISTINCT p.Id) AS PostsCreated, 
+        COUNT(DISTINCT c.Id) AS CommentsMade
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostScores AS (
+    SELECT 
+        p.Id, 
+        p.Score, 
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS Rank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId IN (1, 2)
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Tags, 
+    rp.VoteCount, 
+    tp.TagCount, 
+    ua.PostsCreated, 
+    ua.CommentsMade, 
+    ps.Rank
+FROM 
+    RecentPosts rp
+JOIN 
+    TaggedPosts tp ON rp.Id = tp.Id
+JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.Id
+LEFT JOIN 
+    PostScores ps ON rp.Id = ps.Id
+WHERE 
+    tp.TagCount > 1
+    AND ua.PostsCreated > 5
+    AND ps.Rank <= 10
+ORDER BY 
+    rp.Score DESC, 
+    tp.TagCount DESC, 
+    ua.PostsCreated DESC, 
+    ps.Rank ASC;

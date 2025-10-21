@@ -1,0 +1,134 @@
+WITH RelevantPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+RecentQuestions AS (
+    SELECT 
+        rp.Id AS QuestionId,
+        rp.Title,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Tags,
+        ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.CreationDate DESC) AS RespRank
+    FROM RelevantPosts rp
+),
+TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT rq.QuestionId) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN rq.RespRank = 1 THEN rq.QuestionId END) AS LatestQuestions
+    FROM Users u
+    LEFT JOIN RecentQuestions rq ON u.Id = rq.OwnerUserId
+    WHERE u.Reputation >= 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+AnswerStats AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgScore,
+        SUM(CASE WHEN a.Score >= 10 THEN 1 ELSE 0 END) AS HighScoreAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    GROUP BY v.PostId, v.VoteTypeId
+),
+PostLinksCount AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) AS RelatedLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(tb.TotalQuestions, 0) AS TotalQuestions,
+    COALESCE(tb.LatestQuestions, 0) AS LatestQuestions,
+    COALESCE(asr.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(asr.AvgScore, 0) AS AvgAnswerScore,
+    COALESCE(asr.HighScoreAnswers, 0) AS HighScoreAnswers,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2,3) THEN v.PostId END) AS UpvoteDownvoteCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS Downvotes,
+    COALESCE(pl.TotalRelatedLinks, 0) AS TotalRelatedLinks,
+    COALESCE(ps.EditCount,0) AS TotalEdits,
+    COALESCE(ps.UniqueEditors,0) AS UniqueEditors,
+    ps.LastEditDate
+FROM Users u
+LEFT JOIN TopUsers tb ON u.Id = tb.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+LEFT JOIN AnswerStats asr ON u.Id = asr.OwnerUserId
+LEFT JOIN UserBadgeSummary ub ON u.Id = ub.UserId
+LEFT JOIN (
+    SELECT 
+        v.PostId
+    FROM Votes v
+) v ON v.PostId IS NOT NULL
+LEFT JOIN (
+    SELECT 
+        pl.PostId,
+        SUM(pl.RelatedLinks) AS TotalRelatedLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+) pl ON pl.PostId IS NOT NULL
+LEFT JOIN (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        ph.UserId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,20)
+) ps ON ps.PostId = p.Id
+LEFT JOIN PostHistorySummary phs ON phs.PostId = p.Id
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    tb.TotalQuestions, tb.LatestQuestions,
+    asr.AnswerCount, asr.AvgScore, asr.HighScoreAnswers,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    ps.EditCount, ps.UniqueEditors, ps.LastEditDate
+ORDER BY u.Reputation DESC;

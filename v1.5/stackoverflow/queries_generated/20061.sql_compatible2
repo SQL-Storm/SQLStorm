@@ -1,0 +1,132 @@
+WITH PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        -- Calculate the time difference between edits
+        LAG(p.LastEditDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousEditDate,
+        -- Rank posts by score for each user
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.DeletionDate IS NULL
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.CreationDate AS PostCreationDate,
+        ps.Tags,
+        ps.UserPostRank,
+        -- Calculate a user's tenure in days when they made the post
+        EXTRACT(EPOCH FROM (ps.CreationDate - u.CreationDate)) / 86400.0 AS TenureInDays,
+        -- Time since previous edit
+        EXTRACT(EPOCH FROM (ps.CreationDate - ps.PreviousEditDate)) AS SecondsSincePreviousEdit
+    FROM Users u
+    JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Reputation > 1000
+),
+-- Analyze answers specifically, linking them to their questions
+AnswerAnalysis AS (
+    SELECT
+        a.OwnerUserId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.Tags AS QuestionTags,
+        q.AcceptedAnswerId,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS SecondsToAnswer,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS CommentsOnAnswer
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 -- Answer
+      AND q.PostTypeId = 1 -- Question
+      AND a.OwnerUserId IS NOT NULL
+      AND a.Score > q.Score -- Select only answers with a higher score than the question
+),
+-- Union of two different user segments: high-rep users and users with many gold badges
+UserSegments AS (
+    SELECT
+        Id, DisplayName, Reputation, CreationDate, 'HighReputation' AS Segment
+    FROM Users
+    WHERE Reputation > 75000
+
+    UNION ALL
+
+    SELECT
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, 'GoldBadgeHolder' AS Segment
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Name IN ('Great Answer', 'Famous Question', 'Strunk & White') AND b.Class = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(b.Id) > 2
+)
+-- Main query to aggregate and present the final benchmark result
+SELECT
+    us.DisplayName,
+    us.Segment,
+    us.Reputation,
+    COUNT(DISTINCT ua.PostId) AS TotalPosts,
+    AVG(ua.Score) AS AvgPostScore,
+    MAX(ua.TenureInDays) AS MaxTenureDays,
+    SUM(CASE WHEN ua.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    CAST(SUM(CASE WHEN aa.AnswerId = aa.AcceptedAnswerId THEN 1 ELSE 0 END) AS REAL) / NULLIF(SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AcceptanceRate,
+    AVG(aa.SecondsToAnswer) AS AvgSecondsToAnswer,
+    -- Complicated string manipulation and expression on tags
+    CONCAT(
+        SUBSTRING(MAX(aa.QuestionTags) FROM 2 FOR 15),
+        '... (',
+        CAST(LENGTH(MAX(aa.QuestionTags)) AS VARCHAR),
+        ' chars)'
+    ) AS SampleTagString,
+    -- Correlated subquery to find the last post history type for the user's highest-ranked post
+    (
+        SELECT pht.Name
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        WHERE ph.PostId = (SELECT PostId FROM UserActivity WHERE UserId = us.Id AND UserPostRank = 1)
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) AS LastActivityOnBestPost,
+    CASE
+        WHEN us.Reputation > 100000 AND AVG(aa.SecondsToAnswer) < 3600 THEN 'Elite & Fast'
+        WHEN us.Reputation > 50000 OR (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.Id AND b.Class = 1) > 5 THEN 'Expert'
+        ELSE 'Experienced'
+    END AS UserLevel
+FROM UserSegments us
+LEFT JOIN UserActivity ua ON us.Id = ua.UserId
+LEFT JOIN AnswerAnalysis aa ON ua.UserId = aa.OwnerUserId AND ua.PostId = aa.AnswerId
+WHERE
+    ua.PostCreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+    AND COALESCE(ua.SecondsSincePreviousEdit, 999999) > 600
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = ua.PostId AND pl.LinkTypeId = 1 -- Linked posts
+    )
+GROUP BY
+    us.Id,
+    us.DisplayName,
+    us.Segment,
+    us.Reputation
+HAVING
+    AVG(ua.Score) > 5
+    AND SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END) > 10
+ORDER BY
+    us.Reputation DESC,
+    AvgPostScore DESC,
+    AcceptanceRate DESC NULLS LAST
+LIMIT 200;

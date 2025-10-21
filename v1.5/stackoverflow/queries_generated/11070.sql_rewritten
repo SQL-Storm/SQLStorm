@@ -1,0 +1,65 @@
+-- {"query": "11070.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 658} 
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.Title, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Users.DisplayName AS OwnerDisplayName, 
+        Users.Reputation, 
+        (SELECT COUNT(*) FROM Votes WHERE Votes.PostId = Posts.Id) AS TotalVotes,
+        (SELECT COUNT(*) FROM Comments WHERE Comments.PostId = Posts.Id) AS TotalComments,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostHistory.PostId = Posts.Id) AS TotalEdits,
+        (SELECT COUNT(DISTINCT Tags.TagName) FROM Tags JOIN PostsTags ON Tags.Id = PostsTags.TagId WHERE PostsTags.PostId = Posts.Id) AS TagCount
+    FROM Posts
+    JOIN Users ON Posts.OwnerUserId = Users.Id
+    WHERE Posts.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' 
+      AND Posts.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT 
+        UserId, 
+        COUNT(DISTINCT Posts.Id) AS PostsCreated, 
+        COUNT(DISTINCT Comments.Id) AS CommentsMade, 
+        SUM(Votes.Score) AS TotalVoteScore
+    FROM Users
+    LEFT JOIN Posts ON Users.Id = Posts.OwnerUserId
+    LEFT JOIN Comments ON Users.Id = Comments.UserId
+    LEFT JOIN Votes ON Users.Id = Votes.UserId
+    GROUP BY Users.Id
+),
+BadgeSummary AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalBadges, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT 
+    RecentPosts.Id, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.Reputation, 
+    RecentPosts.TotalVotes, 
+    RecentPosts.TotalComments, 
+    RecentPosts.TotalEdits, 
+    RecentPosts.TagCount, 
+    UserActivity.PostsCreated, 
+    UserActivity.CommentsMade, 
+    UserActivity.TotalVoteScore, 
+    BadgeSummary.TotalBadges, 
+    BadgeSummary.GoldBadges, 
+    BadgeSummary.SilverBadges, 
+    BadgeSummary.BronzeBadges
+FROM RecentPosts
+JOIN UserActivity ON RecentPosts.OwnerUserId = UserActivity.UserId
+JOIN BadgeSummary ON RecentPosts.OwnerUserId = BadgeSummary.UserId
+ORDER BY RecentPosts.Score DESC, RecentPosts.ViewCount DESC, RecentPosts.TotalVotes DESC, UserActivity.TotalVoteScore DESC, BadgeSummary.TotalBadges DESC
+LIMIT 100;

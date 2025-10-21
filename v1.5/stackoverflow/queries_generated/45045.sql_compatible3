@@ -1,0 +1,36 @@
+WITH TagPopularity AS (
+    SELECT 
+        tag AS tag,
+        AVG(CAST(Score AS DECIMAL(20, 6))) AS avg_score,
+        COUNT(*) AS post_count
+    FROM Posts 
+    WHERE PostTypeId = 1
+    GROUP BY tag
+    HAVING COUNT(*) > 100
+),
+UserContribution AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS question_count,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        AVG(CAST(p.Score AS DECIMAL(20, 6))) AS avg_post_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 50
+)
+SELECT 
+    tp.tag,
+    tp.avg_score AS tag_avg_score,
+    tp.post_count,
+    uc.DisplayName AS top_contributor,
+    uc.question_count,
+    uc.vote_count,
+    uc.avg_post_score
+FROM TagPopularity tp
+JOIN UserContribution uc ON uc.avg_post_score > (tp.avg_score * 1.5)
+ORDER BY tp.post_count DESC, uc.question_count DESC
+LIMIT 100;

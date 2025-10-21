@@ -1,0 +1,156 @@
+WITH
+-- 1. Recent activity summary per user
+recent_activity AS (
+    SELECT
+        u.Id                                         AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id)                         AS PostsLast30Days,
+        COUNT(DISTINCT c.Id)                         AS CommentsLast30Days,
+        MAX(u.Reputation) OVER (PARTITION BY u.Id)   AS CurrentReputation,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    LEFT JOIN Comments c
+        ON c.UserId = u.Id
+        AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName
+),
+-- 2. Badge counts and classification
+badge_stats AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                          AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        CASE
+            WHEN COUNT(*) FILTER (WHERE b.Class = 1) > 5 THEN 'Elite'
+            WHEN COUNT(*)      > 10                  THEN 'Veteran'
+            ELSE 'Contributor'
+        END AS BadgeTier
+    FROM Badges b
+    GROUP BY b.UserId
+),
+-- 3. Tag usage exploded into rows
+tag_list AS (
+    SELECT
+        p.Id            AS PostId,
+        u.Id            AS OwnerUserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.Tags IS NOT NULL
+),
+-- 4. Top tags by average score
+top_tags AS (
+    SELECT
+        tl.Tag,
+        COUNT(*)                      AS QuestionCount,
+        AVG(p.Score)                  AS AvgScore,
+        RANK() OVER (ORDER BY AVG(p.Score) DESC) AS TagRank
+    FROM tag_list tl
+    JOIN Posts p ON p.Id = tl.PostId AND p.PostTypeId = 1
+    GROUP BY tl.Tag
+    HAVING COUNT(*) > 50
+),
+-- 5. Links and duplicates summary
+link_summary AS (
+    SELECT
+        pl.RelatedPostId AS QuestionId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateCount,
+        SUM(CASE WHEN lt.Name = 'Linked'    THEN 1 ELSE 0 END) AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.RelatedPostId
+),
+-- 6. Combined user performance snapshot
+user_snapshot AS (
+    SELECT
+        ra.UserId,
+        ra.DisplayName,
+        ra.PostsLast30Days,
+        ra.CommentsLast30Days,
+        ra.CurrentReputation,
+        ra.ActivityRank,
+        COALESCE(bs.TotalBadges,0)   AS TotalBadges,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.BadgeTier
+    FROM recent_activity ra
+    LEFT JOIN badge_stats bs ON bs.UserId = ra.UserId
+)
+-- Final result: users active in last 30 days intersected with those owning highly ranked tags
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.PostsLast30Days,
+    us.CommentsLast30Days,
+    us.CurrentReputation,
+    us.ActivityRank,
+    us.TotalBadges,
+    us.BadgeTier,
+    tt.Tag           AS TopTag,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.TagRank,
+    ls.DuplicateCount,
+    ls.LinkedCount,
+    -- Correlated subquery: last answer score for the user's answers in top tags
+    (
+        SELECT MAX(a.Score)
+        FROM Posts a
+        WHERE a.OwnerUserId = us.UserId
+          AND a.PostTypeId = 2
+          AND EXISTS (
+              SELECT 1
+              FROM tag_list t2
+              WHERE t2.PostId = a.ParentId
+                AND t2.Tag = tt.Tag
+          )
+    ) AS BestAnswerScoreInTag,
+    -- String expression and NULL logic
+    COALESCE (
+      NULLIF(us.DisplayName, '') || ' (' || us.BadgeTier || ')',
+      'Anonymous'
+    ) AS DisplayBadgeLabel
+FROM user_snapshot us
+JOIN top_tags tt
+  ON tt.TagRank <= 10
+LEFT JOIN link_summary ls
+  ON ls.QuestionId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.UserId
+          AND p.PostTypeId = 1
+        ORDER BY p.Score DESC NULLS LAST
+        LIMIT 1
+     )
+WHERE us.PostsLast30Days > (
+    SELECT FLOOR(AVG(PostsLast30Days))
+    FROM recent_activity
+)
+INTERSECT
+SELECT
+    us2.UserId,
+    us2.DisplayName,
+    us2.PostsLast30Days,
+    us2.CommentsLast30Days,
+    us2.CurrentReputation,
+    us2.ActivityRank,
+    us2.TotalBadges,
+    us2.BadgeTier,
+    tt2.Tag,
+    tt2.QuestionCount,
+    tt2.AvgScore,
+    tt2.TagRank,
+    ls2.DuplicateCount,
+    ls2.LinkedCount,
+    NULL,
+    NULL
+FROM user_snapshot us2
+JOIN top_tags tt2 ON tt2.TagRank <= 5
+LEFT JOIN link_summary ls2 ON ls2.QuestionId = us2.UserId
+ORDER BY us.UserId, tt.TagRank;

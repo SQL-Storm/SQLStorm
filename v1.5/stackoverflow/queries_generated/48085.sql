@@ -1,0 +1,88 @@
+-- {"query": "48085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1134} 
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS ActualCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 4) AS TitleEdits,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 5) AS BodyEdits,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 6) AS TagEdits,
+        DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate) AS SecondsSinceLastActivity,
+        DATEDIFF(SECOND, p.CreationDate, p.ClosedDate) AS SecondsToClose
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM
+        Users u
+    WHERE
+        u.Id IS NOT NULL AND u.Id > 0
+)
+SELECT
+    pe.PostId,
+    pe.Title,
+    pe.CreationDate AS PostCreationDate,
+    pe.Score AS PostScore,
+    pe.ViewCount AS PostViewCount,
+    pe.AnswerCount AS PostAnswerCount,
+    pe.CommentCount AS PostCommentCount,
+    pe.ActualCommentCount,
+    pe.UpVotes AS PostUpVotes,
+    pe.DownVotes AS PostDownVotes,
+    pe.TitleEdits,
+    pe.BodyEdits,
+    pe.TagEdits,
+    pe.SecondsSinceLastActivity,
+    pe.SecondsToClose,
+    ua.UserId,
+    ua.Reputation AS UserReputation,
+    ua.CreationDate AS UserCreationDate,
+    ua.UserViews,
+    ua.UserUpVotes,
+    ua.UserDownVotes,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionCount AS UserQuestionCount,
+    ua.AnswerCount AS UserAnswerCount,
+    CASE
+        WHEN ua.Reputation > 100000 THEN 'Expert'
+        WHEN ua.Reputation > 50000 THEN 'Experienced'
+        WHEN ua.Reputation > 10000 THEN 'Proficient'
+        WHEN ua.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserExperienceLevel,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ua.UserId AND PostTypeId = 1) AS AvgUserQuestionScore,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ua.UserId AND PostTypeId = 2) AS AvgUserAnswerScore,
+    (SELECT COUNT(*) FROM PostLinks pl JOIN Posts p ON pl.PostId = p.Id WHERE p.OwnerUserId = ua.UserId AND pl.LinkTypeId = 3) AS DuplicateLinksPosted,
+    (SELECT COUNT(*) FROM PostLinks pl JOIN Posts p ON pl.RelatedPostId = p.Id WHERE p.OwnerUserId = ua.UserId AND pl.LinkTypeId = 3) AS DuplicateLinksReceived
+FROM
+    PostEngagement pe
+JOIN
+    UserActivity ua ON pe.OwnerUserId = ua.UserId
+WHERE
+    pe.PostScore > 0 AND pe.PostViewCount > 1000 AND ua.Reputation > 1000
+ORDER BY
+    pe.Score DESC, pe.ViewCount DESC, ua.Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,44 @@
+-- {"query": "33030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 346} 
+SELECT
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(*) AS TotalPosts,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(DISTINCT u.Id) AS UniqueAuthors,
+    AVG(COALESCE(p.AnswerCount,0)) AS AvgAnswerCount,
+    MAX(p.CreationDate) AS LastPostDate,
+    -- Count of comments per post
+    AVG(c.CommentCount) AS AvgCommentsPerPost,
+    -- Count of votes per post
+    AVG(vote_counts.vote_count) AS AvgVotesPerPost
+FROM
+    Posts p
+JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    (SELECT PostId, COUNT(*) AS CommentCount
+     FROM Comments
+     GROUP BY PostId) c_counts ON p.Id = c_counts.PostId
+LEFT JOIN
+    (SELECT PostId, COUNT(*) AS vote_count
+     FROM Votes
+     GROUP BY PostId) vote_counts ON p.Id = vote_counts.PostId
+LEFT JOIN
+    Comments c ON p.Id = c.PostId
+CROSS JOIN
+    (SELECT AVG(CAST(c2.CommentCount AS float)) AS vote_count
+     FROM (
+         SELECT PostId, COUNT(*) AS CommentCount
+         FROM Votes
+         GROUP BY PostId
+     ) c2) vote_counts ON TRUE
+WHERE
+    p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+GROUP BY
+    p.PostTypeId, pt.Name
+ORDER BY
+    TotalPosts DESC
+LIMIT 10;

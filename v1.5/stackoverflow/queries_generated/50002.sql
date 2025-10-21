@@ -1,0 +1,108 @@
+-- {"query": "50002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1150} 
+
+WITH TopTags AS (
+    SELECT
+        TagName,
+        Id
+    FROM Tags
+    WHERE IsModeratorOnly = B'0' AND IsRequired = B'0'
+    ORDER BY Count DESC
+    LIMIT 10
+),
+QuestionsInTopTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId AS QuestionOwnerId,
+        tt.TagName
+    FROM Posts AS p
+    CROSS JOIN TopTags AS tt
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.Tags LIKE '%' || '<' || tt.TagName || '>' || '%'
+),
+AnswerStats AS (
+    SELECT
+        a.OwnerUserId AS UserId,
+        q.TagName,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        SUM(a.Score) AS TotalAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        AVG(a.CommentCount) AS AvgAnswerComments
+    FROM Posts AS a
+    JOIN QuestionsInTopTags AS q ON a.ParentId = q.QuestionId
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId, q.TagName
+),
+UserTagBadges AS (
+    SELECT
+        b.UserId,
+        tt.TagName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges AS b
+    JOIN TopTags AS tt ON b.Name = tt.TagName
+    WHERE b.TagBased = B'1'
+    GROUP BY b.UserId, tt.TagName
+),
+UserInteraction AS (
+    SELECT
+        c.UserId,
+        q.TagName,
+        COUNT(DISTINCT c.Id) AS CommentsOnQuestions,
+        SUM(c.Score) AS CommentScore
+    FROM Comments AS c
+    JOIN QuestionsInTopTags AS q ON c.PostId = q.QuestionId
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId, q.TagName
+),
+CombinedMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        tt.TagName,
+        COALESCE(ans.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ans.TotalAnswerScore, 0) AS TotalAnswerScore,
+        COALESCE(ans.AcceptedAnswers, 0) AS AcceptedAnswers,
+        COALESCE(bdg.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bdg.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ui.CommentsOnQuestions, 0) AS CommentsOnQuestions,
+        (
+            COALESCE(ans.TotalAnswerScore, 0) * 1.5 +
+            COALESCE(ans.AcceptedAnswers, 0) * 25 +
+            COALESCE(bdg.GoldBadges, 0) * 100 +
+            COALESCE(bdg.SilverBadges, 0) * 50 +
+            COALESCE(ui.CommentsOnQuestions, 0) * 0.5 +
+            (u.Reputation / 1000.0)
+        ) AS InfluenceScore
+    FROM Users AS u
+    JOIN TopTags AS tt ON 1=1
+    LEFT JOIN AnswerStats AS ans ON u.Id = ans.UserId AND tt.TagName = ans.TagName
+    LEFT JOIN UserTagBadges AS bdg ON u.Id = bdg.UserId AND tt.TagName = bdg.TagName
+    LEFT JOIN UserInteraction AS ui ON u.Id = ui.UserId AND tt.TagName = ui.TagName
+    WHERE COALESCE(ans.TotalAnswers, 0) > 0 OR COALESCE(bdg.GoldBadges, 0) > 0 OR COALESCE(bdg.SilverBadges, 0) > 0
+),
+RankedUsers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER(PARTITION BY TagName ORDER BY InfluenceScore DESC, Reputation DESC) AS Rank
+    FROM CombinedMetrics
+)
+SELECT
+    ru.TagName,
+    ru.Rank,
+    ru.DisplayName,
+    ru.Reputation,
+    CAST(ru.InfluenceScore AS INT) AS InfluenceScore,
+    ru.TotalAnswers,
+    ru.AcceptedAnswers,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.CommentsOnQuestions,
+    (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId=2) AS UserAverageAnswerScore
+FROM RankedUsers ru
+WHERE ru.Rank <= 10
+ORDER BY ru.TagName, ru.Rank;

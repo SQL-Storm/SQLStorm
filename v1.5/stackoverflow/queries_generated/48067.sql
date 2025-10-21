@@ -1,0 +1,80 @@
+-- {"query": "48067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 456} 
+WITH
+  HighlyActiveUsers AS (
+    SELECT
+      UserId
+    FROM
+      Posts
+    WHERE
+      CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(Id) > 1000
+  ),
+  PopularQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Score,
+      AnswerCount,
+      ViewCount,
+      FavoriteCount,
+      CreationDate
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1 AND CreationDate >= NOW() - INTERVAL '1 year'
+  )
+SELECT
+  pq.Title,
+  u.DisplayName AS OwnerDisplayName,
+  pq.Score,
+  pq.AnswerCount,
+  pq.ViewCount,
+  pq.FavoriteCount,
+  pq.CreationDate,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments c
+    WHERE
+      c.PostId = pq.Id
+  ) AS CommentCount,
+  (
+    SELECT
+      AVG(CAST(LENGTH(Text) AS DECIMAL))
+    FROM
+      Comments c
+    WHERE
+      c.PostId = pq.Id
+  ) AS AverageCommentLength,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks pl
+    WHERE
+      pl.PostId = pq.Id AND pl.LinkTypeId = 3
+  ) AS DuplicateLinks,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostId = pq.Id AND ph.PostHistoryTypeId IN (4, 6)
+  ) AS EditHistoryCount,
+  CASE WHEN pq.OwnerUserId IN (SELECT UserId FROM HighlyActiveUsers) THEN TRUE ELSE FALSE END AS IsHighlyActiveOwner
+FROM
+  PopularQuestions pq
+JOIN
+  Users u ON pq.OwnerUserId = u.Id
+WHERE
+  pq.Score > 100
+ORDER BY
+  pq.Score DESC,
+  pq.ViewCount DESC
+LIMIT 100;

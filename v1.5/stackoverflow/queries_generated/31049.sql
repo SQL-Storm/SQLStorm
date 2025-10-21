@@ -1,0 +1,49 @@
+-- {"query": "31049.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 320} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS CommentCount,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankWithinUser
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8  -- BountyStart VoteType
+    WHERE 
+        p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        p.Id
+),
+TopPosts AS (
+    SELECT 
+        rp.*,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation
+    FROM 
+        RankedPosts rp
+    JOIN 
+        Users u ON rp.PostId = u.Id
+    WHERE 
+        rp.RankWithinUser <= 3  -- Top 3 posts per user
+)
+SELECT 
+    t.PostId,
+    t.Title,
+    t.CreationDate,
+    t.Score,
+    t.ViewCount,
+    t.CommentCount,
+    t.TotalBounty,
+    t.OwnerDisplayName,
+    t.Reputation
+FROM 
+    TopPosts t
+ORDER BY 
+    t.Reputation DESC, t.Score DESC;

@@ -1,0 +1,120 @@
+-- {"query": "9074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3961} 
+
+WITH recent_posts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn,
+    SUBSTRING(p.Body, 1, 100) AS snippet,
+    LEN(p.Body) AS body_len,
+    (LEN(p.Tags) - LEN(REPLACE(p.Tags, '><', ''))) / NULLIF(LEN('><'),0) + 1 AS tag_count,
+    COALESCE(NULLIF(CHARINDEX('<', p.Tags), 0), LEN(p.Tags) + 1) AS first_tag_pos
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '30' DAY
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) AS gold_badges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation
+  HAVING COUNT(b.Id) FILTER (WHERE b.Class = 1) >= 1
+),
+user_activity AS (
+  SELECT
+    tu.UserId,
+    tu.Reputation,
+    tu.gold_badges,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS total_views,
+    COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS upvotes_received,
+    COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS downvotes_received,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) DESC) AS upvote_rank,
+    COALESCE(AVG(p.Score) OVER (), 0) AS global_avg_score,
+    UPPER(SUBSTRING(COALESCE(u.Location, ''), 1, 10)) AS loc_prefix
+  FROM top_users tu
+  LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+  LEFT JOIN Votes V ON V.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = tu.UserId
+  GROUP BY tu.UserId, tu.Reputation, tu.gold_badges, u.Location
+),
+user_selection AS (
+  SELECT
+    ua.*,
+    rp.Id                  AS recent_high_post_id,
+    rp.CreationDate        AS recent_high_post_date,
+    rp.snippet,
+    rp.body_len,
+    rp.tag_count,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rp.Id AND ph.PostHistoryTypeId = 10) AS close_votes,
+    (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = rp.Id)             AS avg_comment_score
+  FROM user_activity ua
+  LEFT JOIN recent_posts rp
+    ON rp.OwnerUserId = ua.UserId AND rp.rn = 1
+  WHERE ua.total_views > ua.global_avg_score * 10
+)
+SELECT *
+FROM user_selection
+
+UNION ALL
+
+SELECT
+  ua.UserId,
+  ua.Reputation,
+  ua.gold_badges,
+  ua.total_views,
+  ua.upvotes_received,
+  ua.downvotes_received,
+  ua.upvote_rank,
+  ua.global_avg_score,
+  ua.loc_prefix,
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM user_activity ua
+WHERE ua.upvotes_received = 0
+
+EXCEPT
+
+SELECT
+  us.UserId,
+  us.Reputation,
+  us.gold_badges,
+  us.total_views,
+  us.upvotes_received,
+  us.downvotes_received,
+  us.upvote_rank,
+  us.global_avg_score,
+  us.loc_prefix,
+  us.recent_high_post_id,
+  us.recent_high_post_date,
+  us.snippet,
+  us.body_len,
+  us.tag_count,
+  us.close_votes,
+  us.avg_comment_score
+FROM user_selection us
+
+INTERSECT
+
+SELECT
+  UserId,
+  Reputation,
+  gold_badges,
+  total_views,
+  upvotes_received,
+  downvotes_received,
+  upvote_rank,
+  global_avg_score,
+  loc_prefix,
+  recent_high_post_id,
+  recent_high_post_date,
+  snippet,
+  body_len,
+  tag_count,
+  close_votes,
+  avg_comment_score
+FROM user_selection
+
+ORDER BY total_views DESC, UserId;

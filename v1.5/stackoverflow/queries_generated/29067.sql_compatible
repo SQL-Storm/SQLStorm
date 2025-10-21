@@ -1,0 +1,271 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY AVGPostScore DESC) as RankByAvgScore
+    FROM UserActivityStats
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        p.CreationDate,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        COALESCE(p.Tags, '') as Tags,
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2) as TagsParsed,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') as TagArray,
+        CASE 
+            WHEN p.Score < 0 THEN 'Negative'
+            WHEN p.Score BETWEEN 0 AND 5 THEN 'Neutral'
+            WHEN p.Score BETWEEN 6 AND 25 THEN 'Positive'
+            WHEN p.Score > 25 THEN 'HighlyPositive'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount IS NULL THEN 'Unknown'
+            WHEN p.ViewCount < 100 THEN 'LowViews'
+            WHEN p.ViewCount BETWEEN 100 AND 1000 THEN 'MediumViews'
+            WHEN p.ViewCount BETWEEN 1001 AND 10000 THEN 'HighViews'
+            WHEN p.ViewCount > 10000 THEN 'VeryHighViews'
+        END as ViewCategory,
+        CASE 
+            WHEN p.AnswerCount IS NULL THEN 0
+            ELSE p.AnswerCount 
+        END as AnswerCountCapped,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0
+            THEN (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)
+            ELSE 0
+        END as CommentCountOnQuestions
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate IS NOT NULL
+),
+TopTaggedPosts AS (
+    SELECT 
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.TagsParsed,
+        pca.ScoreCategory,
+        pca.ViewCategory,
+        pca.HasAcceptedAnswer,
+        ARRAY_LENGTH(pca.TagArray) as TagCount,
+        CASE 
+            WHEN ARRAY_LENGTH(pca.TagArray) > 1 THEN 
+                STRING_AGG(CASE WHEN tag NOT LIKE '%-%' THEN tag ELSE NULL END, ', ')
+            ELSE NULL 
+        END as StandardTags,
+        ROW_NUMBER() OVER (PARTITION BY pca.ScoreCategory ORDER BY pca.Score DESC) as RankPerScoreCategory,
+        NTH_VALUE(pca.Title, 1) OVER (
+            PARTITION BY pca.ViewCategory 
+            ORDER BY pca.Score DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) as TopScoredPostPerViewCategory
+    FROM PostComplexityAnalysis pca
+    CROSS JOIN UNNEST(pca.TagArray) AS tag
+    WHERE pca.Score >= 0
+),
+CombinedAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.BadgeCount,
+        ru.CommentCount,
+        ru.LastPostDate,
+        ru.AvgPostScore,
+        ru.AllTags,
+        ru.RankByReputation,
+        ru.RankByAvgScore,
+        COALESCE(
+            (SELECT STRING_AGG(SUBSTRING(t.TagName, 1, 20), ', ') 
+             FROM Tags t 
+             WHERE t.TagName IN (
+                 SELECT unnest(ttp.TagArray) 
+                 FROM TopTaggedPosts ttp 
+                 WHERE ttp.Score > 10
+             )), 
+            'No Common Tags'
+        ) as CommonTagsAmongHighScorePosts,
+        COALESCE(
+            (SELECT AVG(ttp.Score) 
+             FROM TopTaggedPosts ttp 
+             WHERE ttp.ScoreCategory = 'HighlyPositive'), 
+            0
+        ) as AvgScoreOfHighlyPositivePosts,
+        CASE 
+            WHEN ru.Reputation > 10000 AND ru.TotalPosts > 100 THEN 'EliteContributor'
+            WHEN ru.Reputation > 5000 AND ru.TotalPosts > 50 THEN 'ExperiencedContributor'
+            WHEN ru.Reputation > 1000 AND ru.TotalPosts > 10 THEN 'ActiveContributor'
+            ELSE 'RegularContributor'
+        END as ContributorTier,
+        CASE 
+            WHEN ru.QuestionCount > 0 AND ru.AnswerCount > 0 THEN
+                (ru.AnswerCount * 100.0 / ru.QuestionCount)
+            ELSE NULL
+        END as AnswerToQuestionRatio
+    FROM RankedUsers ru
+    WHERE ru.Reputation > 0
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate as HistoryCreationDate,
+        ph.PostHistoryTypeId,
+        ph.UserId as HistoryUserId,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'PostStatusChange'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 'PostEdit'
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 'PostModerationAction'
+            WHEN ph.PostHistoryTypeId IN (24, 31, 33, 34, 50, 52, 53) THEN 'SpecialEvents'
+            ELSE 'Other'
+        END as HistoryTypeCategory,
+        CASE 
+            WHEN ph.UserId IS NOT NULL THEN
+                (SELECT u.DisplayName FROM Users u WHERE u.Id = ph.UserId)
+            ELSE 'System'
+        END as HistoryActor,
+        DATEDIFF('day', ph.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceHistoryAction,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as RecentHistoryRank
+    FROM PostHistory ph
+    WHERE ph.CreationDate IS NOT NULL 
+    AND ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId IN (1, 2))
+)
+SELECT 
+    CONCAT(
+        'Top Contributor Analysis: ',
+        ca.DisplayName,
+        ' (Reputation: ',
+        ca.Reputation,
+        ', Tier: ',
+        ca.ContributorTier,
+        ')'
+    ) as AnalysisHeader,
+    ca.UserId,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.BadgeCount,
+    ca.CommentCount,
+    ca.LastPostDate,
+    ca.AvgPostScore,
+    ca.AllTags,
+    ca.RankByReputation,
+    ca.RankByAvgScore,
+    ca.CommonTagsAmongHighScorePosts,
+    ca.AvgScoreOfHighlyPositivePosts,
+    ca.ContributorTier,
+    ca.AnswerToQuestionRatio,
+    STRING_AGG(
+        CASE WHEN tha.HistoryTypeCategory = 'PostStatusChange' THEN 
+            CONCAT(tha.HistoryCreationDate, ': ', tha.HistoryActor, ' changed post status')
+        ELSE NULL 
+        END, 
+        '; '
+    ) as RecentStatusChanges,
+    STRING_AGG(
+        CASE WHEN tha.HistoryTypeCategory = 'PostEdit' THEN 
+            CONCAT(tha.HistoryCreationDate, ': ', tha.HistoryActor, ' edited post')
+        ELSE NULL 
+        END, 
+        '; '
+    ) as RecentEdits,
+    STRING_AGG(
+        CASE WHEN tha.HistoryTypeCategory = 'PostModerationAction' THEN 
+            CONCAT(tha.HistoryCreationDate, ': ', tha.HistoryActor, ' moderated post')
+        ELSE NULL 
+        END, 
+        '; '
+    ) as RecentModerationActions,
+    STRING_AGG(
+        CASE WHEN tha.HistoryTypeCategory = 'SpecialEvents' THEN 
+            CONCAT(tha.HistoryCreationDate, ': ', tha.HistoryActor, ' handled special event')
+        ELSE NULL 
+        END, 
+        '; '
+    ) as RecentSpecialEvents,
+    COUNT(*) as TotalHistoryEvents,
+    COUNT(DISTINCT CASE WHEN tha.HistoryTypeCategory = 'PostStatusChange' THEN tha.PostId END) as PostStatusChangeCount,
+    COUNT(DISTINCT CASE WHEN tha.HistoryTypeCategory = 'PostEdit' THEN tha.PostId END) as PostEditCount,
+    COUNT(DISTINCT CASE WHEN tha.HistoryTypeCategory = 'PostModerationAction' THEN tha.PostId END) as PostModerationActionCount,
+    COUNT(DISTINCT CASE WHEN tha.HistoryTypeCategory = 'SpecialEvents' THEN tha.PostId END) as SpecialEventsCount,
+    CASE
+        WHEN COUNT(DISTINCT CASE WHEN tha.HistoryTypeCategory = 'PostModerationAction' THEN tha.PostId END) > 0 THEN
+            'ActiveModerator'
+        ELSE 'RegularContributor'
+    END as ModerationActivityStatus,
+    STRING_AGG(
+        CASE WHEN ttp.ScoreCategory = 'HighlyPositive' THEN 
+            CONCAT(ttp.Title, ' (Score: ', ttp.Score, ')')
+        ELSE NULL 
+        END, 
+        ' | '
+    ) as TopHighlyPositivePosts
+FROM CombinedAnalysis ca
+LEFT JOIN PostHistoryAnalysis tha ON ca.UserId = tha.HistoryUserId
+LEFT JOIN TopTaggedPosts ttp ON ca.UserId IN (
+    SELECT p.OwnerUserId 
+    FROM Posts p 
+    WHERE p.Id = ttp.PostId AND p.OwnerUserId = ca.UserId
+)
+WHERE ca.Reputation > 1000
+GROUP BY 
+    ca.UserId, 
+    ca.DisplayName, 
+    ca.Reputation, 
+    ca.TotalPosts, 
+    ca.QuestionCount, 
+    ca.AnswerCount, 
+    ca.BadgeCount, 
+    ca.CommentCount, 
+    ca.LastPostDate, 
+    ca.AvgPostScore, 
+    ca.AllTags, 
+    ca.RankByReputation, 
+    ca.RankByAvgScore, 
+    ca.CommonTagsAmongHighScorePosts, 
+    ca.AvgScoreOfHighlyPositivePosts, 
+    ca.ContributorTier, 
+    ca.AnswerToQuestionRatio
+HAVING 
+    COUNT(*) > 0 
+    OR COUNT(DISTINCT CASE WHEN tha.HistoryTypeCategory = 'PostStatusChange' THEN tha.PostId END) > 0
+ORDER BY 
+    ca.Reputation DESC, 
+    ca.TotalPosts DESC,
+    ca.AvgScoreOfHighlyPositivePosts DESC
+LIMIT 20;

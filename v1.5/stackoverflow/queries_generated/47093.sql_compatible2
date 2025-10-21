@@ -1,0 +1,119 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON t.Id <> th.Id
+    WHERE th.Level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as AcceptedAnswers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        EXTRACT(DOW FROM p.CreationDate) as DayOfWeek,
+        EXTRACT(HOUR FROM p.CreationDate) as HourOfDay,
+        p.PostTypeId,
+        COUNT(*) as PostCount,
+        AVG(p.Score) as AvgScore,
+        AVG(p.Views) as AvgViews,
+        AVG(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) * 100 as CloseRate
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+    GROUP BY EXTRACT(DOW FROM p.CreationDate), EXTRACT(HOUR FROM p.CreationDate), p.PostTypeId
+),
+badge_sequences AS (
+    SELECT 
+        b1.UserId,
+        b1.Name as FirstBadge,
+        b2.Name as SecondBadge,
+        b3.Name as ThirdBadge,
+        b1.Date as FirstDate,
+        b3.Date as LastDate,
+        b3.Date - b1.Date as TimeSpan,
+        COUNT(DISTINCT b4.Id) as TotalBadgesInPeriod
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b2.UserId = b1.UserId AND b2.Date > b1.Date
+    INNER JOIN Badges b3 ON b3.UserId = b2.UserId AND b3.Date > b2.Date
+    LEFT JOIN Badges b4 ON b4.UserId = b1.UserId 
+        AND b4.Date BETWEEN b1.Date AND b3.Date
+    WHERE b1.Class = 1 AND b2.Class IN (1,2) AND b3.Class IN (1,2,3)
+    GROUP BY b1.UserId, b1.Name, b2.Name, b3.Name, b1.Date, b3.Date
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        p.PostTypeId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) as RollbackCount,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) as EditTimespan,
+        STRING_AGG(DISTINCT pht.Name, ', ' ORDER BY pht.Name) as HistoryTypes
+    FROM PostHistory ph
+    INNER JOIN Posts p ON p.Id = ph.PostId
+    INNER JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostHistoryTypeId NOT IN (25, 50, 52, 53)
+    GROUP BY ph.PostId, p.PostTypeId
+    HAVING COUNT(DISTINCT ph.Id) > 5
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.TotalScore as ExpertiseScore,
+    ue.AcceptedAnswers,
+    tp.DayOfWeek,
+    tp.HourOfDay,
+    tp.AvgScore as HourlyAvgScore,
+    bs.FirstBadge || ' -> ' || bs.SecondBadge || ' -> ' || bs.ThirdBadge as BadgeProgression,
+    bs.TimeSpan as BadgeProgressionDays,
+    ep.EditCount,
+    ep.UniqueEditors,
+    th.Level as TagHierarchyLevel,
+    th.QuestionCount as TagQuestionCount,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ue.AvgScore) OVER (PARTITION BY ue.TagName) as MedianTagScore,
+    ROW_NUMBER() OVER (ORDER BY ue.TotalScore DESC, bs.TotalBadgesInPeriod DESC) as GlobalRank
+FROM user_expertise ue
+INNER JOIN temporal_patterns tp ON tp.PostTypeId = 2
+INNER JOIN badge_sequences bs ON bs.UserId = ue.UserId
+INNER JOIN Posts p ON p.OwnerUserId = ue.UserId AND p.PostTypeId = 2
+INNER JOIN edit_patterns ep ON ep.PostId = p.Id
+INNER JOIN tag_hierarchy th ON th.TagName = ue.TagName
+WHERE ue.TagRank <= 10
+    AND tp.AvgScore > 5
+    AND ep.EditCount < 20
+GROUP BY ue.DisplayName, ue.TagName, ue.TotalScore, ue.AcceptedAnswers, tp.DayOfWeek, tp.HourOfDay, tp.AvgScore, bs.FirstBadge, bs.SecondBadge, bs.ThirdBadge, bs.TimeSpan, ep.EditCount, ep.UniqueEditors, th.Level, th.QuestionCount
+ORDER BY ue.TotalScore DESC, ue.TagName, tp.DayOfWeek, tp.HourOfDay
+LIMIT 1000;

@@ -1,0 +1,108 @@
+-- {"query": "26066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 774} 
+WITH RankedPosts AS (
+  SELECT 
+    p.Id, 
+    p.Score, 
+    p.ViewCount, 
+    p.Title, 
+    p.Tags, 
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreDenseRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewDenseRank
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1 AND p.Score > 0 AND p.ViewCount > 0
+),
+TopPosts AS (
+  SELECT 
+    Id, 
+    Score, 
+    ViewCount, 
+    Title, 
+    Tags, 
+    ScoreRank, 
+    ViewRank, 
+    ScoreDenseRank, 
+    ViewDenseRank
+  FROM 
+    RankedPosts
+  WHERE 
+    ScoreRank <= 10 OR ViewRank <= 10
+),
+UserReputation AS (
+  SELECT 
+    u.Id, 
+    u.Reputation, 
+    COUNT(DISTINCT b.Id) AS BadgeCount
+  FROM 
+    Users u
+  LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id, 
+    u.Reputation
+),
+PostHistoryStats AS (
+  SELECT 
+    ph.PostId, 
+    COUNT(DISTINCT ph.PostHistoryTypeId) AS HistoryCount, 
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+)
+SELECT 
+  p.Id, 
+  p.Score, 
+  p.ViewCount, 
+  p.Title, 
+  p.Tags, 
+  u.Reputation, 
+  u.BadgeCount, 
+  ph.HistoryCount, 
+  ph.CloseCount, 
+  ph.ReopenCount,
+  CASE 
+    WHEN p.Score > 100 AND p.ViewCount > 1000 THEN 'HighScoreHighView'
+    WHEN p.Score > 100 AND p.ViewCount <= 1000 THEN 'HighScoreLowView'
+    WHEN p.Score <= 100 AND p.ViewCount > 1000 THEN 'LowScoreHighView'
+    ELSE 'LowScoreLowView'
+  END AS ScoreViewCategory,
+  CASE 
+    WHEN u.Reputation > 10000 THEN 'HighReputation'
+    WHEN u.Reputation > 1000 AND u.Reputation <= 10000 THEN 'MediumReputation'
+    ELSE 'LowReputation'
+  END AS ReputationCategory,
+  STRING_AGG(DISTINCT t.TagName, ', ') AS TagNames
+FROM 
+  Posts p
+JOIN 
+  TopPosts tp ON p.Id = tp.Id
+JOIN 
+  UserReputation u ON p.OwnerUserId = u.Id
+JOIN 
+  PostHistoryStats ph ON p.Id = ph.PostId
+LEFT JOIN 
+  PostTags pt ON p.Id = pt.PostId
+LEFT JOIN 
+  Tags t ON pt.TagId = t.Id
+WHERE 
+  p.Score > 0 AND p.ViewCount > 0 AND u.Reputation > 0
+GROUP BY 
+  p.Id, 
+  p.Score, 
+  p.ViewCount, 
+  p.Title, 
+  p.Tags, 
+  u.Reputation, 
+  u.BadgeCount, 
+  ph.HistoryCount, 
+  ph.CloseCount, 
+  ph.ReopenCount
+ORDER BY 
+  p.Score DESC, 
+  p.ViewCount DESC;

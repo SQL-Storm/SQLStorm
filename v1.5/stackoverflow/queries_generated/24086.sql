@@ -1,0 +1,141 @@
+-- {"query": "24086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3029} 
+
+WITH
+
+-- 1. Top‑10 vote scores for each user’s questions
+top_posts AS (
+    SELECT
+        p.OwnerUserId      AS UserId,
+        p.Id                AS PostId,
+        SUM(v.VoteTypeId)   AS VoteScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY v.CreationDate DESC
+        )                AS rn
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, p.Id
+),
+
+-- 2. Average score of those top‑10 posts per user
+top10 AS (
+    SELECT
+        UserId,
+        AVG(VoteScore) AS AvgTop10Score
+    FROM top_posts
+    WHERE rn <= 10
+    GROUP BY UserId
+),
+
+-- 3. Badge counts per class for each user
+badge_counts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 END) AS Gold,
+        SUM(CASE WHEN Class = 2 THEN 1 END) AS Silver,
+        SUM(CASE WHEN Class = 3 THEN 1 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+),
+
+-- 4. Recent unique tags from a user’s latest 5 questions
+tag_union AS (
+    SELECT
+        p.OwnerUserId,
+        unnest(regexp_split_to_array(p.Tags, '>')) AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+tag_summary AS (
+    SELECT
+        OwnerUserId,
+        array_to_string(
+            array_agg(DISTINCT tag ORDER BY tag),
+            ', '
+        ) AS RecentTags
+    FROM (
+        SELECT OwnerUserId, tag,
+               ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM tag_union tu
+        JOIN Posts p ON p.Id = (SELECT Id FROM Posts WHERE OwnerUserId = tu.OwnerUserId ORDER BY CreationDate DESC LIMIT 1)
+    ) t
+    WHERE rn <= 5
+    GROUP BY OwnerUserId
+),
+
+-- 5. Combine duplicate and closed post events (set operator)
+post_events AS (
+    -- Duplicate posts (LinkType 3)
+    SELECT
+        pl.PostId        AS EventPostId,
+        p.OwnerUserId    AS OwnerUserId,
+        'D'              AS EventType
+    FROM PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    WHERE pl.LinkTypeId = 3
+    UNION ALL
+    -- Closed posts (PostHistory type 10)
+    SELECT
+        ph.PostId        AS EventPostId,
+        p.OwnerUserId    AS OwnerUserId,
+        'C'              AS EventType
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+
+-- 6. Count of duplicate / closed posts per user
+event_counts AS (
+    SELECT
+        OwnerUserId     AS UserId,
+        SUM(CASE WHEN EventType = 'D' THEN 1 END) AS DuplicatePosts,
+        SUM(CASE WHEN EventType = 'C' THEN 1 END) AS ClosedPosts
+    FROM post_events
+    GROUP BY OwnerUserId
+),
+
+-- 7. Correlated sub‑query: most recent comment on a user’s latest question
+latest_comment AS (
+    SELECT
+        q.OwnerUserId,
+        (SELECT c.Text
+         FROM Posts qp
+         JOIN Comments c ON c.PostId = qp.Id
+         WHERE qp.PostTypeId = 1
+           AND qp.OwnerUserId = q.OwnerUserId
+         ORDER BY qp.CreationDate DESC, c.CreationDate DESC
+         LIMIT 1) AS CommentText
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.OwnerUserId IS NOT NULL
+    GROUP BY q.OwnerUserId
+)
+
+-- 8. Final result (performance‑heavy join of many CTEs)
+SELECT
+    u.Id                       AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(t10.AvgTop10Score, 0)                  AS AvgTop10Score,
+    COALESCE(bc.Gold, 0)                           AS GoldBadges,
+    COALESCE(bc.Silver, 0)                         AS SilverBadges,
+    COALESCE(bc.Bronze, 0)                         AS BronzeBadges,
+    COALESCE(ts.RecentTags, 'NO TAGS')             AS RecentTags,
+    COALESCE(ec.DuplicatePosts, 0)                 AS DuplicatePosts,
+    COALESCE(ec.ClosedPosts, 0)                    AS ClosedPosts,
+    COALESCE(lc.CommentText, 'NO COMMENT')         AS LatestComment,
+    -- Count of peers differing from you on AvgTop10Score by <= 5
+    (SELECT COUNT(*)
+     FROM top10 t
+     WHERE t.UserId <> u.Id
+       AND abs(t.AvgTop10Score - COALESCE(t10.AvgTop10Score, 0)) <= 5) AS SimilarScorePeers
+FROM Users u
+LEFT JOIN top10 t10 ON t10.UserId = u.Id
+LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+LEFT JOIN tag_summary ts ON ts.OwnerUserId = u.Id
+LEFT JOIN event_counts ec ON ec.UserId = u.Id
+LEFT JOIN latest_comment lc ON lc.OwnerUserId = u.Id
+WHERE u.Reputation > 1000 AND u.DisplayName IS NOT NULL
+ORDER BY u.Reputation DESC
+LIMIT 100;

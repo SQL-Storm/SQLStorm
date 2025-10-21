@@ -1,0 +1,100 @@
+WITH UserQuestionStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalQuestions,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedAnswersCount,
+        STRING_AGG(DISTINCT REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><', ','), ',') AS AggregatedTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswerStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT COALESCE(pl.RelatedPostId, 0)) AS LinkedPosts
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    WHERE p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT 
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(CHAR_LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesReceived,
+        SUM(v.BountyAmount) AS TotalBounties
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+RankedUsers AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        COALESCE(q.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(q.AvgQuestionScore, 0) AS AvgQuestionScore,
+        COALESCE(q.TotalViews, 0) AS TotalViews,
+        COALESCE(q.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+        COALESCE(a.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(a.LinkedPosts, 0) AS LinkedPosts,
+        COALESCE(c.TotalComments, 0) AS TotalComments,
+        COALESCE(c.AvgCommentLength, 0) AS AvgCommentLength,
+        COALESCE(v.UpvotesReceived, 0) AS UpvotesReceived,
+        COALESCE(v.DownvotesReceived, 0) AS DownvotesReceived,
+        COALESCE(v.TotalBounties, 0) AS TotalBounties,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, (COALESCE(q.TotalQuestions, 0) + COALESCE(a.TotalAnswers, 0)) DESC) AS UserRank,
+        DENSE_RANK() OVER (PARTITION BY CASE WHEN u.Reputation > 1000 THEN 1 ELSE 0 END ORDER BY u.Reputation) AS ReputationBracketRank,
+        (u.Reputation + COALESCE(q.AvgQuestionScore, 0) * 10 + COALESCE(a.AvgAnswerScore, 0) * 5) / GREATEST((COALESCE(q.TotalQuestions, 1) + COALESCE(a.TotalAnswers, 1)), 1) AS CompositeScore
+    FROM Users u
+    LEFT JOIN UserQuestionStats q ON u.Id = q.OwnerUserId
+    LEFT JOIN UserAnswerStats a ON u.Id = a.OwnerUserId
+    LEFT JOIN UserCommentStats c ON u.Id = c.UserId
+    LEFT JOIN UserVoteStats v ON u.Id = v.UserId
+    WHERE u.Reputation > 0
+)
+SELECT 
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalQuestions,
+    ru.TotalAnswers,
+    ru.TotalComments,
+    ru.UserRank,
+    ru.ReputationBracketRank,
+    ru.CompositeScore,
+    CASE 
+        WHEN ru.CompositeScore > 50 AND ru.TotalComments > 10 THEN 'High Contributor'
+        WHEN ru.UpvotesReceived > ru.DownvotesReceived * 2 THEN 'Popular'
+        ELSE 'Moderate'
+    END AS UserCategory,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = ru.Id AND p.Score > 10 
+          AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0)
+    ) AS HighScorePostsWithComments
+FROM RankedUsers ru
+WHERE (ru.UserRank <= 100)
+   OR ((ru.UpvotesReceived - ru.DownvotesReceived) > 50)
+   AND ru.Id IN (
+       SELECT DISTINCT b.UserId 
+       FROM Badges b 
+       WHERE b.Class = 1 AND b.TagBased = 0
+   )
+ORDER BY ru.CompositeScore DESC, ru.UserRank;

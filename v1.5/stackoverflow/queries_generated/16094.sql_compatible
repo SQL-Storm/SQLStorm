@@ -1,0 +1,142 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COALESCE(AVG(p.Score), 0) as avg_post_score,
+        MAX(p.CreationDate) as last_post_date,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'Unknown'), 1, 20) ORDER BY u.Reputation DESC) as location_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) as badge_rank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+        AND (u.Reputation > 1000 OR u.UpVotes > 100)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+post_engagement_analysis AS (
+    SELECT 
+        p.Id as post_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as answer_status,
+        COALESCE(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), ARRAY[]::varchar[]) as tag_array,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = p.Id 
+           AND c.Score > 0) as positive_comments,
+        (SELECT STRING_AGG(DISTINCT vt.Name, ', ')
+         FROM Votes v
+         INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+         WHERE v.PostId = p.Id) as vote_types,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 as activity_duration_days,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_post_score,
+        LEAD(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_post_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2018-01-01'
+        AND p.Score IS NOT NULL
+),
+tag_performance AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_usage_count,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        CAST(COUNT(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS float) / NULLIF(COUNT(*), 0) as acceptance_rate
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+correlated_user_stats AS (
+    SELECT 
+        uam.Id,
+        uam.DisplayName,
+        uam.post_count,
+        uam.badge_count,
+        uam.avg_post_score,
+        uam.location_rank,
+        (SELECT COUNT(*)
+         FROM PostHistory ph
+         WHERE ph.UserId = uam.Id
+           AND ph.PostHistoryTypeId IN (4, 5, 6)
+           AND ph.CreationDate > uam.last_post_date - INTERVAL '90 days') as recent_edits,
+        (SELECT COALESCE(SUM(v.BountyAmount), 0)
+         FROM Votes v
+         WHERE v.UserId = uam.Id
+           AND v.VoteTypeId = 8) as total_bounties_offered,
+        CASE 
+            WHEN uam.Reputation > 10000 THEN 'Elite'
+            WHEN uam.Reputation > 5000 THEN 'Expert'
+            WHEN uam.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as user_tier
+    FROM user_activity_metrics uam
+    WHERE uam.location_rank <= 3
+)
+SELECT 
+    cus.DisplayName,
+    cus.user_tier,
+    cus.post_count,
+    cus.badge_count,
+    ROUND(CAST(cus.avg_post_score AS numeric), 2) as avg_score,
+    cus.recent_edits,
+    cus.total_bounties_offered,
+    pea.answer_status,
+    pea.positive_comments,
+    pea.activity_duration_days,
+    COALESCE(NULLIF(TRIM(BOTH FROM SUBSTRING(pea.Title, 1, 50)), ''), 'No Title') as truncated_title,
+    tp.avg_score as tag_avg_score,
+    ROUND(CAST(tp.acceptance_rate * 100 AS numeric), 2) as tag_acceptance_pct,
+    CASE 
+        WHEN pea.prev_post_score IS NULL THEN 'First Post'
+        WHEN pea.Score > pea.prev_post_score THEN 'Improving'
+        WHEN pea.Score < pea.prev_post_score THEN 'Declining'
+        ELSE 'Stable'
+    END as performance_trend,
+    COALESCE(pea.ViewCount, 0) * 0.1 + COALESCE(pea.Score, 0) * 5 as engagement_metric
+FROM correlated_user_stats cus
+INNER JOIN user_activity_metrics uam ON cus.Id = uam.Id
+LEFT JOIN post_engagement_analysis pea ON pea.post_id IN (
+    SELECT p.Id 
+    FROM Posts p 
+    WHERE p.OwnerUserId = cus.Id 
+    ORDER BY p.CreationDate DESC 
+    LIMIT 5
+)
+LEFT JOIN LATERAL (
+    SELECT tp2.* 
+    FROM tag_performance tp2
+    WHERE EXISTS (
+        SELECT 1 
+        FROM unnest(pea.tag_array) AS tag_elem
+        WHERE tag_elem = tp2.TagName
+    )
+    ORDER BY tp2.avg_score DESC
+    LIMIT 1
+) tp ON true
+WHERE cus.post_count > 10
+    AND (pea.ViewCount > 500 OR pea.Score > 5 OR pea.ViewCount IS NULL)
+    AND (cus.total_bounties_offered > 0 OR cus.recent_edits > 2)
+ORDER BY 
+    CASE cus.user_tier
+        WHEN 'Elite' THEN 1
+        WHEN 'Expert' THEN 2
+        WHEN 'Intermediate' THEN 3
+        ELSE 4
+    END,
+    engagement_metric DESC NULLS LAST,
+    cus.badge_count DESC
+LIMIT 100;

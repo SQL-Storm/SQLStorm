@@ -1,0 +1,47 @@
+-- {"query": "58041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1267} 
+
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 10
+    GROUP BY u.Id
+), 
+UserBadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    ups.AvgPostScore,
+    ups.TotalPosts,
+    ups.QuestionsAsked,
+    ups.AnswersProvided,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND v.VoteTypeId = 2) AS TotalUpvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate BETWEEN '2020-01-01' AND '2023-12-31') AS RecentComments,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (2, 5, 8)) AS ContentEdits,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM Users u
+JOIN UserPostStats ups ON u.Id = ups.UserId
+JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+WHERE u.Reputation > 10000
+    AND EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.AnswerCount > 5)
+    AND u.Id IN (SELECT DISTINCT UserId FROM Votes WHERE VoteTypeId = 8 AND BountyAmount > 50)
+HAVING GoldBadges + SilverBadges + BronzeBadges > 10
+ORDER BY ReputationRank, TotalPosts DESC
+LIMIT 100;

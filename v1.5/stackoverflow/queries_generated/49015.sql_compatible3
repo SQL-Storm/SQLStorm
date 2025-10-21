@@ -1,0 +1,146 @@
+WITH UserContributionSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestionsAsked,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswersGiven,
+        COUNT(DISTINCT p_e.Id) AS TotalPostsEdited,
+        SUM(CASE WHEN p_q.Id IS NOT NULL THEN p_q.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p_a.Id IS NOT NULL THEN p_a.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgeClassWeightedScore,
+        COUNT(DISTINCT v_up.Id) AS TotalUpvotesGiven,
+        COUNT(DISTINCT v_down.Id) AS TotalDownvotesGiven,
+        SUM(CASE WHEN v_rec.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN v_rec.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        AVG(COALESCE(p_q.ViewCount, 0)) AS AvgQuestionViewCount,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / (3600 * 24 * 365.25) AS YearsActive
+    FROM Users u
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1 AND p_q.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2 AND p_a.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    LEFT JOIN Posts p_e ON u.Id = p_e.LastEditorUserId AND p_e.LastEditDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date >= DATE '2024-10-01' - INTERVAL '2 years'
+    LEFT JOIN Votes v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2 AND v_up.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    LEFT JOIN Votes v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3 AND v_down.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    LEFT JOIN Posts p_all_user_posts ON u.Id = p_all_user_posts.OwnerUserId
+    LEFT JOIN Votes v_rec ON p_all_user_posts.Id = v_rec.PostId AND v_rec.VoteTypeId IN (2, 3) AND v_rec.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    WHERE u.Reputation >= 5000
+      AND u.LastAccessDate >= DATE '2024-10-01' - INTERVAL '3 months'
+      AND u.CreationDate <= DATE '2024-10-01' - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p_q.Id) + COUNT(DISTINCT p_a.Id) > 5
+),
+PostTagAnalysisWithHistory AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        LOWER(
+            -- Normalize tag extraction without USING unnest in havings: compute tag list then pick first tag as representative if needed
+            CONCAT('[', STRING_AGG(DISTINCT t, ',') , ']')
+        ) AS TagName,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS EditCountRecent,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCountRecent,
+        SUM(CASE WHEN pl_linked.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN pl_duplicate.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.CreationDate >= DATE '2024-10-01' - INTERVAL '6 months'
+    LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId AND pl_linked.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    LEFT JOIN PostLinks pl_duplicate ON p.Id = pl_duplicate.PostId AND pl_duplicate.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+      AND p.Tags IS NOT NULL
+      AND p.Title IS NOT NULL
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+    HAVING LOWER(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) NOT IN ('discussion', 'feature-request', 'bug', 'support')
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT PostId) AS TotalQuestionsInTag,
+        AVG(Score) AS AvgScoreInTag,
+        AVG(ViewCount) AS AvgViewCountInTag,
+        AVG(AnswerCount) AS AvgAnswerCountInTag,
+        SUM(EditCountRecent) AS TotalEditsInTagRecent,
+        SUM(CloseVoteCountRecent) AS TotalCloseVotesInTagRecent,
+        SUM(LinkedPostCount) AS TotalLinkedPostsInTag,
+        SUM(DuplicatePostCount) AS TotalDuplicatePostsInTag,
+        RANK() OVER (ORDER BY COUNT(DISTINCT PostId) DESC, AVG(Score) DESC, SUM(EditCountRecent) ASC) AS TagActivityRank,
+        NTILE(10) OVER (ORDER BY COUNT(DISTINCT PostId) DESC) AS TagPopularityDecile
+    FROM PostTagAnalysisWithHistory
+    WHERE TagName IS NOT NULL
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) > 100
+),
+InfluentialUserTagScores AS (
+    SELECT
+        ucs.UserId,
+        ucs.DisplayName,
+        ucs.Reputation,
+        ucs.TotalQuestionsAsked,
+        ucs.TotalAnswersGiven,
+        ucs.TotalPostsEdited,
+        ucs.BadgeClassWeightedScore,
+        pta.TagName,
+        COUNT(DISTINCT pta.PostId) AS UserQuestionsInTag,
+        SUM(pta.Score) AS UserQuestionScoreInTag,
+        AVG(pta.ViewCount) AS UserAvgQuestionViewCountInTag,
+        SUM(pta.EditCountRecent) AS UserEditsOnQuestionsInTagRecent,
+        SUM(pta.CommentCount) AS UserCommentsOnOwnQuestionsInTag,
+        tpm.AvgScoreInTag,
+        tpm.AvgViewCountInTag,
+        tpm.TotalQuestionsInTag,
+        tpm.TagActivityRank,
+        tpm.TagPopularityDecile,
+        (
+            (ucs.Reputation * 0.001) +
+            (ucs.BadgeClassWeightedScore * 0.1) +
+            (ucs.TotalQuestionsAsked * 0.5) +
+            (ucs.TotalAnswersGiven * 0.3) +
+            (ucs.TotalPostsEdited * 0.05) +
+            (ucs.TotalCommentsMade * 0.02) +
+            (ucs.TotalUpvotesGiven * 0.01) +
+            (ucs.TotalUpvotesReceivedOnPosts * 0.05) +
+            (SUM(pta.Score) * 0.1) +
+            (AVG(pta.ViewCount) * 0.0001)
+        ) * (1.0 + (5 - tpm.TagPopularityDecile) * 0.2)
+        / (LEAST(ucs.YearsActive, 10.0) + 1.0) AS RawInfluenceScoreInTag
+    FROM UserContributionSummary ucs
+    JOIN PostTagAnalysisWithHistory pta ON ucs.UserId = pta.OwnerUserId
+    JOIN TagPerformanceMetrics tpm ON pta.TagName = tpm.TagName
+    WHERE pta.PostTypeId = 1
+    GROUP BY
+        ucs.UserId, ucs.DisplayName, ucs.Reputation, ucs.TotalQuestionsAsked, ucs.TotalAnswersGiven,
+        ucs.TotalPostsEdited, ucs.BadgeClassWeightedScore, ucs.TotalCommentsMade, ucs.TotalUpvotesGiven,
+        ucs.TotalUpvotesReceivedOnPosts, ucs.YearsActive,
+        pta.TagName, tpm.AvgScoreInTag, tpm.AvgViewCountInTag, tpm.TotalQuestionsInTag,
+        tpm.TagActivityRank, tpm.TagPopularityDecile
+    HAVING COUNT(DISTINCT pta.PostId) >= 3
+)
+SELECT
+    ius.UserId,
+    ius.DisplayName,
+    ius.Reputation,
+    ius.TagName,
+    ius.UserQuestionsInTag,
+    ius.UserQuestionScoreInTag,
+    ius.UserAvgQuestionViewCountInTag,
+    ius.UserEditsOnQuestionsInTagRecent,
+    ius.TagActivityRank AS TagRankByPopularity,
+    ius.TagPopularityDecile,
+    ROUND(CAST(ius.RawInfluenceScoreInTag AS NUMERIC), 3) AS FinalInfluenceScore,
+    RANK() OVER (PARTITION BY ius.TagName ORDER BY ius.RawInfluenceScoreInTag DESC) AS RankWithinTag,
+    DENSE_RANK() OVER (ORDER BY ius.RawInfluenceScoreInTag DESC, ius.Reputation DESC, ius.UserId ASC) AS GlobalInfluenceRank
+FROM InfluentialUserTagScores ius
+WHERE ius.RawInfluenceScoreInTag > 50
+ORDER BY GlobalInfluenceRank ASC, ius.TagName, RankWithinTag ASC
+LIMIT 500;

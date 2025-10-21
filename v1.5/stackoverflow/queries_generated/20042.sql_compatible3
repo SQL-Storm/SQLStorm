@@ -1,0 +1,130 @@
+WITH HighActivityTags AS (
+    SELECT
+        tag,
+        SUM(ViewCount) AS TotalViews,
+        COUNT(*) AS QuestionCount
+    FROM
+        Posts
+        CROSS JOIN LATERAL UNNEST(SPLIT(REPLACE(TRIM(BOTH '>' FROM Tags), '<', ''), '><')) AS tag
+    WHERE
+        PostTypeId = 1 AND Tags IS NOT NULL AND ViewCount IS NOT NULL
+    GROUP BY
+        tag
+    HAVING
+        COUNT(*) > 100 AND SUM(ViewCount) > 1000000
+    ORDER BY
+        SUM(ViewCount) DESC
+    LIMIT 20
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        hat.tag,
+        COUNT(a.Id) AS AnswersInTag,
+        AVG(a.Score) AS AvgScoreInTag,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersInTag,
+        (
+            SELECT COALESCE(SUM(v.BountyAmount), 0)
+            FROM Votes v
+            WHERE v.PostId = q.Id AND v.VoteTypeId = 8
+        ) AS TotalBountyOnQuestions
+    FROM
+        Posts a
+    JOIN
+        Posts q ON a.ParentId = q.Id
+    JOIN
+        HighActivityTags hat ON q.Tags LIKE '%' || hat.tag || '%'
+    WHERE
+        a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY
+        a.OwnerUserId, hat.tag
+),
+RankedUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation,
+        Age,
+        UpVotes,
+        DownVotes,
+        (UpVotes - DownVotes) AS NetVotes,
+        (
+            SELECT MIN(Date) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1
+        ) AS FirstGoldBadgeDate,
+        (
+            SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id
+        ) AS TotalComments
+    FROM
+        Users u
+    WHERE
+        Reputation > 1000
+        AND LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+        AND AboutMe IS NOT NULL
+),
+CombinedData AS (
+    SELECT
+        ru.Id AS UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.FirstGoldBadgeDate,
+        ru.NetVotes,
+        ru.TotalComments,
+        uas.tag,
+        uas.AnswersInTag,
+        uas.AvgScoreInTag,
+        uas.AcceptedAnswersInTag,
+        COALESCE(uas.TotalBountyOnQuestions, 0) AS TotalBountyOnQuestions
+    FROM
+        RankedUsers ru
+    LEFT JOIN
+        UserAnswerStats uas ON ru.Id = uas.OwnerUserId
+    WHERE
+        uas.tag IS NOT NULL
+)
+SELECT
+    cd.DisplayName,
+    cd.Reputation,
+    cd.tag,
+    cd.AnswersInTag,
+    CAST(cd.AvgScoreInTag AS DECIMAL(10, 2)) AS AvgScoreInTag,
+    cd.AcceptedAnswersInTag,
+    cd.TotalBountyOnQuestions,
+    DENSE_RANK() OVER (PARTITION BY cd.tag ORDER BY cd.Reputation DESC) AS RepRankInTag,
+    cd.Reputation - LAG(cd.Reputation, 1, 0) OVER (PARTITION BY cd.tag ORDER BY cd.Reputation DESC) AS RepGapToPrevious,
+    SUM(cd.AnswersInTag) OVER (PARTITION BY cd.DisplayName ORDER BY cd.tag) AS CumulativeAnswersAcrossTags,
+    CASE
+        WHEN cd.FirstGoldBadgeDate IS NULL THEN 'No Gold Badge'
+        WHEN EXTRACT(YEAR FROM cd.FirstGoldBadgeDate) < 2015 THEN 'Veteran Gold'
+        ELSE 'Modern Gold'
+    END AS BadgeEra,
+    (cd.NetVotes * 0.2 + cd.TotalComments * 0.05 + cd.AnswersInTag * 5 + cd.AvgScoreInTag * 2) AS CalculatedEngagementScore,
+    (
+        SELECT
+            STRING_AGG(Name, ', ')
+        FROM (
+            SELECT
+                b.Name
+            FROM
+                Badges b
+            WHERE
+                b.UserId = cd.UserId AND b.TagBased = 'f'
+            ORDER BY
+                b.Date DESC
+            LIMIT 3
+        ) AS RecentBadges
+    ) AS LastThreeNamedBadges
+FROM
+    CombinedData cd
+WHERE
+    cd.AnswersInTag > (
+        SELECT AVG(AnswersInTag) FROM UserAnswerStats
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.UserId = cd.UserId
+        AND ph.PostHistoryTypeId IN (10, 11)
+    )
+ORDER BY
+    cd.tag, RepRankInTag
+LIMIT 500;

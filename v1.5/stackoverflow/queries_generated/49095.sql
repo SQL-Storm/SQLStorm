@@ -1,0 +1,116 @@
+-- {"query": "49095.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1581} 
+
+WITH UserActivitySummary AS (
+    -- Summarizes general activity metrics for each user across posts, comments, and votes they received.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsWritten,
+        SUM(CASE WHEN V.VoteTypeId = 2 AND VP.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN V.VoteTypeId = 3 AND VP.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId -- Join Votes to Posts
+    LEFT JOIN Posts AS VP ON V.PostId = VP.Id -- Join Posts again to get OwnerUserId for votes
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+QuestionTagUsage AS (
+    -- Extracts individual tags from question posts and counts their occurrences per user.
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+UserTop3Tags AS (
+    -- Determines the top 3 most frequently used tags for each user based on their questions.
+    SELECT
+        qtu.UserId,
+        STRING_AGG(qtu.TagName, ', ' ORDER BY TagCount DESC, qtu.TagName ASC) AS Top3TagsList
+    FROM (
+        SELECT
+            UserId,
+            TagName,
+            COUNT(*) AS TagCount,
+            ROW_NUMBER() OVER(PARTITION BY UserId ORDER BY COUNT(*) DESC, TagName ASC) AS rn
+        FROM QuestionTagUsage
+        GROUP BY UserId, TagName
+    ) AS RankedTags
+    WHERE rn <= 3
+    GROUP BY UserId
+),
+PostHistoricalEvents AS (
+    -- Aggregates counts of significant historical events for each post.
+    SELECT
+        PH.PostId,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS CommunityOwnedEvents, -- Post now community owned
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS MigrationEvents, -- Post Migrated Away/Here
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedEvents, -- Post Closed
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedEvents, -- Post Reopened
+        SUM(CASE WHEN PH.PostHistoryTypeId = 19 THEN 1 ELSE 0 END) AS ProtectedEvents -- Question Protected
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 16, 19, 35, 36)
+    GROUP BY PH.PostId
+)
+-- Main query to combine all derived information and filter for high-impact users and questions.
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalCommentsWritten,
+    UAS.TotalUpvotesReceivedOnPosts,
+    UAS.TotalDownvotesReceivedOnPosts,
+    UAS.TotalBadgesEarned,
+    UTT.Top3TagsList,
+    SUM(P.Score) AS TotalQuestionScore,
+    AVG(P.Score) AS AverageQuestionScore,
+    SUM(P.ViewCount) AS TotalQuestionViewCount,
+    SUM(P.AnswerCount) AS TotalAnswersReceivedOnQuestions,
+    SUM(P.FavoriteCount) AS TotalFavoriteCountOnQuestions,
+    SUM(COALESCE(PHE.CommunityOwnedEvents, 0)) AS SumCommunityOwnedEventsOnQuestions,
+    SUM(COALESCE(PHE.MigrationEvents, 0)) AS SumMigrationEventsOnQuestions,
+    SUM(COALESCE(PHE.ClosedEvents, 0)) AS SumClosedEventsOnQuestions,
+    SUM(COALESCE(PHE.ReopenedEvents, 0)) AS SumReopenedEventsOnQuestions,
+    SUM(COALESCE(PHE.ProtectedEvents, 0)) AS SumProtectedEventsOnQuestions,
+    MAX(P.LastActivityDate) AS LastQuestionActivity
+FROM UserActivitySummary AS UAS
+JOIN Posts AS P ON UAS.UserId = P.OwnerUserId
+LEFT JOIN UserTop3Tags AS UTT ON UAS.UserId = UTT.UserId
+LEFT JOIN PostHistoricalEvents AS PHE ON P.Id = PHE.PostId
+WHERE P.PostTypeId = 1 -- Focus on Questions
+  AND P.CreationDate >= '2020-01-01' -- Filter for recent questions to limit scope
+  AND (
+        P.Score > 10 OR
+        P.AnswerCount > 5 OR
+        P.ViewCount > 1000 OR
+        P.FavoriteCount > 5 OR
+        P.CommunityOwnedDate IS NOT NULL OR
+        COALESCE(PHE.MigrationEvents, 0) > 0 OR
+        COALESCE(PHE.ClosedEvents, 0) > 0
+      ) -- Filter for high-impact questions
+GROUP BY
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalCommentsWritten,
+    UAS.TotalUpvotesReceivedOnPosts,
+    UAS.TotalDownvotesReceivedOnPosts,
+    UAS.TotalBadgesEarned,
+    UTT.Top3TagsList
+HAVING UAS.Reputation > 5000 -- Consider only users with significant reputation
+   AND SUM(P.Score) > 50 -- Users must have a cumulative positive score from their questions
+   AND UAS.TotalQuestionsOwned > 10 -- Users must have asked a reasonable number of questions
+ORDER BY UAS.Reputation DESC, TotalQuestionScore DESC, TotalQuestionsOwned DESC
+LIMIT 200;

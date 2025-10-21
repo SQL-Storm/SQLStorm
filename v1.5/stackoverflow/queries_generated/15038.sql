@@ -1,0 +1,68 @@
+-- {"query": "15038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 91065, "output_tokens": 27207} 
+WITH UserActivityRanked AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        v.VoteTypeId,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PostSequence,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Id, EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.CreationDate) AS YearlyPostCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.CreationDate > (SELECT AVG(CreationDate) FROM Users)
+        AND (
+            v.VoteTypeId IN (2, 3) OR v.VoteTypeId IS NULL
+        )
+),
+TagMetrics AS (
+    SELECT 
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2), '><')) AS Tag,
+        AVG(Score) AS AvgTagScore,
+        COUNT(*) AS TagPostCount
+    FROM 
+        Posts
+    WHERE 
+        Tags IS NOT NULL
+    GROUP BY 
+        Tag
+)
+SELECT 
+    uar.UserId,
+    uar.DisplayName,
+    uar.PostId,
+    uar.Title,
+    uar.Score,
+    COALESCE(tm.AvgTagScore, 0) AS NormalizedTagScore,
+    CASE 
+        WHEN uar.ScoreRank <= 3 THEN 'Top Contributor'
+        WHEN uar.YearlyPostCount > 10 THEN 'Prolific Poster'
+        ELSE 'Regular User'
+    END AS UserCategory,
+    ROUND(
+        uar.Score * 
+        (1 + LOG(1 + COALESCE(tm.TagPostCount, 1))), 
+        2
+    ) AS WeightedScore
+FROM 
+    UserActivityRanked uar
+LEFT JOIN 
+    TagMetrics tm ON EXISTS (
+        SELECT 1 
+        FROM UNNEST(STRING_TO_ARRAY(SUBSTRING((SELECT Tags FROM Posts WHERE Id = uar.PostId) FROM 2 FOR LENGTH((SELECT Tags FROM Posts WHERE Id = uar.PostId))-2), '><')) tag
+        WHERE tag = tm.Tag
+    )
+WHERE 
+    uar.ScoreRank <= 10
+    AND uar.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+ORDER BY 
+    WeightedScore DESC
+LIMIT 100;

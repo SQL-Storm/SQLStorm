@@ -1,0 +1,126 @@
+-- {"query": "21055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1483} 
+
+WITH active_users AS (
+    SELECT u.Id, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank
+    FROM Users u
+    WHERE u.Reputation > 1000 AND u.LastAccessDate > CURRENT_DATE - INTERVAL '1 year'
+),
+post_stats AS (
+    SELECT p.Id as post_id, p.PostTypeId,
+           p.CreationDate as post_creation,
+           COALESCE(p.Score, 0) + COALESCE(ps.upvotes, 0) - COALESCE(ps.downvotes, 0) as net_score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           CASE 
+               WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'closed'
+               WHEN p.PostTypeId = 2 AND p.ParentId IS NULL THEN 'orphan_answer'
+               ELSE 'active'
+           END as post_status,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ') as top_tags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, 
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as downvotes
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) ps ON p.Id = ps.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+    LEFT JOIN Posts parent ON pl.RelatedPostId = parent.Id AND parent.PostTypeId = 1
+    LEFT JOIN (
+        SELECT Id, TagName FROM Tags 
+        WHERE Count > 100
+        ORDER BY Count DESC 
+        LIMIT 5
+    ) t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2) 
+      AND (p.CreationDate > CURRENT_DATE - INTERVAL '2 years' 
+           OR p.LastActivityDate > CURRENT_DATE - INTERVAL '6 months')
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, p.ClosedDate, p.ParentId, ps.upvotes, ps.downvotes
+),
+engagement_metrics AS (
+    SELECT au.Id as user_id,
+           COUNT(DISTINCT ps.post_id) as posts_contributed,
+           AVG(ps.net_score) as avg_post_score,
+           SUM(ps.ViewCount) as total_views,
+           SUM(ps.AnswerCount) FILTER (WHERE ps.PostTypeId = 1) as total_answers,
+           COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN ph.PostId END) as total_edits,
+           MAX(ps.post_creation) as latest_post,
+           DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT ps.post_id) DESC) as engagement_rank
+    FROM active_users au
+    LEFT JOIN post_stats ps ON au.Id = p.OwnerUserId OR au.Id = p.LastEditorUserId
+    LEFT JOIN PostHistory ph ON (ps.post_id = ph.PostId OR au.Id = ph.UserId)
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)  -- Edit-related history
+    WHERE ps.post_creation IS NOT NULL
+      AND (au.Id = ps.OwnerUserId OR au.Id = p.LastEditorUserId)
+    GROUP BY au.Id, au.Reputation, au.CreationDate
+    HAVING COUNT(DISTINCT ps.post_id) > 0
+),
+complex_posts AS (
+    SELECT ps.*,
+           em.user_id,
+           em.posts_contributed,
+           em.avg_post_score,
+           em.total_views,
+           CASE 
+               WHEN ps.post_status = 'closed' AND ps.net_score < 0 THEN 'poor_closed'
+               WHEN ps.ViewCount > 10000 AND ps.AnswerCount >= 3 THEN 'popular'
+               WHEN ps.CommentCount > ps.AnswerCount * 2 THEN 'discussion_heavy'
+               ELSE 'standard'
+           END as engagement_category,
+           LAG(ps.net_score) OVER (PARTITION BY em.user_id ORDER BY ps.post_creation) as prev_post_score,
+           LEAD(ps.post_creation) OVER (PARTITION BY em.user_id ORDER BY ps.post_creation) as next_post_date,
+           NTILE(4) OVER (ORDER BY ps.ViewCount DESC) as view_quartile,
+           COALESCE(
+               (SELECT AVG(v.BountyAmount) 
+                FROM Votes v 
+                WHERE v.PostId = ps.post_id AND v.VoteTypeId = 8),
+               0
+           ) as avg_bounty
+    FROM post_stats ps
+    INNER JOIN engagement_metrics em ON ps.OwnerUserId = em.user_id OR ps.LastEditorUserId = em.user_id
+    WHERE ps.post_status != 'orphan_answer'
+      AND (ps.net_score > -5 OR ps.ViewCount > 100)  -- Avoid complete spam
+)
+SELECT cp.post_id,
+       cp.Title,
+       cp.top_tags,
+       cp.net_score,
+       cp.total_views,
+       cp.engagement_category,
+       cp.view_quartile,
+       cp.avg_bounty,
+       au.rep_rank,
+       au.Reputation,
+       cp.posts_contributed,
+       (cp.total_views / NULLIF(cp.posts_contributed, 0)) as views_per_post,
+       CASE 
+           WHEN cp.prev_post_score IS NULL THEN 'first_post'
+           WHEN cp.net_score > cp.prev_post_score * 1.5 THEN 'improving'
+           WHEN cp.net_score < cp.prev_post_score * 0.5 THEN 'declining'
+           ELSE 'stable'
+       END as score_trend,
+       DATEDIFF('day', au.CreationDate, cp.latest_post) as user_age_days,
+       -- Complex string manipulation for tag analysis
+       LENGTH(cp.Tags) - LENGTH(REPLACE(cp.Tags, '>', '')) as tag_count,
+       SUBSTRING(cp.Body FROM 1 FOR 100) as body_preview,
+       -- NULL-aware calculation for edit frequency
+       GREATEST(
+           COALESCE(em.total_edits / NULLIF(DATEDIFF('day', au.CreationDate, CURRENT_DATE), 0), 0),
+           0.1
+       ) as edits_per_day
+FROM complex_posts cp
+INNER JOIN active_users au ON cp.user_id = au.Id
+LEFT JOIN Posts p ON cp.post_id = p.Id
+LEFT JOIN engagement_metrics em ON cp.user_id = em.user_id
+WHERE cp.view_quartile <= 2  -- Focus on popular posts
+  AND (cp.engagement_category = 'popular' 
+       OR (cp.engagement_category = 'discussion_heavy' AND cp.tag_count > 3))
+  AND au.rep_rank <= 100  -- Top users only
+  AND cp.post_creation > CURRENT_DATE - INTERVAL '1 year'
+ORDER BY cp.total_views DESC, cp.net_score DESC
+LIMIT 50;

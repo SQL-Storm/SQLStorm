@@ -1,0 +1,110 @@
+WITH user_stats AS (
+  SELECT u.Id,
+         u.DisplayName,
+         COALESCE(COUNT(DISTINCT p.Id), 0) AS post_count,
+         COALESCE(SUM(p.Score), 0) AS total_score,
+         AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_score,
+         COUNT(DISTINCT c.Id) AS comment_count,
+         COUNT(DISTINCT b.Id) AS badge_count
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName
+),
+ranked_users AS (
+  SELECT us.*,
+         RANK() OVER (ORDER BY ((us.total_score + us.badge_count * 100) * COALESCE(us.avg_score, 1)) DESC) AS user_rank
+  FROM user_stats us
+),
+top_posts AS (
+  SELECT p.Id,
+         p.Title,
+         p.Score,
+         p.OwnerUserId,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS post_rank
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Score IS NOT NULL
+),
+user_tags AS (
+  SELECT p.OwnerUserId,
+         STRING_AGG(DISTINCT t.TagName, ' | ') AS frequent_tags
+  FROM Posts p
+  CROSS JOIN UNNEST(COALESCE(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), ARRAY[]::TEXT[])) AS tag
+  LEFT JOIN Tags t ON t.TagName = tag
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId
+  HAVING COUNT(DISTINCT t.TagName) > 0
+),
+upvote_totals AS (
+  SELECT p.OwnerUserId,
+         COUNT(v.Id) AS upvotes_received
+  FROM Posts p
+  JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2
+  GROUP BY p.OwnerUserId
+),
+combined_stats AS (
+  SELECT ru.Id,
+         ru.DisplayName,
+         ru.post_count,
+         ru.total_score,
+         ru.avg_score,
+         ru.comment_count,
+         ru.badge_count,
+         ru.user_rank,
+         tp.Title AS top_question_title,
+         tp.Score AS top_question_score,
+         ut.frequent_tags,
+         COALESCE(utp.upvotes_received, 0) AS upvotes_received,
+         CASE
+           WHEN ru.post_count = 0 THEN 'Inactive'
+           WHEN ru.avg_score > 10 AND ru.badge_count > 5 THEN 'Elite'
+           WHEN ru.avg_score IS NULL OR ru.avg_score < 0 THEN 'Needs Improvement'
+           ELSE 'Active'
+         END AS user_category
+  FROM ranked_users ru
+  LEFT JOIN top_posts tp ON ru.Id = tp.OwnerUserId AND tp.post_rank = 1
+  LEFT JOIN user_tags ut ON ru.Id = ut.OwnerUserId
+  LEFT JOIN upvote_totals utp ON ru.Id = utp.OwnerUserId
+)
+SELECT cs.*,
+       (SELECT COUNT(ph.Id)
+        FROM PostHistory ph
+        WHERE ph.PostId IN (
+          SELECT p.Id FROM Posts p WHERE p.OwnerUserId = cs.Id
+        ) AND ph.PostHistoryTypeId IN (4, 5, 6)
+       ) AS edit_history_count
+FROM combined_stats cs
+WHERE cs.user_rank <= 50
+  AND (cs.upvotes_received > 0 OR cs.frequent_tags IS NOT NULL)
+ORDER BY cs.user_rank,
+         cs.total_score DESC
+UNION ALL
+SELECT NULL AS Id,
+       'Aggregated Summary' AS DisplayName,
+       SUM(cs.post_count) AS post_count,
+       SUM(cs.total_score) AS total_score,
+       AVG(cs.avg_score) AS avg_score,
+       SUM(cs.comment_count) AS comment_count,
+       SUM(cs.badge_count) AS badge_count,
+       NULL AS user_rank,
+       NULL AS top_question_title,
+       SUM(cs.top_question_score) AS top_question_score,
+       STRING_AGG(DISTINCT cs.frequent_tags, '; ') AS frequent_tags,
+       SUM(cs.upvotes_received) AS upvotes_received,
+       'Summary' AS user_category,
+       SUM(edit_history_count) AS edit_history_count
+FROM (
+  SELECT cs.*,
+         (SELECT COUNT(ph.Id)
+          FROM PostHistory ph
+          WHERE ph.PostId IN (
+            SELECT p.Id FROM Posts p WHERE p.OwnerUserId = cs.Id
+          ) AND ph.PostHistoryTypeId IN (4, 5, 6)
+         ) AS edit_history_count
+  FROM combined_stats cs
+  WHERE cs.user_rank <= 50
+    AND (cs.upvotes_received > 0 OR cs.frequent_tags IS NOT NULL)
+) cs
+GROUP BY 1, 2, 7, 8, 9, 15
+ORDER BY Id NULLS LAST;

@@ -1,0 +1,180 @@
+WITH
+AnswerEvents AS (
+  SELECT p.Id AS AnswerId, p.ParentId AS QuestionId, p.OwnerUserId, p.Score AS AnswerScore, p.CreationDate AS AnswerDate
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.OwnerUserId IS NOT NULL
+    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+QuestionTags AS (
+  SELECT q.Id AS QuestionId, q.Tags
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years'
+    AND q.Tags IS NOT NULL
+),
+ExplodedTags AS (
+  SELECT
+    qt.QuestionId,
+    UNNEST(string_to_array(SUBSTRING(qt.Tags, 2, LENGTH(qt.Tags) - 2), '><')) AS Tag
+  FROM QuestionTags qt
+),
+AnswerTagJoin AS (
+  SELECT ae.AnswerId, ae.QuestionId, ae.OwnerUserId, ae.AnswerScore, ae.AnswerDate, et.Tag
+  FROM AnswerEvents ae
+  JOIN ExplodedTags et ON et.QuestionId = ae.QuestionId
+),
+UserTagStats AS (
+  SELECT
+    atj.Tag,
+    atj.OwnerUserId AS UserId,
+    COUNT(*) FILTER (WHERE atj.AnswerScore >= 0) AS AnswersCount,
+    SUM(atj.AnswerScore) AS TotalAnswerScore,
+    MAX(atj.AnswerScore) AS BestAnswerScore,
+    AVG(atj.AnswerScore) AS AvgAnswerScore,
+    MIN(atj.AnswerDate) AS FirstAnswerDate,
+    MAX(atj.AnswerDate) AS LastAnswerDate
+  FROM AnswerTagJoin atj
+  GROUP BY atj.Tag, atj.OwnerUserId
+),
+TopUsersPerTag AS (
+  SELECT
+    uts.*,
+    RANK() OVER (PARTITION BY uts.Tag ORDER BY uts.TotalAnswerScore DESC, uts.AnswersCount DESC, uts.BestAnswerScore DESC) AS TagRank
+  FROM UserTagStats uts
+),
+SelectedTopUsers AS (
+  SELECT * FROM TopUsersPerTag WHERE TagRank <= 5
+),
+UserAnswers AS (
+  SELECT a.* FROM Posts a
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IN (SELECT DISTINCT UserId FROM SelectedTopUsers)
+),
+UserComments AS (
+  SELECT c.* FROM Comments c
+  WHERE c.UserId IN (SELECT DISTINCT UserId FROM SelectedTopUsers)
+    AND c.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+DuplicateLinks AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+AnswerToQuestion AS (
+  SELECT ua.Id AS AnswerId, ua.ParentId AS QuestionId, ua.OwnerUserId
+  FROM UserAnswers ua
+),
+UserCrossAnswers AS (
+  SELECT
+    ata.OwnerUserId AS UserId,
+    COUNT(DISTINCT ata.AnswerId) FILTER (WHERE dup.RelatedPostId IS NOT NULL) AS AnswersOnDuplicatedQuestions,
+    COUNT(DISTINCT dup.RelatedPostId) AS DistinctDuplicateTargets
+  FROM (
+    SELECT ua.Id AS AnswerId, ua.ParentId AS QuestionId, ua.OwnerUserId
+    FROM UserAnswers ua
+  ) ata
+  LEFT JOIN DuplicateLinks dup ON dup.PostId = ata.QuestionId
+  LEFT JOIN Posts rp ON rp.Id = dup.RelatedPostId
+  GROUP BY ata.OwnerUserId
+),
+RecentBadges AS (
+  SELECT b.UserId, b.Date AS BadgeDate, b.Name AS BadgeName, b.Class
+  FROM Badges b
+  WHERE b.UserId IN (SELECT DISTINCT UserId FROM SelectedTopUsers)
+    AND b.Date >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+BadgeBursts AS (
+  SELECT
+    rb.UserId,
+    COUNT(*) AS BadgesLast2y,
+    COUNT(*) FILTER (WHERE rb.Class = 1) AS GoldLast2y,
+    MIN(rb.BadgeDate) AS FirstBadgeDate,
+    MAX(rb.BadgeDate) AS LastBadgeDate,
+    CASE WHEN COUNT(*) = 0 THEN NULL ELSE EXTRACT(EPOCH FROM (MAX(rb.BadgeDate) - MIN(rb.BadgeDate)))/86400 END AS BadgeSpanDays
+  FROM RecentBadges rb
+  GROUP BY rb.UserId
+),
+AnswerVotes AS (
+  SELECT v.PostId AS AnswerId, v.VoteTypeId, COUNT(*) AS Votes
+  FROM Votes v
+  WHERE v.PostId IN (SELECT Id FROM UserAnswers)
+    AND v.VoteTypeId IN (2, 3, 5, 1)
+  GROUP BY v.PostId, v.VoteTypeId
+),
+AnswerVoteAgg AS (
+  SELECT
+    ua.Id AS AnswerId,
+    ua.OwnerUserId AS UserId,
+    SUM(CASE WHEN av.VoteTypeId = 2 THEN av.Votes ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN av.VoteTypeId = 3 THEN av.Votes ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN av.VoteTypeId = 5 THEN av.Votes ELSE 0 END) AS Favorites,
+    SUM(CASE WHEN av.VoteTypeId = 1 THEN av.Votes ELSE 0 END) AS AcceptedCount
+  FROM UserAnswers ua
+  LEFT JOIN AnswerVotes av ON av.AnswerId = ua.Id
+  GROUP BY ua.Id, ua.OwnerUserId
+),
+UserVoteDensity AS (
+  SELECT
+    ava.UserId,
+    COUNT(ava.AnswerId) AS NumAnswers,
+    SUM(ava.UpVotes) AS TotalUpVotes,
+    SUM(ava.DownVotes) AS TotalDownVotes,
+    SUM(ava.Favorites) AS TotalFavorites,
+    SUM(ava.AcceptedCount) AS TotalAccepted,
+    CASE WHEN COUNT(ava.AnswerId)=0 THEN 0 ELSE SUM(ava.UpVotes)::decimal/COUNT(ava.AnswerId) END AS AvgUpPerAnswer
+  FROM AnswerVoteAgg ava
+  GROUP BY ava.UserId
+),
+UserRollup AS (
+  SELECT
+    stu.UserId,
+    u.DisplayName,
+    stu.Tag,
+    stu.AnswersCount,
+    stu.TotalAnswerScore,
+    stu.BestAnswerScore,
+    stu.AvgAnswerScore,
+    COALESCE(ub.BadgesLast2y,0) AS BadgesLast2y,
+    COALESCE(ub.GoldLast2y,0) AS GoldLast2y,
+    COALESCE(uvd.NumAnswers,0) AS NumRecentAnswers,
+    COALESCE(uvd.TotalUpVotes,0) AS TotalUpVotes,
+    COALESCE(uca.AnswersOnDuplicatedQuestions,0) AS AnswersOnDuplicatedQuestions,
+    GREATEST(ROW_NUMBER() OVER (PARTITION BY stu.Tag ORDER BY stu.TotalAnswerScore DESC), ROW_NUMBER() OVER (PARTITION BY stu.UserId ORDER BY stu.Tag, stu.TotalAnswerScore DESC)) AS SyntheticLoadRank
+  FROM SelectedTopUsers stu
+  LEFT JOIN Users u ON u.Id = stu.UserId
+  LEFT JOIN BadgeBursts ub ON ub.UserId = stu.UserId
+  LEFT JOIN UserVoteDensity uvd ON uvd.UserId = stu.UserId
+  LEFT JOIN UserCrossAnswers uca ON uca.UserId = stu.UserId
+)
+SELECT
+  ur.UserId,
+  ur.DisplayName,
+  ur.Tag,
+  ur.AnswersCount,
+  ur.TotalAnswerScore,
+  ur.BestAnswerScore,
+  ROUND(ur.AvgAnswerScore::numeric, 3) AS AvgAnswerScore,
+  ur.BadgesLast2y,
+  ur.GoldLast2y,
+  ur.NumRecentAnswers,
+  ur.TotalUpVotes,
+  ur.AnswersOnDuplicatedQuestions,
+  ur.SyntheticLoadRank,
+  COALESCE((
+    SELECT ROUND(AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - a.CreationDate)))/86400::numeric, 2)
+    FROM Posts a
+    JOIN ExplodedTags et2 ON et2.QuestionId = a.ParentId
+    WHERE a.PostTypeId = 2
+      AND a.OwnerUserId = ur.UserId
+      AND et2.Tag = ur.Tag
+      AND a.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+  ),0) AS AvgAnswerAgeDays,
+  COALESCE(ROUND(
+    CASE WHEN (uvd.TotalUpVotes + uvd.TotalDownVotes)=0 THEN 0
+    ELSE uvd.TotalUpVotes::numeric / (uvd.TotalUpVotes + uvd.TotalDownVotes)
+    END, 3), 0) AS UpvoteRatio,
+  PERCENT_RANK() OVER (PARTITION BY ur.Tag ORDER BY ur.TotalAnswerScore) AS ScorePercentileWithinTag
+FROM UserRollup ur
+LEFT JOIN UserVoteDensity uvd ON uvd.UserId = ur.UserId
+ORDER BY ur.SyntheticLoadRank ASC, ur.TotalAnswerScore DESC NULLS LAST
+LIMIT 100;

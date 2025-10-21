@@ -1,0 +1,40 @@
+-- {"query": "42003.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2057, "output_tokens": 360} 
+
+SELECT 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(v.Id) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.UserId END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.UserId END) AS DownVotes,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT ph.Id) AS EditCount,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    COUNT(DISTINCT t.Id) AS TagCount
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON p.OwnerUserId = b.UserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Id = ANY(string_to_array(p.Tags, '><')::int[])
+GROUP BY 
+    p.Id, u.Id
+HAVING 
+    COUNT(DISTINCT v.Id) > 10 AND COUNT(DISTINCT c.Id) > 5
+ORDER BY 
+    p.Score DESC, p.ViewCount DESC
+LIMIT 100;

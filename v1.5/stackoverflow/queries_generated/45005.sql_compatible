@@ -1,0 +1,48 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate > TIMESTAMP '2015-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        rp.UserId,
+        rp.DisplayName,
+        (
+            SELECT STRING_AGG(DISTINCT t, ', ')
+            FROM (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(rp.Tags, 2, LENGTH(rp.Tags) - 2), '><')) AS t
+            ) AS s
+        ) AS TopTags,
+        AVG(rp.Score) AS AvgPostScore,
+        COUNT(*) AS TotalQuestions,
+        MAX(rp.Score) AS HighestScore
+    FROM RankedUserPosts rp
+    WHERE rp.PostRank <= 5
+    GROUP BY rp.UserId, rp.DisplayName
+)
+SELECT 
+    ta.UserId,
+    ta.DisplayName,
+    ta.TopTags,
+    ta.AvgPostScore,
+    ta.TotalQuestions,
+    ta.HighestScore,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = ta.UserId
+    ) AS TotalBadges
+FROM TagAnalysis ta
+WHERE ta.TotalQuestions > 10
+ORDER BY ta.AvgPostScore DESC, ta.TotalQuestions DESC
+LIMIT 100;

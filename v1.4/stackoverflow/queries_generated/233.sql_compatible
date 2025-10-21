@@ -1,0 +1,109 @@
+WITH
+PostsTT AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         t.Name AS PostTypeName,
+         p.Title,
+         p.Tags,
+         p.Score,
+         p.ViewCount,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.OwnerUserId,
+         p.OwnerDisplayName
+  FROM Posts p
+  LEFT JOIN PostTypes t ON p.PostTypeId = t.Id
+),
+UserInfo AS (
+  SELECT Id AS UserId, DisplayName, Location
+  FROM Users
+),
+UserStats AS (
+  SELECT p.OwnerUserId AS UserId,
+         COUNT(p.Id) AS TotalPosts,
+         SUM(p.Score) AS TotalScore
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+BadgeCounts AS (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+UpVotes AS (
+  SELECT PostId, COUNT(*) AS UpVotes
+  FROM Votes
+  WHERE VoteTypeId = 2
+  GROUP BY PostId
+),
+CommentCounts AS (
+  SELECT PostId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY PostId
+),
+LastEditor AS (
+  SELECT p.Id AS PostId, u.DisplayName AS LastEditorName
+  FROM Posts p
+  LEFT JOIN Users u ON p.LastEditorUserId = u.Id
+)
+SELECT
+  pt.Id AS PostId,
+  pt.PostTypeId,
+  pt.PostTypeName,
+  pt.Title,
+  pt.Tags,
+  pt.Score,
+  pt.ViewCount,
+  pt.CreationDate,
+  pt.LastActivityDate,
+  ui.DisplayName AS OwnerDisplayName,
+  ui.Location AS Location,
+  COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+  COALESCE(uv.UpVotes, 0) AS UpVotes,
+  COALESCE(us.TotalScore, 0) AS UserTotalScore,
+  CAST(DATEDIFF_MINUTE(pt.CreationDate, TIMESTAMP '1970-01-01 00:00:00') AS BIGINT) AS AgeMinutes, -- placeholder for compatibility
+  ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY pt.LastActivityDate DESC) AS RankWithinOwner,
+  le.LastEditorName,
+  COALESCE(cc.CommentCount, 0) AS CommentCount,
+  CONCAT('Post ', pt.Id, ' - ', pt.Title) AS MetaString,
+  (SELECT AVG(Score) FROM Posts p2 WHERE p2.OwnerUserId = pt.OwnerUserId) AS AverageOwnerScore
+FROM PostsTT pt
+LEFT JOIN UserInfo ui ON ui.UserId = pt.OwnerUserId
+LEFT JOIN UserStats us ON us.UserId = pt.OwnerUserId
+LEFT JOIN BadgeCounts bc ON bc.UserId = pt.OwnerUserId
+LEFT JOIN UpVotes uv ON uv.PostId = pt.Id
+LEFT JOIN CommentCounts cc ON cc.PostId = pt.Id
+LEFT JOIN LastEditor le ON le.PostId = pt.Id
+WHERE pt.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56'
+  
+UNION ALL
+
+SELECT
+  pt.Id AS PostId,
+  pt.PostTypeId,
+  pt.PostTypeName,
+  pt.Title,
+  pt.Tags,
+  pt.Score,
+  pt.ViewCount,
+  pt.CreationDate,
+  pt.LastActivityDate,
+  ui.DisplayName AS OwnerDisplayName,
+  ui.Location AS Location,
+  COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+  COALESCE(uv.UpVotes, 0) AS UpVotes,
+  COALESCE(us.TotalScore, 0) AS UserTotalScore,
+  CAST(DATEDIFF_MINUTE(pt.CreationDate, TIMESTAMP '1970-01-01 00:00:00') AS BIGINT) AS AgeMinutes, -- placeholder for compatibility
+  ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY pt.LastActivityDate DESC) AS RankWithinOwner,
+  NULL AS LastEditorName,
+  COALESCE(cc.CommentCount, 0) AS CommentCount,
+  CONCAT('Archived Post ', pt.Id, ' - ', pt.Title) AS MetaString,
+  (SELECT AVG(Score) FROM Posts p2 WHERE p2.OwnerUserId = pt.OwnerUserId) AS AverageOwnerScore
+FROM PostsTT pt
+LEFT JOIN UserInfo ui ON ui.UserId = pt.OwnerUserId
+LEFT JOIN UserStats us ON us.UserId = pt.OwnerUserId
+LEFT JOIN BadgeCounts bc ON bc.UserId = pt.OwnerUserId
+LEFT JOIN UpVotes uv ON uv.PostId = pt.Id
+LEFT JOIN CommentCounts cc ON cc.PostId = pt.Id
+WHERE pt.LastActivityDate <= TIMESTAMP '2024-09-17 12:34:56'
+ORDER BY AgeMinutes DESC;

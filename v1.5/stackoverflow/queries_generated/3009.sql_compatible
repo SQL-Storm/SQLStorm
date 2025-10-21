@@ -1,0 +1,184 @@
+WITH AnswerAuthors AS (
+    SELECT
+        p.OwnerUserId AS AnswerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgScore
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.OwnerUserId
+),
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        p.Score,
+        p.OwnerUserId,
+        uc.DisplayName AS OwnerDisplayName,
+        ac.AnswerCount,
+        ac.AvgScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed
+    FROM
+        Posts p
+        LEFT JOIN Users uc ON p.OwnerUserId = uc.Id
+        LEFT JOIN AnswerAuthors ac ON p.Id = ac.AnswerUserId
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.LastActivityDate,
+        p.CommentCount,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags
+    FROM
+        Posts p
+),
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.LastAccessDate,
+        u.Location,
+        u.AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        u.EmailHash,
+        u.CreationDate
+    FROM
+        Users u
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+PostHistoryCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditHistoryCount
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+CommentsSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        STRING_AGG(c.UserDisplayName, ', ') AS Commenters
+    FROM
+        Comments c
+    GROUP BY
+        c.PostId
+),
+LinkRelations AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM
+        PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+FullPostDetails AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Tags,
+        q.Score,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.AnswerCount,
+        q.AvgScore,
+        q.IsClosed,
+        ru.Reputation,
+        ru.LastAccessDate,
+        ru.Location,
+        ru.AboutMe,
+        ru.Views,
+        ru.UpVotes,
+        ru.DownVotes,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        hc.EditHistoryCount,
+        cs.CommentCount AS NumComments,
+        cs.Commenters,
+        ar.LastActivityDate,
+        ar.ViewCount,
+        ar.FavoriteCount,
+        ar.AcceptedAnswerId,
+        ar.Title AS RecentTitle,
+        ar.Tags AS RecentTags
+    FROM
+        QuestionStats q
+        LEFT JOIN ActiveUsers ru ON q.OwnerUserId = ru.UserId
+        LEFT JOIN UserBadgeCounts ubc ON q.OwnerUserId = ubc.UserId
+        LEFT JOIN PostHistoryCounts hc ON q.QuestionId = hc.PostId
+        LEFT JOIN CommentsSummary cs ON q.QuestionId = cs.PostId
+        LEFT JOIN RecentActivity ar ON q.QuestionId = ar.PostId
+),
+FilteringQuestions AS (
+    SELECT
+        *
+    FROM
+        FullPostDetails
+    WHERE
+        AnswerCount >= 2
+        AND AvgScore > 2
+        AND CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+        AND ('<sql>' = ANY (STRING_TO_ARRAY(Tags, '><')))
+)
+SELECT
+    fq.QuestionId,
+    fq.Title,
+    fq.CreationDate,
+    fq.Tags,
+    fq.Score,
+    fq.OwnerDisplayName,
+    fq.Reputation,
+    fq.AnswerCount,
+    fq.AvgScore,
+    fq.IsClosed,
+    fq.LastAccessDate,
+    fq.Location,
+    fq.Views,
+    fq.UpVotes,
+    fq.DownVotes,
+    fq.GoldBadges,
+    fq.SilverBadges,
+    fq.BronzeBadges,
+    fq.EditHistoryCount,
+    fq.NumComments,
+    fq.Commenters,
+    fq.LastActivityDate,
+    fq.ViewCount,
+    fq.FavoriteCount,
+    fq.AcceptedAnswerId,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+        WHERE pl.PostId = fq.QuestionId AND lt.Name = 'Duplicate'
+    ) AS HasDuplicateLinks
+FROM
+    FilteringQuestions fq
+ORDER BY
+    fq.CreationDate DESC
+LIMIT 100;

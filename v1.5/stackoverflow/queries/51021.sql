@@ -1,0 +1,89 @@
+WITH high_reputation_users AS (
+    SELECT u.Id AS user_id, u.Reputation, u.DisplayName
+    FROM Users u
+    WHERE u.Reputation > 5000
+),
+active_posts AS (
+    SELECT p.Id AS post_id, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags,
+           p.OwnerUserId, p.LastActivityDate, pt.Name AS post_type
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+      AND p.Score > 0
+),
+tag_popularity AS (
+    SELECT t.TagName, t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) as tag_rank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+user_activity AS (
+    SELECT hr.user_id,
+           COUNT(ap.post_id) AS question_count,
+           AVG(ap.Score) AS avg_question_score,
+           SUM(ap.ViewCount) AS total_views,
+           MAX(ap.LastActivityDate) AS last_active
+    FROM high_reputation_users hr
+    JOIN active_posts ap ON hr.user_id = ap.OwnerUserId
+    GROUP BY hr.user_id
+    HAVING COUNT(ap.post_id) >= 5
+),
+detailed_stats AS (
+    SELECT 
+        ua.user_id,
+        ua.question_count,
+        ua.avg_question_score,
+        ua.total_views,
+        ua.last_active,
+        tp.TagName AS popular_tag,
+        COUNT(DISTINCT pl.RelatedPostId) AS link_count,
+        AVG(v.BountyAmount) AS avg_bounty_given,
+        COUNT(DISTINCT CASE WHEN vh.PostHistoryTypeId IN (10, 11) THEN vh.Id END) AS moderation_actions
+    FROM user_activity ua
+    JOIN active_posts ap ON ua.user_id = ap.OwnerUserId
+    LEFT JOIN PostLinks pl ON ap.post_id = pl.PostId
+        AND pl.LinkTypeId = 1
+    LEFT JOIN Votes v ON ua.user_id = v.UserId
+        AND v.VoteTypeId = 8
+        AND v.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    LEFT JOIN PostHistory vh ON ap.post_id = vh.PostId
+        AND vh.UserId = ua.user_id
+        AND vh.PostHistoryTypeId IN (10, 11)
+        AND vh.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    JOIN tag_popularity tp ON (
+        SELECT 1
+        FROM unnest(string_to_array(
+            substring(ap.Tags, 2, length(ap.Tags) - 2),
+            '><'
+        )) AS tag
+        WHERE tag = tp.TagName
+        LIMIT 1
+    ) IS NOT NULL AND tp.tag_rank <= 10
+    GROUP BY ua.user_id, ua.question_count, ua.avg_question_score, ua.total_views, ua.last_active, tp.TagName
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 0 OR
+           COUNT(DISTINCT CASE WHEN vh.PostHistoryTypeId IN (10, 11) THEN vh.Id END) > 0
+)
+SELECT 
+    ds.user_id,
+    hr.DisplayName,
+    ds.question_count,
+    ROUND(ds.avg_question_score, 2) AS avg_score,
+    ds.total_views,
+    ds.popular_tag,
+    ds.link_count,
+    COALESCE(ROUND(ds.avg_bounty_given, 2), 0) AS avg_bounty,
+    ds.moderation_actions,
+    CASE 
+        WHEN ds.question_count > 50 AND ds.avg_question_score > 20 THEN 'Power User'
+        WHEN ds.question_count > 20 AND ds.moderation_actions > 5 THEN 'Community Leader'
+        WHEN ds.total_views > 100000 THEN 'High Impact'
+        ELSE 'Active Contributor'
+    END AS user_category,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ds.last_active)) / 3600 AS hours_since_last_activity
+FROM detailed_stats ds
+JOIN high_reputation_users hr ON ds.user_id = hr.user_id
+JOIN active_posts ap ON ds.user_id = ap.OwnerUserId
+WHERE ap.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+ORDER BY ds.total_views DESC, ds.avg_question_score DESC, ds.user_id
+LIMIT 100;

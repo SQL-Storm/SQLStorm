@@ -1,0 +1,136 @@
+-- {"query": "53054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2646, "output_tokens": 1014} 
+
+WITH PopularTags AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM 
+        Tags t
+    WHERE 
+        t.Count > 1000
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation > 10000
+    GROUP BY 
+        u.Id, u.Reputation, u.DisplayName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 50
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(DISTINCT v.Id) AS TotalVotes
+    FROM 
+        Votes v
+    WHERE 
+        v.CreationDate > '2020-01-01'
+    GROUP BY 
+        v.PostId
+),
+CommentStats AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM 
+        Comments c
+    GROUP BY 
+        c.PostId
+),
+PostHistoryEdits AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY 
+        ph.PostId
+),
+LinkedPosts AS (
+    SELECT 
+        pl.PostId,
+        COUNT(pl.Id) AS LinkCount,
+        STRING_AGG(pl.RelatedPostId::text, ',') AS RelatedPostIds
+    FROM 
+        PostLinks pl
+    WHERE 
+        pl.LinkTypeId = 3
+    GROUP BY 
+        pl.PostId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgPostScore,
+    ua.LastPostDate,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    pt.TagName AS TopTag,
+    pt.TagCount AS TopTagCount,
+    SUM(va.Upvotes) AS TotalUpvotes,
+    SUM(va.Downvotes) AS TotalDownvotes,
+    AVG(cs.CommentCount) AS AvgCommentsPerPost,
+    AVG(phe.EditCount) AS AvgEditsPerPost,
+    COUNT(lp.LinkCount) AS TotalDuplicateLinks
+FROM 
+    UserActivity ua
+JOIN 
+    BadgeSummary bs ON ua.UserId = bs.UserId
+JOIN 
+    Posts p ON ua.UserId = p.OwnerUserId
+JOIN 
+    VoteAnalysis va ON p.Id = va.PostId
+JOIN 
+    CommentStats cs ON p.Id = cs.PostId
+JOIN 
+    PostHistoryEdits phe ON p.Id = phe.PostId
+LEFT JOIN 
+    LinkedPosts lp ON p.Id = lp.PostId
+JOIN 
+    PopularTags pt ON p.Tags LIKE '%' || pt.TagName || '%'
+WHERE 
+    pt.TagRank <= 10
+    AND p.CreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+GROUP BY 
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.TotalPosts, ua.QuestionCount, ua.AnswerCount, ua.AvgPostScore, ua.LastPostDate,
+    bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, pt.TagName, pt.TagCount
+ORDER BY 
+    ua.Reputation DESC, ua.TotalPosts DESC
+LIMIT 100;

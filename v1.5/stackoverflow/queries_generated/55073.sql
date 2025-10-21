@@ -1,0 +1,89 @@
+-- {"query": "55073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1754} 
+
+WITH user_stats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS question_count,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS answer_count,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0)  AS question_score_sum,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0)  AS answer_score_sum,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)               AS upvotes_given,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)               AS downvotes_given,
+        COUNT(DISTINCT t.TagName)                                 AS distinct_tags_used,
+        COUNT(b.Id)                                                AS badge_count,
+        MAX(p.CreationDate)                                        AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+    LEFT JOIN Tags       t ON t.Id = ANY (STRING_TO_ARRAY(REPLACE(p.Tags, '><', ','), ',')::int[])
+    LEFT JOIN Badges     b ON b.UserId = u.Id
+    LEFT JOIN Votes      v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), tag_popularity AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                         AS posts_with_tag,
+        AVG(p.Score)                        AS avg_score,
+        SUM(p.ViewCount)                    AS total_views,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS tag_rank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+), recent_closed AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate                     AS closed_date,
+        ph.Comment::int                     AS close_reason_id,
+        crt.Name                            AS close_reason,
+        p.Title,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = ph.Comment::int
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+)
+SELECT 
+    us.Id                              AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.question_count,
+    us.answer_count,
+    (us.question_score_sum + us.answer_score_sum) AS total_score,
+    us.upvotes_given,
+    us.downvotes_given,
+    us.distinct_tags_used,
+    us.badge_count,
+    us.last_post_date,
+    tp.TagName,
+    tp.posts_with_tag,
+    tp.avg_score,
+    tp.total_views,
+    rc.Title                           AS RecentClosedTitle,
+    rc.closed_date,
+    rc.close_reason
+FROM user_stats us
+LEFT JOIN LATERAL (
+    SELECT 
+        tp2.TagName,
+        tp2.posts_with_tag,
+        tp2.avg_score,
+        tp2.total_views
+    FROM tag_popularity tp2
+    WHERE tp2.tag_rank <= 3
+    ORDER BY tp2.posts_with_tag DESC
+    LIMIT 1
+) tp ON TRUE
+LEFT JOIN LATERAL (
+    SELECT 
+        rc2.Title,
+        rc2.closed_date,
+        rc2.close_reason
+    FROM recent_closed rc2
+    WHERE rc2.OwnerUserId = us.Id AND rc2.rn = 1
+) rc ON TRUE
+WHERE us.Reputation > 50000
+ORDER BY total_score DESC
+LIMIT 100;

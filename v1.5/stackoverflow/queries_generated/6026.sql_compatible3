@@ -1,0 +1,139 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY)
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+Engagement AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.AnswerCount,
+    ARRAY_AGG(DISTINCT v.VoteTypeId) AS VoteTypes,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 14 THEN 1 END) AS ModeratorVotes
+  FROM RecentActivePosts rp
+  LEFT JOIN Votes v ON v.PostId = rp.PostId
+  GROUP BY
+    rp.PostId, rp.PostTypeId, rp.Title, rp.OwnerUserId, rp.CreationDate, rp.LastActivityDate,
+    rp.Score, rp.ViewCount, rp.CommentCount, rp.AnswerCount
+),
+NotableRelations AS (
+  SELECT
+    e.PostId,
+    e.PostTypeId,
+    e.Title,
+    e.OwnerUserId,
+    e.CreationDate,
+    e.LastActivityDate,
+    e.Score,
+    e.ViewCount,
+    e.CommentCount,
+    e.AnswerCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = e.PostId) AS LinkCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = e.PostId) AS CommentCountAll
+  FROM Engagement e
+),
+TagSimilarity AS (
+  SELECT
+    np.PostId,
+    t.TagName AS Tag,
+    SIMILARITY(t.TagName, np.Title) AS TitleTagSimilarity,
+    SIMILARITY(t.TagName, COALESCE(np.Tags, '')) AS TagsTagSimilarity
+  FROM NotableRelations np
+  LEFT JOIN LATERAL (
+    SELECT UNNEST(REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '><' FROM np.Tags), '><')) AS TagName
+  ) AS t ON TRUE
+),
+ComplexPredicate AS (
+  SELECT
+    nr.PostId,
+    nr.Title,
+    nr.OwnerUserId,
+    nr.CreationDate,
+    nr.LastActivityDate,
+    nr.Score,
+    nr.ViewCount,
+    nr.CommentCount,
+    nr.AnswerCount,
+    CASE
+      WHEN nr.Score > 0 AND nr.ViewCount > 100 THEN 'Popular'
+      WHEN nr.ViewCount < 20 THEN 'LowVisibility'
+      ELSE 'Balanced'
+    END AS VisibilityBucket,
+    (CASE WHEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - nr.CreationDate)) / 86400 < 7 THEN true ELSE false END) AS IsNew,
+    (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = nr.OwnerUserId) AS LastBadgeDate
+  FROM NotableRelations nr
+),
+FinalOutput AS (
+  SELECT
+    cp.PostId AS post_id,
+    cp.Title AS post_title,
+    cp.OwnerUserId AS owner_id,
+    up.DisplayName AS owner_display_name,
+    up.Reputation AS owner_reputation,
+    cp.CreationDate,
+    cp.LastActivityDate,
+    cp.Score,
+    cp.ViewCount,
+    cp.CommentCount,
+    cp.AnswerCount,
+    cp.VisibilityBucket,
+    cp.IsNew,
+    cp.LastBadgeDate,
+    ta.Tag AS primary_tag
+  FROM ComplexPredicate cp
+  LEFT JOIN TopAuthors up ON up.UserId = cp.OwnerUserId
+  LEFT JOIN TagSimilarity ta ON ta.PostId = cp.PostId
+  ORDER BY cp.LastActivityDate DESC
+  LIMIT 500
+)
+SELECT
+  fo.post_id,
+  fo.post_title,
+  fo.owner_id,
+  fo.owner_display_name,
+  fo.owner_reputation,
+  fo.CreationDate,
+  fo.LastActivityDate,
+  fo.Score,
+  fo.ViewCount,
+  fo.CommentCount,
+  fo.AnswerCount,
+  fo.VisibilityBucket,
+  fo.IsNew,
+  fo.LastBadgeDate,
+  fo.primary_tag
+FROM FinalOutput fo;

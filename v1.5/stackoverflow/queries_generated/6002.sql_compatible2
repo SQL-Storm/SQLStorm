@@ -1,0 +1,97 @@
+WITH
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    pv.VoteCount,
+    ct.CommentCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2,3)
+    GROUP BY PostId
+  ) pv ON pv.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) ct ON ct.PostId = p.Id
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+),
+TaggedCorrelations AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.Score) AS AvgScore,
+    AVG(p.ViewCount) AS AvgViews
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.ExcerptPostId
+  JOIN UNNEST(string_to_array(tg.TagName, '><')) AS t(TagName) ON TRUE
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+Composite AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ra.PostId,
+    ra.Title,
+    ra.CreationDate AS PostCreationDate,
+    ra.LastActivityDate AS PostLastActivityDate,
+    ra.Score AS PostScore,
+    ra.ViewCount,
+    ra.Tags,
+    ra.PostTypeId,
+    ra.VoteCount,
+    ra.CommentCount,
+    tc.TagName,
+    tc.TagQuestionCount,
+    tc.AvgScore,
+    tc.AvgViews
+  FROM TopUsers u
+  LEFT JOIN RecentActivity ra ON ra.OwnerUserId = u.UserId
+  LEFT JOIN TaggedCorrelations tc ON true
+)
+SELECT
+  *
+FROM Composite
+WHERE rn <= 100
+ORDER BY Reputation DESC, PostLastActivityDate NULLS LAST, PostScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

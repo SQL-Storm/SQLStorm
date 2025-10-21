@@ -1,0 +1,332 @@
+with recent_q as (
+  select p.Id as QuestionId,
+         p.OwnerUserId as AskerId,
+         p.CreationDate as QuestionDate,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.Tags,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts)
+),
+answers as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswererId,
+         a.CreationDate as AnswerDate,
+         a.Score as AnswerScore
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select QuestionId,
+         min(AnswerDate) as FirstAnswerDate
+  from answers
+  group by QuestionId
+),
+qa_combo as (
+  select rq.QuestionId,
+         rq.AskerId,
+         rq.QuestionDate,
+         rq.QuestionScore,
+         rq.ViewCount,
+         rq.Tags,
+         rq.AcceptedAnswerId,
+         a.AnswerId,
+         a.AnswererId,
+         a.AnswerDate,
+         a.AnswerScore,
+         extract(epoch from (a.AnswerDate - rq.QuestionDate))::bigint as AnswerLatencySec,
+         case when rq.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted
+  from recent_q rq
+  join answers a on a.QuestionId = rq.QuestionId
+),
+qa_with_first as (
+  select qac.*,
+         fa.FirstAnswerDate,
+         extract(epoch from (fa.FirstAnswerDate - qac.QuestionDate))::bigint as FirstAnswerLatencySec
+  from qa_combo qac
+  left join first_answer fa on fa.QuestionId = qac.QuestionId
+),
+votes_agg as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyAmount
+  from Votes v
+  group by v.PostId
+),
+comment_agg as (
+  select c.PostId,
+         count(*) as CommentCount,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+user_stats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         u.UpVotes as GivenUpVotes,
+         u.DownVotes as GivenDownVotes,
+         u.Views as ProfileViews
+  from Users u
+),
+badge_agg as (
+  select b.UserId,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges,
+         count(*) as TotalBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+dupe_links as (
+  select pl.PostId as DuplicateOfQuestionId,
+         count(*) as DuplicateCount
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+closed_reasons as (
+  select ph.PostId,
+         max(ph.CreationDate) as LastCloseDate,
+         max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as LastCloseReasonId
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+tag_expansion as (
+  select p.Id as QuestionId,
+         unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+  from Posts p
+  where p.PostTypeId = 1
+),
+tag_freq as (
+  select te.QuestionId,
+         te.Tag,
+         row_number() over (partition by te.QuestionId order by t.Count desc nulls last, te.Tag) as TagRankByGlobalCount
+  from tag_expansion te
+  left join Tags t on t.TagName = te.Tag
+),
+top3_tags as (
+  select QuestionId,
+         string_agg(Tag, '|' order by TagRankByGlobalCount) as TopTags
+  from tag_freq
+  where TagRankByGlobalCount <= 3
+  group by QuestionId
+),
+question_enriched as (
+  select rq.*,
+         coalesce(vq.UpVotes,0) as QUpVotes,
+         coalesce(vq.DownVotes,0) as QDownVotes,
+         coalesce(vq.Favorites,0) as QFavorites,
+         coalesce(vq.BountyAmount,0) as QBountyAmount,
+         coalesce(cq.CommentCount,0) as QCommentCount,
+         cq.LastCommentDate as QLastCommentDate,
+         coalesce(du.DuplicateCount,0) as DuplicateCount,
+         cr.LastCloseDate,
+         cr.LastCloseReasonId,
+         t3.TopTags
+  from recent_q rq
+  left join votes_agg vq on vq.PostId = rq.QuestionId
+  left join comment_agg cq on cq.PostId = rq.QuestionId
+  left join dupe_links du on du.DuplicateOfQuestionId = rq.QuestionId
+  left join closed_reasons cr on cr.PostId = rq.QuestionId
+  left join top3_tags t3 on t3.QuestionId = rq.QuestionId
+),
+answer_enriched as (
+  select qa.*,
+         coalesce(va.UpVotes,0) as AUpVotes,
+         coalesce(va.DownVotes,0) as ADownVotes,
+         coalesce(va.Favorites,0) as AFavorites,
+         coalesce(va.BountyAmount,0) as ABountyAmount,
+         coalesce(ca.CommentCount,0) as ACommentCount,
+         ca.LastCommentDate as ALastCommentDate
+  from qa_with_first qa
+  left join votes_agg va on va.PostId = qa.AnswerId
+  left join comment_agg ca on ca.PostId = qa.AnswerId
+),
+asker_enriched as (
+  select us.UserId as AskerId,
+         us.Reputation as AskerReputation,
+         us.UserCreationDate as AskerCreationDate,
+         us.GivenUpVotes as AskerGivenUpVotes,
+         us.GivenDownVotes as AskerGivenDownVotes,
+         us.ProfileViews as AskerProfileViews,
+         coalesce(ba.TotalBadges,0) as AskerTotalBadges,
+         coalesce(ba.GoldBadges,0) as AskerGoldBadges,
+         coalesce(ba.SilverBadges,0) as AskerSilverBadges,
+         coalesce(ba.BronzeBadges,0) as AskerBronzeBadges,
+         ba.LastBadgeDate as AskerLastBadgeDate
+  from user_stats us
+  left join badge_agg ba on ba.UserId = us.UserId
+),
+answerer_enriched as (
+  select us.UserId as AnswererId,
+         us.Reputation as AnswererReputation,
+         us.UserCreationDate as AnswererCreationDate,
+         us.GivenUpVotes as AnswererGivenUpVotes,
+         us.GivenDownVotes as AnswererGivenDownVotes,
+         us.ProfileViews as AnswererProfileViews,
+         coalesce(ba.TotalBadges,0) as AnswererTotalBadges,
+         coalesce(ba.GoldBadges,0) as AnswererGoldBadges,
+         coalesce(ba.SilverBadges,0) as AnswererSilverBadges,
+         coalesce(ba.BronzeBadges,0) as AnswererBronzeBadges,
+        ba.LastBadgeDate as AnswererLastBadgeDate
+  from user_stats us
+  left join badge_agg ba on ba.UserId = us.UserId
+),
+ranked_answers as (
+  select ae.*,
+         row_number() over (partition by ae.QuestionId order by ae.AnswerScore desc, ae.AUpVotes desc, ae.AnswerDate asc, ae.AnswerId asc) as ScoreRank,
+         row_number() over (partition by ae.QuestionId order by ae.AnswerDate asc, ae.AnswerId asc) as TimeRank
+  from answer_enriched ae
+),
+agg_per_question as (
+  select ra.QuestionId,
+         count(*) as AnswerCount,
+         count(*) filter (where ra.IsAccepted = 1) as AcceptedAnswerExists,
+         max(ra.AnswerScore) as MaxAnswerScore,
+         percentile_cont(0.5) within group (order by ra.AnswerLatencySec) as P50LatencySec,
+         percentile_cont(0.9) within group (order by ra.AnswerLatencySec) as P90LatencySec,
+         avg(ra.AUpVotes - ra.ADownVotes) as AvgAnswerNetVotes,
+         sum(ra.AUpVotes) as TotalAnswerUpVotes,
+         sum(ra.ADownVotes) as TotalAnswerDownVotes
+  from ranked_answers ra
+  group by ra.QuestionId
+),
+joined as (
+  select qe.*,
+         ra.AnswerId,
+         ra.AnswererId,
+         ra.AnswerDate,
+         ra.AnswerScore,
+         ra.AUpVotes,
+         ra.ADownVotes,
+         ra.AFavorites,
+         ra.ABountyAmount,
+         ra.ACommentCount,
+         ra.ALastCommentDate,
+         ra.AnswerLatencySec,
+         ra.FirstAnswerLatencySec,
+         ra.IsAccepted,
+         ra.ScoreRank,
+         ra.TimeRank,
+         aq.AnswerCount,
+         aq.AcceptedAnswerExists,
+         aq.MaxAnswerScore,
+         aq.P50LatencySec,
+         aq.P90LatencySec,
+         aq.AvgAnswerNetVotes,
+         aq.TotalAnswerUpVotes,
+         aq.TotalAnswerDownVotes
+  from question_enriched qe
+  join ranked_answers ra on ra.QuestionId = qe.QuestionId
+  left join agg_per_question aq on aq.QuestionId = qe.QuestionId
+),
+with_users as (
+  select j.*,
+         ask.AskerReputation,
+         ask.AskerCreationDate,
+         ask.AskerGivenUpVotes,
+         ask.AskerGivenDownVotes,
+         ask.AskerProfileViews,
+         ask.AskerTotalBadges,
+         ask.AskerGoldBadges,
+         ask.AskerSilverBadges,
+         ask.AskerBronzeBadges,
+         ans.AnswererReputation,
+         ans.AnswererCreationDate,
+         ans.AnswererGivenUpVotes,
+         ans.AnswererGivenDownVotes,
+         ans.AnswererProfileViews,
+         ans.AnswererTotalBadges,
+         ans.AnswererGoldBadges,
+         ans.AnswererSilverBadges,
+         ans.AnswererBronzeBadges
+  from joined j
+  left join asker_enriched ask on ask.AskerId = j.AskerId
+  left join answerer_enriched ans on ans.AnswererId = j.AnswererId
+),
+scored as (
+  select wu.*,
+         (coalesce(wu.QUpVotes,0) - coalesce(wu.QDownVotes,0)) as QNetVotes,
+         (coalesce(wu.AUpVotes,0) - coalesce(wu.ADownVotes,0)) as ANetVotes,
+         case
+           when wu.IsAccepted = 1 then 3
+           when wu.ScoreRank = 1 then 2
+           when wu.TimeRank = 1 then 1
+           else 0
+         end as AnswerPriorityScore
+  from with_users wu
+),
+windowed as (
+  select s.*,
+         dense_rank() over (partition by s.QuestionId order by s.AnswerPriorityScore desc, s.ANetVotes desc, s.AnswerScore desc, s.AnswerDate asc) as BestAnswerRank,
+         row_number() over (partition by s.QuestionId order by s.ANetVotes desc, s.AnswerScore desc, s.AnswerDate asc) as NetVoteRank,
+         row_number() over (partition by s.QuestionId order by s.AnswerDate asc) as ChronoRank
+  from scored s
+)
+select
+  w.QuestionId,
+  w.AnswerId,
+  w.IsAccepted,
+  w.BestAnswerRank,
+  w.ScoreRank,
+  w.TimeRank,
+  w.NetVoteRank,
+  w.ChronoRank,
+  w.AnswerPriorityScore,
+  w.AnswerScore,
+  w.AUpVotes,
+  w.ADownVotes,
+  w.AFavorites,
+  w.ACommentCount,
+  w.ALastCommentDate,
+  w.ANetVotes,
+  w.AnswerLatencySec,
+  w.FirstAnswerLatencySec,
+  w.QuestionScore,
+  w.QUpVotes,
+  w.QDownVotes,
+  w.QFavorites,
+  w.QCommentCount,
+  w.QLastCommentDate,
+  w.QBountyAmount,
+  w.ViewCount,
+  w.TopTags,
+  w.DuplicateCount,
+  w.LastCloseDate,
+  w.LastCloseReasonId,
+  w.AnswerCount,
+  w.AcceptedAnswerExists,
+  w.MaxAnswerScore,
+  w.P50LatencySec,
+  w.P90LatencySec,
+  w.AvgAnswerNetVotes,
+  w.AskerId,
+  w.AskerReputation,
+  w.AskerGivenUpVotes,
+  w.AskerGivenDownVotes,
+  w.AskerProfileViews,
+  w.AskerTotalBadges,
+  w.AskerGoldBadges,
+  w.AskerSilverBadges,
+  w.AskerBronzeBadges,
+  w.AnswererId,
+  w.AnswererReputation,
+  w.AnswererGivenUpVotes,
+  w.AnswererGivenDownVotes,
+  w.AnswererProfileViews,
+  w.AnswererTotalBadges,
+  w.AnswererGoldBadges,
+  w.AnswererSilverBadges,
+  w.AnswererBronzeBadges
+from windowed w
+where w.BestAnswerRank = 1
+order by w.QNetVotes desc nulls last, w.ViewCount desc nulls last, w.P50LatencySec asc nulls last
+limit 500;

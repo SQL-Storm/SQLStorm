@@ -1,0 +1,145 @@
+-- {"query": "55036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1545} 
+WITH
+/* 1️⃣ All posts authored by each user (questions + answers) */
+user_posts AS (
+    SELECT
+        p.OwnerUserId                                   AS user_id,
+        COUNT(*)                                        AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        SUM(p.Score)                                    AS sum_score,
+        AVG(p.Score)                                    AS avg_score,
+        MAX(p.CreationDate)                             AS latest_post_date,
+        MAX(p.LastActivityDate)                         AS latest_activity_date,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT UNNEST(
+            CASE WHEN p.Tags IS NOT NULL
+                 THEN string_to_array(trim(both '<>' FROM p.Tags), '><')
+                 ELSE ARRAY[]::text[]
+            END)
+        ), NULL)                                        AS tag_array
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 2️⃣ Badge breakdown per user (by class) */
+user_badges AS (
+    SELECT
+        b.UserId                                   AS user_id,
+        COUNT(*)                                   AS total_badges,
+        COUNT(*) FILTER (WHERE b.Class = 1)        AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2)        AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3)        AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ', ')          AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3️⃣ Vote breakdown per user (votes *received* on their posts) */
+user_votes AS (
+    SELECT
+        p.OwnerUserId                              AS user_id,
+        COUNT(v.Id)                                AS total_votes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 12) AS spam_votes
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 4️⃣ Top‑3 tags used by each user (by frequency) */
+user_top_tags AS (
+    SELECT
+        up.user_id,
+        tag,
+        tag_freq,
+        RANK() OVER (PARTITION BY up.user_id ORDER BY tag_freq DESC) AS tag_rank
+    FROM (
+        SELECT
+            up.user_id,
+            UNNEST(up.tag_array) AS tag,
+            COUNT(*)           AS tag_freq
+        FROM user_posts up
+        WHERE up.tag_array IS NOT NULL
+        GROUP BY up.user_id, tag
+    ) AS up
+),
+
+/* 5️⃣ Assemble the final per‑user record */
+user_snapshot AS (
+    SELECT
+        u.Id                                           AS user_id,
+        u.DisplayName                                  AS display_name,
+        u.Reputation                                   AS reputation,
+        u.CreationDate                                 AS account_created,
+        up.total_posts,
+        up.question_count,
+        up.answer_count,
+        up.sum_score,
+        up.avg_score,
+        up.latest_post_date,
+        up.latest_activity_date,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.badge_names,
+        uv.total_votes,
+        uv.upvotes,
+        uv.downvotes,
+        uv.favorites,
+        uv.spam_votes,
+        STRING_AGG(DISTINCT ut.tag || ':' || ut.tag_freq::text, ', ') FILTER (WHERE ut.tag_rank <= 3) AS top_3_tags,
+        /* Reputation percentile (window function) */
+        PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_percentile,
+        /* Composite activity score */
+        (COALESCE(up.sum_score,0) * 0.4 +
+         COALESCE(uv.upvotes,0)   * 0.3 -
+         COALESCE(uv.downvotes,0) * 0.2 +
+         COALESCE(ub.gold_badges,0) * 5 +
+         COALESCE(ub.silver_badges,0) * 3 +
+         COALESCE(ub.bronze_badges,0) * 1)             AS activity_score
+    FROM Users u
+    LEFT JOIN user_posts     up ON up.user_id = u.Id
+    LEFT JOIN user_badges    ub ON ub.user_id = u.Id
+    LEFT JOIN user_votes     uv ON uv.user_id = u.Id
+    LEFT JOIN user_top_tags  ut ON ut.user_id = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        up.total_posts, up.question_count, up.answer_count,
+        up.sum_score, up.avg_score, up.latest_post_date, up.latest_activity_date,
+        ub.total_badges, ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.badge_names,
+        uv.total_votes, uv.upvotes, uv.downvotes, uv.favorites, uv.spam_votes
+)
+
+SELECT
+    us.user_id,
+    us.display_name,
+    us.reputation,
+    us.account_created,
+    us.total_posts,
+    us.question_count,
+    us.answer_count,
+    us.sum_score,
+    ROUND(us.avg_score,2)                AS avg_score,
+    us.latest_post_date,
+    us.latest_activity_date,
+    us.total_badges,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.badge_names,
+    us.total_votes,
+    us.upvotes,
+    us.downvotes,
+    us.favorites,
+    us.spam_votes,
+    us.top_3_tags,
+    ROUND(us.reputation_percentile*100,2) AS rep_percentile,
+    ROUND(us.activity_score,2)           AS activity_score
+FROM user_snapshot us
+ORDER BY us.activity_score DESC
+LIMIT 100;

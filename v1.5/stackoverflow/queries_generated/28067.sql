@@ -1,0 +1,81 @@
+-- {"query": "28067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1564} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, JoinYear
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        JoinYear,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        Upvotes,
+        Downvotes,
+        RANK() OVER (PARTITION BY JoinYear ORDER BY (Upvotes - Downvotes) DESC) AS ReputationRank,
+        NTILE(4) OVER (ORDER BY PostCount DESC) AS ActivityQuartile
+    FROM UserActivity
+)
+SELECT 
+    ru.JoinYear,
+    ru.ReputationRank,
+    u.DisplayName,
+    ru.PostCount,
+    ru.CommentCount,
+    ru.VoteCount,
+    ru.Upvotes,
+    ru.Downvotes,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 3) AS BronzeBadges,
+    COALESCE(STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', '), 'No Tags') AS CommonTags,
+    ph.EditCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM RankedUsers ru
+JOIN Users u ON ru.UserId = u.Id
+LEFT JOIN (
+    SELECT 
+        OwnerUserId,
+        COUNT(*) AS EditCount 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId IN (4,5,6) 
+    GROUP BY OwnerUserId
+) ph ON ru.UserId = ph.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        OwnerUserId,
+        Id,
+        Tags 
+    FROM Posts 
+    WHERE PostTypeId = 1 AND AnswerCount > 0 AND CHAR_LENGTH(Tags) > 2
+) p ON ru.UserId = p.OwnerUserId
+WHERE ru.ActivityQuartile = 1 
+    AND ru.JoinYear BETWEEN 2010 AND 2020 
+    AND (ru.Upvotes - ru.Downvotes) > 100 
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = ru.UserId 
+        AND p2.PostTypeId = 1 
+        AND p2.AcceptedAnswerId IS NOT NULL
+    )
+GROUP BY 
+    ru.JoinYear, ru.ReputationRank, u.DisplayName, ru.PostCount, ru.CommentCount, 
+    ru.VoteCount, ru.Upvotes, ru.Downvotes, ph.EditCount, p.Id, ru.UserId
+HAVING COUNT(DISTINCT p.Id) > 10
+ORDER BY ru.JoinYear DESC, ru.ReputationRank
+LIMIT 100;

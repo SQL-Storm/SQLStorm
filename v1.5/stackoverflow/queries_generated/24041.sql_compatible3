@@ -1,0 +1,136 @@
+WITH
+    -- 1. Get recent questions with owner reputation
+    recent_questions AS (
+        SELECT
+            p.Id,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.Tags,
+            p.AcceptedAnswerId,
+            u.Reputation,
+            u.DisplayName
+        FROM Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE
+            p.PostTypeId = 1
+            AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+    ),
+    -- 2. Split the tags into one row per tag
+    split_tags AS (
+        SELECT
+            rq.Id,
+            rq.OwnerUserId,
+            rq.Score,
+            rq.AcceptedAnswerId,
+            CAST(tag AS VARCHAR(255)) AS Tag
+        FROM recent_questions rq
+        CROSS JOIN LATERAL REGEXP_SPLIT_TO_TABLE(rq.Tags, '><') AS tag
+    ),
+    -- 3. Vote aggregation for each question
+    vote_stats AS (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1
+                     WHEN VoteTypeId = 3 THEN -1
+                     ELSE 0 END) AS VoteScore,
+            COUNT(DISTINCT UserId) AS VoterCount
+        FROM Votes
+        WHERE
+            PostId IN (SELECT Id FROM recent_questions)
+            AND VoteTypeId IN (2,3)
+        GROUP BY PostId
+    ),
+    -- 4. Count answers per question
+    answer_cnt AS (
+        SELECT
+            ParentId,
+            COUNT(*) AS ACount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ),
+    -- 5. Count comments per question
+    comment_cnt AS (
+        SELECT
+            PostId,
+            COUNT(*) AS CCount
+        FROM Comments
+        GROUP BY PostId
+    ),
+    -- 6. Last edit time per question
+    post_hist_last_edit AS (
+        SELECT
+            PostId,
+            MAX(CreationDate) AS LastEdit
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6)
+        GROUP BY PostId
+    ),
+    -- 7. Summary per tag
+    tag_summary AS (
+        SELECT
+            s.Tag,
+            COUNT(DISTINCT s.Id) AS TotalQs,
+            AVG(s.Score) AS AvgScore,
+            SUM(v.VoteScore) AS TotalVoteScore,
+            SUM(ac.ACount) AS TotalAnswers,
+            SUM(cc.CCount) AS TotalComments,
+            SUM(CASE WHEN s.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedCount,
+            COALESCE(MAX(he.LastEdit), TIMESTAMP '1900-01-01 00:00:00') AS LastEdit,
+            MIN(COALESCE(u.Reputation, 0)) AS MinRep,
+            MAX(COALESCE(u.Reputation, 0)) AS MaxRep
+        FROM split_tags s
+        LEFT JOIN vote_stats v ON v.PostId = s.Id
+        LEFT JOIN answer_cnt ac ON ac.ParentId = s.Id
+        LEFT JOIN comment_cnt cc ON cc.PostId = s.Id
+        LEFT JOIN post_hist_last_edit he ON he.PostId = s.Id
+        LEFT JOIN recent_questions rq ON rq.Id = s.Id
+        LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+        GROUP BY s.Tag
+    ),
+    -- 8. Rank and categorize tags
+    flagged_tags AS (
+        SELECT
+            Tag,
+            TotalQs,
+            AvgScore,
+            TotalVoteScore,
+            TotalAnswers,
+            TotalComments,
+            AcceptedCount,
+            LastEdit,
+            MinRep,
+            MaxRep,
+            ROW_NUMBER() OVER (ORDER BY TotalVoteScore DESC) AS Rank,
+            CASE
+                WHEN TotalQs > 30 THEN 'High Qs'
+                WHEN AcceptedCount > 0 THEN 'Has Accepted'
+                ELSE 'Other'
+            END AS Category
+        FROM tag_summary
+    ),
+    -- 9. Combine sets for richer result set
+    union_tags AS (
+        SELECT * FROM flagged_tags
+        UNION ALL
+        SELECT * FROM flagged_tags
+        WHERE Category = 'High Qs'
+    )
+SELECT
+    Tag,
+    TotalQs,
+    AvgScore,
+    TotalVoteScore,
+    TotalAnswers,
+    TotalComments,
+    AcceptedCount,
+    LastEdit,
+    MinRep,
+    MaxRep,
+    Rank,
+    Category
+FROM union_tags
+WHERE Rank <= 20
+ORDER BY Rank, Tag;

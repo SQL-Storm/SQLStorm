@@ -1,0 +1,53 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(p.Id) AS PostCount
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    ORDER BY PostCount DESC
+    LIMIT 100
+),
+TopTags AS (
+    SELECT t.TagName, COUNT(pt.PostId) AS PostCount
+    FROM Tags t
+    JOIN PostTags pt ON t.Id = pt.TagId
+    GROUP BY t.TagName
+    ORDER BY PostCount DESC
+    LIMIT 50
+),
+QuestionAnswers AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT p.Id, p.ParentId, p.Score, p.ViewCount, COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 2
+    GROUP BY p.Id, p.ParentId, p.Score, p.ViewCount
+),
+VoteDistribution AS (
+    SELECT v.PostId, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+)
+SELECT 
+    qu.Id,
+    qu.Title,
+    qu.Score,
+    qu.ViewCount,
+    qu.AnswerCount,
+    ad.Score AS AnswerScore,
+    ad.ViewCount AS AnswerViewCount,
+    ad.CommentCount,
+    vd.UpVotes,
+    vd.DownVotes,
+    tu.DisplayName AS TopUser,
+    tt.TagName AS TopTag
+FROM QuestionAnswers AS qu
+JOIN AnswerDetails AS ad ON qu.Id = ad.ParentId
+JOIN VoteDistribution AS vd ON qu.Id = vd.PostId
+JOIN TopUsers AS tu ON qu.OwnerUserId = tu.Id
+JOIN TopTags AS tt ON CAST(',' || qu.Tags || ',' AS VARCHAR(1000)) LIKE '%,' || tt.TagName || ',%'
+ORDER BY qu.Score DESC, qu.ViewCount DESC;

@@ -1,0 +1,201 @@
+WITH
+Questions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    CAST(p.CreationDate AS date) AS Created,
+    CAST(date_part('year', p.CreationDate) AS int) AS Year,
+    ((date_part('year', p.CreationDate) :: int - 1) / 10) * 10 AS Decade,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.FavoriteCount,
+    u.Id AS OwnerId,
+    u.Reputation AS OwnerReputation,
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><') END AS TagArray,
+    unnest(CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><') END) AS Tag
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+  SELECT
+    q.QuestionId,
+    COUNT(a.Id) AS TotalAnswers,
+    SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted,
+    MAX(a.Score) FILTER (WHERE a.ParentId = q.QuestionId) AS MaxAnswerScore,
+    AVG(a.Score) FILTER (WHERE a.ParentId = q.QuestionId) AS AvgAnswerScore,
+    COUNT(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS DistinctAnswerers,
+    (SELECT u2.DisplayName FROM Posts a2 JOIN Users u2 ON u2.Id = a2.OwnerUserId
+       WHERE a2.ParentId = q.QuestionId AND a2.OwnerUserId IS NOT NULL
+       ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate ASC LIMIT 1) AS TopAnswerer
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+  GROUP BY q.QuestionId, q.AcceptedAnswerId
+),
+CommentStats AS (
+  SELECT
+    p.Id AS PostId,
+    SUM(1) FILTER (WHERE c.Id IS NOT NULL) AS CommentCount,
+    MAX(c.CreationDate) AS LastCommentDate,
+    AVG(char_length(c.Text)) FILTER (WHERE c.Id IS NOT NULL) AS AvgCommentLength
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+  GROUP BY p.Id
+),
+VoteStats AS (
+  SELECT
+    v.PostId,
+    COUNT(*) AS TotalVotes,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN vt.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+    MIN(v.CreationDate) AS FirstVote,
+    MAX(v.CreationDate) AS LastVote
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  GROUP BY v.PostId
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId,
+    t.Count AS GlobalCount,
+    (SELECT p.Title FROM Posts p WHERE p.Id = t.ExcerptPostId LIMIT 1) AS ExcerptTitle
+  FROM Tags t
+  ORDER BY t.Count DESC NULLS LAST
+  LIMIT 200
+),
+CoTags AS (
+  SELECT
+    q.QuestionId,
+    q.Tag,
+    t.TagName AS PrimaryTag,
+    other.Tag AS CoTag
+  FROM Questions q
+  JOIN TagPopularity t ON t.TagName = q.Tag
+  JOIN LATERAL (
+    SELECT unnest(CASE WHEN q.TagArray IS NULL THEN ARRAY[]::varchar[] ELSE q.TagArray END) AS Tag
+  ) other ON other.Tag IS NOT NULL AND other.Tag <> q.Tag
+),
+CoTagAgg AS (
+  SELECT
+    PrimaryTag,
+    CoTag,
+    COUNT(DISTINCT QuestionId) AS CoOccurrence,
+    SUM((SELECT ViewCount FROM Posts p WHERE p.Id = ct.QuestionId)) AS CoTagViews
+  FROM CoTags ct
+  GROUP BY PrimaryTag, CoTag
+  ORDER BY PrimaryTag, CoOccurrence DESC
+),
+UserYearRep AS (
+  SELECT
+    u.Id AS UserId,
+    date_part('year', u.CreationDate)::int AS StartYear,
+    date_part('year', b.Date)::int AS BadgeYear,
+    COUNT(b.Id) AS BadgesThisYear,
+    SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS BadgeWeight
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, date_part('year', u.CreationDate)::int, date_part('year', b.Date)::int
+),
+UserBadgeVelocity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(b.Id) AS TotalBadges,
+    (COUNT(b.Id)::float / GREATEST(EXTRACT(YEAR FROM cast('2024-10-01 12:34:56' as timestamp)) - EXTRACT(YEAR FROM u.CreationDate) + 1,1)) AS BadgesPerYear,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(b.Id) > 0
+  ORDER BY BadgesPerYear DESC NULLS LAST
+  LIMIT 100
+),
+DecadeTagStats AS (
+  SELECT
+    q.Decade,
+    tp.TagName,
+    COUNT(q.QuestionId) AS QuestionsInBucket,
+    AVG(q.ViewCount) AS AvgViews,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.ViewCount) AS MedianViews,
+    AVG(q.Score) AS AvgScore,
+    SUM(COALESCE(asx.TotalAnswers,0)) AS AnswersTotal,
+    SUM(q.FavoriteCount) AS FavoritesTotal,
+    MAX(q.ViewCount) AS MaxViews
+  FROM Questions q
+  JOIN TagPopularity tp ON tp.TagName = q.Tag
+  LEFT JOIN AnswerStats asx ON asx.QuestionId = q.QuestionId
+  GROUP BY q.Decade, tp.TagName
+  HAVING COUNT(q.QuestionId) >= 5
+),
+TopQuestions AS (
+  SELECT DISTINCT ON (d.Decade, d.TagName)
+    d.Decade,
+    d.TagName AS Tag,
+    q.QuestionId,
+    q.Title,
+    q.Created,
+    q.ViewCount,
+    q.Score,
+    COALESCE(vs.UpVotes,0) AS UpVotes,
+    COALESCE(vs.DownVotes,0) AS DownVotes,
+    COALESCE(cs.CommentCount,0) AS CommentCount,
+    COALESCE(asx.TotalAnswers,0) AS TotalAnswers,
+    asx.HasAccepted,
+    ( (COALESCE(q.ViewCount,0) :: double precision / NULLIF(d.AvgViews,0)) * 0.4
+      + (COALESCE(q.Score,0) / GREATEST(d.AvgScore,1)) * 0.3
+      + (LEAST(1.0, COALESCE(asx.HasAccepted,0))) * 0.2
+      + (LEAST(1.0, COALESCE(asx.DistinctAnswerers,0)/5.0)) * 0.1
+    ) AS CompositeScore
+  FROM DecadeTagStats d
+  JOIN Questions q ON q.Decade = d.Decade AND q.Tag = d.TagName
+  LEFT JOIN VoteStats vs ON vs.PostId = q.QuestionId
+  LEFT JOIN CommentStats cs ON cs.PostId = q.QuestionId
+  LEFT JOIN AnswerStats asx ON asx.QuestionId = q.QuestionId
+  ORDER BY d.Decade, d.TagName, CompositeScore DESC
+)
+SELECT
+  tq.Decade,
+  tq.Tag,
+  tq.QuestionId,
+  tq.Title,
+  tq.Created,
+  tq.ViewCount,
+  tq.Score,
+  tq.UpVotes,
+  tq.DownVotes,
+  tq.CommentCount,
+  tq.TotalAnswers,
+  tq.HasAccepted,
+  round(tq.CompositeScore::numeric,4) AS CompositeScore,
+  ct.CoTagCount,
+  ct.TopCoTags,
+  ubv.DisplayName AS TopBadgeUser,
+  ubv.TotalBadges,
+  ubv.BadgesPerYear
+FROM TopQuestions tq
+LEFT JOIN (
+  SELECT
+    PrimaryTag AS Tag,
+    COUNT(*) AS CoTagCount,
+    string_agg(CoTag || ':' || CoOccurrence, ',' ORDER BY CoOccurrence DESC) AS TopCoTags
+  FROM CoTagAgg
+  GROUP BY PrimaryTag
+) ct ON ct.Tag = tq.Tag
+LEFT JOIN (
+  SELECT ub.UserId, ub.DisplayName, ub.TotalBadges, round(ub.BadgesPerYear::numeric,2) AS BadgesPerYear
+  FROM UserBadgeVelocity ub
+  JOIN (
+    SELECT DISTINCT OwnerId FROM Questions q2
+    WHERE q2.TagArray && (SELECT array_agg(TagName) FROM TagPopularity)
+  ) uq ON uq.OwnerId = ub.UserId
+  ORDER BY ub.BadgesPerYear DESC NULLS LAST
+  LIMIT 1
+) ubv ON TRUE
+ORDER BY tq.Decade ASC, tq.Tag ASC
+;

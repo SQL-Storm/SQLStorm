@@ -1,0 +1,321 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    coalesce(u.upvotes, 0) - coalesce(u.downvotes, 0) as net_votes,
+    row_number() over (order by u.creationdate desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    sum(coalesce(p.viewcount,0)) as view_sum,
+    avg(nullif(p.answercount,0)) filter (where p.posttypeid = 1) as avg_answers_per_q,
+    max(p.creationdate) as last_post_date
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+badge_agg as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+comment_stats as (
+  select
+    c.userid as user_id,
+    count(*) as comment_count,
+    avg(coalesce(c.score,0)) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+post_quality as (
+  select
+    p.owneruserid as user_id,
+    percentile_disc(0.9) within group (order by coalesce(p.score,0)) as p90_post_score,
+    percentile_disc(0.9) within group (order by coalesce(p.viewcount,0)) as p90_post_views,
+    sum(case when p.score >= 10 then 1 else 0 end) as hi_score_posts,
+    sum(case when p.favoritecount >= 5 then 1 else 0 end) as favored_posts
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+accepted_answerers as (
+  select
+    a.owneruserid as user_id,
+    count(*) as accepted_answers
+  from posts q
+  join posts a
+    on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+    and a.posttypeid = 2
+    and a.owneruserid is not null
+  group by a.owneruserid
+),
+tag_expertise as (
+  select
+    p.owneruserid as user_id,
+    t.tagname,
+    count(*) as posts_in_tag,
+    row_number() over (partition by p.owneruserid order by count(*) desc, min(p.creationdate)) as tag_rank
+  from posts p
+  join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag(tagname) on true
+  where p.posttypeid = 1 and p.tags is not null
+  group by p.owneruserid, t.tagname
+),
+top_tag as (
+  select user_id,
+         tagname as top_tag,
+         posts_in_tag as top_tag_posts
+  from tag_expertise
+  where tag_rank = 1
+),
+dup_closures as (
+  select
+    ph.userid as user_id,
+    count(*) as duplicate_closure_votes
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+    and (cast(ph.comment as int) = 1 or cast(ph.comment as int) = 101)
+    and ph.userid is not null
+  group by ph.userid
+),
+linking as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    pl.creationdate
+  from postlinks pl
+),
+cross_links as (
+  select
+    u.id as user_id,
+    count(distinct case when pl.linktypeid = 1 then pl.relatedpostid end) as linked_posts,
+    count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as duplicate_links
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join linking pl on pl.postid = p.id
+  group by u.id
+),
+voting_agg as (
+  select
+    v.userid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upmods_cast,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downmods_cast,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+question_metrics as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as questions_total,
+    avg(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as avg_q_views,
+    avg(coalesce(p.score,0)) filter (where p.posttypeid = 1) as avg_q_score,
+    sum(case when p.closeddate is not null then 1 else 0 end) as closed_questions
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+answer_metrics as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 2) as answers_total,
+    avg(coalesce(p.score,0)) filter (where p.posttypeid = 2) as avg_a_score
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+activity_recency as (
+  select
+    u.id as user_id,
+    greatest(
+      coalesce(a.last_post_date, timestamp 'epoch'),
+      coalesce(c.last_comment_date, timestamp 'epoch'),
+      coalesce(b.last_badge_date, timestamp 'epoch')
+    ) as last_activity_date
+  from users u
+  left join user_activity a on a.user_id = u.id
+  left join comment_stats c on c.user_id = u.id
+  left join badge_agg b on b.user_id = u.id
+),
+ranked_users as (
+  select
+    ru.*,
+    dense_rank() over (order by ru.reputation desc, ru.net_votes desc, ru.creationdate asc) as rep_rank
+  from recent_users ru
+),
+composite as (
+  select
+    r.user_id,
+    r.displayname,
+    r.location,
+    r.websiteurl_norm,
+    r.reputation,
+    r.net_votes,
+    ua.q_count,
+    ua.a_count,
+    qa.questions_total,
+    am.answers_total,
+    ua.post_score_sum,
+    ua.view_sum,
+    ua.avg_answers_per_q,
+    pq.p90_post_score,
+    pq.p90_post_views,
+    pq.hi_score_posts,
+    pq.favored_posts,
+    aa.accepted_answers,
+    coalesce(ba.badge_count,0) as badge_count,
+    coalesce(ba.gold_count,0) as gold_count,
+    coalesce(ba.silver_count,0) as silver_count,
+    coalesce(ba.bronze_count,0) as bronze_count,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.avg_comment_score,0) as avg_comment_score,
+    coalesce(dl.duplicate_closure_votes,0) as duplicate_closure_votes,
+    coalesce(cl.linked_posts,0) as linked_posts,
+    coalesce(cl.duplicate_links,0) as duplicate_links,
+    coalesce(va.upmods_cast,0) as upmods_cast,
+    coalesce(va.downmods_cast,0) as downmods_cast,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    tt.top_tag,
+    tt.top_tag_posts,
+    ar.last_activity_date,
+    r.rep_rank,
+    case
+      when r.reputation >= 20000 then 'legend'
+      when r.reputation >= 10000 then 'veteran'
+      when r.reputation >= 5000 then 'expert'
+      when r.reputation >= 1000 then 'intermediate'
+      else 'novice'
+    end as rep_bucket,
+    case when coalesce(ua.a_count,0) > coalesce(ua.q_count,0) then 'answerer' else 'questioner' end as persona,
+    case when r.location ilike '%remote%' or r.websiteurl_norm ilike '%github%' then 1 else 0 end as tech_affinity_bit
+  from ranked_users r
+  left join user_activity ua on ua.user_id = r.user_id
+  left join post_quality pq on pq.user_id = r.user_id
+  left join accepted_answerers aa on aa.user_id = r.user_id
+  left join badge_agg ba on ba.user_id = r.user_id
+  left join comment_stats cs on cs.user_id = r.user_id
+  left join dup_closures dl on dl.user_id = r.user_id
+  left join cross_links cl on cl.user_id = r.user_id
+  left join voting_agg va on va.user_id = r.user_id
+  left join question_metrics qa on qa.user_id = r.user_id
+  left join answer_metrics am on am.user_id = r.user_id
+  left join top_tag tt on tt.user_id = r.user_id
+  left join activity_recency ar on ar.user_id = r.user_id
+),
+outliers as (
+  select
+    c.*,
+    case when c.post_score_sum > (select avg(post_score_sum) + 2*stddev_samp(post_score_sum) from composite) then 1 else 0 end as score_outlier,
+    case when c.view_sum > (select avg(view_sum) + 2*stddev_samp(view_sum) from composite) then 1 else 0 end as view_outlier
+  from composite c
+),
+normalized as (
+  select
+    o.*,
+    coalesce((o.post_score_sum::decimal / nullif((select sum(post_score_sum) from composite),0)),0) as score_norm,
+    coalesce((o.view_sum::decimal / nullif((select sum(view_sum) from composite),0)),0) as view_norm
+  from outliers o
+),
+final_rank as (
+  select
+    n.*,
+    (
+      0.35 * coalesce(n.reputation,0) +
+      0.20 * coalesce(n.post_score_sum,0) +
+      0.15 * coalesce(n.accepted_answers,0) +
+      0.10 * coalesce(n.badge_count,0) +
+      0.10 * coalesce(n.linked_posts,0) +
+      0.10 * greatest(coalesce(n.avg_q_score,0), coalesce(n.avg_a_score,0))
+    ) as raw_score
+  from normalized n
+),
+tiebreak as (
+  select
+    f.*,
+    row_number() over (
+      order by f.raw_score desc,
+               f.rep_rank asc,
+               f.last_activity_date desc,
+               f.user_id asc
+    ) as overall_rank
+  from final_rank f
+)
+select
+  t.overall_rank,
+  t.user_id,
+  t.displayname,
+  t.location,
+  t.websiteurl_norm,
+  t.reputation,
+  t.net_votes,
+  t.rep_bucket,
+  t.persona,
+  t.top_tag,
+  t.top_tag_posts,
+  t.q_count,
+  t.a_count,
+  t.questions_total,
+  t.answers_total,
+  t.avg_answers_per_q,
+  t.avg_q_views,
+  t.avg_q_score,
+  t.avg_a_score,
+  t.post_score_sum,
+  t.view_sum,
+  t.p90_post_score,
+  t.p90_post_views,
+  t.hi_score_posts,
+  t.favored_posts,
+  t.accepted_answers,
+  t.badge_count,
+  t.gold_count,
+  t.silver_count,
+  t.bronze_count,
+  t.comment_count,
+  t.avg_comment_score,
+  t.duplicate_closure_votes,
+  t.linked_posts,
+  t.duplicate_links,
+  t.upmods_cast,
+  t.downmods_cast,
+  t.bounty_started,
+  t.bounty_awarded,
+  t.last_activity_date,
+  t.score_outlier,
+  t.view_outlier,
+  t.raw_score,
+  sum(t.raw_score) over () as total_raw_score,
+  rank() over (order by t.raw_score desc) as score_rank,
+  dense_rank() over (order by coalesce(t.accepted_answers,0) desc) as accepted_rank,
+  count(*) over () as sample_size
+from tiebreak t
+where (
+  t.tech_affinity_bit = 1
+  or (t.rep_bucket in ('expert','veteran','legend') and coalesce(t.accepted_answers,0) >= 5)
+  or (t.score_outlier = 1 and t.view_outlier = 1)
+)
+and coalesce(t.questions_total,0) + coalesce(t.answers_total,0) >= 10
+order by t.overall_rank
+limit 200;

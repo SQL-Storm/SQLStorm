@@ -1,0 +1,112 @@
+-- {"query": "27069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1251} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvoteCount,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostViewCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate >= DATEADD(MONTH, -1, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AnswerCount, p.AcceptedAnswerId
+),
+PopularTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        MAX(p.CreationDate) AS MostRecentPostDate,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName ASC) AS TagRank
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = any(string_to_array(p.Tags,'><'))
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.TotalBadges,
+    ua.LastPostActivityDate,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.AcceptedAnswerId,
+    rp.CommentCount,
+    rp.VoteCount,
+    rp.UpvoteCount,
+    rp.DownvoteCount,
+    rp.PreviousPostScore,
+    rp.PreviousPostViewCount,
+    pt.TagId,
+    pt.TagName,
+    pt.TagCount,
+    pt.PostCount,
+    pt.MostRecentPostDate,
+    pt.TagRank
+FROM
+    UserActivity ua
+LEFT JOIN
+    RecentPosts rp ON ua.UserId = rp.OwnerUserId
+LEFT JOIN
+    PopularTags pt ON rp.Tags LIKE '%>' || pt.TagName || '><%'
+ORDER BY
+    ua.Reputation DESC,
+    rp.PostCreationDate DESC,
+    pt.TagRank ASC;

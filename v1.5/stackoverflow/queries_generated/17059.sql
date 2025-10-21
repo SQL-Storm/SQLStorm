@@ -1,0 +1,138 @@
+-- {"query": "17059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 140100, "output_tokens": 139345} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown Location') AS Location,
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, u.CreationDate)) * 12 + 
+        EXTRACT(MONTH FROM AGE(CURRENT_DATE, u.CreationDate)) AS AccountAgeMonths,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2), ', ') 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM Date - LAG(Date) OVER (PARTITION BY UserId ORDER BY Date))) AS MedianBadgeIntervalSeconds,
+        FIRST_VALUE(Name) OVER (PARTITION BY UserId ORDER BY Date DESC) AS LatestBadgeName
+    FROM Badges
+    GROUP BY UserId
+),
+PostActivityAnalysis AS (
+    SELECT DISTINCT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        COUNT(DISTINCT c.UserId) OVER (PARTITION BY p.Id) AS UniqueCommenters,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS HighScoreComments,
+        MAX(ph.CreationDate) OVER (PARTITION BY p.Id) AS LastEditDate,
+        COUNT(*) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS CumulativePostsAtTime,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRankForUser
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+        AND (p.Score > 0 OR p.ViewCount > 100)
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBounties,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) AS VoteTimeVariance
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 8)
+    GROUP BY v.PostId
+),
+LinkedPostNetwork AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        p1.Score AS SourceScore,
+        p2.Score AS TargetScore,
+        ABS(COALESCE(p1.Score, 0) - COALESCE(p2.Score, 0)) AS ScoreDifference
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    UPPER(LEFT(um.Location, 2)) || LOWER(SUBSTRING(um.Location, 3, 3)) || 
+        CASE WHEN LENGTH(um.Location) > 5 THEN '...' ELSE '' END AS LocationAbbrev,
+    um.AccountAgeMonths,
+    um.QuestionCount + um.AnswerCount AS TotalPosts,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    SUBSTRING(COALESCE(um.TopTags, 'no-tags'), 1, 50) AS TopTagsShort,
+    COUNT(DISTINCT paa.PostId) AS ActivePosts,
+    AVG(paa.ViewCount) FILTER (WHERE paa.PostStatus = 'Open') AS AvgViewsOpenPosts,
+    MAX(paa.UniqueCommenters) AS MaxCommentersOnPost,
+    SUM(COALESCE(vp.Upvotes, 0) - COALESCE(vp.Downvotes, 0)) AS NetVotes,
+    COALESCE(SUM(vp.TotalBounties), 0) AS TotalBountiesReceived,
+    COUNT(DISTINCT lpn.RelatedPostId) FILTER (WHERE lpn.LinkType = 'Duplicate') AS DuplicateLinks,
+    CASE 
+        WHEN um.Reputation > 10000 AND ba.GoldBadges > 5 THEN 'Elite'
+        WHEN um.Reputation > 5000 OR ba.GoldBadges > 0 THEN 'Expert'
+        WHEN um.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, '|' ORDER BY t.Count DESC)
+         FROM Tags t
+         WHERE EXISTS (
+             SELECT 1 FROM Posts p 
+             WHERE p.OwnerUserId = um.Id 
+                 AND p.Tags LIKE '%<' || t.TagName || '>%'
+         )
+         LIMIT 3),
+        'none'
+    ) AS Top3TagsUsed
+FROM UserMetrics um
+LEFT JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT JOIN PostActivityAnalysis paa ON um.Id = paa.OwnerUserId
+LEFT JOIN VotePatterns vp ON paa.PostId = vp.PostId
+LEFT JOIN LinkedPostNetwork lpn ON paa.PostId = lpn.PostId
+WHERE um.Reputation > 100
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph2
+        WHERE ph2.UserId = um.Id
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    )
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.Location, um.AccountAgeMonths,
+    um.QuestionCount, um.AnswerCount, um.AvgPostScore, um.TopTags,
+    ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges, ba.MedianBadgeIntervalSeconds, ba.LatestBadgeName
+HAVING COUNT(DISTINCT paa.PostId) > 0 OR SUM(COALESCE(vp.Upvotes, 0)) > 10
+ORDER BY 
+    um.Reputation DESC NULLS LAST,
+    WeightedBadgeScore DESC NULLS LAST,
+    NetVotes DESC NULLS LAST
+LIMIT 100;

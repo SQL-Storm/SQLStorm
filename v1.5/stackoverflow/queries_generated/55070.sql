@@ -1,0 +1,178 @@
+-- {"query": "55070.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1682} 
+
+WITH
+    -- Count of each badge class per user
+    BadgeStats AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*) AS TotalBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    -- Aggregated vote information per post (excluding vote types that are not user‑generated)
+    PostVoteAgg AS (
+        SELECT
+            v.PostId,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 12) AS SpamFlags,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 14) AS ModeratorNominations
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+
+    -- Latest edit history per post (only keep the most recent entry)
+    LatestEdit AS (
+        SELECT DISTINCT ON (ph.PostId)
+            ph.PostId,
+            ph.PostHistoryTypeId,
+            ph.CreationDate AS EditDate,
+            ph.UserId AS EditorUserId,
+            ph.Comment AS EditComment
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6)   -- Edit Title/Body/Tags
+        ORDER BY ph.PostId, ph.CreationDate DESC
+    ),
+
+    -- Tag co‑occurrence matrix for the top 20 tags by post count
+    TopTags AS (
+        SELECT TagName
+        FROM Tags
+        ORDER BY Count DESC
+        LIMIT 20
+    ),
+    TagPairs AS (
+        SELECT
+            t1.TagName AS TagA,
+            t2.TagName AS TagB,
+            COUNT(*) AS CoOccurrence
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+        ) pt
+        JOIN TopTags t1 ON t1.TagName = pt.TagName
+        JOIN LATERAL (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+        ) pt2 ON pt2.TagName = t1.TagName
+        JOIN TopTags t2 ON t2.TagName = pt2.TagName AND t2.TagName > t1.TagName
+        GROUP BY t1.TagName, t2.TagName
+    ),
+
+    -- Activity window: last 90 days
+    RecentActivity AS (
+        SELECT
+            p.OwnerUserId,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS RecentQuestions,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS RecentAnswers,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+            MAX(p.CreationDate) AS LastPostDate
+        FROM Posts p
+        WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    -- Consolidated user profile
+    UserProfile AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate AS JoinDate,
+            u.LastAccessDate,
+            u.Views,
+            u.UpVotes,
+            u.DownVotes,
+            bs.GoldBadges,
+            bs.SilverBadges,
+            bs.BronzeBadges,
+            bs.TotalBadges,
+            ra.RecentQuestions,
+            ra.RecentAnswers,
+            ra.QuestionScoreSum,
+            ra.AnswerScoreSum,
+            ra.LastPostDate
+        FROM Users u
+        LEFT JOIN BadgeStats bs ON bs.UserId = u.Id
+        LEFT JOIN RecentActivity ra ON ra.OwnerUserId = u.Id
+    )
+
+SELECT
+    up.Id AS UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.TotalBadges,
+    up.RecentQuestions,
+    up.RecentAnswers,
+    up.QuestionScoreSum,
+    up.AnswerScoreSum,
+    up.LastPostDate,
+    -- Top 5 recent posts for each user with vote and edit details
+    jsonb_agg(
+        jsonb_build_object(
+            'PostId', p.Id,
+            'Title', p.Title,
+            'PostType', pt.Name,
+            'Score', p.Score,
+            'ViewCount', p.ViewCount,
+            'CreationDate', p.CreationDate,
+            'LastActivity', p.LastActivityDate,
+            'UpVotes', COALESCE(pva.UpVotes,0),
+            'DownVotes', COALESCE(pva.DownVotes,0),
+            'Favorites', COALESCE(pva.Favorites,0),
+            'LatestEdit', jsonb_build_object(
+                'EditType', le.PostHistoryTypeId,
+                'EditDate', le.EditDate,
+                'EditorUserId', le.EditorUserId,
+                'EditComment', le.EditComment
+            )
+        )
+        ORDER BY p.CreationDate DESC
+        LIMIT 5
+    ) AS RecentPostsJson,
+    -- Tag co‑occurrence matrix (as a nested JSON array) for this user’s tags
+    jsonb_agg(
+        jsonb_build_object(
+            'Tag', t.TagName,
+            'CoTags', (
+                SELECT jsonb_agg(jsonb_build_object('CoTag', tp.TagB, 'Count', tp.CoOccurrence))
+                FROM TagPairs tp
+                WHERE tp.TagA = t.TagName OR tp.TagB = t.TagName
+                ORDER BY tp.CoOccurrence DESC
+                LIMIT 5
+            )
+        )
+    ) FILTER (WHERE t.TagName IS NOT NULL) AS TagCoOccurrenceJson
+FROM UserProfile up
+LEFT JOIN Posts p ON p.OwnerUserId = up.Id
+LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+LEFT JOIN PostVoteAgg pva ON pva.PostId = p.Id
+LEFT JOIN LatestEdit le ON le.PostId = p.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+) t ON TRUE
+WHERE up.Reputation > 1000
+GROUP BY
+    up.Id,
+    up.DisplayName,
+    up.Reputation,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.TotalBadges,
+    up.RecentQuestions,
+    up.RecentAnswers,
+    up.QuestionScoreSum,
+    up.AnswerScoreSum,
+    up.LastPostDate
+ORDER BY up.Reputation DESC
+LIMIT 100;

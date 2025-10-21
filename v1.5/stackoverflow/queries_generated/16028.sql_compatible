@@ -1,0 +1,152 @@
+WITH RECURSIVE user_engagement_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    EXTRACT(YEAR FROM u.CreationDate) AS YearJoined,
+    CASE 
+      WHEN u.Reputation >= 10000 THEN 'Elite'
+      WHEN u.Reputation >= 1000 THEN 'Advanced'
+      WHEN u.Reputation >= 100 THEN 'Intermediate'
+      ELSE 'Beginner'
+    END AS ReputationTier,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore
+  FROM Users u
+  WHERE u.CreationDate >= '2020-01-01'
+    AND u.Reputation > 0
+),
+post_quality_analysis AS (
+  SELECT 
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+    CASE 
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+      ELSE 0 
+    END AS HasAcceptedAnswer,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC NULLS LAST) AS ViewRank,
+    LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+    LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+    AVG(p.Score) OVER (PARTITION BY EXTRACT(MONTH FROM p.CreationDate) ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING) AS MovingAvgScore,
+    COALESCE(
+      (SELECT STRING_AGG(DISTINCT SUBSTRING(tag, 1, 20), ', ') 
+       FROM unnest(string_to_array(COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ''), '><')) AS tag 
+       LIMIT 5),
+      'No Tags'
+    ) AS TopTags
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= '2019-01-01'
+    AND (p.Score IS NULL OR p.Score >= -5)
+),
+answer_acceptance_patterns AS (
+  SELECT 
+    q.Id AS QuestionId,
+    q.OwnerUserId AS QuestionerUserId,
+    a.Id AS AnswerId,
+    a.OwnerUserId AS AnswererUserId,
+    a.Score AS AnswerScore,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAnswer,
+    COUNT(c.Id) AS AnswerComments
+  FROM Posts q
+  INNER JOIN Posts a ON q.Id = a.ParentId
+  LEFT OUTER JOIN Comments c ON a.Id = c.PostId
+  WHERE q.PostTypeId = 1 
+    AND a.PostTypeId = 2
+    AND q.ClosedDate IS NULL
+  GROUP BY q.Id, q.OwnerUserId, q.AcceptedAnswerId, a.Id, a.OwnerUserId, a.Score, a.CreationDate, q.CreationDate
+),
+vote_distribution AS (
+  SELECT 
+    v.PostId,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    COUNT(*) AS VoteCount,
+    MIN(v.CreationDate) AS FirstVoteDate,
+    MAX(v.CreationDate) AS LastVoteDate,
+    COUNT(DISTINCT v.UserId) AS UniqueVoters,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS TotalUpvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS TotalDownvotes
+  FROM Votes v
+  INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.VoteTypeId IN (2, 3, 5, 8)
+  GROUP BY v.PostId, v.VoteTypeId, vt.Name
+)
+SELECT DISTINCT
+  uem.DisplayName,
+  uem.ReputationTier,
+  uem.Location,
+  uem.YearJoined,
+  uem.QuestionCount,
+  uem.AnswerCount,
+  ROUND(COALESCE(uem.AvgAnswerScore, 0), 2) AS AvgAnswerScore,
+  uem.GoldBadges,
+  pqa.PostId,
+  pqa.Score AS PostScore,
+  pqa.ViewCount,
+  pqa.AnswerCount AS ResponseCount,
+  pqa.CommentCount,
+  pqa.BodyLength,
+  pqa.UserPostRank,
+  pqa.ViewRank,
+  pqa.TopTags,
+  COALESCE(ROUND(EXTRACT(EPOCH FROM (pqa.CreationDate - pqa.PrevPostDate))/86400.0, 1), 0) AS DaysSincePrevPost,
+  COALESCE(aap.IsAccepted, 0) AS HasAcceptance,
+  ROUND(COALESCE(aap.HoursToAnswer, 0), 2) AS ResponseTimeHours,
+  COALESCE(aap.AnswerComments, 0) AS AnswerComments,
+  COALESCE(vd.TotalUpvotes, 0) AS Upvotes,
+  COALESCE(vd.TotalDownvotes, 0) AS Downvotes,
+  CASE 
+    WHEN COALESCE(vd.TotalUpvotes, 0) + COALESCE(vd.TotalDownvotes, 0) = 0 THEN NULL
+    ELSE ROUND((COALESCE(vd.TotalUpvotes, 0) * 1.0 / NULLIF(COALESCE(vd.TotalUpvotes, 0) + COALESCE(vd.TotalDownvotes, 0), 0)) * 100, 2)
+  END AS UpvotePercentage,
+  (SELECT COUNT(*) 
+   FROM PostHistory ph 
+   WHERE ph.PostId = pqa.PostId 
+     AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+  EXISTS(
+    SELECT 1 
+    FROM PostLinks pl 
+    WHERE pl.PostId = pqa.PostId 
+      AND pl.LinkTypeId = 3
+  ) AS IsDuplicateTarget,
+  COALESCE(
+    (SELECT COUNT(DISTINCT pl2.RelatedPostId) 
+     FROM PostLinks pl2 
+     WHERE pl2.PostId = pqa.PostId 
+       AND pl2.LinkTypeId = 1),
+    0
+  ) AS LinkedPostsCount
+FROM user_engagement_metrics uem
+INNER JOIN post_quality_analysis pqa ON uem.Id = pqa.OwnerUserId
+LEFT JOIN answer_acceptance_patterns aap 
+  ON (pqa.PostTypeId = 1 AND pqa.PostId = aap.QuestionId) 
+  OR (pqa.PostTypeId = 2 AND pqa.PostId = aap.AnswerId)
+LEFT JOIN vote_distribution vd ON pqa.PostId = vd.PostId AND vd.VoteTypeId = 2
+WHERE pqa.UserPostRank <= 10
+  AND (pqa.ViewCount > 100 OR pqa.ViewCount IS NULL)
+  AND (uem.QuestionCount + uem.AnswerCount >= 5)
+  AND COALESCE(pqa.Score, 0) >= 
+    (SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Score) 
+     FROM Posts 
+     WHERE PostTypeId = pqa.PostTypeId 
+       AND Score IS NOT NULL)
+ORDER BY 
+  uem.Reputation DESC,
+  pqa.ViewRank ASC,
+  pqa.Score DESC NULLS LAST
+LIMIT 500;

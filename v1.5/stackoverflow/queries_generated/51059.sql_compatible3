@@ -1,0 +1,111 @@
+WITH top_users AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        u.CreationDate AS user_creation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        SUM(v.BountyAmount) AS total_bounties,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.DeletionDate IS NULL
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 8 AND v.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+active_tags AS (
+    SELECT 
+        t.Id AS tag_id,
+        t.TagName,
+        t.Count AS tag_usage,
+        p.Title AS excerpt_title,
+        COUNT(DISTINCT pl.PostId) AS linked_posts,
+        AVG(ph.CreationDate) AS avg_history_date
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Posts pl ON pl.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN PostHistory ph ON ph.PostId = pl.Id 
+        AND ph.PostHistoryTypeId IN (3, 4, 6)
+        AND ph.Text LIKE '%' || t.TagName || '%'
+    GROUP BY t.Id, t.TagName, t.Count, p.Title
+    HAVING t.Count > 100
+),
+question_engagement AS (
+    SELECT 
+        posts.Id AS post_id,
+        posts.Title,
+        posts.Score AS post_score,
+        posts.ViewCount,
+        posts.AnswerCount,
+        posts.CommentCount,
+        posts.FavoriteCount,
+        posts.CreationDate AS post_date,
+        COALESCE(accepted.Score, 0) AS accepted_answer_score,
+        COUNT(DISTINCT CASE WHEN votes.VoteTypeId = 2 THEN votes.Id END) AS upvotes,
+        COUNT(DISTINCT CASE WHEN votes.VoteTypeId = 3 THEN votes.Id END) AS downvotes,
+        COUNT(DISTINCT comments.Id) AS actual_comments,
+        AVG(comments.Score) AS avg_comment_score,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS close_votes,
+        BOOL_OR(ph.PostHistoryTypeId = 11) AS was_reopened,
+        tu.post_count AS user_activity_level
+    FROM Posts posts
+    LEFT JOIN Posts accepted ON posts.AcceptedAnswerId = accepted.Id
+    LEFT JOIN Votes votes ON votes.PostId = posts.Id 
+        AND votes.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments comments ON comments.PostId = posts.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = posts.Id 
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    LEFT JOIN top_users tu ON tu.user_id = posts.OwnerUserId
+    WHERE posts.PostTypeId = 1
+        AND posts.DeletionDate IS NULL
+        AND posts.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY posts.Id, posts.Title, posts.Score, posts.ViewCount, posts.AnswerCount, 
+             posts.CommentCount, posts.FavoriteCount, posts.CreationDate,
+             accepted.Score, tu.post_count
+)
+SELECT 
+    tu.user_id,
+    u.DisplayName,
+    tu.Reputation,
+    tu.post_count,
+    tu.question_count,
+    tu.answer_count,
+    tu.avg_score,
+    ROUND(CAST(tu.total_bounties AS NUMERIC), 2) AS total_bounties,
+    qe.post_score,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.avg_comment_score,
+    qe.upvotes - qe.downvotes AS net_votes,
+    qe.close_votes,
+    CASE 
+        WHEN qe.was_reopened THEN 'Reopened'
+        WHEN qe.close_votes > 0 THEN 'Closed'
+        ELSE 'Open'
+    END AS question_status,
+    at.tag_name,
+    at.tag_usage,
+    COUNT(DISTINCT qe.post_id) OVER (PARTITION BY tu.user_id) AS total_user_questions,
+    PERCENT_RANK() OVER (ORDER BY tu.Reputation DESC) * 100 AS reputation_percentile,
+    NTILE(10) OVER (ORDER BY qe.ViewCount DESC) AS view_decile,
+    ROW_NUMBER() OVER (PARTITION BY at.tag_name ORDER BY qe.post_score DESC) AS tag_ranking
+FROM question_engagement qe
+JOIN top_users tu ON tu.user_id = qe.post_id
+JOIN Users u ON u.Id = tu.user_id
+LEFT JOIN (
+    SELECT DISTINCT unnest(string_to_array(
+        substring(posts.Tags, 2, length(posts.Tags)-2), 
+        '><'
+    )) AS tag_name, 
+    posts.Id
+    FROM Posts posts 
+    WHERE posts.PostTypeId = 1 AND posts.Tags IS NOT NULL
+) tag_questions ON tag_questions.Id = qe.post_id
+LEFT JOIN active_tags at ON at.TagName = tag_questions.tag_name
+WHERE qe.post_score > 0 
+    AND tu.rep_rank <= 1000
+    AND qe.ViewCount > 1000
+ORDER BY tu.Reputation DESC, qe.ViewCount DESC, qe.post_score DESC
+LIMIT 5000;

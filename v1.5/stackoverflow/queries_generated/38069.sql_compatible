@@ -1,0 +1,233 @@
+WITH recent_years AS (
+  SELECT date_trunc('year', MAX(CreationDate)) - INTERVAL '2 years' AS start_year
+  FROM Posts
+),
+question_base AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.CreationDate AS QuestionCreation,
+    p.Score AS QuestionScore,
+    p.ViewCount,
+    COALESCE(array_length(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'), 1), 0) AS TagCount,
+    p.OwnerUserId AS AskerId
+  FROM Posts p
+  JOIN recent_years ry ON p.CreationDate >= ry.start_year
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) AS AnswerCount,
+    MAX(a.Score) AS MaxAnswerScore,
+    AVG(a.Score) AS AvgAnswerScore,
+    SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PosAnswers
+  FROM Posts a
+  JOIN recent_years ry ON a.CreationDate >= ry.start_year
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+accepted AS (
+  SELECT
+    q.Id AS QuestionId,
+    pa.Id AS AcceptedId,
+    pa.Score AS AcceptedScore,
+    pa.CreationDate AS AcceptedCreation
+  FROM Posts q
+  JOIN Posts pa ON pa.Id = q.AcceptedAnswerId
+  JOIN recent_years ry ON q.CreationDate >= ry.start_year
+  WHERE q.PostTypeId = 1
+),
+comments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    MAX(c.Score) AS MaxCommentScore,
+    AVG(c.Score) AS AvgCommentScore
+  FROM Comments c
+  JOIN recent_years ry ON c.CreationDate >= ry.start_year
+  GROUP BY c.PostId
+),
+votes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+    COUNT(*) AS TotalVotes,
+    MIN(v.CreationDate) AS FirstVoteAt,
+    MAX(v.CreationDate) AS LastVoteAt
+  FROM Votes v
+  JOIN recent_years ry ON v.CreationDate >= ry.start_year
+  GROUP BY v.PostId
+),
+link_dupes AS (
+  SELECT
+    pl.PostId AS QuestionId,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DupCount,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkCount
+  FROM PostLinks pl
+  JOIN recent_years ry ON pl.CreationDate >= ry.start_year
+  GROUP BY pl.PostId
+),
+close_events AS (
+  SELECT
+    ph.PostId AS QuestionId,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+    MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS FirstCloseAt,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseAt
+  FROM PostHistory ph
+  JOIN recent_years ry ON ph.CreationDate >= ry.start_year
+  GROUP BY ph.PostId
+),
+asker AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    u.Views AS UserViews,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes
+  FROM Users u
+),
+tag_exploded AS (
+  SELECT
+    q.Id AS QuestionId,
+    UNNEST(string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><')) AS TagName
+  FROM Posts q
+  JOIN recent_years ry ON q.CreationDate >= ry.start_year
+  WHERE q.PostTypeId = 1
+),
+tag_stats AS (
+  SELECT
+    te.QuestionId,
+    ARRAY_AGG(ts.TagName ORDER BY ts.Count DESC NULLS LAST) FILTER (WHERE ts.TagName IS NOT NULL) AS TopTagsByGlobalCount,
+    SUM(ts.Count) AS SumGlobalTagCount,
+    AVG(ts.Count) AS AvgGlobalTagCount
+  FROM tag_exploded te
+  LEFT JOIN Tags ts ON ts.TagName = te.TagName
+  GROUP BY te.QuestionId
+),
+activity_windows AS (
+  SELECT
+    q.Id AS QuestionId,
+    MIN(COALESCE(ph.CreationDate, q.CreationDate)) AS FirstActivityAt,
+    MAX(COALESCE(ph.CreationDate, q.LastActivityDate)) AS LastActivityAt
+  FROM Posts q
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  JOIN recent_years ry ON q.CreationDate >= ry.start_year
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+ranked_questions AS (
+  SELECT
+    qb.*,
+    COALESCE(a.AnswerCount, 0) AS AnswerCount,
+    COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(a.PosAnswers, 0) AS PosAnswers,
+    COALESCE(ac.AcceptedScore, 0) AS AcceptedScore,
+    COALESCE(c.CommentCount, 0) AS CommentCount,
+    COALESCE(c.MaxCommentScore, 0) AS MaxCommentScore,
+    COALESCE(v.UpVotes, 0) AS UpVotes,
+    COALESCE(v.DownVotes, 0) AS DownVotes,
+    COALESCE(v.Favorites, 0) AS Favorites,
+    COALESCE(v.TotalVotes, 0) AS TotalVotes,
+    COALESCE(ld.DupCount, 0) AS DupCount,
+    COALESCE(ld.LinkCount, 0) AS LinkCount,
+    COALESCE(cl.CloseVotes, 0) AS CloseVotes,
+    COALESCE(ts.SumGlobalTagCount, 0) AS SumGlobalTagCount,
+    COALESCE(ts.AvgGlobalTagCount, 0) AS AvgGlobalTagCount,
+    aw.FirstActivityAt,
+    aw.LastActivityAt,
+    ac.AcceptedCreation,
+    v.FirstVoteAt,
+    v.LastVoteAt
+  FROM question_base qb
+  LEFT JOIN answers a ON a.QuestionId = qb.QuestionId
+  LEFT JOIN accepted ac ON ac.QuestionId = qb.QuestionId
+  LEFT JOIN comments c ON c.PostId = qb.QuestionId
+  LEFT JOIN votes v ON v.PostId = qb.QuestionId
+  LEFT JOIN link_dupes ld ON ld.QuestionId = qb.QuestionId
+  LEFT JOIN close_events cl ON cl.QuestionId = qb.QuestionId
+  LEFT JOIN tag_stats ts ON ts.QuestionId = qb.QuestionId
+  LEFT JOIN activity_windows aw ON aw.QuestionId = qb.QuestionId
+),
+scored AS (
+  SELECT
+    rq.*,
+    /* composite engagement score */
+    (
+      0.30 * LN(1 + rq.ViewCount) +
+      0.25 * LN(1 + rq.UpVotes - rq.DownVotes) +
+      0.20 * LN(1 + rq.AnswerCount) +
+      0.10 * LN(1 + rq.CommentCount) +
+      0.10 * LN(1 + rq.Favorites) +
+      0.05 * LN(1 + GREATEST(rq.AcceptedScore, rq.MaxAnswerScore))
+    )::NUMERIC(18,6) AS EngagementScore,
+    /* volatility score based on activity span and vote spread */
+    (
+      0.6 * EXTRACT(EPOCH FROM (COALESCE(rq.LastActivityAt, rq.QuestionCreation) - rq.QuestionCreation)) / 86400.0 +
+      0.4 * (rq.TotalVotes - ABS(rq.UpVotes - rq.DownVotes))
+    )::NUMERIC(18,6) AS VolatilityScore,
+    /* quality heuristic */
+    (
+      0.5 * rq.QuestionScore +
+      0.3 * rq.MaxAnswerScore +
+      0.2 * rq.AvgAnswerScore -
+      0.4 * rq.DupCount -
+      0.2 * rq.CloseVotes
+    )::NUMERIC(18,6) AS QualityHeuristic
+  FROM ranked_questions rq
+),
+with_user AS (
+  SELECT
+    s.*,
+    u.Reputation AS AskerReputation,
+    u.UserViews AS AskerViews,
+    u.UserUpVotes AS AskerUpVotes,
+    u.UserDownVotes AS AskerDownVotes,
+    RANK() OVER (PARTITION BY DATE_TRUNC('month', s.QuestionCreation) ORDER BY s.EngagementScore DESC, s.VolatilityScore DESC, s.QuestionId) AS RankInMonth
+  FROM scored s
+  LEFT JOIN asker u ON u.UserId = s.AskerId
+),
+final_rank AS (
+  SELECT
+    w.*,
+    NTILE(10) OVER (ORDER BY w.EngagementScore DESC) AS EngagementDecile,
+    NTILE(10) OVER (ORDER BY w.QualityHeuristic DESC) AS QualityDecile,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        (0.6 * w.EngagementScore + 0.3 * w.QualityHeuristic + 0.1 * w.VolatilityScore) DESC,
+        w.QuestionId
+    ) AS GlobalRank
+  FROM with_user w
+)
+SELECT
+  fr.QuestionId,
+  fr.QuestionCreation,
+  fr.ViewCount,
+  fr.UpVotes,
+  fr.DownVotes,
+  fr.Favorites,
+  fr.AnswerCount,
+  fr.CommentCount,
+  fr.DupCount,
+  fr.CloseVotes,
+  fr.TagCount,
+  fr.SumGlobalTagCount,
+  fr.AvgGlobalTagCount,
+  fr.EngagementScore,
+  fr.VolatilityScore,
+  fr.QualityHeuristic,
+  fr.AskerId,
+  fr.AskerReputation,
+  fr.AskerUpVotes,
+  fr.AskerDownVotes,
+  fr.RankInMonth,
+  fr.EngagementDecile,
+  fr.QualityDecile,
+  fr.GlobalRank
+FROM final_rank fr
+WHERE fr.RankInMonth <= 50
+ORDER BY fr.GlobalRank
+LIMIT 1000;

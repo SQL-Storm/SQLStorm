@@ -1,0 +1,122 @@
+WITH
+    recent_posts AS (
+        SELECT
+            p.Id,
+            p.PostTypeId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '180 days')
+    ),
+
+    user_aggregates AS (
+        SELECT
+            u.Id                              AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_posted,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_posted,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS question_score_sum,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS answer_score_sum,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_given,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_given,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1)      AS gold_badges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2)      AS silver_badges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3)      AS bronze_badges
+        FROM Users u
+        LEFT JOIN Posts p  ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v  ON v.UserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    tag_aggregates AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS tag_question_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS tag_answer_cnt,
+            SUM(p.Score)                              AS tag_total_score,
+            AVG(p.ViewCount)                          AS tag_avg_views,
+            COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) AS tag_unique_upvoters
+        FROM Tags t
+        JOIN LATERAL (
+            SELECT
+                unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+            FROM Posts p
+            WHERE p.Tags IS NOT NULL
+        ) pt ON pt.tag = t.TagName
+        LEFT JOIN Posts p ON p.Id = CAST(pt.tag AS INTEGER)
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY t.TagName
+    ),
+
+    post_link_stats AS (
+        SELECT
+            pl.PostId,
+            COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS linked_cnt,
+            COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_cnt,
+            MAX(pl.CreationDate)                      AS last_link_date
+        FROM PostLinks pl
+        GROUP BY pl.PostId
+    ),
+
+    post_edit_stats AS (
+        SELECT
+            ph.PostId,
+            COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edit_cnt,
+            COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10)      AS close_votes_cnt
+        FROM PostHistory ph
+        GROUP BY ph.PostId
+    )
+
+SELECT
+    rp.Id                                         AS post_id,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    ua.questions_posted,
+    ua.answers_posted,
+    ua.question_score_sum,
+    ua.answer_score_sum,
+    ua.upvotes_given,
+    ua.downvotes_given,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    pl.linked_cnt,
+    pl.duplicate_cnt,
+    pl.last_link_date,
+    pe.edit_cnt,
+    pe.close_votes_cnt,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id)          AS comment_cnt,
+    (SELECT json_agg(json_build_object('BadgeName', b.Name, 'Class', b.Class))
+       FROM Badges b
+       WHERE b.UserId = rp.OwnerUserId AND b.Class = 1)               AS gold_badges_json,
+    tg.tag_total_score,
+    tg.tag_question_cnt,
+    tg.tag_answer_cnt,
+    tg.tag_avg_views,
+    tg.tag_unique_upvoters
+FROM recent_posts rp
+JOIN Users u               ON u.Id = rp.OwnerUserId
+LEFT JOIN user_aggregates ua   ON ua.user_id = u.Id
+LEFT JOIN post_link_stats pl   ON pl.PostId = rp.Id
+LEFT JOIN post_edit_stats pe   ON pe.PostId = rp.Id
+LEFT JOIN LATERAL (
+    SELECT
+        SUM(tg2.tag_total_score)      AS tag_total_score,
+        SUM(tg2.tag_question_cnt)     AS tag_question_cnt,
+        SUM(tg2.tag_answer_cnt)       AS tag_answer_cnt,
+        AVG(tg2.tag_avg_views)        AS tag_avg_views,
+        SUM(tg2.tag_unique_upvoters)  AS tag_unique_upvoters
+    FROM unnest(string_to_array(trim(both '<>' FROM rp.Tags), '><')) AS t(tag)
+    LEFT JOIN tag_aggregates tg2 ON tg2.TagName = t.tag
+) tg ON TRUE
+WHERE rp.rn <= 5
+ORDER BY rp.CreationDate DESC
+LIMIT 100;

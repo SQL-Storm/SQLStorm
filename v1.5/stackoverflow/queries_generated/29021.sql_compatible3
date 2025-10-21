@@ -1,0 +1,726 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY (COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id)) DESC) as ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexityMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CAST(DATE_PART('day', COALESCE(p.LastActivityDate, p.CreationDate)) AS INT) as AgeInDays,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag)
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL AND LENGTH(p.Body) > 0 THEN LENGTH(p.Body) 
+            ELSE 0 
+        END as BodyLength,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            WHEN p.Score < 0 THEN 'DownVoted'
+            ELSE 'Neutral'
+        END as VoteCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAverageScore,
+        (p.Score - AVG(p.Score) OVER (PARTITION BY p.OwnerUserId)) as ScoreDeviation,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1 
+            ELSE 0 
+        END as IsClosed,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as UserPostCount,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as PostRank,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) as UpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) as DownvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) as Favorites,
+        COUNT(DISTINCT v.PostId) as TotalVotes,
+        AVG(EXTRACT(EPOCH FROM v.CreationDate)) as AvgVoteDate,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.PostId END) as VotingPosts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) as FavoritePosts,
+        MAX(v.CreationDate) as LastVoteDate,
+        MIN(v.CreationDate) as FirstVoteDate
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+AnswerQualityAnalysis AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId,
+        a.Score,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.LastActivityDate,
+        a.LastEditDate,
+        CAST(DATE_PART('day', COALESCE(a.LastEditDate, a.CreationDate)) AS INT) as EditAgeDays,
+        CASE 
+            WHEN a.Score > 10 THEN 'HighlyRated'
+            WHEN a.Score > 5 THEN 'ModeratelyRated'
+            ELSE 'LowRated'
+        END as QualityRating,
+        PERCENT_RANK() OVER (ORDER BY a.Score) as ScorePercentile,
+        DENSE_RANK() OVER (ORDER BY a.Score DESC) as ScoreRank,
+        AVG(a.Score) OVER (PARTITION BY a.ParentId) as QuestionAvgScore,
+        (a.Score - AVG(a.Score) OVER (PARTITION BY a.ParentId)) as ScoreVsQuestionAvg,
+        CASE 
+            WHEN a.LastEditDate > a.CreationDate THEN 'Edited'
+            ELSE 'Unedited'
+        END as EditStatus
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ActivityRank,
+    COALESCE(ue.UpvotesReceived, 0) as UpvotesReceived,
+    COALESCE(ue.DownvotesReceived, 0) as DownvotesReceived,
+    COALESCE(ue.Favorites, 0) as Favorites,
+    COALESCE(ue.TotalVotes, 0) as TotalVotes,
+    CASE 
+        WHEN uas.Questions > 0 THEN (COALESCE(ue.UpvotesReceived, 0) * 1.0 / uas.Questions)
+        ELSE 0 
+    END as UpvotesPerQuestion,
+    CASE 
+        WHEN uas.Answers > 0 THEN (COALESCE(ue.DownvotesReceived, 0) * 1.0 / uas.Answers)
+        ELSE 0 
+    END as DownvotesPerAnswer,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.TotalPosts AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as AnswerPercentage,
+    CASE 
+        WHEN (uas.Questions + uas.Answers) > 0 THEN (CAST(uas.Comments AS DECIMAL(10,2)) / CAST((uas.Questions + uas.Answers) AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as CommentsPerPost,
+    MAX(CASE WHEN pcm.PostType = 'Question' THEN pcm.Score END) as MaxQuestionScore,
+    MAX(CASE WHEN pcm.PostType = 'Answer' THEN pcm.Score END) as MaxAnswerScore,
+    AVG(CASE WHEN pcm.PostType = 'Question' THEN pcm.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pcm.PostType = 'Answer' THEN pcm.Score END) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AvgQuestionScoreUser,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AvgAnswerScoreUser,
+    (SELECT COUNT(DISTINCT ParentId) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) as QuestionsAnswered,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 4) as OffensiveVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13)) as ClosureActivity,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as LinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0) as TaggedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (16,17,18,19,20)) as ModerationActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.ViewCount > 1000) as HighViewCountPosts,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as RecentQuestions,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as RecentAnswers,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+            (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.Questions AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as QAToQuestionRatio,
+    CASE 
+        WHEN (uas.Questions + uas.Answers + uas.Comments) > 0 THEN 
+            (uas.Reputation + uas.UpVotes + uas.DownVotes + uas.Views + uas.Badges * 10) / 
+            CAST((uas.Questions + uas.Answers + uas.Comments) AS DECIMAL(10,2))
+        ELSE 0 
+    END as ActivityIndex,
+    (ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) - 
+     ROW_NUMBER() OVER (ORDER BY (uas.Answers + uas.Questions + uas.Comments) DESC)) as ReputationRankDiff,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastPost,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastComment,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL AND uas.LastPostDate IS NOT NULL THEN 
+            CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - GREATEST(uas.LastCommentDate, uas.LastPostDate)) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueVoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueCommenters
+FROM UserActivityStats uas
+LEFT JOIN UserEngagement ue ON uas.UserId = ue.UserId
+LEFT JOIN PostComplexityMetrics pcm ON uas.UserId = pcm.OwnerUserId
+WHERE uas.Reputation > 100
+  AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.ActivityRank,
+    ue.UpvotesReceived, ue.DownvotesReceived, ue.Favorites, ue.TotalVotes
+HAVING 
+    uas.TotalPosts + uas.Answers + uas.Comments > 0
+    OR uas.Badges > 0
+EXCEPT
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ActivityRank,
+    COALESCE(ue.UpvotesReceived, 0) as UpvotesReceived,
+    COALESCE(ue.DownvotesReceived, 0) as DownvotesReceived,
+    COALESCE(ue.Favorites, 0) as Favorites,
+    COALESCE(ue.TotalVotes, 0) as TotalVotes,
+    CASE 
+        WHEN uas.Questions > 0 THEN (COALESCE(ue.UpvotesReceived, 0) * 1.0 / uas.Questions)
+        ELSE 0 
+    END as UpvotesPerQuestion,
+    CASE 
+        WHEN uas.Answers > 0 THEN (COALESCE(ue.DownvotesReceived, 0) * 1.0 / uas.Answers)
+        ELSE 0 
+    END as DownvotesPerAnswer,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.TotalPosts AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as AnswerPercentage,
+    CASE 
+        WHEN (uas.Questions + uas.Answers) > 0 THEN (CAST(uas.Comments AS DECIMAL(10,2)) / CAST((uas.Questions + uas.Answers) AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as CommentsPerPost,
+    MAX(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as MaxQuestionScore,
+    MAX(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as MaxAnswerScore,
+    AVG(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AvgQuestionScoreUser,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AvgAnswerScoreUser,
+    (SELECT COUNT(DISTINCT ParentId) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) as QuestionsAnswered,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 4) as OffensiveVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13)) as ClosureActivity,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as LinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0) as TaggedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (16,17,18,19,20)) as ModerationActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.ViewCount > 1000) as HighViewCountPosts,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as RecentQuestions,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as RecentAnswers,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+            (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.Questions AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as QAToQuestionRatio,
+    CASE 
+        WHEN (uas.Questions + uas.Answers + uas.Comments) > 0 THEN 
+            (uas.Reputation + uas.UpVotes + uas.DownVotes + uas.Views + uas.Badges * 10) / 
+            CAST((uas.Questions + uas.Answers + uas.Comments) AS DECIMAL(10,2))
+        ELSE 0 
+    END as ActivityIndex,
+    (ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) - 
+     ROW_NUMBER() OVER (ORDER BY (uas.Answers + uas.Questions + uas.Comments) DESC)) as ReputationRankDiff,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastPost,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastComment,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL AND uas.LastPostDate IS NOT NULL THEN 
+            CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - GREATEST(uas.LastCommentDate, uas.LastPostDate)) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueVoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueCommenters
+FROM UserActivityStats uas
+LEFT JOIN UserEngagement ue ON uas.UserId = ue.UserId
+LEFT JOIN PostComplexityMetrics pcm ON uas.UserId = pcm.OwnerUserId
+WHERE uas.Reputation > 100
+  AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.ActivityRank,
+    ue.UpvotesReceived, ue.DownvotesReceived, ue.Favorites, ue.TotalVotes
+HAVING 
+    uas.TotalPosts + uas.Answers + uas.Comments > 0
+    OR uas.Badges > 0
+EXCEPT
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ActivityRank,
+    COALESCE(ue.UpvotesReceived, 0) as UpvotesReceived,
+    COALESCE(ue.DownvotesReceived, 0) as DownvotesReceived,
+    COALESCE(ue.Favorites, 0) as Favorites,
+    COALESCE(ue.TotalVotes, 0) as TotalVotes,
+    CASE 
+        WHEN uas.Questions > 0 THEN (COALESCE(ue.UpvotesReceived, 0) * 1.0 / uas.Questions)
+        ELSE 0 
+    END as UpvotesPerQuestion,
+    CASE 
+        WHEN uas.Answers > 0 THEN (COALESCE(ue.DownvotesReceived, 0) * 1.0 / uas.Answers)
+        ELSE 0 
+    END as DownvotesPerAnswer,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.TotalPosts AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as AnswerPercentage,
+    CASE 
+        WHEN (uas.Questions + uas.Answers) > 0 THEN (CAST(uas.Comments AS DECIMAL(10,2)) / CAST((uas.Questions + uas.Answers) AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as CommentsPerPost,
+    MAX(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as MaxQuestionScore,
+    MAX(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as MaxAnswerScore,
+    AVG(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AvgQuestionScoreUser,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AvgAnswerScoreUser,
+    (SELECT COUNT(DISTINCT ParentId) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) as QuestionsAnswered,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 4) as OffensiveVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13)) as ClosureActivity,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as LinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0) as TaggedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (16,17,18,19,20)) as ModerationActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.ViewCount > 1000) as HighViewCountPosts,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as RecentQuestions,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as RecentAnswers,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+            (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.Questions AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as QAToQuestionRatio,
+    CASE 
+        WHEN (uas.Questions + uas.Answers + uas.Comments) > 0 THEN 
+            (uas.Reputation + uas.UpVotes + uas.DownVotes + uas.Views + uas.Badges * 10) / 
+            CAST((uas.Questions + uas.Answers + uas.Comments) AS DECIMAL(10,2))
+        ELSE 0 
+    END as ActivityIndex,
+    (ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) - 
+     ROW_NUMBER() OVER (ORDER BY (uas.Answers + uas.Questions + uas.Comments) DESC)) as ReputationRankDiff,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastPost,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastComment,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL AND uas.LastPostDate IS NOT NULL THEN 
+            CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - GREATEST(uas.LastCommentDate, uas.LastPostDate)) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueVoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueCommenters
+FROM UserActivityStats uas
+LEFT JOIN UserEngagement ue ON uas.UserId = ue.UserId
+LEFT JOIN PostComplexityMetrics pcm ON uas.UserId = pcm.OwnerUserId
+WHERE uas.Reputation > 100
+  AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.ActivityRank,
+    ue.UpvotesReceived, ue.DownvotesReceived, ue.Favorites, ue.TotalVotes
+HAVING 
+    uas.TotalPosts + uas.Answers + uas.Comments > 0
+    OR uas.Badges > 0
+EXCEPT
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ActivityRank,
+    COALESCE(ue.UpvotesReceived, 0) as UpvotesReceived,
+    COALESCE(ue.DownvotesReceived, 0) as DownvotesReceived,
+    COALESCE(ue.Favorites, 0) as Favorites,
+    COALESCE(ue.TotalVotes, 0) as TotalVotes,
+    CASE 
+        WHEN uas.Questions > 0 THEN (COALESCE(ue.UpvotesReceived, 0) * 1.0 / uas.Questions)
+        ELSE 0 
+    END as UpvotesPerQuestion,
+    CASE 
+        WHEN uas.Answers > 0 THEN (COALESCE(ue.DownvotesReceived, 0) * 1.0 / uas.Answers)
+        ELSE 0 
+    END as DownvotesPerAnswer,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.TotalPosts AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as AnswerPercentage,
+    CASE 
+        WHEN (uas.Questions + uas.Answers) > 0 THEN (CAST(uas.Comments AS DECIMAL(10,2)) / CAST((uas.Questions + uas.Answers) AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as CommentsPerPost,
+    MAX(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as MaxQuestionScore,
+    MAX(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as MaxAnswerScore,
+    AVG(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AvgQuestionScoreUser,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AvgAnswerScoreUser,
+    (SELECT COUNT(DISTINCT ParentId) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) as QuestionsAnswered,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 4) as OffensiveVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13)) as ClosureActivity,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as LinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0) as TaggedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (16,17,18,19,20)) as ModerationActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.ViewCount > 1000) as HighViewCountPosts,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as RecentQuestions,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as RecentAnswers,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+            (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.Questions AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as QAToQuestionRatio,
+    CASE 
+        WHEN (uas.Questions + uas.Answers + uas.Comments) > 0 THEN 
+            (uas.Reputation + uas.UpVotes + uas.DownVotes + uas.Views + uas.Badges * 10) / 
+            NULLIF((uas.Questions + uas.Answers + uas.Comments), 0)
+        ELSE 0 
+    END as ActivityIndex,
+    (ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) - 
+     ROW_NUMBER() OVER (ORDER BY (uas.Answers + uas.Questions + uas.Comments) DESC)) as ReputationRankDiff,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastPost,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastComment,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL AND uas.LastPostDate IS NOT NULL THEN 
+            CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - GREATEST(uas.LastCommentDate, uas.LastPostDate)) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueVoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueCommenters
+FROM UserActivityStats uas
+LEFT JOIN UserEngagement ue ON uas.UserId = ue.UserId
+LEFT JOIN PostComplexityMetrics pcm ON uas.UserId = pcm.OwnerUserId
+WHERE uas.Reputation > 100
+  AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.ActivityRank,
+    ue.UpvotesReceived, ue.DownvotesReceived, ue.Favorites, ue.TotalVotes
+HAVING 
+    uas.TotalPosts + uas.Answers + uas.Comments > 0
+    OR uas.Badges > 0
+EXCEPT
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ActivityRank,
+    COALESCE(ue.UpvotesReceived, 0) as UpvotesReceived,
+    COALESCE(ue.DownvotesReceived, 0) as DownvotesReceived,
+    COALESCE(ue.Favorites, 0) as Favorites,
+    COALESCE(ue.TotalVotes, 0) as TotalVotes,
+    CASE 
+        WHEN uas.Questions > 0 THEN (COALESCE(ue.UpvotesReceived, 0) * 1.0 / uas.Questions)
+        ELSE 0 
+    END as UpvotesPerQuestion,
+    CASE 
+        WHEN uas.Answers > 0 THEN (COALESCE(ue.DownvotesReceived, 0) * 1.0 / uas.Answers)
+        ELSE 0 
+    END as DownvotesPerAnswer,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.TotalPosts AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as AnswerPercentage,
+    CASE 
+        WHEN (uas.Questions + uas.Answers) > 0 THEN (CAST(uas.Comments AS DECIMAL(10,2)) / CAST((uas.Questions + uas.Answers) AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as CommentsPerPost,
+    MAX(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as MaxQuestionScore,
+    MAX(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as MaxAnswerScore,
+    AVG(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AvgQuestionScoreUser,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AvgAnswerScoreUser,
+    (SELECT COUNT(DISTINCT ParentId) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) as QuestionsAnswered,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 4) as OffensiveVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13)) as ClosureActivity,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as LinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0) as TaggedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (16,17,18,19,20)) as ModerationActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.ViewCount > 1000) as HighViewCountPosts,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as RecentQuestions,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as RecentAnswers,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+            (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.Questions AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as QAToQuestionRatio,
+    CASE 
+        WHEN (uas.Questions + uas.Answers + uas.Comments) > 0 THEN 
+            (uas.Reputation + uas.UpVotes + uas.DownVotes + uas.Views + uas.Badges * 10) / 
+            NULLIF((uas.Questions + uas.Answers + uas.Comments), 0)
+        ELSE 0 
+    END as ActivityIndex,
+    (ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) - 
+     ROW_NUMBER() OVER (ORDER BY (uas.Answers + uas.Questions + uas.Comments) DESC)) as ReputationRankDiff,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastPost,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastComment,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL AND uas.LastPostDate IS NOT NULL THEN 
+            CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - GREATEST(uas.LastCommentDate, uas.LastPostDate)) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueVoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueCommenters
+FROM UserActivityStats uas
+LEFT JOIN UserEngagement ue ON uas.UserId = ue.UserId
+LEFT JOIN PostComplexityMetrics pcm ON uas.UserId = pcm.OwnerUserId
+WHERE uas.Reputation > 100
+  AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.ActivityRank,
+    ue.UpvotesReceived, ue.DownvotesReceived, ue.Favorites, ue.TotalVotes
+HAVING 
+    uas.TotalPosts + uas.Answers + uas.Comments > 0
+    OR uas.Badges > 0
+EXCEPT
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ActivityRank,
+    COALESCE(ue.UpvotesReceived, 0) as UpvotesReceived,
+    COALESCE(ue.DownvotesReceived, 0) as DownvotesReceived,
+    COALESCE(ue.Favorites, 0) as Favorites,
+    COALESCE(ue.TotalVotes, 0) as TotalVotes,
+    CASE 
+        WHEN uas.Questions > 0 THEN (COALESCE(ue.UpvotesReceived, 0) * 1.0 / uas.Questions)
+        ELSE 0 
+    END as UpvotesPerQuestion,
+    CASE 
+        WHEN uas.Answers > 0 THEN (COALESCE(ue.DownvotesReceived, 0) * 1.0 / uas.Answers)
+        ELSE 0 
+    END as DownvotesPerAnswer,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.TotalPosts AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as AnswerPercentage,
+    CASE 
+        WHEN (uas.Questions + uas.Answers) > 0 THEN (CAST(uas.Comments AS DECIMAL(10,2)) / CAST((uas.Questions + uas.Answers) AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as CommentsPerPost,
+    MAX(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as MaxQuestionScore,
+    MAX(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as MaxAnswerScore,
+    AVG(CASE WHEN pcm.PostTypeId = 1 THEN pcm.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pcm.PostTypeId = 2 THEN pcm.Score END) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AvgQuestionScoreUser,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AvgAnswerScoreUser,
+    (SELECT COUNT(DISTINCT ParentId) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) as QuestionsAnswered,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 4) as OffensiveVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13)) as ClosureActivity,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as LinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0) as TaggedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (16,17,18,19,20)) as ModerationActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.ViewCount > 1000) as HighViewCountPosts,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as RecentQuestions,
+    (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as RecentAnswers,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+            (CAST(uas.Answers AS DECIMAL(10,2)) / CAST(uas.Questions AS DECIMAL(10,2))) * 100
+        ELSE 0 
+    END as QAToQuestionRatio,
+    CASE 
+        WHEN (uas.Questions + uas.Answers + uas.Comments) > 0 THEN 
+            (uas.Reputation + uas.UpVotes + uas.DownVotes + uas.Views + uas.Badges * 10) / 
+            CAST((uas.Questions + uas.Answers + uas.Comments) AS DECIMAL(10,2))
+        ELSE 0 
+    END as ActivityIndex,
+    (ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) - 
+     ROW_NUMBER() OVER (ORDER BY (uas.Answers + uas.Questions + uas.Comments) DESC)) as ReputationRankDiff,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastPost,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL THEN CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastComment,
+    CASE 
+        WHEN uas.LastCommentDate IS NOT NULL AND uas.LastPostDate IS NOT NULL THEN 
+            CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - GREATEST(uas.LastCommentDate, uas.LastPostDate)) AS INT)
+        ELSE NULL 
+    END as DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueVoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as UniqueCommenters
+FROM UserActivityStats uas
+LEFT JOIN UserEngagement ue ON uas.UserId = ue.UserId
+LEFT JOIN PostComplexityMetrics pcm ON uas.UserId = pcm.OwnerUserId
+WHERE uas.Reputation > 100
+  AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.ActivityRank,
+    ue.UpvotesReceived, ue.DownvotesReceived, ue.Favorites, ue.TotalVotes
+HAVING 
+    uas.TotalPosts + uas.Answers + uas.Comments > 0
+    OR uas.Badges > 0
+ORDER BY uas.Reputation DESC, uas.TotalPosts DESC
+LIMIT 1000;

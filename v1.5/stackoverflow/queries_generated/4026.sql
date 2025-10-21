@@ -1,0 +1,144 @@
+-- {"query": "4026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1190} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+  union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join PostLinks pl on pl.PostId = (select p.Id from Posts p where p.PostTypeId = 1 and array_position(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), t.TagName) is not null limit 1)
+    join RecursiveTagHierarchy r on pl.RelatedPostId = r.Id
+    where not t.Id = any(r.Path) and r.Level < 3
+),
+UserBadgeRankings as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName,
+        b.Class,
+        b.Name,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class in (1,2,3)
+),
+PostScoresWithActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0) as VoteDifference
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+QuestionsWithAnswerCounts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.LastActivityDate
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerRanks as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScoreAndDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+RecentCommentCounts as (
+    select
+        c.PostId,
+        count(*) as RecentCommentsCount
+    from Comments c
+    where c.CreationDate > now() - interval '30 days'
+    group by c.PostId
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then cr.Name else null end) as CloseReasonName,
+        max(ph.CreationDate) as ClosedDate
+    from PostHistory ph
+    left join CloseReasonTypes cr on ph.Comment::int = cr.Id and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+QuestionsWithCloseInfo as (
+    select q.*, c.CloseReasonName, c.ClosedDate
+    from QuestionsWithAnswerCounts q
+    left join ClosedQuestionsWithReasons c on c.PostId = q.Id
+)
+select distinct
+    q.Id as QuestionId,
+    q.Title,
+    u.DisplayName as QuestionOwner,
+    q.CreationDate as QuestionCreated,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    q.Tags,
+    coalesce(q.AcceptedAnswerId, 0) as AcceptedAnswerId,
+    a.Id as AnswerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreated,
+    ur.DisplayName as AnswerOwner,
+    q.CloseReasonName,
+    q.ClosedDate,
+    rcc.RecentCommentsCount,
+    us.BadgeRank as UserBadgeRank,
+    us.Class as BadgeClass,
+    us.Name as BadgeName,
+    rh.Level as TagRecursionLevel,
+    rh.Path as TagHierarchyPath,
+    row_number() over (partition by q.Id order by a.Score desc) as AnswerRankOverall
+from QuestionsWithCloseInfo q
+left join AnswerRanks a on a.ParentId = q.Id and a.RankByScoreAndDate <= 3
+left join Users u on u.Id = q.OwnerUserId
+left join Users ur on ur.Id = a.ParentId
+left join RecentCommentCounts rcc on rcc.PostId = q.Id
+left join UserBadgeRankings us on us.UserId = q.OwnerUserId and us.BadgeRank = 1
+left join RecursiveTagHierarchy rh on array_position(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><'), rh.TagName) is not null
+where 
+    q.Score > (
+        select avg(Score)*0.5
+        from Posts
+        where PostTypeId = 1
+    )
+    and (q.ClosedDate is null or q.ClosedDate > now() - interval '90 days')
+order by q.Score desc, a.Score desc
+limit 100;

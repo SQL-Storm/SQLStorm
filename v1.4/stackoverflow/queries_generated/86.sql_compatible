@@ -1,0 +1,129 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId
+                       ORDER BY p.LastActivityDate DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS l ON true
+  WHERE p.CloseDate IS NULL
+     OR p.ClosedDate IS NULL
+),
+TopQuestions AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.OwnerDisplayName,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.AcceptedAnswerId,
+    ROW_NUMBER() OVER (ORDER BY r.Score DESC, r.LastActivityDate DESC) AS rn_q
+  FROM RecentActivity r
+  WHERE r.PostTypeId = 1
+    AND r.rn <= 100
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TagTotalCount,
+    AVG(t.Count) AS TagAvgCount,
+    MIN(t.Count) AS TagMinCount,
+    MAX(t.Count) AS TagMaxCount
+  FROM Tags t
+  GROUP BY t.TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn_user
+  FROM Users u
+),
+Combined AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate AS PostCreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.AcceptedAnswerId,
+    (SELECT STRING_AGG(ta.TagName, ',') WITHIN GROUP (ORDER BY ta.TagName)
+     FROM unnest(string_to_array(q.Tags, '><')) AS ta(TagName)) AS ParsedTags,
+    u.UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    u.LastAccessDate AS UserLastAccess
+  FROM TopQuestions q
+  LEFT JOIN UserActivity u ON u.UserId = q.OwnerUserId AND u.rn_user = 1
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.ParsedTags,
+  c.PostCreationDate,
+  c.LastActivityDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId,
+  c.OwnerDisplayName,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.AcceptedAnswerId,
+  tu.TagTotalCount,
+  tu.TagAvgCount,
+  tu.TagMinCount,
+  tu.TagMaxCount,
+  cu.UserId,
+  cu.UserDisplayName,
+  cu.Reputation,
+  cu.UserLastAccess
+FROM Combined c
+LEFT JOIN TagStats tu ON EXISTS (SELECT 1 FROM unnest(string_to_array(c.ParsedTags, ',')) AS nt(TagName) WHERE TagName = tu.TagName)
+LEFT JOIN (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    u.LastAccessDate AS UserLastAccess
+  FROM Users u
+) cu ON cu.UserId = c.OwnerUserId
+WHERE c.rn_q = 1
+ORDER BY c.Score DESC, c.LastActivityDate DESC
+LIMIT 50;

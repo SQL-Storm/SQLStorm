@@ -1,0 +1,174 @@
+-- {"query": "9075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 6235} 
+
+WITH
+-- Exclude wiki‐type posts via a set operator (EXCEPT)
+AllPostsExceptWiki AS (
+    SELECT Id, Title, Tags, Body, PostTypeId, Score, CreationDate, OwnerUserId, ViewCount
+      FROM Posts
+    EXCEPT
+    SELECT Id, Title, Tags, Body, PostTypeId, Score, CreationDate, OwnerUserId, ViewCount
+      FROM Posts
+     WHERE PostTypeId IN (3,4,5)
+),
+-- Badge counts per user with conditional aggregation
+UserBadgeStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(b.Id)                          AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+      FROM Users u
+      LEFT JOIN Badges b ON b.UserId = u.Id
+     GROUP BY u.Id, u.DisplayName
+),
+-- Rank tags by overall usage
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS Rank
+      FROM Tags t
+),
+-- Recent post‐history snippets, concatenating comments
+RecentActivity AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        STRING_AGG(
+          pht.Name || ':' || COALESCE(ph.Comment,''),
+          '; ' ORDER BY ph.CreationDate DESC
+        ) AS HistorySummary
+      FROM PostHistory ph
+      JOIN PostHistoryTypes pht
+        ON pht.Id = ph.PostHistoryTypeId
+     WHERE ph.CreationDate > NOW() - INTERVAL '60 days'
+     GROUP BY ph.PostId
+),
+-- Rank answers (by score & recency) per question via window functions
+RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        RANK()     OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate DESC)   AS RecencyRank
+      FROM Posts a
+     WHERE a.PostTypeId = 2
+),
+-- Identify popular tags that also actually appear on questions using INTERSECT
+IntersectTags AS (
+    SELECT t.TagName
+      FROM TopTags t
+     WHERE t.Count > 100000
+    INTERSECT
+    SELECT DISTINCT UNNEST(
+        string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')
+    )
+      FROM Posts p
+     WHERE p.PostTypeId = 1
+       AND p.Tags IS NOT NULL
+),
+-- Assemble the heavyweight CTE that drives everything
+QualifiedPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        -- filtered comment counts and summed vote‐deltas
+        COALESCE(COUNT(c.Id) FILTER (WHERE c.Score >= 0),0) AS NonNegativeComments,
+        COALESCE(vd.VoteDelta,0)                     AS VoteDelta,
+        ra.AnswerRank,
+        ra.RecencyRank,
+        -- cumulative window‐sum of comment scores by owner
+        SUM(c.Score) OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS CumulativeOwnerCommentScore,
+        ra2.HistorySummary,
+        ut.TotalBadges,
+        ut.GoldBadges,
+        ut.SilverBadges,
+        ut.BronzeBadges,
+        -- correlated‐subquery for score category
+        CASE
+          WHEN p.Score > (
+              SELECT AVG(x.Score)
+                FROM Posts x
+               WHERE x.PostTypeId = p.PostTypeId
+          ) THEN 'AboveAvg'
+          WHEN p.Score = (
+              SELECT AVG(x.Score)
+                FROM Posts x
+               WHERE x.PostTypeId = p.PostTypeId
+          ) THEN 'AtAvg'
+          ELSE 'BelowAvg'
+        END AS ScoreCategory,
+        -- correlated count of owner's more‐viewed questions
+        (
+            SELECT COUNT(*) 
+              FROM Posts p2 
+             WHERE p2.OwnerUserId = p.OwnerUserId 
+               AND p2.PostTypeId = 1 
+               AND p2.ViewCount > p.ViewCount
+        ) AS MoreViewedQuestionsByOwner
+      FROM AllPostsExceptWiki p
+      LEFT JOIN Comments c
+        ON c.PostId = p.Id
+      LEFT JOIN (
+          SELECT
+              v.PostId,
+              SUM(
+                CASE
+                  WHEN v.VoteTypeId = 2 THEN  1
+                  WHEN v.VoteTypeId = 3 THEN -1
+                  ELSE 0
+                END
+              ) AS VoteDelta
+            FROM Votes v
+           GROUP BY v.PostId
+      ) vd ON vd.PostId = p.Id
+      LEFT JOIN RankedAnswers ra
+        ON ra.Id = p.Id
+      LEFT JOIN RecentActivity ra2
+        ON ra2.PostId = p.Id
+      LEFT JOIN Users u
+        ON u.Id = p.OwnerUserId
+      LEFT JOIN UserBadgeStats ut
+        ON ut.Id = u.Id
+     WHERE p.CreationDate BETWEEN NOW() - INTERVAL '90 days' AND NOW()
+     GROUP BY
+        p.Id, p.OwnerUserId, p.Title, p.Score,
+        vd.VoteDelta,
+        ra.AnswerRank, ra.RecencyRank,
+        ra2.HistorySummary,
+        ut.TotalBadges, ut.GoldBadges, ut.SilverBadges, ut.BronzeBadges
+)
+-- Final selection with outer joins, string expressions, NULL logic, set‐filter, ordering & limit
+SELECT
+    QP.Id                   AS PostId,
+    QP.Title,
+    QP.ScoreCategory,
+    QP.NonNegativeComments,
+    QP.VoteDelta,
+    QP.AnswerRank,
+    QP.RecencyRank,
+    QP.CumulativeOwnerCommentScore,
+    QP.HistorySummary,
+    QP.TotalBadges,
+    CONCAT('G=',QP.GoldBadges,' S=',QP.SilverBadges,' B=',QP.BronzeBadges)
+      AS BadgeSummary,
+    COALESCE(TT.TagName,'<none>') AS TopTag,
+    QP.MoreViewedQuestionsByOwner,
+    COALESCE(
+      NULLIF(SUBSTRING(QP.HistorySummary FROM 1 FOR 30),''),
+      'NoHistory'
+    ) AS ShortHistory
+  FROM QualifiedPosts QP
+  LEFT JOIN TopTags TT
+    ON TT.Rank = 1
+ WHERE QP.VoteDelta <> 0
+   AND TT.TagName IN (SELECT TagName FROM IntersectTags)
+ ORDER BY QP.VoteDelta DESC NULLS LAST
+ LIMIT 100;

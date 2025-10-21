@@ -1,0 +1,37 @@
+SELECT 
+    p.Id, 
+    p.Title, 
+    count(v.Id) AS VoteCount, 
+    count(c.Id) AS CommentCount,
+    u.DisplayName,
+    u.Reputation,
+    array_agg(t.TagName) AS Tags
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+JOIN 
+    lateral unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) as tag ON true
+JOIN 
+    Tags t ON t.TagName = tag
+WHERE 
+    p.PostTypeId = 1 
+    AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+GROUP BY 
+    p.Id, 
+    u.Id, 
+    p.Title, 
+    u.DisplayName, 
+    u.Reputation
+HAVING 
+    count(v.Id) > 10 
+    AND count(c.Id) > 5
+ORDER BY 
+    p.Score DESC, 
+    VoteCount DESC, 
+    CommentCount DESC
+LIMIT 100;

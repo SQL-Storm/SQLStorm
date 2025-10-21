@@ -1,0 +1,120 @@
+WITH cte AS (
+  SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.LastEditorUserId,
+    u2.DisplayName AS LastEditorDisplayName,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN (
+      SELECT c.Name
+      FROM CloseReasonTypes c
+      JOIN PostHistory ph ON ph.Comment = CAST(c.Id AS VARCHAR)
+      WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+      ORDER BY ph.CreationDate DESC
+      LIMIT 1
+    ) END AS CloseReason,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN (
+      SELECT STRING_AGG(u.DisplayName, ', ')
+      FROM PostHistory ph
+      JOIN Users u ON ph.UserId = u.Id
+      WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 16
+      ORDER BY ph.CreationDate
+    ) END AS CommunityOwners,
+    (
+      SELECT STRING_AGG(l.Name, ', ')
+      FROM PostLinks pl
+      JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+      WHERE pl.PostId = p.Id
+    ) AS LinkTypes,
+    (
+      SELECT STRING_AGG(CAST(v.VoteTypeId AS VARCHAR), ', ')
+      FROM Votes v
+      WHERE v.PostId = p.Id
+    ) AS VoteTypes,
+    (
+      SELECT COUNT(*)
+      FROM Comments c
+      WHERE c.PostId = p.Id
+    ) AS CommentCount,
+    (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+    ) AS UpVotes,
+    (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+    ) AS DownVotes,
+    (
+      SELECT STRING_AGG(CAST(b.Id AS VARCHAR), ', ')
+      FROM Badges b
+      WHERE b.UserId = p.OwnerUserId
+    ) AS Badges,
+    (
+      SELECT STRING_AGG(CAST(t.Id AS VARCHAR), ', ')
+      FROM Tags t
+      JOIN PostTags pt ON t.Id = pt.TagId
+      WHERE pt.PostId = p.Id
+    ) AS TagIds
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Users u2 ON p.LastEditorUserId = u2.Id
+)
+SELECT 
+  PostId,
+  Title,
+  Body,
+  Tags,
+  OwnerDisplayName,
+  LastEditorDisplayName,
+  LastEditDate,
+  LastActivityDate,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  ClosedDate,
+  CommunityOwnedDate,
+  CloseReason,
+  CommunityOwners,
+  LinkTypes,
+  VoteTypes,
+  CommentCount AS TotalComments,
+  UpVotes,
+  DownVotes,
+  Badges,
+  TagIds
+FROM cte
+GROUP BY
+  PostId,
+  Title,
+  Body,
+  Tags,
+  OwnerDisplayName,
+  LastEditorDisplayName,
+  LastEditDate,
+  LastActivityDate,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  ClosedDate,
+  CommunityOwnedDate,
+  CloseReason,
+  CommunityOwners,
+  LinkTypes,
+  VoteTypes,
+  UpVotes,
+  DownVotes,
+  Badges,
+  TagIds
+ORDER BY COALESCE(AnswerCount, 0) DESC, COALESCE(CommentCount, 0) DESC, COALESCE(FavoriteCount, 0) DESC;

@@ -1,0 +1,95 @@
+-- {"query": "27055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1462} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        SUM(CASE WHEN pt.Id = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN pt.Id = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12) THEN 1 ELSE 0 END) AS TotalClosedPosts,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.CreationDate) AS PreviousReputation,
+        LEAD(u.Reputation, 1) OVER (ORDER BY u.CreationDate) AS NextReputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS PreviousReputationRank,
+        LEAD(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS NextReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostActivityRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalBadges,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalClosedPosts,
+    ua.LastPostActivity,
+    ua.ReputationRank,
+    ua.PreviousReputation,
+    ua.NextReputation,
+    ua.PreviousReputationRank,
+    ua.NextReputationRank,
+    ua.PostActivityRank,
+    ua.ReputationDecile,
+    (ua.TotalUpvotes - ua.TotalDownvotes) AS NetVotes,
+    CASE
+        WHEN ua.TotalQuestions > 0 THEN ua.TotalAnswers / ua.TotalQuestions::DECIMAL
+        ELSE 0
+    END AS AnswerToQuestionRatio,
+    COALESCE(STRING_AGG(t.TagName, ', '), '') AS Tags,
+    SUBSTRING(p.Body FROM 1 FOR 500) AS LastPostSnippet,
+    CASE
+        WHEN ua.LastPostActivity IS NOT NULL AND EXTRACT(YEAR FROM AGE(ua.LastPostActivity)) > 1 THEN 'Inactive'
+        ELSE 'Active'
+    END AS ActivityStatus
+FROM
+    UserActivity ua
+LEFT JOIN
+    (SELECT DISTINCT p.OwnerUserId, t.TagName,p.Body
+    FROM Posts p
+    JOIN Tags t ON p.Tags LIKE CONCAT('%',t.TagName, '%')
+    AND p.PostTypeId = 1
+    ) AS active_tags ON ua.UserId = active_tags.OwnerUserId
+LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId AND p.LastActivityDate = ua.LastPostActivity
+WHERE
+    ua.TotalPosts > 0 OR ua.TotalComments > 0 OR ua.TotalVotes > 0
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.TotalPosts, ua.TotalComments, ua.TotalVotes, ua.TotalBadges, ua.TotalUpvotes, ua.TotalDownvotes, ua.TotalQuestions,
+    ua.TotalAnswers, ua.TotalClosedPosts, ua.LastPostActivity, ua.ReputationRank, ua.PreviousReputation, ua.NextReputation, ua.PreviousReputationRank, ua.NextReputationRank, ua.PostActivityRank,
+    ua.ReputationDecile,
+    ua.PreviousReputation, ua.NextReputation, ua.PreviousReputationRank, ua.NextReputationRank, p.Body, ua.LastPostActivity, ua.ActivityStatus
+ORDER BY ua.Reputation DESC
+LIMIT 100;

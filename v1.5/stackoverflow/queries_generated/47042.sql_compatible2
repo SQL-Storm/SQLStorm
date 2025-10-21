@@ -1,0 +1,115 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        t.WikiPostId
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    JOIN Posts pt ON pt.Id = p.Id AND pt.PostTypeId = 1
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName, t.WikiPostId
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as answer_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        AVG(CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Score END) as avg_positive_answer_score,
+        COUNT(DISTINCT b.Id) as tag_badges,
+        MAX(b.Class) as highest_badge_class
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN tag_hierarchy t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name = t.TagName AND b.TagBased = 1
+    WHERE u.Reputation > 5000
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 10
+),
+post_quality_metrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN ph.Id END) as negative_actions,
+        COUNT(DISTINCT c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) as linked_posts,
+        COUNT(DISTINCT pl2.Id) FILTER (WHERE pl2.LinkTypeId = 3) as duplicate_links,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))/3600 as hours_to_close
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = p.Id
+    WHERE p.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, 
+             p.CreationDate, p.Tags, p.AnswerCount, p.ClosedDate
+),
+user_activity_patterns AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        DATE_PART('hour', p.CreationDate) as hour_of_day,
+        DATE_PART('dow', p.CreationDate) as day_of_week,
+        COUNT(*) as posts_created,
+        AVG(pqm.Score) as avg_score_at_time,
+        STDDEV(pqm.Score) as score_variance
+    FROM Users u
+    JOIN post_quality_metrics pqm ON pqm.OwnerUserId = u.Id
+    JOIN Posts p ON p.Id = pqm.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, 
+             DATE_PART('hour', p.CreationDate), 
+             DATE_PART('dow', p.CreationDate)
+)
+SELECT 
+    ue.TagName,
+    ue.DisplayName as expert_user,
+    ue.answers as expert_answers,
+    ue.answer_score as total_answer_score,
+    ue.avg_positive_answer_score,
+    ue.highest_badge_class,
+    th.direct_questions as tag_question_count,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pqm.Score) as median_post_score,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY pqm.Score) as p95_post_score,
+    AVG(pqm.ViewCount / GREATEST(1, EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pqm.CreationDate))/86400)) as avg_daily_views,
+    SUM(CASE WHEN pqm.Score >= 10 THEN 1 ELSE 0 END) as high_score_posts,
+    SUM(CASE WHEN pqm.negative_actions > 0 THEN 1 ELSE 0 END) as posts_with_negative_actions,
+    AVG(pqm.hours_to_close) FILTER (WHERE pqm.hours_to_close IS NOT NULL) as avg_hours_to_close,
+    CORR(pqm.edit_count, pqm.Score) as edit_score_correlation,
+    REGR_SLOPE(pqm.Score, pqm.comment_count) as score_comment_slope,
+    JSON_AGG(
+        DISTINCT jsonb_build_object(
+            'hour', uap.hour_of_day, 
+            'day', uap.day_of_week, 
+            'posts', uap.posts_created,
+            'avg_score', ROUND(uap.avg_score_at_time, 2)
+        ) ORDER BY uap.posts_created DESC
+    ) FILTER (WHERE uap.posts_created > 5) as activity_pattern
+FROM user_expertise ue
+JOIN tag_hierarchy th ON th.TagName = ue.TagName
+JOIN post_quality_metrics pqm ON pqm.Tags LIKE '%' || '<' || ue.TagName || '>' || '%' 
+    AND pqm.OwnerUserId = ue.UserId
+LEFT JOIN user_activity_patterns uap ON uap.Id = ue.UserId
+WHERE ue.answer_score > 100
+GROUP BY ue.TagName, ue.DisplayName, ue.answers, ue.answer_score, 
+         ue.avg_positive_answer_score, ue.highest_badge_class, th.direct_questions
+HAVING COUNT(DISTINCT pqm.Id) >= 20
+    AND AVG(pqm.Score) > 5
+ORDER BY ue.answer_score DESC, th.direct_questions DESC
+LIMIT 100;

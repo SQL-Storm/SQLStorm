@@ -1,0 +1,76 @@
+-- {"query": "23075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 798} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT OUTER JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    LEFT OUTER JOIN Votes v ON v.PostId = p.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+TopTags AS (
+    SELECT 
+        us.UserId,
+        STRING_AGG(t.TagName, ', ') WITHIN GROUP (ORDER BY COUNT(*) DESC) AS TopTags
+    FROM UserStats us
+    INNER JOIN Posts p ON p.OwnerUserId = us.UserId AND p.PostTypeId = 1
+    CROSS JOIN LATERAL STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS tag_array(tag)
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    GROUP BY us.UserId
+),
+RecentActivity AS (
+    SELECT 
+        ph.UserId,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.Comment IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.AvgPostScore,
+    COALESCE(us.LastPostDate, '1900-01-01'::TIMESTAMP) AS LastPostDate,
+    us.TotalUpvotes,
+    tt.TopTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = us.UserId AND c.Score > 5) AS HighScoreComments,
+    ra.LastEditDate,
+    CASE 
+        WHEN us.Reputation > 100000 THEN 'Legend'
+        WHEN us.Reputation > 50000 THEN 'Expert'
+        ELSE 'Enthusiast'
+    END AS ReputationLevel,
+    RANK() OVER (PARTITION BY us.ReputationRank / 10 ORDER BY us.TotalUpvotes DESC) AS GroupRank
+FROM UserStats us
+LEFT OUTER JOIN TopTags tt ON tt.UserId = us.UserId
+LEFT OUTER JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE us.ReputationRank <= 10
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    SUM(us.BadgeCount) AS BadgeCount,
+    AVG(us.AvgPostScore) AS AvgPostScore,
+    MAX(us.LastPostDate) AS LastPostDate,
+    SUM(us.TotalUpvotes) AS TotalUpvotes,
+    NULL AS TopTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.Score > 5 AND EXISTS (SELECT 1 FROM UserStats us2 WHERE us2.UserId = c.UserId)) AS HighScoreComments,
+    MAX(ra.LastEditDate) AS LastEditDate,
+    'Total' AS ReputationLevel,
+    1 AS GroupRank
+FROM UserStats us
+LEFT OUTER JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE us.ReputationRank <= 10
+ORDER BY ReputationRank NULLS LAST, GroupRank;

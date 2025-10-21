@@ -1,0 +1,98 @@
+WITH UserPostEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount,
+        (
+            SELECT COUNT(bh.Id)
+            FROM PostHistory bh
+            WHERE bh.UserId = u.Id
+              AND bh.PostHistoryTypeId IN (2, 5) -- Edit Body
+        ) AS BodyEditCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.PostId) AS PostsWithTag,
+        AVG(p.Score) AS AverageScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+),
+UserContributions AS (
+    SELECT
+        upe.UserId,
+        upe.DisplayName,
+        upe.TotalPosts,
+        upe.QuestionCount,
+        upe.AnswerCount,
+        upe.CommentCount,
+        upe.UpVoteCount,
+        upe.DownVoteCount,
+        upe.BodyEditCount,
+        COALESCE(t.PostsWithTag, 0) AS TotalTagUsage,
+        COALESCE(t.AverageScore, 0.0) AS AvgTagScore,
+        COALESCE(t.QuestionsWithAcceptedAnswer, 0) AS TagsOnQuestionsWithAcceptedAnswers
+    FROM UserPostEngagement upe
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            COUNT(DISTINCT t.TagName) AS PostsWithTag,
+            AVG(p.Score) AS AverageScore,
+            SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer
+        FROM Posts p
+        JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) t ON upe.UserId = t.OwnerUserId
+)
+SELECT
+    uc.DisplayName,
+    uc.TotalPosts,
+    uc.QuestionCount,
+    uc.AnswerCount,
+    uc.CommentCount,
+    uc.UpVoteCount,
+    uc.DownVoteCount,
+    uc.BodyEditCount,
+    uc.TotalTagUsage,
+    uc.AvgTagScore,
+    uc.TagsOnQuestionsWithAcceptedAnswers,
+    pht.Name AS MostFrequentPostHistoryType,
+    AVG(p.Score) OVER (PARTITION BY uc.UserId) AS AverageUserPostScore,
+    CASE
+        WHEN uc.TotalPosts > 1000 THEN 'Prolific'
+        WHEN uc.TotalPosts > 100 THEN 'Active'
+        WHEN uc.TotalPosts > 10 THEN 'Regular'
+        ELSE 'New'
+    END AS UserActivityLevel,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    CASE WHEN u.WebsiteUrl IS NULL THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus
+FROM UserContributions uc
+JOIN Users u ON uc.UserId = u.Id
+LEFT JOIN (
+    SELECT PostId, PostHistoryTypeId, ROW_NUMBER() OVER(PARTITION BY PostId ORDER BY CreationDate DESC) as rn
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+) ph ON uc.UserId = ph.PostId AND ph.rn = 1
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Posts p ON uc.UserId = p.OwnerUserId
+WHERE uc.TotalPosts > 5
+  AND uc.UpVoteCount > uc.DownVoteCount * 2
+  AND uc.AnswerCount > 0
+  AND uc.CommentCount > uc.AnswerCount
+  AND uc.AvgTagScore > 5.0
+ORDER BY uc.TotalPosts DESC, uc.UpVoteCount DESC
+LIMIT 100;

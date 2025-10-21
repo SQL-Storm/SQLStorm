@@ -1,0 +1,77 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+FilteredQuestions AS (
+    SELECT *
+    FROM RecentQuestions
+    WHERE rn <= 5
+),
+TagExplode AS (
+    SELECT
+        fq.Id        AS QuestionId,
+        unnest(
+            string_to_array(
+                substring(fq.Tags, 2, length(fq.Tags) - 2),
+                '><'
+            )
+        )           AS TagName,
+        fq.Score,
+        fq.OwnerUserId
+    FROM FilteredQuestions fq
+),
+TagStats AS (
+    SELECT
+        te.TagName,
+        COUNT(*)             AS QuestionCount,
+        AVG(te.Score)        AS AvgScore,
+        COUNT(DISTINCT te.OwnerUserId) AS DistinctAskers
+    FROM TagExplode te
+    GROUP BY te.TagName
+),
+TopUsers AS (
+    SELECT
+        te.TagName,
+        te.OwnerUserId,
+        u.DisplayName,
+        COUNT(*) AS UserQuestionCount,
+        RANK() OVER (
+            PARTITION BY te.TagName
+            ORDER BY COUNT(*) DESC
+        ) AS UserRank
+    FROM TagExplode te
+    JOIN Users u ON u.Id = te.OwnerUserId
+    GROUP BY te.TagName, te.OwnerUserId, u.DisplayName
+),
+Top3Users AS (
+    SELECT
+        TagName,
+        STRING_AGG(
+            DisplayName || ' (' || UserQuestionCount || ')',
+            ', ' ORDER BY UserQuestionCount DESC
+        ) AS Top3Contributors
+    FROM TopUsers
+    WHERE UserRank <= 3
+    GROUP BY TagName
+)
+SELECT
+    ts.TagName,
+    ts.QuestionCount,
+    ts.AvgScore,
+    ts.DistinctAskers,
+    t3.Top3Contributors
+FROM TagStats ts
+JOIN Top3Users t3 USING (TagName)
+ORDER BY ts.QuestionCount DESC, ts.AvgScore DESC
+LIMIT 10;

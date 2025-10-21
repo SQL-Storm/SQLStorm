@@ -1,0 +1,164 @@
+-- {"query": "9047.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5125} 
+
+WITH
+-- recent questions in the last 90 days, with title snippet and tag count, ranked per user
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        substring(p.Title FROM 1 FOR 50) AS title_snippet,
+        array_length(
+          string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')
+        ,1) AS tag_count
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CURRENT_DATE - INTERVAL '90 days'
+),
+-- per‐user aggregate of recent questions
+UserStats AS (
+    SELECT
+        u.Id        AS user_id,
+        u.DisplayName,
+        COUNT(rq.Id)                                 AS recent_q_count,
+        SUM(CASE WHEN rq.Score > 0 THEN 1 ELSE 0 END) AS positive_q_count,
+        COALESCE(AVG(rq.Score)::numeric, 0)           AS avg_q_score,
+        COALESCE(u.Location, '(unknown)')            AS location,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC)      AS rep_rank
+    FROM Users u
+    LEFT JOIN RecentQuestions rq
+      ON rq.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation
+),
+-- explode tags per question and count overall usage
+TagStats AS (
+    SELECT
+        p.Id   AS question_id,
+        t     AS tag,
+        COUNT(*) OVER (PARTITION BY t) AS tag_usage
+    FROM Posts p
+    CROSS JOIN LATERAL
+      unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS t
+    WHERE p.PostTypeId = 1
+),
+-- count link‐types per question (e.g. duplicates, linked posts)
+DuplicatePairs AS (
+    SELECT
+        pl.PostId   AS question_id,
+        lt.Name     AS link_type,
+        COUNT(*)    AS link_count
+    FROM PostLinks pl
+    JOIN LinkTypes lt
+      ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId, lt.Name
+),
+-- capture closed‐reason from PostHistory for closed questions
+ClosedReasons AS (
+    SELECT
+        p.Id        AS question_id,
+        p.Title,
+        crt.Name    AS close_reason
+    FROM Posts p
+    JOIN PostHistory ph
+      ON ph.PostId = p.Id
+     AND ph.PostHistoryTypeId = 10
+    JOIN CloseReasonTypes crt
+      ON crt.Id = CAST(ph.Comment AS int)
+)
+/* Main header SELECT: combine all CTEs with full outer joins,
+   correlated subquery for comment count, NULL‐logic and calculations */
+SELECT
+    rq.Id                     AS question_id,
+    us.DisplayName            AS owner_name,
+    ts.tag                    AS tag,
+    dp.link_count,
+    cr.close_reason,
+    (
+      SELECT COUNT(*) 
+      FROM Comments c 
+      WHERE c.PostId = rq.Id
+    )                         AS comment_count,
+    CASE 
+      WHEN rq.ViewCount > 0 
+      THEN rq.Score::numeric / rq.ViewCount 
+      ELSE NULL 
+    END                        AS score_to_view_ratio,
+    CASE 
+      WHEN dp.link_count >= 1 
+      THEN TRUE 
+      ELSE FALSE 
+    END                        AS has_links
+FROM RecentQuestions rq
+FULL OUTER JOIN UserStats us
+  ON us.user_id = rq.OwnerUserId
+FULL OUTER JOIN TagStats ts
+  ON ts.question_id = rq.Id
+FULL OUTER JOIN DuplicatePairs dp
+  ON dp.question_id = rq.Id
+FULL OUTER JOIN ClosedReasons cr
+  ON cr.question_id = rq.Id
+WHERE (us.Reputation > 1000 OR us.Reputation IS NULL)
+  AND rq.Score > COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.PostTypeId = 1)
+      , 0)
+  AND (ts.tag IS NOT NULL OR dp.link_count IS NOT NULL)
+
+UNION
+
+-- include negatively‐scored answers for stress‐testing
+SELECT
+    p.Id,
+    p.OwnerDisplayName,
+    NULL::text,
+    NULL::int,
+    NULL::text,
+    (
+      SELECT COUNT(*) 
+      FROM Comments c 
+      WHERE c.PostId = p.Id
+    ),
+    CASE 
+      WHEN p.ViewCount > 0 
+      THEN p.Score::numeric / p.ViewCount 
+      ELSE NULL 
+    END,
+    FALSE
+FROM Posts p
+WHERE p.PostTypeId = 2
+  AND p.Score < 0
+
+INTERSECT
+
+-- intersect with heavy down‐voters
+SELECT
+    u.Id,
+    u.DisplayName,
+    'USER'::text,
+    NULL::int,
+    NULL::text,
+    NULL::int,
+    NULL::numeric,
+    NULL::boolean
+FROM Users u
+WHERE u.DownVotes > u.UpVotes
+
+EXCEPT
+
+-- exclude posts flagged as spam
+SELECT
+    v.PostId,
+    NULL::text,
+    NULL::text,
+    NULL::int,
+    NULL::text,
+    NULL::int,
+    NULL::numeric,
+    NULL::boolean
+FROM Votes v
+WHERE v.VoteTypeId = (
+    SELECT Id FROM VoteTypes WHERE Name = 'Spam'
+);

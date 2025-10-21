@@ -1,0 +1,98 @@
+WITH
+question_tags AS (
+    SELECT
+        p.Id                AS PostId,
+        COUNT(DISTINCT tag) AS TagCount,
+        STRING_AGG(tag, ',' ORDER BY tag) AS TagList
+    FROM Posts p
+    CROSS JOIN LATERAL
+        UNNEST(ARRAY_REMOVE(STRING_TO_ARRAY(p.Tags, '><'), '')) AS t(tag)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+post_votes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS Accepted
+    FROM Votes v
+    GROUP BY v.PostId
+),
+top_answer AS (
+    SELECT
+        a.ParentId,
+        a.Id AS AnswerId,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rnk
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+duplicates AS (
+    SELECT
+        pl.PostId,
+        MIN(CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateOf
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    p.Id                    AS QuestionId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.ClosedDate,
+    COALESCE(q.TagCount, 0)          AS TagCount,
+    COALESCE(q.TagList, '')         AS Tags,
+    COALESCE(v.UpVotes, 0)          AS UpVotes,
+    COALESCE(v.DownVotes, 0)        AS DownVotes,
+    COALESCE(v.Accepted, 0)         AS Accepted,
+    COALESCE(a.AnswerId, 0)         AS TopAnswerId,
+    COALESCE(a.Score, 0)            AS TopAnswerScore,
+    COALESCE(a.rnk, 0)              AS TopAnswerRank,
+    COALESCE(d.DuplicateOf, 0)      AS DuplicateOf,
+    CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END            AS Status,
+    CASE WHEN d.DuplicateOf IS NULL THEN 'Unique' ELSE 'Duplicate' END      AS DuplicateStatus,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0)  AS NegativeCommentCount,
+    u.Reputation,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC) AS GlobalRank
+FROM Posts p
+LEFT JOIN question_tags q ON p.Id = q.PostId
+LEFT JOIN post_votes v ON p.Id = v.PostId
+LEFT JOIN top_answer a ON p.Id = a.ParentId AND a.rnk = 1
+LEFT JOIN duplicates d ON p.Id = d.PostId
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1
+  AND (p.Score > 0 OR p.ViewCount > 5000)
+  AND (q.TagCount IS NULL OR (q.TagCount BETWEEN 2 AND 5))
+  AND (p.ClosedDate IS NULL OR EXISTS (
+        SELECT 1 FROM PostLinks pl
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3))
+UNION ALL
+SELECT
+    p2.Id                    AS QuestionId,
+    CONCAT('Duplicate of ', p2.Title) AS Title,
+    p2.Score,
+    p2.ViewCount,
+    p2.CreationDate,
+    p2.ClosedDate,
+    0                          AS TagCount,
+    ''                         AS Tags,
+    0                          AS UpVotes,
+    0                          AS DownVotes,
+    0                          AS Accepted,
+    0                          AS TopAnswerId,
+    0                          AS TopAnswerScore,
+    0                          AS TopAnswerRank,
+    0                          AS DuplicateOf,
+    0                          AS NegativeCommentCount,
+    u2.Reputation,
+    'Closed'            AS Status,
+    'Duplicate'         AS DuplicateStatus,
+    NULL                AS GlobalRank
+FROM Posts p2
+INNER JOIN duplicates d2 ON p2.Id = d2.DuplicateOf
+LEFT JOIN Users u2 ON p2.OwnerUserId = u2.Id
+WHERE p2.PostTypeId = 1
+  AND p2.ClosedDate IS NOT NULL
+ORDER BY GlobalRank NULLS LAST, QuestionId;

@@ -1,0 +1,109 @@
+WITH PopularTags AS (
+    SELECT
+        Id,
+        TagName
+    FROM Tags
+    ORDER BY Count DESC
+    LIMIT 15
+),
+QuestionAnswerPairs AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswererUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        pt.TagName
+    FROM Posts q
+    JOIN PopularTags pt ON q.Tags LIKE '%' || '<' || pt.TagName || '>' || '%'
+    JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1
+      AND a.PostTypeId = 2
+      AND a.OwnerUserId IS NOT NULL
+),
+UserTagContributions AS (
+    SELECT
+        qap.AnswererUserId,
+        qap.TagName,
+        COUNT(DISTINCT qap.AnswerId) AS NumAnswers,
+        AVG(qap.AnswerScore) AS AvgAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        MAX(qap.AnswerCreationDate) AS LastAnswerDate
+    FROM QuestionAnswerPairs qap
+    LEFT JOIN Votes v ON qap.AnswerId = v.PostId
+    GROUP BY
+        qap.AnswererUserId,
+        qap.TagName
+),
+UserTagBadges AS (
+    SELECT
+        b.UserId,
+        pt.TagName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges b
+    JOIN PopularTags pt ON b.Name = pt.TagName
+    WHERE b.TagBased = 1
+    GROUP BY
+        b.UserId,
+        pt.TagName
+),
+CombinedUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        utc.TagName,
+        utc.NumAnswers,
+        utc.AvgAnswerScore,
+        utc.TotalUpvotes,
+        utc.LastAnswerDate,
+        COALESCE(utb.GoldBadges, 0) AS GoldTagBadges,
+        COALESCE(utb.SilverBadges, 0) AS SilverTagBadges,
+        (
+            (LOG(GREATEST(1, utc.NumAnswers)) * 25) +
+            (utc.AvgAnswerScore * 10) +
+            (LOG(GREATEST(1, utc.TotalUpvotes)) * 5) +
+            (LOG(GREATEST(1, u.Reputation)) * 1) +
+            (COALESCE(utb.GoldBadges, 0) * 100) +
+            (COALESCE(utb.SilverBadges, 0) * 40)
+        ) AS ContributionScore
+    FROM UserTagContributions utc
+    JOIN Users u ON utc.AnswererUserId = u.Id
+    LEFT JOIN UserTagBadges utb ON utc.AnswererUserId = utb.UserId AND utc.TagName = utb.TagName
+    WHERE u.Reputation > 1000
+      AND utc.LastAnswerDate > (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '3 year'
+)
+SELECT
+    cs.TagName,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.NumAnswers,
+    cs.AvgAnswerScore,
+    cs.TotalUpvotes,
+    cs.GoldTagBadges,
+    cs.ContributionScore,
+    p_best.Title AS BestAnswerQuestionTitle,
+    p_best.Score AS BestAnswerScore
+FROM (
+    SELECT
+        *,
+        ROW_NUMBER() OVER(PARTITION BY TagName ORDER BY ContributionScore DESC, Reputation DESC) AS Rank
+    FROM CombinedUserStats
+) AS cs
+JOIN LATERAL (
+    SELECT q_inner.Title, a_inner.Score
+    FROM Posts a_inner
+    JOIN Posts q_inner ON a_inner.ParentId = q_inner.Id
+    WHERE a_inner.OwnerUserId = cs.UserId
+      AND q_inner.Tags LIKE '%' || '<' || cs.TagName || '>' || '%'
+      AND a_inner.PostTypeId = 2
+    ORDER BY a_inner.Score DESC
+    LIMIT 1
+) p_best ON TRUE
+WHERE cs.Rank <= 5
+ORDER BY
+    cs.TagName,
+    cs.Rank;

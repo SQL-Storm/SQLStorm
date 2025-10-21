@@ -1,0 +1,70 @@
+WITH
+user_base AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalPosts,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS Questions,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS Answers
+  FROM Users u
+),
+per_user_activity AS (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(p.Score) AS SumPostScore,
+         SUM(COALESCE(p.ViewCount,0)) AS SumViewCount,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS SumUpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS SumDownVotes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+badge_counts AS (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+tag_activity AS (
+  SELECT OwnerUserId AS UserId, MAX(LastActivityDate) AS LastActive, SUM(CASE WHEN Tags IS NOT NULL THEN 1 ELSE 0 END) AS TagInstances
+  FROM Posts
+  GROUP BY OwnerUserId
+)
+SELECT
+  u.UserId,
+  COALESCE(u.DisplayName, 'Unknown') AS DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  COALESCE(u.TotalPosts, 0) AS TotalPosts,
+  COALESCE(u.Questions, 0) AS Questions,
+  COALESCE(u.Answers, 0) AS Answers,
+  COALESCE(a.SumPostScore, 0) AS SumPostScore,
+  COALESCE(a.SumViewCount, 0) AS SumViewCount,
+  COALESCE(a.SumUpVotes, 0) AS SumUpVotes,
+  COALESCE(a.SumDownVotes, 0) AS SumDownVotes,
+  COALESCE(b.BadgeCount, 0) AS BadgeCount,
+  COALESCE(t.LastActive, u.CreationDate) AS LastActiveDate,
+  COALESCE(t.TagInstances, 0) AS TagInstanceCount,
+  (
+    SELECT MAX(Name)
+    FROM Badges b2
+    WHERE b2.UserId = u.UserId
+  ) AS MostRecentBadge,
+  UPPER(COALESCE(u.DisplayName, 'Unknown')) || '(' || CAST(u.UserId AS varchar) || ')' AS Label,
+  (
+    SELECT tagname
+    FROM (
+      SELECT unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><')) AS tagname,
+             COUNT(*) AS c
+      FROM Posts p2
+      WHERE p2.OwnerUserId = u.UserId
+      GROUP BY tagname
+      ORDER BY c DESC
+      LIMIT 1
+    ) AS s
+  ) AS MostCommonTag
+FROM user_base u
+LEFT JOIN per_user_activity a ON a.UserId = u.UserId
+LEFT JOIN badge_counts b ON b.UserId = u.UserId
+LEFT JOIN tag_activity t ON t.UserId = u.UserId
+ORDER BY SumPostScore DESC NULLS LAST, u.Reputation DESC, u.UserId ASC
+LIMIT 100;

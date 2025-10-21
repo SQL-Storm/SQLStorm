@@ -1,0 +1,124 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(c.Id) AS TotalComments,
+        DENSE_RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(v.Id) DESC) AS VoteRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(c.Id) DESC) AS CommentRank,
+        RANK() OVER (
+          PARTITION BY u.Id
+          ORDER BY MAX(v.CreationDate)
+          DESC
+        ) AS LastVoteRank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Body,
+        p.Tags,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousViewCount,
+        LAG(p.AnswerCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousAnswerCount,
+        LAG(p.CommentCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousCommentCount,
+        NTILE(100) OVER (ORDER BY p.Score DESC) AS ScorePercentile,
+        NTILE(100) OVER (ORDER BY p.ViewCount DESC) AS ViewCountPercentile
+    FROM
+        Posts p
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.LastPostDate,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalVotes,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.TotalComments,
+    ua.PostRank,
+    ua.VoteRank,
+    ua.CommentRank,
+    ua.LastVoteRank,
+    pa.PostId,
+    pt.Name AS PostType,
+    pa.CreationDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.Title,
+     SUBSTRING(pa.Body, 1, 200) AS BodyPreview,
+    pa.Tags,
+    pa.PreviousScore,
+    pa.PreviousViewCount,
+    pa.PreviousAnswerCount,
+    pa.PreviousCommentCount,
+    pa.ScorePercentile,
+    pa.ViewCountPercentile,
+    vt.Name AS VoteType,
+    v.BountyAmount,
+    ph.PostHistoryTypeId,
+    pht.Name AS PostHistoryType,
+    ph.UserId AS PostHistoryUserId,
+    ph.CreationDate AS PostHistoryDate,
+    ph.Comment AS PostHistoryComment,
+    prt.Name AS CloseReason,
+      CASE
+          WHEN string_to_array(pa.Tags, '><') IS NULL THEN pa.Tags
+          ELSE (string_to_array(pa.Tags, '><'))[1]
+      END AS FirstTag,
+    COALESCE(ph.Comment, 'No Comment') AS CloseReasonDetail
+FROM
+    UserActivity ua
+    LEFT JOIN
+        PostActivity pa ON ua.UserId = pa.OwnerUserId
+    LEFT JOIN
+        PostTypes pt ON pa.PostTypeId = pt.Id
+    LEFT JOIN
+        Votes v ON pa.PostId = v.PostId
+    LEFT JOIN
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN
+        PostHistory ph ON pa.PostId = ph.PostId
+    LEFT JOIN
+     PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN
+        CloseReasonTypes prt ON CAST(ph.Comment AS INTEGER) = prt.Id
+WHERE
+    ua.TotalPosts > 1 AND ua.TotalUpvotes > 5 AND ua.LastPostDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+AND
+       pt.Name IN ('Question', 'Answer')
+ORDER BY
+    ua.Reputation DESC, ua.TotalPosts DESC, pa.Score DESC, pa.ViewCount DESC
+LIMIT 1000;

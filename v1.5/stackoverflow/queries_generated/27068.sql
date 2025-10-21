@@ -1,0 +1,136 @@
+-- {"query": "27068.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1393} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Location,
+        COALESCE(u.Views, 0) AS Views,
+        COALESCE(u.UpVotes, 0) AS UpVotes,
+        COALESCE(u.DownVotes, 0) AS DownVotes,
+        (u.UpVotes - u.DownVotes) AS NetVotes,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM
+        Users u
+    WHERE
+        u.LastAccessDate > NOW() - INTERVAL '30 days'
+),
+HighScorePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 50
+),
+RecentComments AS (
+    SELECT
+        c.Id AS CommentId,
+        c.PostId,
+        c.CreationDate,
+        c.Text,
+        c.UserId,
+        u.DisplayName AS UserDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS CommentRank
+    FROM
+        Comments c
+    LEFT JOIN
+        Users u ON c.UserId = u.Id
+    WHERE
+        c.CreationDate > NOW() - INTERVAL '7 days'
+),
+TagMetrics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS RelatedPostsCount,
+        AVG(p.Score) AS AveragePostScore,
+        STRING_AGG(DISTINCT p.Title, ', ') AS RelatedPostTitles
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY
+        t.Id, t.TagName, t.Count
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS MostRecentBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.ReputationRank,
+    au.Location,
+    au.Views,
+    au.UpVotes,
+    au.DownVotes,
+    au.NetVotes,
+    hp.PostId,
+    hp.Title AS PostTitle,
+    hp.Score AS PostScore,
+    hp. previousScore,
+    hp.NextScore,
+    hp.ViewCount,
+    hp.CommentCount,
+    hp.OwnerDisplayName AS PostOwnerDisplayName,
+    COALESCE(ub.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    ub.MostRecentBadgeDate,
+    rc.CommentId,
+    rc.Text AS CommentText,
+    rc.UserDisplayName AS CommentUserDisplayName,
+    rc.CommentRank,
+    tm.TagId,
+    tm.TagName,
+    tm.Count AS TagCount,
+    tm.RelatedPostsCount,
+    tm.AveragePostScore,
+    tm.RelatedPostTitles
+FROM
+    ActiveUsers au
+LEFT JOIN
+    HighScorePosts hp ON au.UserId = hp.OwnerUserId
+LEFT JOIN
+    UserBadgeStats ub ON au.UserId = ub.UserId
+LEFT JOIN
+    RecentComments rc ON hp.PostId = rc.PostId
+LEFT JOIN
+    TagMetrics tm ON hp.Tags LIKE CONCAT('%<', tm.TagName, '>%')
+WHERE
+    au.Reputation > 1000
+    AND (hp.PostScore IS NOT NULL OR ub.TotalBadges IS NOT NULL OR rc.CommentId IS NOT NULL)
+ORDER BY
+    au.ReputationRank, hp.PostScore DESC, rc.CommentRank;

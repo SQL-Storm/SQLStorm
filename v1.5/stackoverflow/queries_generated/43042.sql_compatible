@@ -1,0 +1,30 @@
+SELECT 
+    U.DisplayName,
+    U.Reputation,
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN P.Score > 10 THEN 1 ELSE 0 END) AS HighScoringPosts,
+    AVG(P.Score) AS AvgScore,
+    MAX(PH.CreationDate) AS LastActivityDate,
+    (SELECT COUNT(*) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Comments C WHERE C.UserId = U.Id) AS TotalComments,
+    ARRAY_AGG(DISTINCT T.TagName ORDER BY T.TagName) AS FrequentTags
+FROM 
+    Users U
+LEFT JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    PostHistory PH ON P.Id = PH.PostId
+LEFT JOIN 
+    Tags T ON P.Tags LIKE CONCAT('%<', T.TagName, '>%')
+WHERE 
+    U.Reputation > 1000
+    AND P.CreationDate >= DATE_TRUNC('month', cast('2024-10-01' as date) - INTERVAL '6 months')
+GROUP BY 
+    U.Id, U.DisplayName, U.Reputation
+HAVING 
+    COUNT(DISTINCT P.Id) > 10
+ORDER BY 
+    AVG(P.Score) DESC, COUNT(DISTINCT P.Id) DESC
+LIMIT 10;

@@ -1,0 +1,177 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> ALL (
+        SELECT UNNEST(r.Path)
+    )
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+),
+TopUsersByCompetition AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT a.Id) AS TotalAnswersPosted,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS TotalUpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS TotalDownVotesReceived,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+    )
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 10 AND u.Reputation > 1000
+),
+TopQuestionsWithActivity AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        COALESCE(a.AnswersCount, 0) AS AnswersCount,
+        COALESCE(c.CommentsCount, 0) AS CommentsCount,
+        u.DisplayName AS OwnerUser,
+        ARRAY(
+            SELECT tgt.TagName FROM Tags tgt 
+            WHERE tgt.ExcerptPostId = q.Id OR tgt.WikiPostId = q.Id
+            LIMIT 5
+        ) AS Tags,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswersCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentsCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = q.Id
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1 AND q.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 YEAR'
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, a.AnswersCount, c.CommentsCount, u.DisplayName
+    ORDER BY q.Score DESC, q.ViewCount DESC
+    LIMIT 100
+),
+AnswerPerformance AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        a.CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotes,
+        u.DisplayName
+    FROM Posts a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        l.Name AS LinkType
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    JOIN LinkTypes l ON l.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+RecentModerationActivity AS (
+    SELECT
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.CreationDate,
+        u.DisplayName AS Moderator,
+        ph.Comment,
+        crt.Name AS CloseReason
+    FROM PostHistory ph
+    LEFT JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    ORDER BY ph.CreationDate DESC
+    LIMIT 100
+)
+SELECT 
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.CreationDate AS UserCreationDate,
+    tu.TotalQuestionsPosted,
+    tu.TotalAnswersPosted,
+    tu.TotalUpVotesReceived,
+    tu.TotalDownVotesReceived,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionCreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViewCount,
+    q.AnswersCount,
+    q.CommentsCount AS QuestionCommentsCount,
+    q.OwnerUser AS QuestionOwner,
+    q.Tags AS QuestionTags,
+    q.LastEditDate AS QuestionLastEditDate,
+    a.AnswerId,
+    a.Score AS AnswerScore,
+    a.CommentCount AS AnswerCommentsCount,
+    a.UpVotes,
+    a.DownVotes,
+    a.DisplayName AS AnswerOwnerDisplayName,
+    dl.PostId AS DuplicatePostId,
+    dl.RelatedPostId AS DuplicateRelatedPostId,
+    dl.CreationDate AS DuplicateLinkCreationDate,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    dl.LinkType AS DuplicateLinkType,
+    rm.Id AS ModerationHistoryId,
+    rm.PostId AS ModeratedPostId,
+    rm.PostHistoryTypeId,
+    rm.Title AS ModeratedPostTitle,
+    rm.CreationDate AS ModerationDate,
+    rm.Moderator,
+    rm.Comment AS ModerationComment,
+    rm.CloseReason
+FROM TopUsersByCompetition tu
+LEFT JOIN TopQuestionsWithActivity q ON q.OwnerUser = tu.DisplayName
+LEFT JOIN AnswerPerformance a ON a.OwnerUserId = tu.Id AND a.QuestionId = q.QuestionId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = q.QuestionId
+LEFT JOIN RecentModerationActivity rm ON rm.PostId = q.QuestionId
+WHERE tu.Reputation > 1000
+ORDER BY tu.Reputation DESC, q.Score DESC, a.Score DESC
+LIMIT 50;

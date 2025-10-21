@@ -1,0 +1,14 @@
+WITH ranked_users AS (
+    SELECT Id, Reputation, ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rank
+    FROM Users
+),
+top_users AS (
+    SELECT Id, Reputation, rank
+    FROM ranked_users
+    WHERE rank <= 100
+)
+SELECT u.Id, u.DisplayName, u.Reputation, b.Name AS BadgeName
+FROM top_users AS u
+JOIN Badges AS b ON u.Id = b.UserId
+WHERE b.Class = 1
+ORDER BY u.Reputation DESC;

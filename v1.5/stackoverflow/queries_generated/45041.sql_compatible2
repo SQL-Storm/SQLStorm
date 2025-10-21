@@ -1,0 +1,64 @@
+WITH ActiveUserTags AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        t.TagName, 
+        COUNT(*) AS TagPostCount,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM 
+        Users u
+        JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN (
+            SELECT CAST(NULL AS VARCHAR) AS dummy
+        ) AS dummy_table ON 1 = 0
+        CROSS APPLY (
+            SELECT value AS TagName
+            FROM (
+                SELECT REPLACE(REPLACE(p.Tags, '&lt;', '<'), '&gt;', '>') AS CleanTags
+            ) AS s
+            CROSS APPLY STRING_SPLIT(s.CleanTags, '><')
+        ) AS tags
+        JOIN Tags t ON tags.TagName = t.TagName
+    WHERE 
+        p.PostTypeId = 1 
+        AND u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName, t.TagName
+), TopExpertUsers AS (
+    SELECT 
+        UserId, 
+        DisplayName, 
+        MAX(TagPostCount) AS MaxTagPostCount,
+        STRING_AGG(TagName, ', ' ORDER BY TagPostCount DESC) AS TopTags
+    FROM 
+        ActiveUserTags
+    WHERE 
+        TagRank <= 3
+    GROUP BY 
+        UserId, DisplayName
+)
+SELECT 
+    e.UserId,
+    e.DisplayName,
+    e.TopTags,
+    e.MaxTagPostCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = e.UserId 
+          AND v.VoteTypeId = 2
+    ) AS UpVoteCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = e.UserId 
+          AND b.Class = 1
+    ) AS GoldBadgeCount
+FROM 
+    TopExpertUsers e
+WHERE 
+    e.MaxTagPostCount > 10
+ORDER BY 
+    e.MaxTagPostCount DESC, 
+    UpVoteCount DESC
+LIMIT 100;

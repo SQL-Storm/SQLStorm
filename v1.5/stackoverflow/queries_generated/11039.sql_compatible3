@@ -1,0 +1,71 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.Title, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Users.DisplayName AS OwnerDisplayName, 
+        Users.Reputation, 
+        Tags.TagName
+    FROM 
+        Posts
+    JOIN 
+        Users ON Posts.OwnerUserId = Users.Id
+    JOIN 
+        Posts AS TagPosts ON Posts.Id = TagPosts.Id
+    JOIN 
+        Tags ON TagPosts.Id = Tags.Id
+    WHERE 
+        Posts.CreationDate > DATE '2024-10-01' - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        -- Ensure alignment with standard SQL: use the same column as in SELECT
+        Posts.OwnerUserId AS UserId, 
+        COUNT(*) AS ActivityCount
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > DATE '2024-10-01' - INTERVAL '30 days'
+    GROUP BY 
+        Posts.OwnerUserId
+),
+BadgeEarners AS (
+    SELECT 
+        Badges.UserId, 
+        COUNT(*) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        Badges.UserId
+)
+SELECT 
+    RecentPosts.Id, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.Reputation, 
+    RecentPosts.TagName, 
+    COALESCE(UserActivity.ActivityCount, 0) AS ActivityCount, 
+    COALESCE(BadgeEarners.BadgeCount, 0) AS BadgeCount
+FROM 
+    RecentPosts
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.UserId
+LEFT JOIN 
+    BadgeEarners ON RecentPosts.OwnerUserId = BadgeEarners.UserId
+WHERE 
+    (RecentPosts.Score > 10 OR RecentPosts.ViewCount > 1000) 
+    AND (COALESCE(UserActivity.ActivityCount, 0) > 5 OR COALESCE(BadgeEarners.BadgeCount, 0) > 3)
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC, 
+    RecentPosts.ViewCount DESC;

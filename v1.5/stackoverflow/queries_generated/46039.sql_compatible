@@ -1,0 +1,119 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        AVG(p.Score) as AvgScore,
+        SUM(p.ViewCount) as TotalViews
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND p.Score > 5
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswererUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        COUNT(DISTINCT c.Id) as AnswerComments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownVotes,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE a.PostTypeId = 2
+        AND q.PostTypeId = 1
+        AND a.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate, q.AcceptedAnswerId
+),
+TagPerformance AS (
+    SELECT 
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName,
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) as GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) as SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) as BronzeBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.TagBased = 1) as TagBasedBadges
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2020-01-01'
+    GROUP BY b.UserId
+),
+EditActivity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) as EditCount,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        MAX(ph.CreationDate) as LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY ph.PostId
+)
+SELECT 
+    tqa.DisplayName,
+    tqa.QuestionCount,
+    ROUND(CAST(tqa.AvgScore AS numeric), 2) as AvgQuestionScore,
+    tqa.TotalViews,
+    COUNT(DISTINCT am.AnswerId) as TotalAnswersReceived,
+    COUNT(DISTINCT am.AnswerId) FILTER (WHERE am.IsAccepted = 1) as AcceptedAnswers,
+    ROUND(CAST(AVG(am.AnswerScore) AS numeric), 2) as AvgAnswerScoreReceived,
+    COUNT(DISTINCT tp.TagName) as UniqueTagsUsed,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName) FILTER (
+        WHERE tp.TagName IN (
+            SELECT TagName 
+            FROM TagPerformance 
+            WHERE OwnerUserId = tqa.OwnerUserId 
+            GROUP BY TagName 
+            ORDER BY COUNT(*) DESC 
+            LIMIT 5
+        )
+    ) as TopTags,
+    COALESCE(ubs.GoldBadges, 0) as GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) as SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) as BronzeBadges,
+    AVG(ea.EditCount) as AvgEditsPerQuestion,
+    COUNT(DISTINCT pl.RelatedPostId) as QuestionsLinkedToOthers,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) as DuplicateMarks
+FROM TopQuestionAuthors tqa
+LEFT JOIN AnswerMetrics am ON am.QuestionId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = tqa.OwnerUserId AND PostTypeId = 1
+)
+LEFT JOIN TagPerformance tp ON tp.OwnerUserId = tqa.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = tqa.OwnerUserId
+LEFT JOIN EditActivity ea ON ea.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = tqa.OwnerUserId AND PostTypeId = 1
+)
+LEFT JOIN PostLinks pl ON pl.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = tqa.OwnerUserId AND PostTypeId = 1
+)
+GROUP BY 
+    tqa.DisplayName, 
+    tqa.QuestionCount, 
+    tqa.AvgScore, 
+    tqa.TotalViews,
+    tqa.OwnerUserId,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges
+HAVING COUNT(DISTINCT am.AnswerId) > 0
+ORDER BY tqa.TotalViews DESC, tqa.QuestionCount DESC
+LIMIT 100;

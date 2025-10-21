@@ -1,0 +1,196 @@
+-- {"query": "18073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1476} 
+
+WITH
+  PostInteraction AS (
+    SELECT
+      p.Id AS PostId,
+      pt.Name AS PostType,
+      COALESCE(
+        p.Title,
+        'No Title'
+      ) AS PostTitle,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      COUNT(c.Id) AS CommentCountOnPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.Id
+        ORDER BY
+          c.CreationDate DESC
+      ) AS LatestCommentRank
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Users AS u
+        ON p.OwnerUserId = u.Id
+      LEFT JOIN Comments AS c
+        ON p.Id = c.PostId
+      LEFT JOIN Votes AS v
+        ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      pt.Name,
+      p.Title,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      c.CreationDate
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      MAX(ph.CreationDate) AS LastPostEditDate,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 ELSE 0 END) AS TitleEdits,
+      AVG(
+        DATEDIFF(
+          minute,
+          p.CreationDate,
+          ph.CreationDate
+        )
+      ) AS AvgTimeUntilFirstEdit
+    FROM
+      Users AS u
+      JOIN PostHistory AS ph
+        ON u.Id = ph.UserId
+      LEFT JOIN Posts AS p
+        ON ph.PostId = p.Id
+    WHERE
+      ph.PostHistoryTypeId IN (1, 2, 4, 5)
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TopQuestions AS (
+    SELECT
+      Id,
+      Title,
+      Score,
+      AnswerCount,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          Score DESC,
+          AnswerCount DESC
+      ) AS QuestionRank
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1
+  )
+SELECT
+  pi.PostId,
+  pi.PostType,
+  pi.PostTitle,
+  pi.OwnerDisplayName,
+  pi.PostCreationDate,
+  pi.PostScore,
+  pi.PostViewCount,
+  pi.AnswerCount,
+  pi.CommentCount AS TotalCommentCount,
+  pi.FavoriteCount,
+  pi.UpVoteCount,
+  pi.DownVoteCount,
+  ua.DisplayName AS LastEditorDisplayName,
+  ua.Reputation AS LastEditorReputation,
+  ua.UserCreationDate AS LastEditorCreationDate,
+  ua.PostsEdited AS NumberOfPostsEditedByLastEditor,
+  ua.BodyEdits AS BodyEditsByLastEditor,
+  ua.TitleEdits AS TitleEditsByLastEditor,
+  CASE
+    WHEN pi.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  CASE
+    WHEN pi.PostScore > 100 THEN 'High Score'
+    WHEN pi.PostScore > 10 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  t.TagName,
+  t.Count AS TagPostCount,
+  t.ExcerptPostId,
+  t.WikiPostId,
+  CASE
+    WHEN LAST_VALUE(c.Text) IGNORE NULLS OVER (
+      PARTITION BY
+        pi.PostId
+      ORDER BY
+        c.CreationDate
+    ) LIKE '%interesting%' THEN 'Contains "interesting"'
+    ELSE 'Does not contain "interesting"'
+  END AS LatestCommentKeywordMatch,
+  CASE
+    WHEN pi.OwnerDisplayName IS NULL THEN 'Community User'
+    ELSE pi.OwnerDisplayName
+  END AS DisplayOwnerName,
+  COALESCE(pi.ClosedDate, pi.LastActivityDate) AS EffectiveCloseOrActivityDate,
+  CASE
+    WHEN pi.PostScore > (
+      SELECT
+        AVG(Score)
+      FROM
+        Posts
+      WHERE
+        PostTypeId = 1
+    ) THEN 'Above Average Score'
+    ELSE 'Below Average Score'
+  END AS ScoreVsAverage,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.PostId = pi.PostId
+      AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount
+FROM
+  PostInteraction AS pi
+LEFT JOIN UserActivitySummary AS ua
+  ON pi.PostId = (
+    SELECT
+      PostId
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = ua.UserId
+      AND ph.PostHistoryTypeId IN (4, 5)
+    ORDER BY
+      ph.CreationDate DESC
+    LIMIT
+      1
+  )
+LEFT JOIN Tags AS t
+  ON pi.PostTitle LIKE '%' || t.TagName || '%'
+  LEFT JOIN Comments AS c
+  ON pi.PostId = c.PostId
+WHERE
+  pi.PostScore > 0
+  AND pi.PostCreationDate > '2023-01-01'
+  AND t.TagName IS NOT NULL
+ORDER BY
+  pi.PostCreationDate DESC,
+  pi.PostScore DESC
+LIMIT
+  100;

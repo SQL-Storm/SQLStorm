@@ -1,0 +1,70 @@
+-- {"query": "14048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 114415, "output_tokens": 48601} 
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    CAST(ROUND(DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) / 365.25, 2) AS DECIMAL(10,2)) AS UserAgeYears,
+    COALESCE(b.Name, '') AS Badge,
+    CASE WHEN b.TagBased = 1 THEN 'Tag-based' ELSE 'Named' END AS BadgeType,
+    CASE b.Class
+      WHEN 1 THEN 'Gold'
+      WHEN 2 THEN 'Silver'
+      WHEN 3 THEN 'Bronze'
+      ELSE 'Unknown'
+    END AS BadgeClass,
+    DATEDIFF(CURRENT_TIMESTAMP, b.Date) AS DaysSinceBadgeAwarded
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+)
+SELECT
+  PostId,
+  Title,
+  Body,
+  Tags,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  UserCreationDate,
+  LastAccessDate,
+  DATEDIFF(CURRENT_TIMESTAMP, LastAccessDate) AS DaysLastAccess,
+  Views,
+  UpVotes,
+  DownVotes,
+  CAST(ROUND(CAST(UpVotes AS DECIMAL) / NULLIF(CAST(UpVotes + DownVotes AS DECIMAL), 0), 2) AS DECIMAL(3,2)) AS VoteRatio,
+  UserAgeYears,
+  STUFF((
+    SELECT ', ' + Badge
+    FROM cte c2
+    WHERE c2.OwnerUserId = c1.OwnerUserId
+    ORDER BY DaysSinceBadgeAwarded DESC
+    FOR XML PATH('')
+  ), 1, 2, '') AS Badges,
+  STUFF((
+    SELECT ', ' + BadgeType
+    FROM cte c2
+    WHERE c2.OwnerUserId = c1.OwnerUserId
+    GROUP BY BadgeType
+    ORDER BY BadgeType
+    FOR XML PATH('')
+  ), 1, 2, '') AS BadgeTypes,
+  STUFF((
+    SELECT ', ' + BadgeClass
+    FROM cte c2
+    WHERE c2.OwnerUserId = c1.OwnerUserId
+    GROUP BY BadgeClass
+    ORDER BY BadgeClass
+    FOR XML PATH('')
+  ), 1, 2, '') AS BadgeClasses
+FROM cte c1
+ORDER BY PostId;

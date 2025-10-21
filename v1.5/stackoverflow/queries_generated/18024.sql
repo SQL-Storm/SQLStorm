@@ -1,0 +1,126 @@
+-- {"query": "18024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1369} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5) -- Edit Title, Edit Body
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        AVG(p.Score) AS AveragePostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id ELSE NULL END) AS ClosedPostCount,
+        COUNT(CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN p.Id ELSE NULL END) AS CommunityOwnedPostCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerDisplayName,
+        CASE WHEN p.PostTypeId = 1 THEN
+            (SELECT COUNT(*) FROM Posts ans WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2)
+        ELSE 0 END AS AnswerCountForPost,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCountForPost,
+        DATEDIFF(DAY, p.CreationDate, p.LastActivityDate) AS PostAgeInDays,
+        DATEDIFF(MINUTE, p.CreationDate, GETDATE()) AS MinutesSinceCreation,
+        CASE WHEN p.Tags LIKE '%<sql>%' THEN 1 ELSE 0 END AS HasSqlTag
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+CommentSentiment AS (
+    SELECT
+        c.PostId,
+        AVG(CASE
+            WHEN c.Text LIKE '%great%' THEN 1.0
+            WHEN c.Text LIKE '%awesome%' THEN 1.0
+            WHEN c.Text LIKE '%excellent%' THEN 1.0
+            WHEN c.Text LIKE '%bad%' THEN -1.0
+            WHEN c.Text LIKE '%terrible%' THEN -1.0
+            WHEN c.Text LIKE '%poor%' THEN -1.0
+            ELSE 0.0
+        END) AS AverageCommentSentiment
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.PostTypeName,
+    pd.OwnerDisplayName,
+    pd.PostScore,
+    pd.PostViewCount,
+    pd.FavoriteCountForPost,
+    pd.AnswerCountForPost,
+    pd.PostAgeInDays,
+    pd.MinutesSinceCreation,
+    pd.HasSqlTag,
+    COALESCE(cs.AverageCommentSentiment, 0) AS CommentSentiment,
+    ua.DisplayName AS ContributingUserDisplayName,
+    ua.TotalPostsCreated AS UserTotalPostsCreated,
+    ua.QuestionCount AS UserQuestionCount,
+    ua.AnswerCount AS UserAnswerCount,
+    ua.BadgeCount AS UserBadgeCount,
+    rpe.CreationDate AS LastEditDateForUser,
+    CASE WHEN rpe.rn = 1 THEN 'Latest' WHEN rpe.rn = 2 THEN 'Second Latest' ELSE 'Other' END AS EditOrder
+FROM PostDetails pd
+LEFT JOIN CommentSentiment cs ON pd.PostId = cs.PostId
+LEFT JOIN RankedPostEdits rpe ON pd.PostId = rpe.PostId
+LEFT JOIN Users ua ON rpe.UserId = ua.Id -- Joining to get user details for edits
+WHERE
+    pd.PostScore > 5
+    OR pd.PostViewCount > 1000
+    OR pd.FavoriteCountForPost > 10
+UNION ALL
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.PostTypeName,
+    pd.OwnerDisplayName,
+    pd.PostScore,
+    pd.PostViewCount,
+    pd.FavoriteCountForPost,
+    pd.AnswerCountForPost,
+    pd.PostAgeInDays,
+    pd.MinutesSinceCreation,
+    pd.HasSqlTag,
+    COALESCE(cs.AverageCommentSentiment, 0) AS CommentSentiment,
+    ua.DisplayName AS ContributingUserDisplayName,
+    ua.TotalPostsCreated AS UserTotalPostsCreated,
+    ua.QuestionCount AS UserQuestionCount,
+    ua.AnswerCount AS UserAnswerCount,
+    ua.BadgeCount AS UserBadgeCount,
+    NULL AS LastEditDateForUser,
+    'No Edit' AS EditOrder
+FROM PostDetails pd
+LEFT JOIN CommentSentiment cs ON pd.PostId = cs.PostId
+LEFT JOIN Users ua ON pd.OwnerUserId = ua.Id
+WHERE
+    pd.PostTypeId = 1 -- Only questions for this part
+    AND pd.PostAgeInDays > 365
+    AND pd.AnswerCountForPost < 3
+    AND ua.Reputation > 10000
+    AND ua.DownVotes < ua.UpVotes / 10
+ORDER BY
+    pd.PostScore DESC, pd.PostViewCount DESC;

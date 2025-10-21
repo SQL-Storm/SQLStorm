@@ -1,0 +1,29 @@
+SELECT 
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT u.Id) AS TotalUsers,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    SUM(p.Score) AS TotalScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreationDate,
+    AVG(DATEDIFF(day, u.CreationDate, TIMESTAMP '2024-10-01 12:34:56')) AS AvgUserAge
+FROM 
+    Posts p
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+WHERE 
+    p.PostTypeId IN (1, 2) AND 
+    u.Id IS NOT NULL AND 
+    b.Id IS NOT NULL AND 
+    v.PostId IS NOT NULL AND 
+    c.PostId IS NOT NULL
+GROUP BY
+    p.Id, u.Id, b.Id, v.PostId, c.Id;

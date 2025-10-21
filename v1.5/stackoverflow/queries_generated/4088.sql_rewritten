@@ -1,0 +1,165 @@
+-- {"query": "4088.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1692} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    
+    UNION ALL
+    
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        th.TagPath || c.TagName
+    FROM Tags c
+    JOIN RecursiveTagHierarchy th ON POSITION(c.TagName IN th.TagPath[array_length(th.TagPath, 1)]) = 0
+    WHERE c.IsModeratorOnly = 0 AND c.Id > th.Id
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        COALESCE(SUM(v.VoteTypeId=2)::int,0) AS UpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId=3)::int,0) AS DownVotesReceived,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank,
+        MAX(b.Date) FILTER (WHERE b.Class = 1) OVER (PARTITION BY u.Id) AS LatestGoldBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p2.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.ClosedDate,
+        COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRecentRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalUserPosts,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentsCount,
+        EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 AND ph.CreationDate > p.CreationDate
+        ) AS IsClosedRecently
+    FROM Posts p
+),
+ClosedReasonSummary AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    WHERE ph.PostHistoryTypeId = 10 AND crt.Id IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+PostTagExplode AS (
+    SELECT
+        p.Id AS PostId,
+        UNNEST(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+),
+TopTagRanked AS (
+    SELECT 
+        pte.PostId,
+        pte.TagName,
+        RANK() OVER (PARTITION BY pte.PostId ORDER BY t.Count DESC NULLS LAST) AS TagRank,
+        t.Count AS TagUsageCount
+    FROM PostTagExplode pte
+    LEFT JOIN Tags t ON t.TagName = pte.TagName
+),
+FilteredPosts AS (
+    SELECT
+        pd.*,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.BadgesCount,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.ReputationRank,
+        ua.LatestGoldBadgeDate,
+        crs.CloseReasonName,
+        crs.CloseVotesCount,
+        STRING_AGG(tt.TagName, ', ' ORDER BY tt.TagUsageCount DESC) FILTER (WHERE tt.TagRank <= 3) AS TopTags
+    FROM PostDetails pd
+    LEFT JOIN UserActivity ua ON ua.UserId = pd.OwnerUserId
+    LEFT JOIN ClosedReasonSummary crs ON crs.PostId = pd.Id
+    LEFT JOIN TopTagRanked tt ON tt.PostId = pd.Id
+    GROUP BY pd.Id, pd.PostTypeId, pd.OwnerUserId, pd.ParentId, pd.AcceptedAnswerId, pd.Title, pd.CreationDate, pd.Score, pd.ViewCount, pd.Tags, pd.ClosedDate, pd.FavoriteCount, pd.UserPostRecentRank, pd.TotalUserPosts, pd.CommentsCount, pd.IsClosedRecently, ua.DisplayName, ua.Reputation, ua.BadgesCount, ua.UpVotesReceived, ua.DownVotesReceived, ua.ReputationRank, ua.LatestGoldBadgeDate, crs.CloseReasonName, crs.CloseVotesCount
+),
+AggregatedAnswers AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score > 0) AS AvgPositiveScore,
+        MAX(p.Score) AS MaxScore,
+        COUNT(CASE WHEN p.OwnerUserId IS NULL THEN 1 END) AS AnonymousAnswersCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+)
+SELECT
+    fp.Id AS PostId,
+    fp.Title,
+    COALESCE(fp.TopTags, 'No Tags') AS TopTags,
+    fp.Score,
+    fp.ViewCount,
+    fp.FavoriteCount,
+    fp.CommentsCount,
+    fp.IsClosedRecently,
+    fp.CloseReasonName,
+    fp.CloseVotesCount,
+    fp.DisplayName AS OwnerName,
+    fp.Reputation AS OwnerReputation,
+    fp.BadgesCount AS OwnerBadges,
+    fp.UpVotesReceived,
+    fp.DownVotesReceived,
+    fp.ReputationRank,
+    fp.LatestGoldBadgeDate,
+    COALESCE(aa.AnswerCount, 0) AS NumberOfAnswers,
+    COALESCE(aa.AvgPositiveScore, 0) AS AvgAnswerPositiveScore,
+    COALESCE(aa.MaxScore, 0) AS MaxAnswerScore,
+    COALESCE(aa.AnonymousAnswersCount, 0) AS AnonymousAnswers,
+    CASE 
+        WHEN fp.ClosedDate IS NOT NULL THEN 'Closed' 
+        ELSE 'Open' 
+    END AS PostStatus,
+    CASE 
+        WHEN fp.Score >= 100 THEN 'High Score' 
+        WHEN fp.Score BETWEEN 50 AND 99 THEN 'Medium Score' 
+        ELSE 'Low Score' 
+    END AS ScoreLevel,
+    length(trim(coalesce(fp.Body, ''))) AS BodyLength,
+    substring(fp.Title FROM '^(.*?)(?:[:\-–—]|$)') AS TitleMainPart,
+    COALESCE(
+      (SELECT ph.UserDisplayName FROM PostHistory ph WHERE ph.PostId = fp.Id AND ph.PostHistoryTypeId = 4 ORDER BY ph.CreationDate DESC LIMIT 1),
+      fp.DisplayName,
+      'Unknown'
+    ) AS LastEditor,
+    ROW_NUMBER() OVER (PARTITION BY fp.OwnerUserId ORDER BY fp.CreationDate DESC) AS UserPostRecencyRank
+FROM FilteredPosts fp
+LEFT JOIN AggregatedAnswers aa ON aa.QuestionId = fp.Id
+WHERE fp.PostTypeId = 1
+AND (fp.Score > 10 OR fp.BadgesCount > 5 OR fp.UpVotesReceived > 100)
+AND (fp.ClosedDate IS NULL OR fp.ClosedDate > cast('2024-10-01' as date) - INTERVAL '1 year')
+ORDER BY fp.ReputationRank, fp.Score DESC NULLS LAST, fp.ViewCount DESC NULLS LAST
+LIMIT 100;

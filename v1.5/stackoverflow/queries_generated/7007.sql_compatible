@@ -1,0 +1,252 @@
+with
+-- recent active questions with tag arrays and basic metrics
+questions as (
+  select
+    p.id,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.tags,
+    -- normalize tags into array (Postgres-like syntax in schema comment)
+    case
+      when p.tags is null then array[]::text[]
+      else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+),
+-- richest user metrics and decayed reputation factor
+user_stats as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    -- time-decayed reputation: recent users get slight boost
+    (u.reputation * greatest(0.1, least(2.0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate))/(60*60*24*365) + 1)))::numeric(18,4) as decayed_reputation
+  from users u
+  where u.reputation is not null
+),
+-- aggregate badge counts per user by class and tag-based split
+badge_agg as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    count(*) filter (where b.tagbased = 1) as tagbadges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- compute per-question answer stats and top answer info via window functions
+answer_stats as (
+  select
+    q.id as question_id,
+    count(a.id) filter (where a.id is not null) as answers_total,
+    sum(a.score) filter (where a.id is not null) as answers_score_sum,
+    max(a.score) filter (where a.id is not null) as answers_score_max,
+    -- top answer id by score, tie-breaker: earliest creationdate
+    (
+      select a2.id
+      from posts a2
+      where a2.parentid = q.id and a2.posttypeid = 2
+      order by a2.score desc nulls last, a2.creationdate asc
+      limit 1
+    ) as top_answer_id,
+    -- average length of answers' body (characters)
+    avg(char_length(a.body)) filter (where a.id is not null) as avg_answer_length
+  from questions q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  group by q.id
+),
+-- compute comment sentiment proxies and counts per post (simple heuristics)
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    sum(case when c.score >= 2 then 1 else 0 end) as positive_comments,
+    sum(case when c.score <= 0 then 1 else 0 end) as negative_comments,
+    avg(char_length(c.text)) as avg_comment_len,
+    -- simple keyword presence score (contains 'thanks' or 'thank' or 'ty' etc.)
+    sum(case when lower(c.text) ~ '(thanks|thank you|ty\\b|appreciate)' then 1 else 0 end) as gratitude_hits
+  from comments c
+  group by c.postid
+),
+-- close/reopen history per question using PostHistory
+close_history as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as close_votes_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,35,11)) as last_close_reopen_date,
+    bool_or(ph.posthistorytypeid in (10,35)) as ever_closed
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11,35)
+  group by ph.postid
+),
+-- linkage density: posts linking to or from question
+link_stats as (
+  select
+    p.id as postid,
+    count(pl.id) filter (where pl.postid = p.id) as outgoing_links,
+    count(pl.id) filter (where pl.relatedpostid = p.id) as incoming_links,
+    count(pl.id) as total_links
+  from posts p
+  left join postlinks pl on (pl.postid = p.id or pl.relatedpostid = p.id)
+  group by p.id
+),
+-- votes aggregation per post with types pivot and last vote date
+vote_stats as (
+  select
+    v.postid,
+    count(*) as votes_total,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+-- tag popularity across recent questions
+tag_popularity as (
+  select
+    t.tagname,
+    count(q.id) as occurrences,
+    avg(q.score) as avg_score,
+    avg(q.viewcount) as avg_views,
+    percentile_cont(0.5) within group (order by q.score) as median_score
+  from questions q
+  cross join lateral unnest(q.tag_array) as t(tagname)
+  group by t.tagname
+  having count(q.id) >= 5
+  order by occurrences desc
+  limit 200
+),
+-- heavy benchmark join: pick candidate questions and enrich with many metrics
+candidates as (
+  select
+    q.*,
+    coalesce(a.answers_total,0) as answers_total,
+    coalesce(a.answers_score_sum,0) as answers_score_sum,
+    a.top_answer_id,
+    round(coalesce(a.avg_answer_length,0))::int as avg_answer_length,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.positive_comments,0) as positive_comments,
+    coalesce(cs.negative_comments,0) as negative_comments,
+    coalesce(cs.gratitude_hits,0) as gratitude_hits,
+    coalesce(ch.close_votes_events,0) as close_events,
+    coalesce(ch.reopen_events,0) as reopen_events,
+    coalesce(ch.ever_closed,false) as ever_closed,
+    coalesce(ls.outgoing_links,0) as outgoing_links,
+    coalesce(ls.incoming_links,0) as incoming_links,
+    coalesce(vs.votes_total,0) as votes_total,
+    coalesce(vs.upvotes,0) as upvotes,
+    coalesce(vs.downvotes,0) as downvotes,
+    coalesce(vs.favorites,0) as favorites
+  from questions q
+  left join answer_stats a on a.question_id = q.id
+  left join comment_stats cs on cs.postid = q.id
+  left join close_history ch on ch.postid = q.id
+  left join link_stats ls on ls.postid = q.id
+  left join vote_stats vs on vs.postid = q.id
+  where q.score >= 0
+),
+-- enrich with owner and badge metrics and compute composite quality score using multiple expressions
+scored as (
+  select
+    c.*,
+    us.displayname as owner_name,
+    us.reputation,
+    us.decayed_reputation,
+    ba.gold_count,
+    ba.silver_count,
+    ba.bronze_count,
+    ba.total_badges,
+    -- complexity: compute a composite score with non-linear transforms, null handling and correlated subquery
+    (
+      -- base: weighted signal from post-level metrics
+      (least(1000, c.viewcount) / nullif(greatest(1, c.answercount),0)) * 0.12
+      + greatest(0, c.score) * 0.35
+      + ln(greatest(1, c.answers_total) + 1) * 7.3
+      + sqrt(greatest(0, c.answers_score_sum)) * 0.6
+      + (c.upvotes - c.downvotes) * 0.25
+      -- badge influence (owner)
+      + coalesce(ba.gold_count,0) * 3.5 + coalesce(ba.silver_count,0) * 1.4 + coalesce(ba.bronze_count,0) * 0.5
+      -- comment sentiment: reward gratitude, penalize negatives
+      + (c.gratitude_hits * 1.2) - (c.negative_comments * 0.8)
+      -- penalize if ever closed, but encourage reopen
+      - case when c.ever_closed then 8.0 else 0 end + (c.reopen_events * 1.6)
+      -- link centrality: incoming links more valuable
+      + (c.incoming_links * 0.9) + (c.outgoing_links * 0.2)
+      -- recent activity boost: last edit or last vote proximity (correlated subquery to get last activity)
+      + (
+          select greatest(0.0, 10 - extract(days from (cast('2024-10-01 12:34:56' as timestamp) - greatest(coalesce(p.lastactivitydate, p.creationdate), coalesce(vs2.last_vote_date, p.creationdate))))) * 0.7
+          from posts p where p.id = c.id
+        )
+    )::numeric(18,4) as composite_score,
+    -- diversification: count of distinct top tags that are also popular (join to tag_popularity)
+    (
+      select count(distinct t.tagname)
+      from unnest(c.tag_array) as t(tagname)
+      join tag_popularity tp on tp.tagname = t.tagname
+    ) as popular_tag_overlap,
+    -- string manipulation & null logic: compact preview of title and tags
+    left(coalesce(c.title, '(no title)'), 120) ||
+      ' [' ||
+      coalesce(array_to_string(coalesce(c.tag_array, array[]::text[]), ', '), 'no-tags') ||
+      ']' as preview
+  from candidates c
+  left join users us on us.id = c.owneruserid
+  left join badge_agg ba on ba.userid = us.id
+  left join vote_stats vs2 on vs2.postid = c.id
+),
+-- final ranking with window functions, picks diverse top items per popular tag using row_number partition
+ranked as (
+  select
+    s.*,
+    row_number() over (order by s.composite_score desc nulls last, s.answers_total desc, s.viewcount desc) as global_rank,
+    -- for each popular tag, rank within that tag for lateral unnest
+    null::int as tag_rank -- placeholder to be filled in final select via lateral
+  from scored s
+)
+select
+  r.global_rank,
+  r.id as question_id,
+  r.title,
+  r.owner_name,
+  r.reputation as owner_reputation,
+  r.decayed_reputation,
+  r.score as question_score,
+  r.viewcount,
+  r.answers_total,
+  r.avg_answer_length,
+  r.comment_count,
+  r.composite_score,
+  r.popular_tag_overlap,
+  r.preview,
+  r.lastactivitydate,
+  -- select top 3 tags (by joining back into tag_popularity and ordering)
+  (select array_agg(tp.tagname order by tp.occurrences desc limit 3)
+   from unnest(r.tag_array) as t(tagname)
+   left join tag_popularity tp on tp.tagname = t.tagname
+  ) as top_related_popular_tags,
+  -- correlate to top answer details if present
+  json_build_object(
+    'top_answer_id', r.top_answer_id,
+    'top_answer_score', (select a.score from posts a where a.id = r.top_answer_id),
+    'top_answer_owner', (select u.displayname from posts a join users u on u.id = a.owneruserid where a.id = r.top_answer_id)
+  ) as top_answer_summary
+from ranked r
+where r.composite_score is not null
+order by r.composite_score desc, r.viewcount desc
+limit 100;

@@ -1,0 +1,51 @@
+-- {"query": "36098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 421} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  pc.Counts AS CommentTotalAcrossPosts,
+  COALESCE(vt.VoteCount, 0) AS UpDownVoteCount,
+  COALESCE(bd.BadgeTotal, 0) AS BadgeTotal,
+  STRING_AGG(DISTINCT ct.CommunityTag, ',') AS TopTagCluster
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS Counts
+    FROM Comments
+    GROUP BY PostId
+  ) pc ON pc.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3) -- UpMod / DownMod
+    GROUP BY PostId
+  ) vt ON vt.PostId = p.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS BadgeTotal
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) bd ON bd.OwnerUserId = p.OwnerUserId
+  LEFT JOIN (
+    SELECT pt.Id AS PostTypeId, STRING_AGG(t.TagName, ',') AS CommunityTag
+    FROM Posts pt
+      JOIN Tags t ON pt.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY pt.Id
+  ) ct ON ct.PostTypeId = p.Id
+WHERE
+  p.PostTypeId IN (1, 2) -- focus on Questions and Answers
+  AND p.CreationDate >= NOW() - INTERVAL '365 days'
+ORDER BY
+  p.Score DESC,
+  vt.VoteCount DESC,
+  p.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,76 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.OwnerUserId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  p.LastActivityDate,
+  pv.TotalUpVotes,
+  pv.TotalDownVotes,
+  awk.AvailableAuthorCount,
+  cl.CountsByHour,
+  bl.UniqueLinkCount,
+  bh.EditsLast30Days
+FROM Posts p
+LEFT JOIN (
+  SELECT v.PostId,
+         SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+         SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+  FROM Votes v
+  INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+) pv ON pv.PostId = p.Id
+LEFT JOIN (
+  SELECT Posts.PostId,
+         COUNT(*) AS AvailableAuthorCount
+  FROM Posts
+  WHERE Posts.OwnerUserId IS NOT NULL
+  GROUP BY Posts.PostId
+) awk ON awk.PostId = p.Id
+LEFT JOIN (
+  SELECT RelatedPostId,
+         COUNT(*) AS CountsByHour
+  FROM PostLinks
+  WHERE CreationDate >= DATE_TRUNC('hour', TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '24 hours')
+  GROUP BY RelatedPostId
+) cl ON cl.RelatedPostId = p.Id
+LEFT JOIN (
+  SELECT PostId,
+         COUNT(*) AS UniqueLinkCount
+  FROM PostLinks
+  GROUP BY PostId
+) bl ON bl.PostId = p.Id
+LEFT JOIN (
+  SELECT ph.PostId,
+         COUNT(*) AS EditsLast30Days
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+  GROUP BY ph.PostId
+) bh ON bh.PostId = p.Id
+WHERE p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days'
+  AND p.PostTypeId = 1
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.OwnerUserId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  p.LastActivityDate,
+  pv.TotalUpVotes,
+  pv.TotalDownVotes,
+  awk.AvailableAuthorCount,
+  cl.CountsByHour,
+  bl.UniqueLinkCount,
+  bh.EditsLast30Days
+ORDER BY p.CreationDate DESC
+LIMIT 100;

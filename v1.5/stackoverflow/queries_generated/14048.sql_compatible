@@ -1,0 +1,71 @@
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    CAST(ROUND(DATEDIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), u.CreationDate) / 365.25, 2) AS DECIMAL(10, 2)) AS UserAgeYears,
+    COALESCE(b.Name, '') AS Badge,
+    CASE WHEN b.TagBased = 1 THEN 'Tag-based' ELSE 'Named' END AS BadgeType,
+    CASE b.Class
+      WHEN 1 THEN 'Gold'
+      WHEN 2 THEN 'Silver'
+      WHEN 3 THEN 'Bronze'
+      ELSE 'Unknown'
+    END AS BadgeClass,
+    DATEDIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), b.Date) AS DaysSinceBadgeAwarded
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+)
+SELECT
+  PostId,
+  Title,
+  Body,
+  Tags,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  UserCreationDate,
+  LastAccessDate,
+  DATEDIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), LastAccessDate) AS DaysLastAccess,
+  Views,
+  UpVotes,
+  DownVotes,
+  CAST(ROUND(CAST(UpVotes AS DECIMAL) / NULLIF(CAST(UpVotes + DownVotes AS DECIMAL), 0), 2) AS DECIMAL(3, 2)) AS VoteRatio,
+  UserAgeYears,
+  (
+    SELECT STRING_AGG(Badge, ', ')
+    FROM (
+      SELECT c2.Badge
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+      ORDER BY c2.DaysSinceBadgeAwarded DESC
+    ) AS sub
+  ) AS Badges,
+  (
+    SELECT STRING_AGG(DISTINCT BadgeType, ', ')
+    FROM (
+      SELECT c2.BadgeType
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS sub2
+  ) AS BadgeTypes,
+  (
+    SELECT STRING_AGG(DISTINCT BadgeClass, ', ')
+    FROM (
+      SELECT c2.BadgeClass
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS sub3
+  ) AS BadgeClasses
+FROM cte c1
+ORDER BY PostId;

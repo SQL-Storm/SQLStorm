@@ -1,0 +1,108 @@
+-- {"query": "5034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1216} 
+WITH ActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > u.CreationDate + INTERVAL '180 days'
+),
+TopTags AS (
+    SELECT t.TagName, t.Count, t.Id,
+           DENSE_RANK() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+),
+PostEngagement AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount,
+           COALESCE(SUM(vt.Score), 0) AS TotalCommentScore,
+           COUNT(DISTINCT c.Id) AS NumComments,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END), 0) AS NetVotes,
+           MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT SUM(Score) AS Score
+        FROM Comments c2
+        WHERE c2.PostId = p.Id
+    ) vt ON true
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount
+),
+BadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           COUNT(*) AS TotalBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopQuestions AS (
+    SELECT p.Id, p.OwnerUserId, p.Title, p.Tags,
+           p.Score, p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.Id) AS TopQ
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0
+),
+TagUsageCounts AS (
+    SELECT p.OwnerUserId, tag.TagName, COUNT(*) AS TagUsage
+    FROM Posts p
+    JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tagname ON true
+    JOIN Tags tag ON tag.TagName = tagname
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, tag.TagName
+),
+UserTagStats AS (
+    SELECT tuc.OwnerUserId, tuc.TagName,
+           tuc.TagUsage,
+           RANK() OVER (PARTITION BY tuc.OwnerUserId ORDER BY tuc.TagUsage DESC, tuc.TagName) AS TagRank
+    FROM TagUsageCounts tuc
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    COALESCE(bs.GoldBadges,0) AS GoldBadges,
+    COALESCE(bs.SilverBadges,0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(bs.TotalBadges,0) AS TotalBadges,
+    bs.LastBadgeDate,
+    tq.Title AS TopQuestionTitle,
+    tq.Score AS TopQuestionScore,
+    pq.ViewCount AS TopQuestionViews,
+    pq.NetVotes AS TopQuestionNetVotes,
+    pq.NumComments AS TopQuestionNumComments,
+    pq.TotalCommentScore AS TopQuestionCommentScore,
+    pq.LastCommentDate AS TopQuestionLastComment,
+    uts.TagName AS TopUsedTag,
+    uts.TagUsage AS TopTagUsage,
+    (CASE 
+        WHEN uts.TagUsage > 20 THEN 'PowerUser'
+        WHEN uts.TagUsage BETWEEN 10 AND 20 THEN 'FrequentUser'
+        ELSE 'CasualUser'
+     END) AS UsageCategory,
+    tt.tag_rank AS TopTagRank,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = au.UserId) AS TotalPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = au.UserId AND p.PostTypeId = 2) AS TotalAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = au.UserId AND p.PostTypeId = 1) AS TotalQuestions,
+    (CASE 
+        WHEN (COALESCE(bs.GoldBadges,0)) >= 3 AND au.Reputation > 25000 THEN 1
+        ELSE 0
+     END) AS IsEliteUser
+FROM ActiveUsers au
+LEFT JOIN BadgeStats bs ON bs.UserId = au.UserId
+LEFT JOIN TopQuestions tq 
+    ON tq.OwnerUserId = au.UserId AND tq.TopQ = 1
+LEFT JOIN PostEngagement pq ON pq.PostId = tq.Id
+LEFT JOIN LATERAL (
+    SELECT uts2.TagName, uts2.TagUsage
+    FROM UserTagStats uts2
+    WHERE uts2.OwnerUserId = au.UserId AND uts2.TagRank = 1
+    LIMIT 1
+) uts ON true
+LEFT JOIN TopTags tt ON tt.TagName = uts.TagName
+WHERE au.rn <= 1000
+ORDER BY IsEliteUser DESC, au.Reputation DESC, bs.GoldBadges DESC NULLS LAST, TopQuestionScore DESC NULLS LAST;

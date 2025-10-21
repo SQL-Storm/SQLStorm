@@ -1,0 +1,48 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        (SELECT AVG(Score) FROM Comments WHERE UserId = u.Id) AS AvgCommentScore,
+        COUNT(DISTINCT v.Id) AS TotalUpvotesReceived,
+        (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id AND Class = 1) AS GoldBadges
+    FROM 
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    WHERE 
+        u.Reputation > 1000
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY 
+        u.Id
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    us.TotalPosts,
+    us.QuestionsAsked,
+    us.AnswersProvided,
+    us.AvgPostScore,
+    us.TotalComments,
+    us.AvgCommentScore,
+    us.TotalUpvotesReceived,
+    us.GoldBadges,
+    RANK() OVER (ORDER BY us.TotalUpvotesReceived DESC) AS GlobalRank,
+    DENSE_RANK() OVER (PARTITION BY us.GoldBadges ORDER BY us.Reputation DESC) AS ReputationRankPerGoldBadge,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = us.UserId AND ph.PostHistoryTypeId = 5) AS EditsMade
+FROM 
+    UserStats us
+WHERE 
+    us.GoldBadges > 2 
+    AND us.TotalPosts > 50 
+    AND us.TotalUpvotesReceived > 100
+ORDER BY 
+    us.Reputation DESC, 
+    us.TotalUpvotesReceived DESC, 
+    us.GoldBadges DESC 
+LIMIT 100;

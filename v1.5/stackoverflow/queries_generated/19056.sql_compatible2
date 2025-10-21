@@ -1,0 +1,207 @@
+WITH UserActivitySummary AS (
+    -- Summarizes user activity metrics: posts, comments, votes, badges, and reputation rank
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId IN (2, 3)) AS TotalUpDownVotesGiven, -- UpMod/DownMod votes given by user
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AvgPostScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(B.Date) AS FirstBadgeDate,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        -- Window function: Rank users by reputation within their account creation year
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC) AS RepRankByCreationYear
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+PostEngagementMetrics AS (
+    -- Calculates detailed engagement metrics for questions, including answer statistics and link relationships
+    SELECT
+        Q.Id AS QuestionId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        COUNT(A.Id) AS ActualAnswerCount,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LastAnswerDate,
+        COALESCE(SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN 1 ELSE 0 END), 0) AS HasAcceptedAnswer,
+        -- Complex calculation: Percentage of answers that are accepted
+        (CAST(COALESCE(Q.AcceptedAnswerId IS NOT NULL, FALSE) AS INTEGER) * 100.0 / NULLIF(COUNT(A.Id), 0)) AS AcceptedAnswerRatio,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS DuplicatePostsCount,
+        -- Window function: Rank questions by score and view count within the same month of creation
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM Q.CreationDate), EXTRACT(MONTH FROM Q.CreationDate) ORDER BY Q.Score DESC, Q.ViewCount DESC) AS QuestionRankMonthly
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2 -- Answers to this question
+    LEFT JOIN PostLinks PL_Linked ON Q.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1 -- Linked posts
+    LEFT JOIN PostLinks PL_Duplicate ON Q.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3 -- Duplicate posts
+    WHERE Q.PostTypeId = 1 -- Only questions
+    GROUP BY Q.Id, Q.CreationDate, Q.ViewCount, Q.Score, Q.AnswerCount, Q.FavoriteCount, Q.ClosedDate, Q.AcceptedAnswerId
+),
+TagGlobalMetrics AS (
+    -- Calculates global popularity and yearly growth rate for each tag
+    SELECT
+        T.TagName,
+        EXTRACT(YEAR FROM P.CreationDate) AS TaggedYear,
+        COUNT(P.Id) AS YearlyTagCount,
+        SUM(P.Score) AS YearlyTagScoreSum,
+        -- Window function: Compare current year's tag count to the previous year's
+        LAG(COUNT(P.Id), 1, 0) OVER (PARTITION BY T.TagName ORDER BY EXTRACT(YEAR FROM P.CreationDate)) AS PrevYearlyTagCount,
+        (CAST(COUNT(P.Id) AS NUMERIC) - LAG(COUNT(P.Id), 1, 0) OVER (PARTITION BY T.TagName ORDER BY EXTRACT(YEAR FROM P.CreationDate))) / NULLIF(LAG(COUNT(P.Id), 1, 0) OVER (PARTITION BY T.TagName ORDER BY EXTRACT(YEAR FROM P.CreationDate)), 0) AS TagYearlyGrowthRate
+    FROM Posts P
+    -- String expression: Parse tags from the Posts table
+    JOIN LATERAL string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><') AS TagsArray(TagName) ON TRUE
+    JOIN Tags T ON TagsArray.TagName = T.TagName
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY T.TagName, EXTRACT(YEAR FROM P.CreationDate)
+),
+RecentPostHistoryEvents AS (
+    -- Aggregates counts of significant post history events for questions and fetches the latest body edit text
+    SELECT
+        PH.PostId,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS ClosedCount, -- Post Closed
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenedCount, -- Post Reopened
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 END) AS DeletedCount, -- Post Deleted
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 19 THEN 1 END) AS ProtectedCount, -- Question Protected
+        -- Correlated subquery: Fetches the text of the latest body edit/rollback for the post
+        (SELECT PH_INNER.Text
+         FROM PostHistory PH_INNER
+         WHERE PH_INNER.PostId = PH.PostId
+           AND PH_INNER.PostHistoryTypeId IN (5, 8) -- Edit Body, Rollback Body
+           AND PH_INNER.CreationDate = MAX(PH.CreationDate) -- Correlated to the outer query's max date for this PostId
+         ORDER BY PH_INNER.CreationDate DESC
+         LIMIT 1) AS LatestBodyEditText
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20, 5, 8) -- Common significant events
+    GROUP BY PH.PostId
+),
+UserBadgeTimeline AS (
+    -- Ranks user badges by date to easily find the first/last badge of each class for a user
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class AS BadgeClass,
+        -- Window function: Rank badges for a user within each class by date
+        ROW_NUMBER() OVER (PARTITION BY B.UserId, B.Class ORDER BY B.Date ASC) AS RnFirstBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId, B.Class ORDER BY B.Date DESC) AS RnLastBadgeClass
+    FROM Badges B
+)
+-- Main query: Combines data from all CTEs to analyze user engagement and question performance
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalComments,
+    UA.TotalUpDownVotesGiven,
+    UA.AvgPostScore,
+    UA.HasGoldBadge,
+    UA.RepRankByCreationYear,
+    Q.Id AS QuestionId,
+    Q.Title AS QuestionTitle,
+    Q.CreationDate AS QuestionPostDate,
+    Q.ViewCount AS QuestionViews,
+    Q.Score AS QuestionScore,
+    Q.AnswerCount AS ReportedAnswerCount, -- AnswerCount from Posts table
+    Q.FavoriteCount,
+    PE.ActualAnswerCount, -- Actual count of answers from PostEngagementMetrics CTE
+    PE.TotalAnswerScore,
+    PE.AvgAnswerScore,
+    PE.HasAcceptedAnswer,
+    PE.AcceptedAnswerRatio,
+    PE.LinkedPostsCount,
+    PE.DuplicatePostsCount,
+    PE.QuestionRankMonthly,
+    COALESCE(RPE.ClosedCount, 0) AS QuestionClosedCount, -- NULL logic
+    COALESCE(RPE.ReopenedCount, 0) AS QuestionReopenedCount, -- NULL logic
+    RPE.LatestBodyEditText,
+    -- Lateral join and string aggregation for question tags and their yearly metrics
+    STRING_AGG(TGM_QuestionTag.TagName || ':' || TGM_QuestionTag.YearlyTagCount, ', ') WITHIN GROUP (ORDER BY TGM_QuestionTag.YearlyTagCount DESC) AS QuestionTagsWithYearlyCount,
+    STRING_AGG(TGM_QuestionTag.TagName || ':' || ROUND(COALESCE(TGM_QuestionTag.TagYearlyGrowthRate, 0), 2), ', ') WITHIN GROUP (ORDER BY TGM_QuestionTag.TagYearlyGrowthRate DESC NULLS LAST) AS QuestionTagsWithGrowthRate,
+    -- Correlated subquery: Get the text of the highest-scoring comment on this specific question
+    (SELECT C.Text
+     FROM Comments C
+     WHERE C.PostId = Q.Id
+     ORDER BY C.Score DESC, C.CreationDate DESC
+     LIMIT 1) AS TopCommentTextOnQuestion,
+    -- Correlated subquery: Get the name of the user's most recent badge
+    (SELECT UBT.BadgeName
+     FROM UserBadgeTimeline UBT
+     WHERE UBT.UserId = U.Id AND UBT.RnLastBadgeClass = 1
+     ORDER BY UBT.BadgeDate DESC
+     LIMIT 1) AS LatestUserBadge,
+    -- Complicated calculation: Net upvotes per total posts
+    (CAST(U.UpVotes AS NUMERIC) - U.DownVotes) / NULLIF(UA.TotalPosts, 0) AS NetVotePerPost,
+    -- Date expression: Calculate user account age
+    AGE(TIMESTAMP '2024-10-01 12:34:56', U.CreationDate) AS UserAccountAge,
+    -- Date expression: Calculate days between question creation and last activity
+    EXTRACT(EPOCH FROM (COALESCE(Q.LastActivityDate, Q.CreationDate) - Q.CreationDate)) / (60*60*24) AS DaysUntilLastActivity,
+    -- Complex weighted score for question engagement, handling potential NULLs
+    (Q.ViewCount * Q.Score * COALESCE(PE.AvgAnswerScore, 0.5) * (1 + COALESCE(PE.AcceptedAnswerRatio, 0))) AS QuestionEngagementWeightedScore,
+    -- CASE expression with NULL logic for question status categorization
+    CASE
+        WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN Q.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        WHEN PE.HasAcceptedAnswer > 0 THEN 'AnsweredAndAccepted'
+        WHEN PE.ActualAnswerCount > 0 THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatusCategory,
+    -- String expression: Check if question body contains specific performance-related keywords (case-insensitive)
+    CASE
+        WHEN Q.Body ILIKE '%performance%' OR Q.Body ILIKE '%optimization%' OR Q.Body ILIKE '%latency%' THEN TRUE
+        ELSE FALSE
+    END AS ContainsPerformanceKeyword,
+    -- Correlated subquery: Average comment score for questions with 'performance' in title within 7 days of creation
+    (SELECT AVG(C_sub.Score)
+     FROM Comments C_sub
+     WHERE C_sub.PostId = Q.Id
+       AND C_sub.CreationDate <= Q.CreationDate + INTERVAL '7 days'
+       AND Q.Title ILIKE '%performance%'
+    ) AS AvgEarlyCommentScoreForPerformanceQuestions
+FROM Users U
+LEFT JOIN UserActivitySummary UA ON U.Id = UA.UserId
+LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1 -- Only questions owned by the user
+LEFT JOIN PostEngagementMetrics PE ON Q.Id = PE.QuestionId
+LEFT JOIN RecentPostHistoryEvents RPE ON Q.Id = RPE.PostId
+LEFT JOIN LATERAL ( -- Lateral join to process tags for each question and fetch their global metrics
+    SELECT
+        TGM.TagName,
+        TGM.YearlyTagCount,
+        TGM.TagYearlyGrowthRate
+    FROM string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><') AS QuestionTags(TagName)
+    JOIN TagGlobalMetrics TGM ON QuestionTags.TagName = TGM.TagName AND TGM.TaggedYear = EXTRACT(YEAR FROM Q.CreationDate)
+) AS TGM_QuestionTag ON TRUE
+WHERE
+    U.Reputation > 5000 -- Filter for experienced users
+    AND Q.Id IS NOT NULL -- Exclude users without questions matching other criteria
+    AND Q.CreationDate >= TIMESTAMP '2019-01-01' -- Focus on recent questions for trend analysis
+    AND (Q.ViewCount > 1000 OR Q.Score > 50 OR Q.FavoriteCount > 5) -- Filter for significant questions
+    AND Q.Body IS NOT NULL AND LENGTH(Q.Body) > 100 -- Ensure meaningful post bodies
+    AND U.LastAccessDate >= TIMESTAMP '2022-01-01' -- Filter for currently active users
+ORDER BY
+    QuestionEngagementWeightedScore DESC NULLS LAST, -- Order by composite score, handling NULLs
+    U.Reputation DESC,
+    QuestionPostDate DESC
+LIMIT 1000;

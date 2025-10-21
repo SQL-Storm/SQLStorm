@@ -1,0 +1,59 @@
+WITH UserTagInteractions AS (
+    SELECT 
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.VoteCount) AS TotalVotes,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagRank
+    FROM 
+        Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT
+            pid AS PostId,
+            TRIM(tagname) AS TagName
+        FROM (
+            SELECT
+                Id,
+                REGEXP_REPLACE(tags, '^\\[|\\]$', '', 'g') AS clean_tags
+            FROM Posts
+        ) s
+        CROSS APPLY (
+            SELECT TRIM(value) AS tagname
+            -- Replaced CROSS APPLY with a portable equivalent using a derived table
+            -- Split strings in a dialect-agnostic way
+            FROM (
+                SELECT TRIM(value) AS value
+                FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '><', ','), '[', ''), ',')
+            ) AS split_tags
+            WHERE value <> ''
+        ) t
+    ) t ON p.Id = t.PostId
+    WHERE 
+        p.PostTypeId = 1
+        AND u.Reputation > 1000
+    GROUP BY 
+        u.Id, t.TagName
+)
+SELECT 
+    UserId,
+    TagName,
+    PostCount,
+    AvgPostScore,
+    TotalVotes,
+    TagRank
+FROM 
+    UserTagInteractions
+WHERE 
+    TagRank <= 3
+    AND PostCount > 5
+ORDER BY 
+    TotalVotes DESC, 
+    AvgPostScore DESC
+LIMIT 1000;

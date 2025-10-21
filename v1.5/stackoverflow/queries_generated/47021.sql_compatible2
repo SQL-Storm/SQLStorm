@@ -1,0 +1,159 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        CAST(t.TagName AS VARCHAR(1000)) as tag_path,
+        1 as depth
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE CONCAT('%<', t.TagName, '>%' )
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th.direct_questions,
+        th.tag_path || ' -> ' || t2.TagName,
+        th.depth + 1
+    FROM tag_hierarchy th
+    CROSS JOIN Tags t2
+    INNER JOIN Posts p1 ON p1.Tags LIKE CONCAT('%<', th.TagName, '>%' )
+    INNER JOIN Posts p2 ON p2.Tags LIKE CONCAT('%<', t2.TagName, '>%' )
+        AND p1.Id = p2.Id
+    WHERE th.depth < 3
+        AND t2.Id != th.Id
+        AND th.tag_path NOT LIKE CONCAT('%', t2.TagName, '%')
+),
+expert_users AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_given,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN p.Id END) as high_score_answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_post_score,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Name) as badges_earned,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as reputation_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN p.Id END) DESC) as quality_rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class IN (1, 2)
+    WHERE u.Reputation > 10000
+        AND u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 50
+),
+post_evolution AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate as post_created,
+        COUNT(DISTINCT ph.Id) as total_edits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as content_edits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN ph.Id END) as close_reopen_cycles,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) as first_closed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) as last_reopened,
+        COUNT(DISTINCT ph.UserId) as unique_editors,
+        (EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 3600.0) as edit_timespan_hours
+    FROM Posts p
+    INNER JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score >= 5
+    GROUP BY p.Id, p.Title, p.CreationDate
+),
+comment_analysis AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) as comment_count,
+        AVG(LENGTH(c.Text)) as avg_comment_length,
+        COUNT(DISTINCT c.UserId) as unique_commenters,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) as high_score_comments,
+        MAX(c.Score) as max_comment_score,
+        STDDEV(c.Score) as comment_score_stddev
+    FROM Comments c
+    GROUP BY c.PostId
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) as bounties_started,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as total_bounty_amount,
+        COUNT(DISTINCT DATE(v.CreationDate)) as voting_days,
+        (COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) * 1.0 / NULLIF(COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 END), 0)) as upvote_ratio
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '730 days'
+    GROUP BY v.PostId
+)
+SELECT 
+    th.tag_path,
+    th.depth as tag_combination_depth,
+    th.direct_questions,
+    eu.DisplayName as expert_user,
+    eu.Reputation,
+    eu.reputation_rank,
+    eu.quality_rank,
+    eu.high_score_answers,
+    eu.accepted_answers,
+    ROUND(eu.avg_answer_score, 2) as avg_answer_score,
+    eu.median_post_score,
+    eu.badges_earned,
+    pe.PostId,
+    pe.Title as evolved_post_title,
+    pe.total_edits,
+    pe.content_edits,
+    pe.close_reopen_cycles,
+    ROUND(pe.edit_timespan_hours, 2) as edit_timespan_hours,
+    pe.unique_editors,
+    ca.comment_count,
+    ROUND(ca.avg_comment_length, 1) as avg_comment_length,
+    ca.unique_commenters,
+    ca.high_score_comments,
+    ca.max_comment_score,
+    ROUND(COALESCE(ca.comment_score_stddev, 0), 2) as comment_score_stddev,
+    vp.upvotes,
+    vp.downvotes,
+    ROUND(COALESCE(vp.upvote_ratio, 0), 3) as upvote_ratio,
+    vp.bounties_started,
+    vp.total_bounty_amount,
+    vp.voting_days,
+    p.Score as current_post_score,
+    p.ViewCount as views,
+    p.AnswerCount as answers,
+    p.FavoriteCount as favorites,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END as post_status,
+    EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate))/86400.0 as lifetime_days,
+    (CAST(p.Score AS FLOAT) / NULLIF(p.ViewCount, 0)) * 1000 as score_per_1k_views,
+    ROW_NUMBER() OVER (PARTITION BY th.tag_path ORDER BY p.Score DESC, p.ViewCount DESC) as tag_combination_rank
+FROM tag_hierarchy th
+CROSS JOIN expert_users eu
+INNER JOIN Posts p ON p.OwnerUserId = eu.UserId 
+    AND p.Tags LIKE CONCAT('%<', SPLIT_PART(th.tag_path, ' -> ', 1), '>%' )
+    AND p.PostTypeId = 1
+LEFT JOIN post_evolution pe ON pe.PostId = p.Id
+LEFT JOIN comment_analysis ca ON ca.PostId = p.Id
+LEFT JOIN vote_patterns vp ON vp.PostId = p.Id
+WHERE eu.quality_rank <= 100
+    AND p.Score >= 10
+    AND p.ViewCount >= 1000
+    AND pe.total_edits >= 3
+ORDER BY 
+    th.depth DESC,
+    th.direct_questions DESC,
+    eu.reputation_rank,
+    p.Score DESC
+LIMIT 500;

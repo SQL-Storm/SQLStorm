@@ -1,0 +1,125 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS Rank,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS DownVotes,
+        SUM(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (24, 31) THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS EditCount
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) 
+        AND P.CreationDate >= (DATE '2024-10-01') - INTERVAL '1 year'
+), 
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+), 
+PostTags AS (
+    SELECT 
+        P.Id,
+        CAST(unnest(string_to_array(P.Tags, '<')) AS TEXT) AS TagName
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1
+), 
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(PT.Id) AS QuestionCount,
+        SUM(P.Score) AS TotalScore
+    FROM 
+        Tags T
+    JOIN 
+        PostTags PT ON T.TagName = PT.TagName
+    JOIN 
+        Posts P ON PT.Id = P.Id
+    GROUP BY 
+        T.TagName
+), 
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        COUNT(C.Id) AS CommentCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    WHERE 
+        P.CreationDate >= (DATE '2024-10-01') - INTERVAL '1 year'
+    GROUP BY 
+        U.Id, U.DisplayName
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.Rank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.EditCount,
+    TU.DisplayName AS TopUser,
+    TU.Reputation,
+    TU.GoldBadges,
+    TU.SilverBadges,
+    TU.BronzeBadges,
+    TS.TagName,
+    TS.QuestionCount,
+    TS.TotalScore,
+    UA.PostCount,
+    UA.TotalScore AS UserTotalScore,
+    UA.CommentCount AS UserCommentCount
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id AND TU.UserRank <= 10
+LEFT JOIN 
+    TagStats TS ON RP.Id IN (
+        SELECT PT.Id
+        FROM PostTags PT
+        WHERE PT.TagName = TS.TagName
+    )
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+WHERE 
+    RP.Rank <= 10
+ORDER BY 
+    RP.PostTypeId, RP.Score DESC, RP.CreationDate;

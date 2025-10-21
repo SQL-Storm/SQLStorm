@@ -1,0 +1,128 @@
+-- {"query": "16014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 35025, "output_tokens": 32602} 
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedQuestions,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2020-01-01'::timestamp
+        AND (u.Location IS NULL OR UPPER(u.Location) LIKE '%US%' OR UPPER(u.Location) LIKE '%UNITED%')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) AS BadgeList,
+        MAX(b.Date) AS LatestBadgeDate,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (b.Date - u.CreationDate))) AS MedianDaysToBadge
+    FROM Badges b
+    INNER JOIN Users u ON b.UserId = u.Id
+    WHERE b.TagBased = 0
+    GROUP BY b.UserId
+),
+PostInteractionCTE AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS ActualCommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'Unanswered'
+        END AS PostStatus,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate >= '2021-01-01'::timestamp
+        AND p.Body IS NOT NULL
+        AND LENGTH(COALESCE(p.Title, '')) > 10
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.CommentCount, 
+             p.FavoriteCount, p.ClosedDate, p.AcceptedAnswerId, p.AnswerCount, p.CreationDate
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueUsers,
+        AVG(p.Score) AS AvgPostScore,
+        STDDEV_POP(p.Score) AS ScoreStdDev,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END)::FLOAT / 
+            NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS AcceptanceRate
+    FROM Tags t
+    INNER JOIN Posts p ON CONCAT('<', t.TagName, '>') = ANY(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    EXTRACT(YEAR FROM AGE(cast('2024-10-01 12:34:56' as timestamp), uem.UserCreationDate)) AS YearsActive,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(COALESCE(uem.AvgQuestionScore, 0)::NUMERIC, 2) AS AvgQuestionScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.1 AS WeightedBadgeScore,
+    SUBSTRING(COALESCE(ba.BadgeList, 'No Badges'), 1, 100) AS TopBadges,
+    uem.YearlyRepRank,
+    (SELECT COUNT(*) 
+     FROM PostInteractionCTE pic 
+     WHERE pic.OwnerUserId = uem.UserId 
+       AND pic.PostStatus = 'Answered') AS AnsweredPostCount,
+    (SELECT AVG(pic.VoteCount) 
+     FROM PostInteractionCTE pic 
+     WHERE pic.OwnerUserId = uem.UserId 
+       AND pic.PostTypeId = 1) AS AvgVotesPerQuestion,
+    (SELECT STRING_AGG(DISTINCT cta.TagName, ', ' ORDER BY cta.TagName)
+     FROM ComplexTagAnalysis cta
+     INNER JOIN Posts p ON CONCAT('<', cta.TagName, '>') = ANY(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+     WHERE p.OwnerUserId = uem.UserId 
+       AND p.PostTypeId = 1
+     LIMIT 5) AS TopTags,
+    CASE 
+        WHEN uem.Reputation > 10000 AND COALESCE(ba.GoldBadges, 0) >= 3 THEN 'Elite'
+        WHEN uem.Reputation > 5000 AND COALESCE(ba.SilverBadges, 0) >= 5 THEN 'Expert'
+        WHEN uem.Reputation > 1000 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS UserTier,
+    ROUND((uem.Reputation::FLOAT / NULLIF(EXTRACT(EPOCH FROM AGE(cast('2024-10-01 12:34:56' as timestamp), uem.UserCreationDate)) / 86400, 0))::NUMERIC, 2) AS RepPerDay,
+    EXISTS(
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = uem.UserId 
+          AND p2.Score > 50
+    ) AS HasHighScoredPost
+FROM UserEngagementMetrics uem
+LEFT OUTER JOIN BadgeAnalysis ba ON uem.UserId = ba.UserId
+WHERE uem.PostCountRank <= 500
+    AND (ba.GoldBadges > 0 OR ba.SilverBadges > 2 OR uem.Reputation > 2000)
+ORDER BY 
+    CASE WHEN ba.GoldBadges IS NULL THEN 1 ELSE 0 END,
+    WeightedBadgeScore DESC,
+    uem.Reputation DESC,
+    uem.QuestionCount DESC
+LIMIT 100;

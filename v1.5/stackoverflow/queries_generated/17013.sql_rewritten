@@ -1,0 +1,162 @@
+-- {"query": "17013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 32690, "output_tokens": 32204} 
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(cast('2024-10-01' as date), u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2), ', ') 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate < cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate,
+        STRING_AGG(Name || ' (' || 
+            CASE Class 
+                WHEN 1 THEN 'Gold' 
+                WHEN 2 THEN 'Silver' 
+                ELSE 'Bronze' 
+            END || ')', ', ' 
+            ORDER BY Class, Date DESC) 
+            FILTER (WHERE ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class, Date DESC) <= 5) AS RecentBadges
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class, Date DESC) AS rn
+        FROM Badges
+    ) b
+    GROUP BY UserId
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY c.Score) AS MedianCommentScore,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Resolved'
+            ELSE 'Active'
+        END AS PostStatus,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId
+),
+EditHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorId,
+        COUNT(*) AS EditCount,
+        MIN(ph.CreationDate) AS FirstEdit,
+        MAX(ph.CreationDate) AS LastEdit,
+        ARRAY_AGG(DISTINCT pht.Name ORDER BY pht.Name) AS EditTypes
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.UserId IS NOT NULL
+    GROUP BY ph.PostId, ph.UserId
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    REPLACE(UPPER(SUBSTRING(um.Location, 1, 3)), ' ', '') || '-' || 
+        LPAD(CAST(um.Id % 1000 AS VARCHAR), 3, '0') AS UserCode,
+    um.YearsActive,
+    um.TotalPosts,
+    um.Questions,
+    um.Answers,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.25 AS BadgeScore,
+    COALESCE(ba.RecentBadges, 'No recent badges') AS RecentBadges,
+    SUM(CASE WHEN pe.UserPostRank <= 3 THEN pe.Score ELSE 0 END) AS Top3PostsScore,
+    SUM(pe.ViewCount) FILTER (WHERE pe.PostStatus = 'Active') AS ActivePostViews,
+    AVG(pe.UpVotes - pe.DownVotes)::numeric(10,2) AS AvgVoteDiff,
+    COUNT(DISTINCT pe.PostId) FILTER (WHERE pe.PostStatus = 'Resolved') AS ResolvedPosts,
+    MAX(pe.MedianCommentScore) AS MaxMedianCommentScore,
+    COUNT(DISTINCT eh.PostId) AS EditedPosts,
+    SUM(eh.EditCount) AS TotalEdits,
+    CASE 
+        WHEN um.Reputation >= 10000 AND COALESCE(ba.GoldBadges, 0) > 0 THEN 'Expert'
+        WHEN um.Reputation >= 5000 OR COALESCE(ba.SilverBadges, 0) >= 5 THEN 'Advanced'
+        WHEN um.Reputation >= 1000 OR um.TotalPosts >= 50 THEN 'Intermediate'
+        WHEN um.YearsActive >= 1 THEN 'Regular'
+        ELSE 'Beginner'
+    END AS UserTier,
+    COALESCE(um.TopTags, 'No tags') AS PrimaryTags,
+    ROW_NUMBER() OVER (
+        ORDER BY 
+            um.Reputation * 0.4 + 
+            COALESCE(SUM(pe.Score), 0) * 0.3 + 
+            COALESCE(ba.GoldBadges, 0) * 100 + 
+            COALESCE(ba.SilverBadges, 0) * 20 + 
+            COALESCE(ba.BronzeBadges, 0) * 5 +
+            um.TotalPosts * 0.1 DESC
+    ) AS OverallRank
+FROM UserMetrics um
+LEFT JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT JOIN PostEngagement pe ON um.Id = pe.OwnerUserId
+LEFT JOIN EditHistory eh ON um.Id = eh.EditorId
+WHERE um.TotalPosts > 0
+    OR ba.UserId IS NOT NULL
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.Location,
+    um.YearsActive, um.TotalPosts, um.Questions, um.Answers,
+    um.AvgPostScore, um.TopTags, ba.GoldBadges, ba.SilverBadges,
+    ba.BronzeBadges, ba.RecentBadges
+HAVING 
+    (um.Reputation > 100 OR COUNT(DISTINCT pe.PostId) > 5)
+    AND (SUM(pe.ViewCount) > 0 OR ba.UserId IS NOT NULL)
+
+UNION ALL
+
+SELECT 
+    'SYSTEM AVERAGE' AS DisplayName,
+    AVG(u.Reputation)::int AS Reputation,
+    'SYS-AVG' AS UserCode,
+    AVG(DATE_PART('year', AGE(cast('2024-10-01' as date), u.CreationDate)))::int AS YearsActive,
+    COUNT(DISTINCT p.Id) / NULLIF(COUNT(DISTINCT u.Id), 0) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) / NULLIF(COUNT(DISTINCT u.Id), 0) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) / NULLIF(COUNT(DISTINCT u.Id), 0) AS Answers,
+    AVG(p.Score)::numeric(10,2) AS AvgPostScore,
+    AVG(b.Class)::numeric(10,2) AS BadgeScore,
+    'N/A' AS RecentBadges,
+    AVG(p.Score) FILTER (WHERE p.Score > 10)::int AS Top3PostsScore,
+    AVG(p.ViewCount)::int AS ActivePostViews,
+    AVG(v.VoteTypeId)::numeric(10,2) AS AvgVoteDiff,
+    0 AS ResolvedPosts,
+    NULL AS MaxMedianCommentScore,
+    0 AS EditedPosts,
+    0 AS TotalEdits,
+    'AVERAGE' AS UserTier,
+    'Various' AS PrimaryTags,
+    0 AS OverallRank
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE u.Id > 0
+
+ORDER BY OverallRank
+LIMIT 100;

@@ -1,0 +1,184 @@
+-- {"query": "9026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 6006} 
+
+WITH
+RecentQuestions AS (
+  SELECT p.Id,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.Tags,
+         u.DisplayName AS Author
+  FROM Posts p
+  JOIN Users u
+    ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+ExplodedTags AS (
+  SELECT
+    rq.Id     AS QuestionId,
+    trim(tag) AS Tag
+  FROM RecentQuestions rq
+  CROSS JOIN unnest(
+    string_to_array(
+      substring(rq.Tags, 2, length(rq.Tags) - 2),
+      '><'
+    )
+  ) AS tag
+),
+TagStats AS (
+  SELECT
+    et.Tag              AS TagName,
+    COUNT(*)            AS QuestionCount,
+    AVG(rq.Score) FILTER (WHERE rq.Score > 0) AS AvgPositiveScore,
+    MAX(rq.Score)       AS MaxScore,
+    MIN(rq.Score)       AS MinScore
+  FROM ExplodedTags et
+  JOIN RecentQuestions rq
+    ON rq.Id = et.QuestionId
+  GROUP BY et.Tag
+),
+UserActivity AS (
+  SELECT
+    u.Id             AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCnt,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCnt,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS UserRank
+  FROM Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopTagUsers AS (
+  SELECT
+    ts.TagName,
+    ua.DisplayName AS TopUser,
+    ua.Reputation,
+    ROW_NUMBER() OVER (PARTITION BY ts.TagName ORDER BY ua.Reputation DESC) AS RankInTag
+  FROM TagStats ts
+  JOIN Posts p
+    ON p.Tags LIKE '%<'||ts.TagName||'>%'
+  JOIN Users u
+    ON u.Id = p.OwnerUserId
+  JOIN UserActivity ua
+    ON ua.UserId = u.Id
+),
+Summary AS (
+  SELECT
+    'Overall'      AS Category,
+    SUM(QuestionCnt) AS TotalQuestions,
+    SUM(AnswerCnt)   AS TotalAnswers
+  FROM UserActivity
+)
+SELECT
+  ts.TagName,
+  ts.QuestionCount,
+  ts.AvgPositiveScore,
+  ts.MaxScore,
+  ts.MinScore,
+  ttu.TopUser,
+  ttu.Reputation    AS TopUserRep,
+  ttu.RankInTag,
+  (
+    SELECT COUNT(*)
+    FROM Posts p2
+    WHERE p2.Tags LIKE '%<'||ts.TagName||'>%'
+      AND p2.PostTypeId IN (1,2)
+  ) AS RelatedPostCount,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.PostId IN (
+      SELECT p3.Id
+      FROM Posts p3
+      WHERE p3.Tags LIKE '%<'||ts.TagName||'>%'
+    )
+  ) AS CommentCount,
+  (
+    SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+    FROM Votes v
+    JOIN Posts p4
+      ON v.PostId = p4.Id
+    WHERE p4.Tags LIKE '%<'||ts.TagName||'>%'
+      AND v.CreationDate BETWEEN p4.CreationDate
+                             AND p4.CreationDate + INTERVAL '7 days'
+  ) AS UpVotes7D,
+  (
+    SELECT SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)
+    FROM Votes v
+    JOIN Posts p4
+      ON v.PostId = p4.Id
+    WHERE p4.Tags LIKE '%<'||ts.TagName||'>%'
+      AND v.CreationDate BETWEEN p4.CreationDate
+                             AND p4.CreationDate + INTERVAL '7 days'
+  ) AS DownVotes7D,
+  COALESCE(
+    (
+      SELECT COUNT(*)
+      FROM Badges b
+      WHERE b.UserId = ua.UserId
+        AND b.Class  = 1
+    ), 0
+  ) AS GoldBadges,
+  CASE
+    WHEN ts.QuestionCount > 100 THEN 'HighActivity'
+    ELSE 'Normal'
+  END AS ActivityLevel,
+  replace(lower(ts.TagName), 'sql', '') AS CleanTag,
+  (
+    SELECT COUNT(*)
+    FROM Posts p5
+    WHERE p5.ParentId IN (
+      SELECT Id
+      FROM Posts
+      WHERE Tags LIKE '%<'||ts.TagName||'>%'
+    )
+      AND p5.Score > ua.Reputation % 5
+  ) AS HighScoreAnswers
+FROM TagStats ts
+LEFT JOIN TopTagUsers ttu
+  ON ttu.TagName = ts.TagName
+ AND ttu.RankInTag = 1
+LEFT JOIN UserActivity ua
+  ON ua.UserId = (
+    SELECT u2.Id
+    FROM Users u2
+    WHERE u2.DisplayName = ttu.TopUser
+    LIMIT 1
+  )
+WHERE EXISTS (
+    SELECT 1
+    FROM Posts p6
+    WHERE p6.Tags LIKE '%<'||ts.TagName||'>%'
+  )
+  AND (
+    ts.QuestionCount < 10
+    OR (
+      SELECT COUNT(*) 
+      FROM Comments c2
+      WHERE c2.PostId IN (
+        SELECT Id
+        FROM Posts
+        WHERE Tags LIKE '%<'||ts.TagName||'>%'
+      )
+    ) > ts.QuestionCount / 2
+  )
+UNION ALL
+SELECT
+  Category,
+  TotalQuestions,
+  TotalAnswers,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Summary;

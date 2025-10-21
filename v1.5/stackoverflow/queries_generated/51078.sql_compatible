@@ -1,0 +1,90 @@
+WITH active_users AS (
+  SELECT u.Id, u.Reputation, u.UpVotes, u.DownVotes, COUNT(DISTINCT p.Id) as post_count,
+         AVG(p.Score) as avg_post_score, SUM(b.Count) as total_badges
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId 
+                AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years')
+                AND p.PostTypeId IN (1, 2)
+                AND p.Score >= 0
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Reputation >= 1000 
+    AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+  GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+  HAVING COUNT(DISTINCT p.Id) >= 5
+),
+top_tags AS (
+  SELECT t.TagName, COUNT(*) as usage_count,
+         AVG(p.Score) as avg_question_score,
+         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.ViewCount) as p90_views
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1 
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+    AND p.DeletedDate IS NULL
+  GROUP BY t.TagName
+  HAVING COUNT(*) >= 50
+),
+user_engagement AS (
+  SELECT au.Id as user_id,
+         COUNT(DISTINCT v.PostId) as voted_posts,
+         COUNT(DISTINCT c.PostId) as commented_posts,
+         AVG(EXTRACT(DAY FROM (c.CreationDate - p.CreationDate))) as avg_comment_delay,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvote_count
+  FROM active_users au
+  LEFT JOIN Votes v ON au.Id = v.UserId 
+                     AND v.VoteTypeId IN (2, 3)
+                     AND v.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+  LEFT JOIN Comments c ON au.Id = c.UserId
+  LEFT JOIN Posts p ON c.PostId = p.Id
+  WHERE c.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+  GROUP BY au.Id
+),
+question_performance AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount,
+         p.FavoriteCount, p.CreationDate, p.Tags,
+         ROW_NUMBER() OVER (PARTITION BY tt.TagName ORDER BY p.ViewCount DESC) as tag_rank,
+         p.OwnerUserId
+  FROM Posts p
+  JOIN top_tags tt ON p.Tags LIKE '%' || tt.TagName || '%'
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+    AND p.ClosedDate IS NULL
+    AND p.AnswerCount > 0
+),
+engagement_metrics AS (
+  SELECT qp.Id,
+         au.post_count,
+         au.avg_post_score,
+         ue.upvote_count,
+         ue.commented_posts,
+         qp.ViewCount * 1.0 / GREATEST(qp.AnswerCount, 1) as views_per_answer,
+         CASE 
+           WHEN qp.Score >= 10 THEN 'High'
+           WHEN qp.Score >= 1 THEN 'Medium'
+           ELSE 'Low'
+         END as score_category,
+         tt.usage_count as tag_popularity,
+         qp.OwnerUserId,
+         qp.ViewCount,
+         qp.AnswerCount
+  FROM question_performance qp
+  JOIN active_users au ON qp.OwnerUserId = au.Id
+  JOIN user_engagement ue ON au.Id = ue.user_id
+  JOIN top_tags tt ON qp.Tags LIKE '%' || tt.TagName || '%'
+  WHERE qp.tag_rank <= 10
+)
+SELECT 
+  em.score_category,
+  em.tag_popularity,
+  COUNT(*) as question_count,
+  AVG(em.views_per_answer) as avg_views_per_answer,
+  AVG(em.post_count) as avg_user_posts,
+  AVG(em.upvote_count) as avg_user_upvotes,
+  PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY em.ViewCount) as p75_views,
+  SUM(em.ViewCount) as total_views,
+  CORR(em.upvote_count, em.views_per_answer) as upvote_view_correlation,
+  COUNT(CASE WHEN em.commented_posts > 10 THEN 1 END) as active_commenters
+FROM engagement_metrics em
+GROUP BY em.score_category, em.tag_popularity
+HAVING COUNT(*) >= 3
+ORDER BY total_views DESC, score_category;

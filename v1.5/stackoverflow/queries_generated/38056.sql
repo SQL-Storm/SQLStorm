@@ -1,0 +1,211 @@
+-- {"query": "38056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1898} 
+WITH recent_users AS (
+  SELECT u.Id, u.Reputation, u.CreationDate
+  FROM Users u
+  WHERE u.CreationDate >= (SELECT date_trunc('month', max(CreationDate)) - interval '12 months' FROM Users)
+),
+tag_exploded AS (
+  SELECT
+    p.Id AS PostId,
+    lower(unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS tagname
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+),
+top_tags AS (
+  SELECT te.tagname, COUNT(*) AS q_count
+  FROM tag_exploded te
+  GROUP BY te.tagname
+  HAVING COUNT(*) > 50
+),
+answers AS (
+  SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.CreationDate, a.Score
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+question_core AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.OwnerUserId AS AskerId,
+    q.CreationDate AS QCreationDate,
+    q.Score AS QScore,
+    q.ViewCount AS QViews,
+    q.AnswerCount,
+    q.AcceptedAnswerId
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+first_answer AS (
+  SELECT
+    a.QuestionId,
+    MIN(a.CreationDate) AS FirstAnswerDate
+  FROM answers a
+  GROUP BY a.QuestionId
+),
+accepted_latency AS (
+  SELECT
+    qc.QuestionId,
+    qc.QCreationDate,
+    fa.FirstAnswerDate,
+    pa.CreationDate AS AcceptedDate,
+    EXTRACT(EPOCH FROM (fa.FirstAnswerDate - qc.QCreationDate)) AS secs_to_first_answer,
+    EXTRACT(EPOCH FROM (pa.CreationDate - qc.QCreationDate)) AS secs_to_accept
+  FROM question_core qc
+  LEFT JOIN first_answer fa ON fa.QuestionId = qc.QuestionId
+  LEFT JOIN Posts pa ON pa.Id = qc.AcceptedAnswerId
+),
+vote_agg AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comment_agg AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS comment_count,
+    max(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  GROUP BY c.PostId
+),
+link_dupes AS (
+  SELECT
+    pl.PostId AS dup_post_id,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS dup_links,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS linked_links
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+edit_events AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edits,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_votes_logged,
+    MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS first_edit_at,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS last_edit_at
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+question_tagged AS (
+  SELECT
+    qc.*,
+    te.tagname
+  FROM question_core qc
+  JOIN tag_exploded te ON te.PostId = qc.QuestionId
+  JOIN top_tags tt ON tt.tagname = te.tagname
+),
+question_metrics AS (
+  SELECT
+    qt.QuestionId,
+    qt.AskerId,
+    qt.QCreationDate,
+    qt.QScore,
+    qt.QViews,
+    qt.AnswerCount,
+    qt.AcceptedAnswerId,
+    qt.tagname,
+    COALESCE(va.upvotes,0) AS upvotes,
+    COALESCE(va.downvotes,0) AS downvotes,
+    COALESCE(va.favorites,0) AS favorites,
+    COALESCE(ca.comment_count,0) AS comment_count,
+    ca.last_comment_date,
+    COALESCE(ld.dup_links,0) AS dup_links,
+    COALESCE(ld.linked_links,0) AS linked_links,
+    COALESCE(ee.edits,0) AS edits,
+    COALESCE(ee.close_votes_logged,0) AS close_votes_logged,
+    ee.first_edit_at,
+    ee.last_edit_at,
+    al.secs_to_first_answer,
+    al.secs_to_accept
+  FROM question_tagged qt
+  LEFT JOIN vote_agg va ON va.PostId = qt.QuestionId
+  LEFT JOIN comment_agg ca ON ca.PostId = qt.QuestionId
+  LEFT JOIN link_dupes ld ON ld.dup_post_id = qt.QuestionId
+  LEFT JOIN edit_events ee ON ee.PostId = qt.QuestionId
+  LEFT JOIN accepted_latency al ON al.QuestionId = qt.QuestionId
+),
+user_dims AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    date_trunc('month', u.CreationDate) AS user_cohort_month
+  FROM Users u
+),
+score_buckets AS (
+  SELECT
+    qm.*,
+    CASE
+      WHEN qm.QScore <= -5 THEN 'very low'
+      WHEN qm.QScore BETWEEN -4 AND -1 THEN 'low'
+      WHEN qm.QScore BETWEEN 0 AND 4 THEN 'neutral'
+      WHEN qm.QScore BETWEEN 5 AND 14 THEN 'good'
+      ELSE 'great'
+    END AS score_bucket,
+    CASE
+      WHEN qm.QViews < 100 THEN 'cold'
+      WHEN qm.QViews < 1000 THEN 'warm'
+      WHEN qm.QViews < 10000 THEN 'hot'
+      ELSE 'viral'
+    END AS view_bucket
+  FROM question_metrics qm
+),
+rolled AS (
+  SELECT
+    sb.tagname,
+    sb.score_bucket,
+    sb.view_bucket,
+    date_trunc('month', sb.QCreationDate) AS question_month,
+    COALESCE(ud.user_cohort_month, date_trunc('month', sb.QCreationDate)) AS asker_cohort_month,
+    COUNT(*) AS q_cnt,
+    AVG(sb.QScore) AS avg_qscore,
+    AVG(sb.QViews) AS avg_qviews,
+    AVG(sb.AnswerCount) AS avg_answers,
+    AVG(sb.upvotes - sb.downvotes) AS avg_net_votes,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sb.secs_to_first_answer) AS p50_first_answer_secs,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY sb.secs_to_first_answer) AS p90_first_answer_secs,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sb.secs_to_accept) AS p50_accept_secs,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY sb.secs_to_accept) AS p90_accept_secs,
+    AVG(sb.edits) AS avg_edits,
+    AVG(sb.comment_count) AS avg_comments,
+    AVG(sb.dup_links) AS avg_dupe_links,
+    SUM(CASE WHEN sb.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::float / COUNT(*) AS accept_rate,
+    SUM(CASE WHEN sb.close_votes_logged > 0 THEN 1 ELSE 0 END)::float / COUNT(*) AS close_touched_rate
+  FROM score_buckets sb
+  LEFT JOIN user_dims ud ON ud.UserId = sb.AskerId
+  GROUP BY 1,2,3,4,5
+),
+topk AS (
+  SELECT
+    r.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.tagname, r.question_month
+      ORDER BY r.q_cnt DESC, r.avg_qscore DESC
+    ) AS rn
+  FROM rolled r
+)
+SELECT
+  t.tagname,
+  t.question_month,
+  t.asker_cohort_month,
+  t.score_bucket,
+  t.view_bucket,
+  t.q_cnt,
+  t.avg_qscore,
+  t.avg_qviews,
+  t.avg_answers,
+  t.avg_net_votes,
+  t.p50_first_answer_secs,
+  t.p90_first_answer_secs,
+  t.p50_accept_secs,
+  t.p90_accept_secs,
+  t.avg_edits,
+  t.avg_comments,
+  t.avg_dupe_links,
+  t.accept_rate,
+  t.close_touched_rate
+FROM topk t
+WHERE t.rn <= 10
+ORDER BY t.tagname, t.question_month, t.rn;

@@ -1,0 +1,68 @@
+-- {"query": "258.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 12145} 
+WITH Part1 AS (
+  SELECT
+     u.Id AS UserId,
+     u.DisplayName,
+     COUNT(p.Id) AS PostCount,
+     COALESCE(SUM(p.Score), 0) AS ScoreSum,
+     MAX(p.LastActivityDate) AS LastActivityDate,
+     (
+        SELECT tagName
+        FROM (
+           SELECT tagName, COUNT(*) AS cnt
+           FROM (
+              SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tagName
+              FROM Posts p
+              WHERE p.OwnerUserId = u.Id
+                AND p.Tags IS NOT NULL
+                AND length(p.Tags) > 2
+           ) a
+           GROUP BY tagName
+           ORDER BY cnt DESC
+           LIMIT 1
+        ) b
+     ) AS TopTagName,
+     (
+        SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+                       - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0)
+        FROM Votes v
+        JOIN Posts pv ON pv.Id = v.PostId
+        WHERE pv.OwnerUserId = u.Id
+     ) AS NetVotes
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+Part2 AS (
+  SELECT
+     u.Id AS UserId,
+     u.DisplayName,
+     0 AS PostCount,
+     0 AS ScoreSum,
+     NULL AS LastActivityDate,
+     NULL AS TopTagName,
+     (
+       SELECT COALESCE(COUNT(b.Id), 0)
+       FROM Badges b
+       WHERE b.UserId = u.Id
+     ) AS NetVotes
+  FROM Users u
+  WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+),
+AllUsers AS (
+  SELECT * FROM Part1
+  UNION ALL
+  SELECT * FROM Part2
+)
+SELECT
+   UserId,
+   DisplayName,
+   PostCount,
+   ScoreSum,
+   LastActivityDate,
+   TopTagName,
+   NetVotes,
+   ROW_NUMBER() OVER (ORDER BY NetVotes DESC, ScoreSum DESC NULLS LAST, PostCount DESC) AS Rank
+FROM AllUsers
+ORDER BY Rank
+LIMIT 200;

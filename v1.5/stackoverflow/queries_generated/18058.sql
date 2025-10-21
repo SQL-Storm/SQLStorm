@@ -1,0 +1,122 @@
+-- {"query": "18058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1412} 
+
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0 AND u.DisplayName IS NOT NULL AND u.EmailHash IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount AS PostAnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        COALESCE(c.CommentCount, 0) AS ActualCommentCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+    WHERE p.CreationDate >= '2023-01-01'
+),
+UserPostMetrics AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.UserCreationDate,
+        rua.PostCount,
+        rua.QuestionCount,
+        rua.AnswerCount,
+        rua.AveragePostScore,
+        pe.PostId,
+        pe.Title,
+        pe.PostTypeName,
+        pe.PostCreationDate,
+        pe.PostScore,
+        pe.PostViewCount,
+        pe.PostAnswerCount,
+        pe.PostCommentCount,
+        pe.PostFavoriteCount,
+        pe.ActualCommentCount,
+        pe.IsClosed,
+        pe.IsCommunityOwned,
+        pe.UpVoteCount,
+        pe.DownVoteCount,
+        pe.ScoreRank,
+        pe.PreviousPostScore,
+        ROW_NUMBER() OVER (PARTITION BY rua.UserId ORDER BY pe.PostCreationDate DESC) AS UserPostSequence
+    FROM RankedUserActivity rua
+    LEFT JOIN PostEngagement pe ON rua.UserId = pe.OwnerUserId
+    WHERE rua.ActivityRank <= 1000
+)
+SELECT
+    upm.UserId,
+    upm.DisplayName,
+    upm.Reputation,
+    upm.UserCreationDate,
+    upm.PostCount,
+    upm.QuestionCount,
+    upm.AnswerCount,
+    upm.AveragePostScore,
+    upm.PostId,
+    upm.Title,
+    upm.PostTypeName,
+    upm.PostCreationDate,
+    upm.PostScore,
+    upm.PostViewCount,
+    upm.PostAnswerCount,
+    upm.PostCommentCount,
+    upm.PostFavoriteCount,
+    upm.ActualCommentCount,
+    upm.IsClosed,
+    upm.IsCommunityOwned,
+    upm.UpVoteCount,
+    upm.DownVoteCount,
+    upm.ScoreRank,
+    upm.PreviousPostScore,
+    CASE
+        WHEN upm.PostScore > 500 AND upm.PostAnswerCount > 20 THEN 'High Engagement Question'
+        WHEN upm.PostScore < -5 AND upm.PostTypeName = 'Question' THEN 'Potentially Unpopular Question'
+        WHEN upm.PostTypeName = 'Answer' AND upm.PostScore > 0 AND upm.PostCreationDate > upm.UserCreationDate + INTERVAL '1 day' THEN 'Timely Answer'
+        ELSE 'Standard Post'
+    END AS PostCategorization,
+    LENGTH(upm.Title) AS TitleLength,
+    UPPER(SUBSTRING(upm.DisplayName FROM 1 FOR 3)) AS DisplayNamePrefix,
+    CASE
+        WHEN upm.PostTypeName = 'Question' AND upm.PostScore BETWEEN 10 AND 50 AND upm.PostFavoriteCount > 0 THEN 'Moderately Popular Question with Favorites'
+        WHEN upm.PostTypeName = 'Answer' AND upm.PostScore < 0 THEN 'Downvoted Answer'
+        ELSE 'Other'
+    END AS SpecificMetric,
+    COALESCE(LAG(upm.PostScore) OVER (PARTITION BY upm.UserId ORDER BY upm.PostCreationDate), 0) AS PreviousUserPostScore
+FROM UserPostMetrics upm
+WHERE upm.UserPostSequence <= 5
+ORDER BY upm.Reputation DESC, upm.UserId, upm.UserPostSequence;

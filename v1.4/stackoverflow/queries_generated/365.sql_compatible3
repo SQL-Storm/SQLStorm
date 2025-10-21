@@ -1,0 +1,112 @@
+WITH
+  UserPostStats AS (
+    SELECT p.OwnerUserId AS UserId,
+           COUNT(*) AS TotalPosts,
+           SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+           SUM(COALESCE(p.Score, 0)) AS TotalScore,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+  ),
+  UserVoteStats AS (
+    SELECT p.OwnerUserId AS UserId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesLastYear,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesLastYear
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+      AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+  ),
+  UserBadgeStats AS (
+    SELECT UserId,
+           COUNT(*) AS GoldBadges
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+  ),
+  UserTagDiversity AS (
+    SELECT p.OwnerUserId AS UserId,
+           COUNT(DISTINCT t.TagName) AS DistinctTagCount
+    FROM Posts p
+    JOIN LATERAL (VALUES (regexp_split_to_table(substr(p.Tags, 2, char_length(p.Tags) - 2), '><'))) AS t(TagName)
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+  ),
+  UserLastActivity AS (
+    SELECT OwnerUserId AS UserId,
+           MAX(LastActivityDate) AS LastActivity
+    FROM Posts
+    WHERE OwnerUserId > 0
+    GROUP BY OwnerUserId
+  ),
+  UserSummary AS (
+    SELECT u.Id AS UserId,
+           COALESCE(u.Reputation, 0) AS Reputation,
+           COALESCE(ps.TotalPosts, 0) AS TotalPosts,
+           COALESCE(ps.TotalViews, 0) AS TotalViews,
+           COALESCE(ps.TotalScore, 0) AS TotalScore,
+           COALESCE(ps.QuestionCount, 0) AS QuestionCount,
+           COALESCE(ps.AnswerCount, 0) AS AnswerCount,
+           COALESCE(vs.UpVotesLastYear, 0) AS UpVotesLastYear,
+           COALESCE(vs.DownVotesLastYear, 0) AS DownVotesLastYear,
+           COALESCE(bg.GoldBadges, 0) AS GoldBadges,
+           COALESCE(td.DistinctTagCount, 0) AS DistinctTagCount,
+           COALESCE(la.LastActivity, u.CreationDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN UserPostStats ps ON ps.UserId = u.Id
+    LEFT JOIN UserVoteStats vs ON vs.UserId = u.Id
+    LEFT JOIN UserBadgeStats bg ON bg.UserId = u.Id
+    LEFT JOIN UserTagDiversity td ON td.UserId = u.Id
+    LEFT JOIN UserLastActivity la ON la.UserId = u.Id
+  ),
+  CompositeRanking AS (
+    SELECT UserId,
+           (Reputation * 1.75
+            + TotalScore * 2.25
+            + TotalPosts * 0.75
+            + TotalViews / 1000.0
+            + (UpVotesLastYear - DownVotesLastYear) * 1.2
+            + DistinctTagCount * 2.0
+            + GoldBadges * 3.0) AS Score
+    FROM UserSummary
+  ),
+  RankedComposite AS (
+    SELECT UserId, Score, ROW_NUMBER() OVER (ORDER BY Score DESC) AS rn
+    FROM CompositeRanking
+  ),
+  TagDiversityRanking AS (
+    SELECT u.Id AS UserId,
+           COALESCE(td.DistinctTagCount, 0) AS Score,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(td.DistinctTagCount, 0) DESC) AS rn
+    FROM Users u
+    LEFT JOIN UserTagDiversity td ON td.UserId = u.Id
+  ),
+  RankedTag AS (
+    SELECT UserId, Score, rn
+    FROM TagDiversityRanking
+  ),
+  AllScores AS (
+    SELECT r.UserId,
+           (SELECT DisplayName FROM Users u2 WHERE u2.Id = r.UserId) AS DisplayName,
+           r.Score,
+           'Composite' AS ScoreType
+    FROM RankedComposite r
+    UNION ALL
+    SELECT t.UserId,
+           (SELECT DisplayName FROM Users u2 WHERE u2.Id = t.UserId) AS DisplayName,
+           t.Score,
+           'TagDiversity' AS ScoreType
+    FROM RankedTag t
+  ),
+  FinalRank AS (
+    SELECT UserId, DisplayName, Score, ScoreType,
+           ROW_NUMBER() OVER (ORDER BY Score DESC) AS GlobalRank
+    FROM AllScores
+  )
+SELECT UserId, DisplayName, Score, ScoreType
+FROM FinalRank
+WHERE GlobalRank <= 100
+ORDER BY GlobalRank;

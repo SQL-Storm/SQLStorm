@@ -1,0 +1,130 @@
+WITH AnswerStats AS (
+    SELECT
+        p1.Id AS QuestionId,
+        COUNT(p2.Id) AS AnswerCount,
+        AVG(COALESCE(p2.Score, 0)) AS AvgAnswerScore,
+        MAX(p2.Score) AS MaxAnswerScore
+    FROM
+        Posts p1
+        LEFT JOIN Posts p2 ON p2.ParentId = p1.Id AND p2.PostTypeId = 2
+    WHERE
+        p1.PostTypeId = 1
+    GROUP BY
+        p1.Id
+),
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) OVER (PARTITION BY v.PostId) AS TotalVotes,
+        COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS VoteTypeCount
+    FROM
+        Votes v
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE
+        v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+PostsWithTags AS (
+    SELECT
+        p.Id,
+        p.Title,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY t.TagName) AS TagRank
+    FROM
+        Posts p
+        LEFT JOIN UNNEST(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS t(TagName) ON TRUE
+),
+TopTags AS (
+    SELECT
+        TagName,
+        COUNT(*) AS TagUsageCount
+    FROM
+        PostsWithTags
+    GROUP BY
+        TagName
+    ORDER BY
+        TagUsageCount DESC
+    LIMIT 10
+),
+AnswerScoreRank AS (
+    SELECT
+        p.Id AS AnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 2
+),
+ActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        badge_counts.BadgeSum,
+        badge_counts.GoldCount,
+        badge_counts.SilverCount,
+        badge_counts.BronzeCount
+    FROM
+        Users u
+        LEFT JOIN (
+            SELECT
+                UserId,
+                COUNT(*) AS BadgeSum,
+                SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+                SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+                SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+            FROM
+                Badges
+            GROUP BY
+                UserId
+        ) badge_counts ON u.Id = badge_counts.UserId
+),
+NullHandling AS (
+    SELECT
+        p.Id AS PostId,
+        COALESCE(p.ViewCount, 0) AS ViewCountSafe,
+        COALESCE(p.Score, 0) AS ScoreSafe,
+        CASE WHEN p.Title IS NULL THEN 'Untitled' ELSE p.Title END AS SafeTitle
+    FROM
+        Posts p
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT q.Id) AS TotalQuestions,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+    SUM(CASE WHEN a.Score >= 10 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+    ARRAY_AGG(DISTINCT t.TagName ORDER BY t.TagName) AS TopTagsUsed,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS ClosedQuestionsCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 2 AND v.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)) AS UpvotesOnQuestions,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT p3.Id) FILTER (WHERE p3.PostTypeId = 2 AND p3.Score >= 20) AS VeryHighScoreAnswers,
+    MAX(COALESCE(v2.CreationDate, TIMESTAMP '1970-01-01')) AS MostRecentVoteDate
+FROM
+    ActiveUsers u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Posts p3 ON p3.OwnerUserId = u.Id AND p3.PostTypeId = 2
+    LEFT JOIN Posts p4 ON p4.OwnerUserId = u.Id AND p4.PostTypeId = 1
+    LEFT JOIN Posts p5 ON p5.Id = p4.ParentId
+    LEFT JOIN PostsWithTags t ON t.Id = q.Id
+    LEFT JOIN RecentVotes v2 ON v2.PostId = q.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            COUNT(*) AS TotalQuestions
+        FROM
+            Posts
+        WHERE
+            PostTypeId = 1
+        GROUP BY
+            OwnerUserId
+    ) qcount ON u.Id = qcount.OwnerUserId
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation
+HAVING
+    COUNT(DISTINCT q.Id) > 5
+ORDER BY
+    u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,94 @@
+-- {"query": "11043.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 893} 
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        AVG(v.BountyAmount) AS AvgBountyAmount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(c.Id) AS CommentCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        t.TagName, 
+        COUNT(DISTINCT pt.Id) AS TagUsageCount
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.Id
+    JOIN 
+        PostTags pt ON p.Id = pt.PostId
+    GROUP BY 
+        p.Id, t.TagName
+),
+UserActivity AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(p.Id) AS PostCount, 
+        COUNT(DISTINCT c.Id) AS CommentCount, 
+        SUM(v.Score) AS TotalScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    rp.VoteCount, 
+    rp.UniqueVoters, 
+    rp.AvgBountyAmount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount, 
+    rp.LastCommentDate, 
+    rp.CommentCount, 
+    STRING_AGG(pt.TagName, ', ') AS Tags, 
+    pt.TagUsageCount, 
+    ua.PostCount, 
+    ua.CommentCount, 
+    ua.TotalScore, 
+    COALESCE(ua.TotalScore, 0) / NULLIF(ua.PostCount, 0) AS AvgScorePerPost
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    PostTags pt ON rp.Id = pt.Id
+LEFT JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.Id
+GROUP BY 
+    rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.OwnerReputation, rp.VoteCount, rp.UniqueVoters, rp.AvgBountyAmount, rp.UpVoteCount, rp.DownVoteCount, rp.LastCommentDate, rp.CommentCount, pt.TagUsageCount, ua.PostCount, ua.CommentCount, ua.TotalScore
+ORDER BY 
+    rp.Score DESC, rp.ViewCount DESC, rp.CreationDate DESC
+LIMIT 100;

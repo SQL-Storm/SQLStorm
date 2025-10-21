@@ -1,0 +1,89 @@
+-- {"query": "27093.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 872} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(v.VoteTypeId = 2) AS TotalUpVotesReceived,
+        SUM(v.VoteTypeId = 3) AS TotalDownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON p.Id = a.ParentId AND p.AcceptedAnswerId IS NOT NULL
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        u.CreationDate >= DATE_TRUNC('year', cast('2024-10-01' as date)) - INTERVAL '1 year'
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+), TagActivity AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COUNT(p.Id) AS TaggedPosts,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.VoteTypeId = 2) AS TotalUpVotes,
+        SUM(v.VoteTypeId = 3) AS TotalDownVotes,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, LENGTH(p.Tags)-2), ''><''))
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        t.Id, t.TagName
+), TopUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalAnswers,
+        TotalComments,
+        TotalUpVotesReceived,
+        TotalDownVotesReceived,
+        LastPostDate,
+        LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalUpVotesReceived DESC) AS Rank
+    FROM
+        UserActivity
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.TotalAnswers,
+    tu.TotalComments,
+    tu.TotalUpVotesReceived,
+    tu.TotalDownVotesReceived,
+    tu.LastPostDate,
+    tu.LastCommentDate,
+    ta.TagId,
+    ta.TagName,
+    ta.TaggedPosts,
+    ta.AvgPostScore,
+    ta.TotalUpVotes,
+    ta.TotalDownVotes,
+    ta.TotalViews,
+    ta.LastPostDate AS TagLastPostDate,
+    tu.Rank
+FROM
+    TopUsers tu
+JOIN
+    TagActivity ta ON ta.TagName = ANY(string_to_array(COALESCE(tu.DisplayName, ''), ' '))
+WHERE
+    tu.Rank <= 100
+ORDER BY
+    tu.Rank, ta.TaggedPosts DESC;

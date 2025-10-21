@@ -1,0 +1,132 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS direct_questions,
+        1 AS level
+    FROM Tags t
+    JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+      AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        SUM(p.Score) AS tag_score,
+        COUNT(DISTINCT p.Id) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) OVER (PARTITION BY t.TagName) AS p95_score
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON q.Id = p.ParentId
+    JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+      AND p.Score > 0
+      AND u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        pt.Name AS post_type,
+        COUNT(*) AS post_count,
+        AVG(p.Score) AS avg_score,
+        STDDEV(p.Score) AS score_stddev,
+        SUM(p.ViewCount) AS total_views,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_authors,
+        LAG(COUNT(*), 1) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_count,
+        LAG(COUNT(*), 12) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS year_ago_count
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), pt.Name
+),
+badge_progression AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        b.Name AS badge_name,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY u.Id, b.Class ORDER BY b.Date) AS badge_sequence,
+        LEAD(b.Date) OVER (PARTITION BY u.Id, b.Class ORDER BY b.Date) - b.Date AS time_to_next,
+        COUNT(*) OVER (PARTITION BY u.Id, b.Class ORDER BY b.Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_badges
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.TagBased = 0
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        p.OwnerUserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS edit_count,
+        COUNT(DISTINCT ph.UserId) AS unique_editors,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN 1 END) AS rollback_count,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) AS edit_timespan,
+        STRING_AGG(DISTINCT pht.Name, ', ' ORDER BY pht.Name) AS history_types
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY ph.PostId, p.OwnerUserId
+    HAVING COUNT(*) > 3
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.tag_score,
+    ue.answer_count,
+    ue.avg_score,
+    ue.tag_rank,
+    bp.cumulative_badges AS gold_badges,
+    COALESCE(ep.avg_edit_count, 0) AS avg_edits_per_post,
+    tp.growth_rate,
+    th.total_tag_questions,
+    DENSE_RANK() OVER (ORDER BY ue.tag_score * LOG(ue.answer_count + 1) * POWER(ue.avg_score, 0.5) DESC) AS overall_expertise_rank,
+    CASE 
+        WHEN ue.tag_rank = 1 THEN 'Domain Expert'
+        WHEN ue.tag_rank <= 5 THEN 'Top Contributor'
+        WHEN ue.tag_rank <= 20 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END AS contributor_tier,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ue.tag_score) OVER (PARTITION BY ue.TagName) AS median_tag_score,
+    ue.tag_score / NULLIF(ue.p95_score, 0) AS relative_performance
+FROM user_expertise ue
+LEFT JOIN (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS cumulative_badges
+    FROM badge_progression
+    WHERE Class = 1
+    GROUP BY UserId
+) bp ON bp.UserId = ue.UserId
+LEFT JOIN (
+    SELECT 
+        OwnerUserId,
+        AVG(edit_count) AS avg_edit_count
+    FROM edit_patterns
+    GROUP BY OwnerUserId
+) ep ON ep.OwnerUserId = ue.UserId
+LEFT JOIN (
+    SELECT 
+        post_type,
+        AVG((post_count - COALESCE(prev_month_count, post_count)) / NULLIF(prev_month_count, 0)) AS growth_rate
+    FROM temporal_patterns
+    WHERE post_type = 'Question'
+    GROUP BY post_type
+) tp ON 1 = 1
+LEFT JOIN (
+    SELECT 
+        TagName,
+        SUM(direct_questions) AS total_tag_questions
+    FROM tag_hierarchy
+    GROUP BY TagName
+) th ON th.TagName = ue.TagName
+WHERE ue.tag_rank <= 10
+ORDER BY overall_expertise_rank
+LIMIT 100;

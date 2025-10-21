@@ -1,0 +1,113 @@
+WITH TopTags AS (
+    SELECT
+        t.TagName,
+        SUM(t.Count) AS TotalCount,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        ROW_NUMBER() OVER (ORDER BY SUM(t.Count) DESC) AS TagRank
+    FROM
+        Tags t
+    LEFT JOIN Posts p ON
+        p.PostTypeId = 1
+        AND CAST('/' || t.TagName || '/' AS TEXT) = ANY (string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(distinct b.Id) AS BadgeCount,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM
+        Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagActivity AS (
+    SELECT
+        tt.TagName,
+        COUNT(DISTINCT p.Id) AS RecentQuestions,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM
+        TopTags tt
+    JOIN Posts p ON
+        p.PostTypeId = 1
+        AND CAST('/' || tt.TagName || '/' AS TEXT) = ANY (string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+        AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days'
+    GROUP BY tt.TagName
+),
+ClosedStatus AS (
+    SELECT
+        p.Id AS PostId,
+        MAX (CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosed,
+        string_agg(crt.Name, ', ') AS CloseReasons
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = ph.Comment
+    GROUP BY p.Id
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.CreationDate,
+    ru.BadgeCount,
+    tt.TagName,
+    tt.TagRank,
+    ta.RecentQuestions,
+    ta.AvgScore,
+    ta.TotalViews,
+    COUNT(DISTINCT a.Id) AS AnswersGiven,
+    COUNT(DISTINCT pq.Id) FILTER (WHERE cs.IsClosed = 1) AS QuestionsClosed,
+    COALESCE(MAX(cs.CloseReasons), 'None') AS ClosedReasonsList,
+    SUM(COALESCE(vv.UpVotes, 0) - COALESCE(vv.DownVotes, 0)) AS NetVotesOnAnswers
+FROM
+    RecentActiveUsers ru
+CROSS JOIN LATERAL (
+    SELECT TagName, TagRank
+    FROM TopTags
+    WHERE TagRank <= 10
+    ORDER BY RANDOM()
+    LIMIT 1
+) tt
+LEFT JOIN TagActivity ta ON tt.TagName = ta.TagName
+LEFT JOIN Posts pq ON
+    pq.OwnerUserId = ru.UserId
+    AND pq.PostTypeId = 1
+    AND CAST('/' || tt.TagName || '/' AS TEXT) = ANY (string_to_array(substring(pq.Tags, 2, length(pq.Tags) - 2), '><'))
+LEFT JOIN ClosedStatus cs ON cs.PostId = pq.Id
+LEFT JOIN Posts a ON
+    a.OwnerUserId = ru.UserId
+    AND a.PostTypeId = 2
+    AND a.ParentId = pq.Id
+LEFT JOIN LATERAL (
+    SELECT
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes v
+    WHERE v.PostId = a.Id
+) vv ON TRUE
+WHERE
+    ru.UserRank <= 100
+GROUP BY
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.CreationDate,
+    ru.BadgeCount,
+    tt.TagName,
+    tt.TagRank,
+    ta.RecentQuestions,
+    ta.AvgScore,
+    ta.TotalViews
+HAVING COUNT(DISTINCT pq.Id) > 0
+ORDER BY
+    ru.UserRank,
+    tt.TagRank
+LIMIT 50;

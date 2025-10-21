@@ -1,0 +1,84 @@
+-- {"query": "11017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 591} 
+
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COUNT(v.Id) OVER (PARTITION BY p.Id) AS VoteCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(p.Id) AS PostCount, 
+        SUM(p.Score) AS TotalScore, 
+        SUM(p.ViewCount) AS TotalViews
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        t.TagName, 
+        COUNT(p.Id) AS PostCount
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.Id = ANY(string_to_array(p.Tags, ',')::int[])
+    GROUP BY 
+        t.TagName
+    ORDER BY 
+        PostCount DESC
+    LIMIT 10
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.PostType, 
+    rp.VoteCount, 
+    ua.PostCount AS UserPostCount, 
+    ua.TotalScore, 
+    ua.TotalViews, 
+    tt.TagName, 
+    tt.PostCount AS TagPostCount
+FROM 
+    RecentPosts rp
+JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.Id
+LEFT JOIN 
+    TopTags tt ON rp.Id = ANY(string_to_array(tt.TagName, ',')::int[])
+WHERE 
+    rp.Score > 0
+    AND ua.PostCount > 5
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.CreationDate DESC

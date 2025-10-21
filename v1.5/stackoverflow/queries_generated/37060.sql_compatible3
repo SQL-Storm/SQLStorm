@@ -1,0 +1,172 @@
+WITH
+-- recent active questions with tags exploded
+questions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         REGEXP_SPLIT_TO_TABLE(SUBSTR(COALESCE(p.Tags,''), 2, LENGTH(COALESCE(p.Tags,'')) - 2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+),
+-- top answer per question (by score, tie-breaker: most recent)
+top_answers AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwner,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreationDate,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate DESC, a.Id) AS rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+),
+top_answer_selected AS (
+  SELECT * FROM top_answers WHERE rn = 1
+),
+-- recent comments aggregated per post
+comments_agg AS (
+  SELECT c.PostId,
+         COUNT(*) FILTER (WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days') AS RecentComments30d,
+         COUNT(*) FILTER (WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS RecentComments365d,
+         MAX(c.CreationDate) AS LastCommentDate,
+         STRING_AGG(DISTINCT SUBSTR(COALESCE(c.UserDisplayName, (SELECT DisplayName FROM Users u WHERE u.Id = c.UserId)), 1, 30), ', ' ORDER BY MAX(c.CreationDate) DESC) AS RecentCommentersSample
+  FROM Comments c
+  GROUP BY c.PostId
+),
+-- votes breakdown per post
+votes_agg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedByOwner,
+         COUNT(*) AS TotalVotes,
+         MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years' OR v.CreationDate IS NULL
+  GROUP BY v.PostId
+),
+-- link relationships: duplicates and linked counts
+links_agg AS (
+  SELECT pl.PostId,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateTargetCount,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedOutCount,
+         COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+-- user summary statistics
+user_stats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate AS UserCreated,
+         u.LastAccessDate,
+         u.Views AS ProfileViews,
+         COUNT(DISTINCT b.Id) AS BadgesLastYear,
+         COUNT(p.Id) AS PostsLast2y
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON (p.OwnerUserId = u.Id)
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+-- tag popularity over last 2 years (questions only)
+tag_stats AS (
+  SELECT q.Tag,
+         COUNT(*) AS QuestionsCount,
+         AVG(q.Score) AS AvgQuestionScore,
+         AVG(q.ViewCount) AS AvgQuestionViews,
+         COUNT(DISTINCT q.OwnerUserId) AS DistinctAskers
+  FROM questions q
+  GROUP BY q.Tag
+),
+-- assemble primary dataset: questions joined to top answers, votes, comments, links, and user stats
+base AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.Tag,
+         q.CreationDate AS QuestionCreation,
+         q.OwnerUserId,
+         q.Score AS QuestionScore,
+         q.ViewCount AS QuestionViews,
+         q.AnswerCount,
+         q.FavoriteCount,
+         ta.AnswerId,
+         ta.AnswerOwner,
+         ta.AnswerScore,
+         ta.AnswerCreationDate,
+         COALESCE(vu.UpVotes,0) AS QuestionUpVotes,
+         COALESCE(vu.DownVotes,0) AS QuestionDownVotes,
+         COALESCE(ca.RecentComments30d,0) AS RecentComments30d,
+         COALESCE(ca.RecentComments365d,0) AS RecentComments365d,
+         COALESCE(la.DuplicateTargetCount,0) AS DuplicateTargetCount,
+         COALESCE(ts.QuestionsCount,0) AS TagQuestionsCount,
+         us.DisplayName AS AskerName,
+         us.Reputation AS AskerReputation,
+         us.BadgesLastYear
+  FROM questions q
+  LEFT JOIN top_answer_selected ta ON ta.QuestionId = q.QuestionId
+  LEFT JOIN votes_agg vu ON vu.PostId = q.QuestionId
+  LEFT JOIN comments_agg ca ON ca.PostId = q.QuestionId
+  LEFT JOIN links_agg la ON la.PostId = q.QuestionId
+  LEFT JOIN tag_stats ts ON ts.Tag = q.Tag
+  LEFT JOIN user_stats us ON us.UserId = q.OwnerUserId
+),
+-- identify "fast answered" questions: first answer within 24 hours
+first_answer AS (
+  SELECT a.ParentId AS QuestionId,
+         MIN(a.CreationDate) AS FirstAnswerDate,
+         MIN(a.CreationDate) - q.CreationDate AS TimeToFirstAnswer
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+    AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+  GROUP BY a.ParentId
+),
+fast_answered AS (
+  SELECT fa.QuestionId
+  FROM first_answer fa
+  WHERE fa.TimeToFirstAnswer <= INTERVAL '24 hours'
+),
+-- scoring function to rank questions for benchmarking (complex expression)
+ranked AS (
+  SELECT b.*,
+         ( -- composite score with non-linear weights and penalizations
+           0.35 * (LOG(1 + GREATEST(b.QuestionViews,0)) / LOG(10))  -- view-driven term
+           + 0.25 * (POWER(GREATEST(b.QuestionScore,0), 0.8))      -- score-driven term
+           + 0.20 * (COALESCE(b.AnswerScore,0) * 0.7)             -- top answer contribution
+           + 0.10 * (CASE WHEN b.DuplicateTargetCount > 0 THEN -2 ELSE 1 END)  -- duplicates penalized
+           + 0.10 * (LEAST(1.0, GREATEST(b.BadgesLastYear::numeric / NULLIF(b.TagQuestionsCount,0), 0))) -- asker provenance normalized
+         )
+         * (CASE WHEN fa.QuestionId IS NOT NULL THEN 1.25 ELSE 1 END) -- boost if fast answered
+         AS CompositeScore
+  FROM base b
+  LEFT JOIN fast_answered fa ON fa.QuestionId = b.QuestionId
+)
+SELECT
+  r.QuestionId,
+  LEFT(r.Title,200) AS TitleSample,
+  r.Tag,
+  r.QuestionCreation,
+  r.AskerName,
+  r.AskerReputation,
+  r.QuestionScore,
+  r.QuestionViews,
+  r.AnswerId,
+  r.AnswerScore,
+  r.RecentComments30d,
+  r.RecentComments365d,
+  r.DuplicateTargetCount,
+  r.TagQuestionsCount,
+  ROUND(CAST(r.CompositeScore AS NUMERIC), 4) AS CompositeScore,
+  DENSE_RANK() OVER (PARTITION BY r.Tag ORDER BY r.CompositeScore DESC) AS TagRank,
+  RANK() OVER (ORDER BY r.CompositeScore DESC) AS GlobalRank
+FROM ranked r
+WHERE r.QuestionViews IS NOT NULL
+ORDER BY r.CompositeScore DESC, r.QuestionViews DESC
+LIMIT 1000;

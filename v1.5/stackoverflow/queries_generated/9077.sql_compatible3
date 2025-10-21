@@ -1,0 +1,114 @@
+WITH
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(
+            CASE
+               WHEN v.VoteTypeId = 2 THEN  1
+               WHEN v.VoteTypeId = 3 THEN -1
+               ELSE 0
+            END
+        ) AS VoteBalance,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes AS v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) AS CodeSnippets,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerBestRank
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1
+      AND p.Score > (
+          SELECT AVG(score)
+          FROM Posts
+          WHERE PostTypeId = 1
+      )
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)     AS QCount,
+        AVG(p.Score)    AS AvgScore
+    FROM Tags AS t
+    JOIN Posts AS p
+      ON p.PostTypeId = 1
+     AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50
+),
+Combined AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ts.TagName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.VoteBalance,
+        ts.QCount,
+        ts.AvgScore,
+        ua.Reputation + ts.QCount * COALESCE(ua.VoteBalance, 0) AS WeightedMetric
+    FROM UserActivity AS ua
+    CROSS JOIN TagStats AS ts
+    WHERE ua.RepRank < 100
+),
+Agg AS (
+    SELECT
+        c.UserId,
+        c.DisplayName,
+        STRING_AGG(DISTINCT c.TagName, ', ' ORDER BY c.TagName) AS TagsEngaged,
+        SUM(c.WeightedMetric) OVER (PARTITION BY c.UserId) AS TotalImpact,
+        RANK() OVER (ORDER BY SUM(c.WeightedMetric) OVER (PARTITION BY c.UserId) DESC) AS ImpactRank
+    FROM Combined AS c
+    WHERE c.WeightedMetric > (
+        SELECT AVG(cc.WeightedMetric)
+        FROM Combined AS cc
+        WHERE cc.TagName = c.TagName
+    )
+    GROUP BY c.UserId, c.DisplayName
+    HAVING COUNT(*) > 3
+)
+SELECT *
+FROM (
+    SELECT
+        a.UserId,
+        a.DisplayName,
+        a.TagsEngaged,
+        a.TotalImpact,
+        a.ImpactRank
+    FROM Agg AS a
+    WHERE a.ImpactRank IS NOT NULL
+) AS t
+INTERSECT
+SELECT
+    CAST(u.Id AS INTEGER) AS UserId,
+    u.DisplayName,
+    CAST(NULL AS VARCHAR) AS TagsEngaged,
+    CAST(0 AS INTEGER) AS TotalImpact,
+    CAST(NULL AS INTEGER) AS ImpactRank
+FROM (
+    SELECT Id, DisplayName, Views
+    FROM Users
+) AS u
+WHERE u.Views > 10000
+EXCEPT
+SELECT
+    CAST(a.UserId AS INTEGER) AS UserId,
+    a.DisplayName,
+    NULL,
+    CAST(0 AS INTEGER) AS TotalImpact,
+    CAST(NULL AS INTEGER) AS ImpactRank
+FROM Agg AS a
+WHERE a.DisplayName IS NULL
+ORDER BY ImpactRank;

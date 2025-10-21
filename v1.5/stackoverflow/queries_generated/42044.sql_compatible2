@@ -1,0 +1,55 @@
+SELECT 
+    p.Id, 
+    p.Title, 
+    COUNT(v.Id) AS TotalVotes, 
+    COUNT(DISTINCT c.Id) AS TotalComments, 
+    COUNT(DISTINCT ph.Id) AS TotalEdits, 
+    COUNT(DISTINCT b.Id) AS TotalBadges, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate, 
+    u.UpVotes, 
+    u.DownVotes, 
+    u.Views, 
+    u.Location, 
+    u.AboutMe, 
+    u.ProfileImageUrl, 
+    u.EmailHash, 
+    u.AccountId
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    p.PostTypeId = 1 
+    AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+GROUP BY 
+    p.Id, 
+    p.Title,
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate, 
+    u.UpVotes, 
+    u.DownVotes, 
+    u.Views, 
+    u.Location, 
+    u.AboutMe, 
+    u.ProfileImageUrl, 
+    u.EmailHash, 
+    u.AccountId
+HAVING 
+    COUNT(v.Id) > 10 
+    AND COUNT(DISTINCT c.Id) > 5
+ORDER BY 
+    SUM(p.Score) DESC, 
+    u.Reputation DESC
+LIMIT 100;

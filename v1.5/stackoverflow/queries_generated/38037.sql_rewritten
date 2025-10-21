@@ -1,0 +1,355 @@
+-- {"query": "38037.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 5003} 
+with recent_q as (
+  select p.Id as QuestionId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         coalesce(p.AnswerCount, 0) as AnswerCount,
+         p.OwnerUserId,
+         p.Title,
+         p.Tags
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '90 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select a.ParentId as QuestionId,
+         a.Id as AnswerId,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate,
+         row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc, a.Id asc) as rn_top,
+         row_number() over (partition by a.ParentId order by a.CreationDate asc, a.Id asc) as rn_first
+  from Posts a
+  join recent_q q on q.Id = a.ParentId
+  where a.PostTypeId = 2
+),
+agg_answers as (
+  select
+    QuestionId,
+    count(*) as total_answers,
+    avg(AnswerScore::numeric) as avg_answer_score,
+    max(AnswerScore) as max_answer_score,
+    min(AnswerScore) as min_answer_score,
+    percentile_disc(0.5) within group (order by AnswerScore) as median_answer_score
+  from answers
+  group by QuestionId
+),
+accepted as (
+  select q.Id as QuestionId,
+         q.AcceptedAnswerId
+  from Posts q
+  where q.PostTypeId = 1
+    and q.Id in (select QuestionId from recent_q)
+),
+first_answer as (
+  select QuestionId, AnswerId as FirstAnswerId, AnswererId as FirstAnswererId, AnswerScore as FirstAnswerScore, AnswerCreationDate as FirstAnswerCreationDate
+  from answers
+  where rn_first = 1
+),
+top_answer as (
+  select QuestionId, AnswerId as TopAnswerId, AnswererId as TopAnswererId, AnswerScore as TopAnswerScore, AnswerCreationDate as TopAnswerCreationDate
+  from answers
+  where rn_top = 1
+),
+votes_q as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes_q,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes_q,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites_q
+  from Votes v
+  join recent_q q on q.Id = v.PostId
+  group by v.PostId
+),
+comments_q as (
+  select c.PostId as QuestionId,
+         count(*) as comments_q,
+         max(c.CreationDate) as last_comment_q
+  from Comments c
+  join recent_q q on q.Id = c.PostId
+  group by c.PostId
+),
+links as (
+  select pl.PostId as QuestionId,
+         sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as linked_count,
+         sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as duplicate_count
+  from PostLinks pl
+  join recent_q q on q.Id = pl.PostId
+  group by pl.PostId
+),
+edits as (
+  select ph.PostId as QuestionId,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as edit_count,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as last_edit_date,
+         count(*) filter (where ph.PostHistoryTypeId in (24)) as suggested_edits_applied
+  from PostHistory ph
+  join recent_q q on q.Id = ph.PostId
+  group by ph.PostId
+),
+closures as (
+  select ph.PostId as QuestionId,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as close_votes,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as last_close_vote
+  from PostHistory ph
+  join recent_q q on q.Id = ph.PostId
+  group by ph.PostId
+),
+tag_expansion as (
+  select q.Id as QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+  from Posts q
+  where q.PostTypeId = 1
+    and q.Id in (select QuestionId from recent_q)
+),
+tag_stats as (
+  select te.QuestionId,
+         count(*) as tag_count,
+         string_agg(te.tag, ',' order by te.tag) as tag_list,
+         sum(t.Count) as tag_popularity_sum,
+         avg(t.Count::numeric) as tag_popularity_avg,
+         max(t.Count) as tag_popularity_max
+  from tag_expansion te
+  left join Tags t on t.TagName = te.tag
+  group by te.QuestionId
+),
+owners as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views
+  from Users u
+),
+owner_badges as (
+  select b.UserId,
+         count(*) as badge_count,
+         count(*) filter (where b.Class = 1) as gold_badges,
+         count(*) filter (where b.Class = 2) as silver_badges,
+         count(*) filter (where b.Class = 3) as bronze_badges,
+         max(b.Date) as last_badge_date
+  from Badges b
+  group by b.UserId
+),
+owner_metrics as (
+  select q.Id as QuestionId,
+         o.UserId as OwnerUserId,
+         o.Reputation as owner_rep,
+         o.UpVotes as owner_upvotes,
+         o.DownVotes as owner_downvotes,
+         o.Views as owner_views,
+         ob.badge_count,
+         ob.gold_badges,
+         ob.silver_badges,
+         ob.bronze_badges,
+         ob.last_badge_date
+  from recent_q q
+  left join owners o on o.UserId = q.OwnerUserId
+  left join owner_badges ob on ob.UserId = q.OwnerUserId
+),
+accept_timing as (
+  select q.Id as QuestionId,
+         q.AcceptedAnswerId,
+         a.AnswerCreationDate as accepted_created_at
+  from Posts q
+  left join answers a on a.AnswerId = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+    and q.Id in (select QuestionId from recent_q)
+),
+engagement as (
+  select q.Id as QuestionId,
+         coalesce(v.upvotes_q,0) - coalesce(v.downvotes_q,0) as net_votes_q,
+         coalesce(v.favorites_q,0) as favorites_q,
+         coalesce(c.comments_q,0) as comments_q,
+         greatest(coalesce(q.ViewCount,0),0) as views_q
+  from recent_q q
+  left join votes_q v on v.QuestionId = q.Id
+  left join comments_q c on c.QuestionId = q.Id
+),
+time_windows as (
+  select q.Id as QuestionId,
+         q.CreationDate as q_created_at,
+         fa.FirstAnswerCreationDate,
+         ta.TopAnswerCreationDate,
+         at.accepted_created_at,
+         extract(epoch from (fa.FirstAnswerCreationDate - q.CreationDate)) as seconds_to_first_answer,
+         extract(epoch from (ta.TopAnswerCreationDate - q.CreationDate)) as seconds_to_top_answer,
+         extract(epoch from (at.accepted_created_at - q.CreationDate)) as seconds_to_accept
+  from recent_q q
+  left join first_answer fa on fa.QuestionId = q.Id
+  left join top_answer ta on ta.QuestionId = q.Id
+  left join accept_timing at on at.QuestionId = q.Id
+),
+quality_flags as (
+  select q.Id as QuestionId,
+         case when q.Score >= 5 and coalesce(aa.avg_answer_score,0) >= 1 then 1 else 0 end as is_high_quality,
+         case when coalesce(aa.total_answers,0) = 0 then 1 else 0 end as is_unanswered,
+         case when coalesce(ln.duplicate_count,0) > 0 then 1 else 0 end as is_marked_duplicate,
+         case when coalesce(cl.close_votes,0) > 0 then 1 else 0 end as has_close_votes
+  from recent_q q
+  left join agg_answers aa on aa.QuestionId = q.Id
+  left join links ln on ln.QuestionId = q.Id
+  left join closures cl on cl.QuestionId = q.Id
+)
+select
+  q.Id as QuestionId,
+  q.Title,
+  q.CreationDate,
+  q.Score,
+  q.ViewCount,
+  q.AnswerCount,
+  tm.seconds_to_first_answer,
+  tm.seconds_to_top_answer,
+  tm.seconds_to_accept,
+  aa.total_answers,
+  aa.avg_answer_score,
+  aa.max_answer_score,
+  aa.min_answer_score,
+  aa.median_answer_score,
+  e.net_votes_q,
+  e.favorites_q,
+  e.comments_q,
+  e.views_q,
+  ts.tag_count,
+  ts.tag_list,
+  ts.tag_popularity_sum,
+  ts.tag_popularity_avg,
+  ts.tag_popularity_max,
+  coalesce(v.upvotes_q,0) as upvotes_q,
+  coalesce(v.downvotes_q,0) as downvotes_q,
+  coalesce(l.linked_count,0) as linked_count,
+  coalesce(l.duplicate_count,0) as duplicate_count,
+  coalesce(ed.edit_count,0) as edit_count,
+  ed.last_edit_date,
+  coalesce(ed.suggested_edits_applied,0) as suggested_edits_applied,
+  coalesce(cl.close_votes,0) as close_votes,
+  cl.last_close_vote,
+  fa.FirstAnswerId,
+  fa.FirstAnswererId,
+  fa.FirstAnswerScore,
+  ta.TopAnswerId,
+  ta.TopAnswererId,
+  ta.TopAnswerScore,
+  ac.AcceptedAnswerId,
+  om.owner_rep,
+  om.owner_upvotes,
+  om.owner_downvotes,
+  om.owner_views,
+  om.badge_count,
+  om.gold_badges,
+  om.silver_badges,
+  om.bronze_badges,
+  om.last_badge_date,
+  q.Tags,
+  q.OwnerUserId,
+  q.LastActivityDate,
+  q.LastEditDate,
+  q.CommentCount,
+  q.FavoriteCount,
+  q.ContentLicense,
+  q.ViewCount::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / 3600.0, 1), 0) as views_per_hour_since_creation,
+  case when q.AnswerCount > 0 then aa.avg_answer_score else null end as avg_answer_score_if_answered,
+  q.Score::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / 86400.0, 1), 0) as score_per_day_since_creation,
+  q.ViewCount::numeric / nullif(greatest(coalesce(aa.total_answers,1), 1), 0) as views_per_answer,
+  q.Score::numeric / nullif(nullif(coalesce(aa.total_answers,0),0), 0) as score_per_answer,
+  q.ViewCount::numeric / nullif(greatest(coalesce(ed.edit_count,1),1), 0) as views_per_edit,
+  q.ViewCount::numeric / nullif(greatest(coalesce(e.comments_q,1),1), 0) as views_per_comment,
+  q.Score::numeric - coalesce(aa.avg_answer_score,0) as score_minus_avg_answer,
+  q.Score::numeric - coalesce(ta.TopAnswerScore,0) as score_minus_top_answer,
+  q.Score::numeric + coalesce(e.net_votes_q,0) as score_plus_net_votes,
+  q.Score::numeric + coalesce(v.upvotes_q,0) - coalesce(v.downvotes_q,0) as score_plus_votes_redundant_check,
+  q.ViewCount::numeric / nullif(greatest(ts.tag_popularity_avg,1),1) as views_over_tag_popularity,
+  q.Score::numeric / nullif(greatest(ts.tag_popularity_avg,1),1) as score_over_tag_popularity,
+  q.AnswerCount - coalesce(aa.total_answers,0) as answercount_vs_actual_delta,
+  q.ViewCount - e.views_q as viewcount_consistency_delta,
+  q.Score - (coalesce(v.upvotes_q,0) - coalesce(v.downvotes_q,0)) as score_vs_votes_delta,
+  q.CreationDate::date as created_date,
+  case when q.ClosedDate is not null then 1 else 0 end as is_closed,
+  case when q.CommunityOwnedDate is not null then 1 else 0 end as is_community_owned,
+  q.ClosedDate,
+  q.CommunityOwnedDate,
+  q.LastActivityDate as last_activity,
+  q.LastEditDate as last_edit,
+  q.AcceptedAnswerId as accepted_answer_id_from_q,
+  q.PostTypeId,
+  q.Id || '-' || coalesce(q.OwnerDisplayName, 'anon') as synthetic_key,
+  q.Title || ' [' || coalesce(ts.tag_list,'') || ']' as title_with_tags,
+  q.Score::numeric / nullif(greatest(aa.total_answers,1),1) + coalesce(ta.TopAnswerScore,0) as composite_metric_1,
+  coalesce(aa.total_answers,0) + coalesce(ed.edit_count,0) + coalesce(e.comments_q,0) as activity_sum,
+  q.ViewCount::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.LastActivityDate)) / 3600.0, 1), 0) as views_per_hour_since_last_activity,
+  q.ViewCount::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ed.last_edit_date, q.CreationDate))) / 3600.0, 1), 0) as views_per_hour_since_last_edit,
+  q.Score::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.LastActivityDate)) / 86400.0, 1), 0) as score_per_day_since_last_activity,
+  q.Score::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ed.last_edit_date, q.CreationDate))) / 86400.0, 1), 0) as score_per_day_since_last_edit,
+  q.ViewCount::numeric / nullif(greatest(ts.tag_count,1),1) as views_per_tag,
+  q.Score::numeric / nullif(greatest(ts.tag_count,1),1) as score_per_tag,
+  q.AnswerCount::numeric / nullif(greatest(ts.tag_count,1),1) as answers_per_tag,
+  q.CommentCount::numeric / nullif(greatest(ts.tag_count,1),1) as comments_per_tag,
+  q.FavoriteCount::numeric / nullif(greatest(ts.tag_count,1),1) as favorites_per_tag,
+  q.Score::numeric + coalesce(aa.avg_answer_score,0) + coalesce(ta.TopAnswerScore,0) as composite_metric_2,
+  q.ViewCount::numeric + 10 * coalesce(v.upvotes_q,0) - 5 * coalesce(v.downvotes_q,0) + 2 * coalesce(e.comments_q,0) as composite_metric_3,
+  q.Score::numeric * coalesce(aa.total_answers,1) * nullif(coalesce(ts.tag_popularity_avg,1),0) as multiplicative_metric_guarded,
+  q.Score::numeric * coalesce(aa.total_answers,1) as score_times_answers,
+  q.Score::numeric * coalesce(v.upvotes_q,0) as score_times_upvotes,
+  q.ViewCount::numeric * coalesce(aa.total_answers,1) as views_times_answers,
+  q.ViewCount::numeric * coalesce(v.upvotes_q,0) as views_times_upvotes,
+  q.ViewCount::numeric * coalesce(e.comments_q,0) as views_times_comments,
+  q.Score::numeric * coalesce(e.comments_q,0) as score_times_comments,
+  q.ViewCount::numeric * coalesce(ed.edit_count,0) as views_times_edits,
+  q.Score::numeric * coalesce(ed.edit_count,0) as score_times_edits,
+  q.ViewCount::numeric / nullif(greatest(q.Score,1),1) as views_over_score,
+  q.Score::numeric / nullif(greatest(q.ViewCount,1),1) as score_over_views,
+  q.Score::numeric / nullif(greatest(e.comments_q,1),1) as score_over_comments,
+  q.ViewCount::numeric / nullif(greatest(aa.total_answers,1),1) as views_over_answers,
+  q.Score::numeric / nullif(greatest(aa.total_answers,1),1) as score_over_answers,
+  q.ViewCount::numeric / nullif(greatest(v.upvotes_q,1),1) as views_over_upvotes,
+  q.ViewCount::numeric / nullif(greatest(v.downvotes_q,1),1) as views_over_downvotes,
+  q.ViewCount::numeric / nullif(greatest(e.favorites_q,1),1) as views_over_favorites,
+  q.ViewCount::numeric / nullif(greatest(ts.tag_popularity_max,1),1) as views_over_max_tag_popularity,
+  q.Score::numeric / nullif(greatest(ts.tag_popularity_max,1),1) as score_over_max_tag_popularity,
+  q.Score::numeric + coalesce(aa.total_answers,0) + coalesce(e.comments_q,0) + coalesce(ed.edit_count,0) as simple_activity_score,
+  q.Score::numeric + coalesce(aa.max_answer_score,0) - coalesce(aa.min_answer_score,0) as answer_score_spread_added,
+  q.ViewCount::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / 86400.0, 1), 0) as views_per_day_since_creation,
+  q.ViewCount::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.LastActivityDate)) / 86400.0, 1), 0) as views_per_day_since_last_activity,
+  q.ViewCount::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ed.last_edit_date, q.CreationDate))) / 86400.0, 1), 0) as views_per_day_since_last_edit,
+  q.Score::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / 3600.0, 1), 0) as score_per_hour_since_creation,
+  q.Score::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.LastActivityDate)) / 3600.0, 1), 0) as score_per_hour_since_last_activity,
+  q.Score::numeric / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ed.last_edit_date, q.CreationDate))) / 3600.0, 1), 0) as score_per_hour_since_last_edit,
+  q.ViewCount::numeric + q.Score::numeric as views_plus_score,
+  q.ViewCount::numeric - q.Score::numeric as views_minus_score,
+  q.ViewCount::numeric * nullif(q.Score::numeric,0) as views_times_score_guarded,
+  q.ViewCount::numeric / nullif(nullif(q.Score::numeric,0),0) as views_over_score_guarded,
+  q.Score::numeric / nullif(nullif(q.ViewCount::numeric,0),0) as score_over_views_guarded,
+  q.Score::numeric + coalesce(om.owner_rep,0) / 100.0 as score_plus_owner_rep_scaled,
+  q.ViewCount::numeric + coalesce(om.owner_views,0) as views_plus_owner_views,
+  q.Score::numeric + coalesce(om.badge_count,0) as score_plus_badges,
+  q.Score::numeric + coalesce(om.gold_badges,0) * 5 + coalesce(om.silver_badges,0) * 3 + coalesce(om.bronze_badges,0) as score_plus_weighted_badges,
+  q.Score::numeric + coalesce(v.upvotes_q,0) + coalesce(e.comments_q,0) as score_plus_votes_and_comments,
+  q.ViewCount::numeric + coalesce(aa.total_answers,0) * 100 as views_plus_answer_bonus,
+  q.Score::numeric + coalesce(ts.tag_count,0) as score_plus_tagcount,
+  q.Score::numeric + coalesce(ts.tag_popularity_avg,0) / 1000.0 as score_plus_tag_popularity_scaled,
+  q.Score::numeric + case when q.AcceptedAnswerId is not null then 10 else 0 end as score_plus_accept_bonus,
+  q.ViewCount::numeric + case when coalesce(cl.close_votes,0) > 0 then -100 else 0 end as views_penalized_by_close_votes,
+  q.ViewCount::numeric + case when coalesce(ln.duplicate_count,0) > 0 then -200 else 0 end as views_penalized_by_duplicates,
+  q.Score::numeric + case when coalesce(ql.is_high_quality,0) = 1 then 5 else 0 end as score_plus_quality_flag,
+  q.Score::numeric + case when coalesce(ql.is_unanswered,0) = 1 then -2 else 0 end as score_penalized_if_unanswered,
+  q.Score::numeric + case when coalesce(ql.has_close_votes,0) = 1 then -3 else 0 end as score_penalized_if_close_votes,
+  q.Score::numeric + case when coalesce(ql.is_marked_duplicate,0) = 1 then -4 else 0 end as score_penalized_if_duplicate
+from recent_q q
+left join agg_answers aa on aa.QuestionId = q.Id
+left join votes_q v on v.QuestionId = q.Id
+left join comments_q c on c.QuestionId = q.Id
+left join links l on l.QuestionId = q.Id
+left join edits ed on ed.QuestionId = q.Id
+left join closures cl on cl.QuestionId = q.Id
+left join first_answer fa on fa.QuestionId = q.Id
+left join top_answer ta on ta.QuestionId = q.Id
+left join accept_timing ac on ac.QuestionId = q.Id
+left join tag_stats ts on ts.QuestionId = q.Id
+left join owner_metrics om on om.QuestionId = q.Id
+left join engagement e on e.QuestionId = q.Id
+left join time_windows tm on tm.QuestionId = q.Id
+left join quality_flags ql on ql.QuestionId = q.Id
+order by
+  coalesce(aa.total_answers,0) desc,
+  q.Score desc,
+  q.ViewCount desc
+limit 500;

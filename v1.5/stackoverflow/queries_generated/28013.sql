@@ -1,0 +1,76 @@
+-- {"query": "28013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1516} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id
+), PostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEvents,
+        STRING_AGG(DISTINCT t.TagName, '; ') FILTER (WHERE t.TagName IS NOT NULL) AS FrequentTags
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    LEFT JOIN (SELECT Id, UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags)-2), '><'), NULL)) AS TagName FROM Posts) t ON p.Id = t.Id
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    us.DisplayName || ' (' || us.Location || ')' AS UserProfile,
+    pa.TotalPosts,
+    pa.TotalComments,
+    (pa.MaxQuestionScore * 1.0) / NULLIF(us.UpvotesGiven, 0) AS ScoreEfficiency,
+    us.GoldBadges + us.SilverBadges * 0.5 + us.BronzeBadges * 0.25 AS BadgeWeight,
+    ROW_NUMBER() OVER (ORDER BY pa.AvgCommentLength DESC) AS CommentVerbosityRank,
+    pa.FrequentTags,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = us.Id AND p2.PostTypeId = 2 AND EXISTS (
+        SELECT 1 FROM Posts p3 WHERE p3.AcceptedAnswerId = p2.Id
+    )) AS AcceptedAnswers,
+    COALESCE(ph.CloseReasonCount, 0) AS TotalClosures
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CloseReasonCount 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId = 10 AND Comment::INT IN (SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%')
+    GROUP BY UserId
+) ph ON us.Id = ph.UserId
+WHERE us.ReputationRank <= 1000
+  AND pa.TotalPosts > (SELECT AVG(TotalPosts) FROM PostAnalysis)
+  AND us.DownvotesGiven < (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY DownvotesGiven) FROM UserStats)
+UNION ALL
+SELECT 
+    'Community Total' AS UserProfile,
+    SUM(pa.TotalPosts),
+    SUM(pa.TotalComments),
+    AVG((pa.MaxQuestionScore * 1.0) / NULLIF(us.UpvotesGiven, 0)),
+    SUM(us.GoldBadges + us.SilverBadges * 0.5 + us.BronzeBadges * 0.25),
+    NULL,
+    NULL,
+    SUM((SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = us.Id AND p2.PostTypeId = 2 AND EXISTS (
+        SELECT 1 FROM Posts p3 WHERE p3.AcceptedAnswerId = p2.Id
+    ))),
+    SUM(COALESCE(ph.CloseReasonCount, 0))
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CloseReasonCount 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId = 10 AND Comment::INT IN (SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%')
+    GROUP BY UserId
+) ph ON us.Id = ph.UserId;

@@ -1,0 +1,155 @@
+WITH
+questions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         CASE
+           WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[] 
+           ELSE string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')
+         END AS TagArray,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId AS AnswererId,
+         a.CreationDate AS AnswerDate,
+         a.Score AS AnswerScore,
+         a.CommentCount AS AnswerCommentCount,
+         a.Body AS AnswerBody
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+best_answer AS (
+  SELECT DISTINCT ON (q.QuestionId)
+         q.QuestionId,
+         a.AnswerId,
+         a.AnswererId,
+         a.AnswerDate,
+         a.AnswerScore
+  FROM questions q
+  JOIN answers a ON a.QuestionId = q.QuestionId
+  ORDER BY q.QuestionId, a.AnswerScore DESC, a.AnswerDate ASC
+),
+activity_windows AS (
+  SELECT q.QuestionId,
+         COUNT(DISTINCT a.AnswerId) FILTER (WHERE a.AnswerDate >= q.CreationDate AND a.AnswerDate < q.CreationDate + INTERVAL '7 days') AS Answers_7d,
+         COUNT(DISTINCT a.AnswerId) FILTER (WHERE a.AnswerDate >= q.CreationDate AND a.AnswerDate < q.CreationDate + INTERVAL '30 days') AS Answers_30d,
+         COUNT(DISTINCT v.Id) FILTER (WHERE v.CreationDate >= q.CreationDate AND v.CreationDate < q.CreationDate + INTERVAL '30 days' AND v.VoteTypeId = 2) AS Upvotes_30d,
+         COUNT(c.Id) FILTER (WHERE c.CreationDate >= q.CreationDate AND c.CreationDate < q.CreationDate + INTERVAL '30 days') AS Comments_30d
+  FROM questions q
+  LEFT JOIN answers a ON a.QuestionId = q.QuestionId
+  LEFT JOIN Votes v ON v.PostId = q.QuestionId
+  LEFT JOIN Comments c ON c.PostId = q.QuestionId
+  GROUP BY q.QuestionId
+),
+tag_pairs AS (
+  SELECT t1.tag AS tag,
+         t2.tag AS co_tag,
+         COUNT(*) AS pair_count,
+         AVG(q.Score) AS avg_question_score
+  FROM (
+    SELECT QuestionId, UNNEST(TagArray) AS tag
+    FROM questions
+  ) t1
+  JOIN (
+    SELECT QuestionId, UNNEST(TagArray) AS tag
+    FROM questions
+  ) t2 ON t1.QuestionId = t2.QuestionId AND t1.tag <> t2.tag
+  JOIN questions q ON q.QuestionId = t1.QuestionId
+  GROUP BY t1.tag, t2.tag
+),
+answerer_stats AS (
+  SELECT a.OwnerUserId AS UserId,
+         COUNT(*) FILTER (WHERE a.Score >= 5) AS HighScoreAnswers,
+         COUNT(*) AS TotalAnswers,
+         AVG(a.Score) AS AvgAnswerScore,
+         MAX(a.Score) AS MaxAnswerScore
+  FROM Pages a
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+ranked_questions AS (
+  SELECT q.*,
+         bw.Answers_7d,
+         bw.Answers_30d,
+         bw.Upvotes_30d,
+         bw.Comments_30d,
+         ba.AnswerId AS BestAnswerId,
+         ba.AnswererId,
+         ba.AnswerScore AS BestAnswerScore,
+         COALESCE(ansr.HighScoreAnswers,0) AS AnswererHighScoreAnswers,
+         COALESCE(ansr.TotalAnswers,0) AS AnswererTotalAnswers,
+         COALESCE(ansr.AvgAnswerScore,0) AS AnswererAvgScore,
+         (
+           GREATEST(q.Score,0) * 1.5
+           + (GREATEST(q.ViewCount,0) * 1.0) / NULLIF(GREATEST(FOREIGN_CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) / 86400, 1), 0)
+           * 0.05
+           + (bw.Answers_7d * 3.0)
+           + (bw.Answers_30d * 1.0)
+           + bw.Upvotes_30d * 2.0
+           + bw.Comments_30d * 0.8
+           + COALESCE(ba.AnswerScore,0) * 2.5
+           + COALESCE(ansr.AvgAnswerScore,0) * 1.2
+           + LEAST(COALESCE(ansr.HighScoreAnswers,0),20) * 0.7
+         ) AS HotnessScore
+  FROM questions q
+  LEFT JOIN activity_windows bw ON bw.QuestionId = q.QuestionId
+  LEFT JOIN best_answer ba ON ba.QuestionId = q.QuestionId
+  LEFT JOIN answerer_stats ansr ON ansr.UserId = ba.AnswererId
+),
+question_tag_signals AS (
+  SELECT q.QuestionId,
+         ARRAY_AGG(tp.co_tag ORDER BY tp.pair_count DESC, tp.avg_question_score DESC LIMIT 3) AS TopCoTags
+  FROM questions q
+  LEFT JOIN LATERAL (
+    SELECT co_tag, pair_count, avg_question_score
+    FROM tag_pairs tp
+    WHERE tp.tag = (SELECT UNNEST(q.TagArray) LIMIT 1)
+    ORDER BY pair_count DESC
+    LIMIT 10
+  ) tp ON TRUE
+  GROUP BY q.QuestionId
+)
+SELECT q.QuestionId,
+       q.Title,
+       q.CreationDate,
+       q.OwnerUserId,
+       q.Score,
+       q.ViewCount,
+       q.TagArray,
+       r.Answers_7d,
+       r.Answers_30d,
+       r.Upvotes_30d,
+       r.Comments_30d,
+       r.BestAnswerId,
+       r.AnswererId,
+       r.BestAnswerScore,
+       r.AnswererHighScoreAnswers,
+       r.AnswererTotalAnswers,
+       r.AnswererAvgScore,
+       q.FavoriteCount,
+       q.AnswerCount,
+       q.CommentCount,
+       CASE WHEN q.Body IS NOT NULL THEN TRUE ELSE FALSE END AS HasBody,
+       (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = q.QuestionId) AS OutboundLinks,
+       (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = q.QuestionId) AS InboundLinks,
+       qs.TopCoTags,
+       r.HotnessScore,
+       ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('week', q.CreationDate) ORDER BY r.HotnessScore DESC, q.ViewCount DESC) AS WeeklyRank,
+       DENSE_RANK() OVER (ORDER BY r.HotnessScore DESC NULLS LAST) AS GlobalDenseRank
+FROM ranked_questions r
+JOIN questions q ON q.QuestionId = r.QuestionId
+LEFT JOIN question_tag_signals qs ON qs.QuestionId = q.QuestionId
+WHERE q.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+  AND (r.HotnessScore IS NOT NULL AND r.HotnessScore > 5)
+ORDER BY DATE_TRUNC('week', q.CreationDate) DESC, r.HotnessScore DESC
+LIMIT 500;

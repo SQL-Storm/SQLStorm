@@ -1,0 +1,122 @@
+-- {"query": "54005.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 2107} 
+
+WITH user_stats AS (
+    SELECT
+        u.Id                     AS user_id,
+        u.Reputation             AS rep,
+        u.DisplayName            AS name,
+        u.CreationDate           AS created,
+        u.EmailHash
+    FROM Users u
+), 
+post_activity AS (
+    SELECT
+        p.OwnerUserId                            AS uid,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)           AS questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)           AS answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END)            AS qscore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)            AS ascore,
+        SUM(p.ViewCount)                                            AS views,
+        SUM(p.FavoriteCount)                                        AS favorites,
+        SUM(p.AnswerCount)                                          AS acount,
+        MAX(p.LastActivityDate)                                    AS last_activity
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+vote_counts AS (
+    SELECT
+        v.PostId                                                            AS pid,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)                         AS upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)                         AS downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END)                         AS favs
+    FROM Votes v
+    GROUP BY v.PostId
+),
+comment_counts AS (
+    SELECT
+        c.PostId                                                            AS pid,
+        COUNT(*)                                                            AS comments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+post_detailed AS (
+    SELECT
+        p.Id                     AS post_id,
+        p.OwnerUserId            AS uid,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(vc.upvotes,0)   AS upvotes,
+        COALESCE(vc.downvotes,0) AS downvotes,
+        COALESCE(vc.favs,0)      AS favs,
+        COALESCE(cc.comments,0)  AS comments
+    FROM Posts p
+    LEFT JOIN vote_counts vc ON vc.pid = p.Id
+    LEFT JOIN comment_counts cc ON cc.pid = p.Id
+),
+user_badges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)   AS gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)   AS silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)   AS bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+closed_posts AS (
+    SELECT
+        p.OwnerUserId            AS uid,
+        COUNT(p.Id) FILTER (WHERE p.ClosedDate IS NOT NULL) AS closed_cnt
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+tagged_questions AS (
+    SELECT
+        p.OwnerUserId            AS uid,
+        COUNT(p.Id) FILTER (WHERE p.Tags IS NOT NULL) AS tagged_cnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+ranked_summary AS (
+    SELECT
+        u.user_id,
+        u.name,
+        u.rep,
+        u.created,
+        COALESCE(ps.questions,0)   AS num_questions,
+        COALESCE(ps.answers,0)    AS num_answers,
+        COALESCE(ps.views,0)      AS total_views,
+        COALESCE(ps.favorites,0)  AS total_favorites,
+        COALESCE(bs.gold,0)       AS gold_badges,
+        COALESCE(bs.silver,0)     AS silver_badges,
+        COALESCE(bs.bronze,0)     AS bronze_badges,
+        COALESCE(cp.closed_cnt,0) AS closed_posts,
+        COALESCE(tq.tagged_cnt,0) AS tagged_questions,
+        SUM(pd.upvotes) OVER (PARTITION BY u.user_id)      AS summed_upvotes,
+        SUM(pd.downvotes) OVER (PARTITION BY u.user_id)    AS summed_downvotes,
+        SUM(pd.favs) OVER (PARTITION BY u.user_id)        AS summed_favs,
+        AVG(pd.score) OVER (PARTITION BY u.user_id)       AS avg_score,
+        COUNT(*) FILTER (WHERE pd.post_typeid = 1)        AS postings_per_user
+    FROM user_stats u
+    LEFT JOIN post_activity ps ON ps.uid = u.user_id
+    LEFT JOIN user_badges bs ON bs.UserId = u.user_id
+    LEFT JOIN closed_posts cp ON cp.uid = u.user_id
+    LEFT JOIN tagged_questions tq ON tq.uid = u.user_id
+    LEFT JOIN post_detailed pd ON pd.uid = u.user_id
+    GROUP BY
+        u.user_id, u.name, u.rep, u.created,
+        ps.questions, ps.answers, ps.views, ps.favorites,
+        bs.gold, bs.silver, bs.bronze,
+        cp.closed_cnt, tq.tagged_cnt
+)
+SELECT
+    r.*,
+    RANK() OVER (ORDER BY r.avg_score DESC, r.summed_favs DESC)       AS score_rank,
+    ROW_NUMBER() OVER (ORDER BY r.num_questions DESC, r.num_answers DESC) AS activity_rank
+FROM ranked_summary r
+WHERE r.num_questions > 0
+  AND r.num_answers > 0
+  AND r.summed_favs > 10
+ORDER BY r.avg_score DESC, r.num_questions DESC
+LIMIT 200;

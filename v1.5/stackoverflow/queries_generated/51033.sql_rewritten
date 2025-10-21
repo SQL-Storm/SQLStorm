@@ -1,0 +1,128 @@
+-- {"query": "51033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1130} 
+WITH top_users AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+active_posts AS (
+    SELECT 
+        p.Id AS post_id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        tu.rep_rank
+    FROM Posts p
+    INNER JOIN top_users tu ON p.OwnerUserId = tu.user_id
+    WHERE p.PostTypeId IN (1, 2) 
+    AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    AND p.Score > 0
+),
+user_engagement AS (
+    SELECT 
+        ap.user_id,
+        ap.rep_rank,
+        COUNT(ap.post_id) as post_count,
+        AVG(ap.Score) as avg_score,
+        SUM(ap.ViewCount) as total_views,
+        MAX(ap.LastActivityDate) as last_active
+    FROM active_posts ap
+    GROUP BY ap.user_id, ap.rep_rank
+),
+tag_analysis AS (
+    SELECT 
+        p.post_id,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ') as top_tags
+    FROM active_posts p
+    LEFT JOIN LATERAL (
+        SELECT TagName
+        FROM unnest(CASE 
+            WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL 
+            THEN string_to_array(
+                substring(p.Tags, 2, length(p.Tags) - 2), 
+                '><'
+            ) 
+            ELSE ARRAY[]::varchar[]
+        END) AS extracted_tag
+        INNER JOIN Tags t ON t.TagName = extracted_tag
+        WHERE t.Count > 10
+        LIMIT 5
+    ) tag_query ON true
+    GROUP BY p.post_id
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        vt.Name as vote_type,
+        COUNT(v.Id) as vote_count,
+        AVG(v.CreationDate) as avg_vote_time
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.VoteTypeId IN (2, 3, 1, 5) -- Upvotes, Downvotes, Accepted, Favorites
+    GROUP BY v.PostId, vt.Name
+),
+comment_activity AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score
+    FROM Comments c
+    WHERE c.Score >= -5
+    GROUP BY c.PostId
+),
+history_summary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) as edit_count,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) as last_edit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9) -- Edit-related history
+    GROUP BY ph.PostId
+)
+SELECT 
+    ue.user_id,
+    u.DisplayName as user_name,
+    ue.rep_rank,
+    ue.post_count,
+    ue.avg_score,
+    ue.total_views,
+    ue.last_active,
+    COALESCE(ta.top_tags, 'No tags') as popular_tags,
+    COALESCE(vp_up.vote_count, 0) as total_upvotes,
+    COALESCE(vp_down.vote_count, 0) as total_downvotes,
+    COALESCE(vp_accepted.vote_count, 0) as accepted_answers,
+    COALESCE(ca.comment_count, 0) as total_comments,
+    COALESCE(hs.edit_count, 0) as total_edits,
+    ROUND(
+        (COALESCE(vp_up.vote_count, 0)::float / 
+         GREATEST(ue.post_count, 1)) * 10, 2
+    ) as avg_upvotes_per_post,
+    CASE 
+        WHEN ue.post_count > 50 AND ue.avg_score > 10 THEN 'Power User'
+        WHEN ue.post_count > 10 AND ue.avg_score > 5 THEN 'Active Contributor'
+        ELSE 'Regular'
+    END as engagement_level
+FROM user_engagement ue
+INNER JOIN Users u ON ue.user_id = u.Id
+LEFT JOIN active_posts ap ON ue.user_id = ap.user_id AND ap.post_id = (
+    SELECT ap2.post_id 
+    FROM active_posts ap2 
+    WHERE ap2.user_id = ue.user_id 
+    ORDER BY ap2.ViewCount DESC 
+    LIMIT 1
+)
+LEFT JOIN tag_analysis ta ON ap.post_id = ta.post_id
+LEFT JOIN vote_patterns vp_up ON ap.post_id = vp_up.PostId AND vp_up.vote_type = 'UpMod'
+LEFT JOIN vote_patterns vp_down ON ap.post_id = vp_down.PostId AND vp_down.vote_type = 'DownMod'
+LEFT JOIN vote_patterns vp_accepted ON ap.post_id = vp_accepted.PostId AND vp_accepted.vote_type = 'AcceptedByOriginator'
+LEFT JOIN comment_activity ca ON ap.post_id = ca.PostId
+LEFT JOIN history_summary hs ON ap.post_id = hs.PostId
+WHERE ue.rep_rank <= 100  -- Top 100 users by reputation
+ORDER BY ue.rep_rank, ue.total_views DESC
+LIMIT 50;

@@ -1,0 +1,33 @@
+-- {"query": "44098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 224812, "output_tokens": 76933} 
+WITH recent_posts AS (
+  SELECT p.Id, p.PostTypeId, p.CreationDate, p.LastActivityDate, p.OwnerUserId, u.Reputation
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 1 YEAR)
+),
+popular_tags AS (
+  SELECT t.TagName, t.Count
+  FROM Tags t
+  ORDER BY t.Count DESC
+  LIMIT 20
+),
+post_votes AS (
+  SELECT v.PostId, COUNT(*) AS vote_count
+  FROM Votes v
+  WHERE v.VoteTypeId IN (2, 3)
+  GROUP BY v.PostId
+)
+SELECT
+  rp.Id AS post_id,
+  rp.PostTypeId,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.Reputation AS owner_reputation,
+  pt.TagName,
+  pt.Count AS tag_count,
+  pv.vote_count
+FROM recent_posts rp
+JOIN popular_tags pt ON FIND_IN_SET(pt.TagName, rp.Tags) > 0
+LEFT JOIN post_votes pv ON rp.Id = pv.PostId
+ORDER BY rp.LastActivityDate DESC, pv.vote_count DESC
+LIMIT 1000;

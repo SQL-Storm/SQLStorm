@@ -1,0 +1,74 @@
+WITH UserStatistics AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        U.Reputation > 1000
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+FailedVotes AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        COUNT(V.Id) AS TotalVotes
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.ViewCount < 100 AND (SELECT COUNT(*) FROM Votes WHERE PostId = P.Id AND VoteTypeId = 3) > 
+        (SELECT COUNT(*) FROM Votes WHERE PostId = P.Id AND VoteTypeId = 2)
+    GROUP BY 
+        P.Id, P.Title
+),
+RecentActions AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS RecentActionCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY CreationDate DESC) AS ActionRank
+    FROM 
+        PostHistory
+    WHERE 
+        CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day'
+    GROUP BY 
+        UserId
+)
+SELECT 
+    UStats.UserId,
+    UStats.DisplayName,
+    UStats.Reputation,
+    UStats.PostCount,
+    UStats.QuestionCount,
+    UStats.AnswerCount,
+    UStats.UpVoteCount,
+    UStats.DownVoteCount,
+    UStats.BadgeCount,
+    COALESCE(FV.Title, 'No Failed Votes') AS FailedVotePostTitle,
+    COALESCE(FV.TotalVotes, 0) AS FailedVoteCount,
+    COALESCE(RA.RecentActionCount, 0) AS RecentActivityCount
+FROM 
+    UserStatistics UStats
+LEFT JOIN 
+    (SELECT PostId, Title, TotalVotes FROM FailedVotes) FV ON UStats.UserId = (
+        SELECT OwnerUserId FROM Posts P2 WHERE P2.Id = FV.PostId LIMIT 1
+    )
+LEFT JOIN 
+    RecentActions RA ON UStats.UserId = RA.UserId AND RA.ActionRank = 1
+ORDER BY 
+    UStats.Reputation DESC, UStats.PostCount DESC;

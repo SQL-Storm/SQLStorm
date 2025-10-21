@@ -1,0 +1,117 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' AND p.PostTypeId = 1
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName, t.Count
+),
+UserExpertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS AcceptedAnswers,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    JOIN TagHierarchy t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+PostEvolution AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorId,
+        u.DisplayName AS EditorName,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEditDate,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEditDate,
+        COUNT(*) OVER (PARTITION BY ph.PostId) AS TotalEdits,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS EditSequence
+    FROM PostHistory ph
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date AS BadgeDate,
+        COUNT(*) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS CumulativeBadges,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS CumulativeByClass,
+        DENSE_RANK() OVER (PARTITION BY b.Name ORDER BY b.Date) AS BadgeRank
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS Favorites,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS Bounties,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBounty,
+        (EXTRACT(EPOCH FROM (MIN(v.CreationDate) - p.CreationDate)) / 3600.0) AS HoursToFirstVote,
+        (EXTRACT(EPOCH FROM (MAX(v.CreationDate) - p.CreationDate)) / 86400.0) AS DaysOfVotingActivity
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.Score > 10
+    GROUP BY v.PostId, p.PostTypeId, p.CreationDate
+)
+SELECT 
+    ue.TagName,
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ue.AvgAnswerScore,
+    ue.AcceptedAnswers,
+    ue.TagRank,
+    th.QuestionCount AS TagQuestionCount,
+    th.AvgScore AS TagAvgScore,
+    COALESCE(bp.CumulativeBadges, 0) AS UserTotalBadges,
+    COALESCE(bp.CumulativeByClass, 0) AS GoldBadges,
+    COUNT(DISTINCT pe.PostId) AS EditedPosts,
+    AVG(pe.TotalEdits) AS AvgEditsPerPost,
+    COUNT(DISTINCT c.Id) AS CommentsWritten,
+    AVG(c.Score) AS AvgCommentScore,
+    COUNT(DISTINCT vp.PostId) AS HighScoringPosts,
+    AVG(vp.UpVotes) AS AvgUpVotesPerPost,
+    AVG(vp.HoursToFirstVote) AS AvgHoursToFirstVote,
+    SUM(vp.TotalBounty) AS TotalBountiesReceived,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ue.AvgAnswerScore) OVER (PARTITION BY ue.TagName) AS MedianScoreInTag,
+    STDDEV(ue.TotalScore) OVER (PARTITION BY ue.TagName) AS ScoreStdDevInTag,
+    RANK() OVER (ORDER BY ue.TotalScore DESC) AS GlobalScoreRank,
+    DENSE_RANK() OVER (PARTITION BY ue.TagName ORDER BY ue.AcceptedAnswers DESC) AS AcceptanceRankInTag
+FROM UserExpertise ue
+JOIN TagHierarchy th ON th.TagName = ue.TagName
+LEFT JOIN BadgeProgression bp ON bp.UserId = ue.UserId AND bp.Class = 1
+LEFT JOIN PostEvolution pe ON pe.EditorId = ue.UserId
+LEFT JOIN Comments c ON c.UserId = ue.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = ue.UserId
+LEFT JOIN VotePatterns vp ON vp.PostId = p.Id
+WHERE ue.TagRank <= 100
+GROUP BY 
+    ue.TagName, ue.UserId, ue.DisplayName, ue.Reputation,
+    ue.AnswerCount, ue.TotalScore, ue.AvgAnswerScore,
+    ue.AcceptedAnswers, ue.TagRank, th.QuestionCount,
+    th.AvgScore, bp.CumulativeBadges, bp.CumulativeByClass
+HAVING COUNT(DISTINCT pe.PostId) > 5
+ORDER BY ue.TagName, ue.TagRank
+LIMIT 1000;

@@ -1,0 +1,68 @@
+-- {"query": "55091.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1480} 
+WITH user_stats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)                                   AS question_count,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)                                   AS answer_count,
+        COALESCE(SUM(p.Score),0)                                                              AS total_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)                                          AS avg_question_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)                                          AS avg_answer_score,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)                                           AS upvote_given,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)                                           AS downvote_given,
+        COUNT(b.Id)                                                                          AS badge_count,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)                                               AS gold_badge,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)                                               AS silver_badge,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)                                               AS bronze_badge,
+        MAX(p.CreationDate)                                                                  AS last_post_date,
+        MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId IN (1,2,3,5,10,11))                    AS last_vote_date
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes      v ON v.UserId      = u.Id
+    LEFT JOIN Badges     b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ranked_users AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, total_score DESC)                      AS rep_rank,
+        RANK()       OVER (ORDER BY badge_count DESC)                                        AS badge_rank
+    FROM user_stats
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.rep_rank,
+    ru.badge_rank,
+    ru.question_count,
+    ru.answer_count,
+    ru.total_score,
+    ru.avg_question_score,
+    ru.avg_answer_score,
+    ru.upvote_given,
+    ru.downvote_given,
+    ru.gold_badge,
+    ru.silver_badge,
+    ru.bronze_badge,
+    TO_CHAR(ru.last_post_date, 'YYYY-MM-DD')                                               AS last_post_date,
+    TO_CHAR(ru.last_vote_date, 'YYYY-MM-DD')                                               AS last_vote_date,
+    COALESCE(tag_stats.top_tag, 'None')                                                    AS top_tag
+FROM ranked_users ru
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName AS top_tag,
+        COUNT(*)  AS tag_usage
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag_raw ON TRUE
+    JOIN Tags t ON t.TagName = tag_raw
+    WHERE p.OwnerUserId = ru.Id
+      AND p.PostTypeId = 1
+    GROUP BY t.TagName
+    ORDER BY tag_usage DESC
+    LIMIT 1
+) tag_stats ON TRUE
+WHERE ru.rep_rank <= 100
+ORDER BY ru.rep_rank
+LIMIT 100;

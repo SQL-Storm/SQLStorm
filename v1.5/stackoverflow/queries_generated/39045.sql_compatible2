@@ -1,0 +1,143 @@
+WITH RecentQuestions AS (
+    SELECT p.Id,
+           p.Title,
+           p.Tags,
+           p.OwnerUserId,
+           p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1' YEAR
+),
+UnnestedTags AS (
+    SELECT
+        rq.Id           AS question_id,
+        rq.OwnerUserId,
+        rq.CreationDate,
+        t.tag_name
+    FROM RecentQuestions rq
+    CROSS JOIN LATERAL (
+        SELECT
+            UNNEST(
+                STRING_TO_ARRAY(
+                    SUBSTR(rq.Tags, 2, LENGTH(rq.Tags) - 2),
+                    '><'
+                )
+            ) AS tag_name
+    ) AS t
+),
+AnswerStats AS (
+    SELECT
+        ut.question_id,
+        COUNT(a.Id) FILTER (WHERE a.Score > 0) AS positive_answers,
+        AVG(CAST(a.CreationDate - ut.CreationDate AS INTERVAL)) AS avg_answer_delay
+    FROM UnnestedTags ut
+    JOIN Posts a
+      ON a.ParentId = ut.question_id
+    GROUP BY ut.question_id
+),
+TagStats AS (
+    SELECT
+        ut.tag_name                    AS tag,
+        COUNT(DISTINCT ut.question_id) AS question_count,
+        AVG(COALESCE(ans.avg_answer_delay, INTERVAL '0 seconds')) AS avg_response_time,
+        SUM(COALESCE(ans.positive_answers,   0))          AS total_positive_answers,
+        AVG(qb.badge_count)            AS avg_asker_badges,
+        AVG(qc.comment_count)          AS avg_comments,
+        SUM(phc.closed_count)          AS total_closed
+    FROM UnnestedTags ut
+    LEFT JOIN AnswerStats ans
+      ON ans.question_id = ut.question_id
+    LEFT JOIN (
+        SELECT
+            p.Id     AS qid,
+            COUNT(b.Id) AS badge_count
+        FROM Posts p
+        LEFT JOIN Badges b
+          ON b.UserId = p.OwnerUserId
+        WHERE p.PostTypeId = 1
+        GROUP BY p.Id
+    ) qb
+      ON qb.qid = ut.question_id
+    LEFT JOIN (
+        SELECT
+            c.PostId AS qid,
+            COUNT(*)  AS comment_count
+        FROM Comments c
+        GROUP BY c.PostId
+    ) qc
+      ON qc.qid = ut.question_id
+    LEFT JOIN (
+        SELECT
+            ph.PostId AS qid,
+            COUNT(*)   AS closed_count
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10, 12)
+        GROUP BY ph.PostId
+    ) phc
+      ON phc.qid = ut.question_id
+    GROUP BY ut.tag_name
+),
+TopTags AS (
+    SELECT
+        tag,
+        question_count,
+        avg_response_time,
+        total_positive_answers,
+        avg_asker_badges,
+        avg_comments,
+        total_closed
+    FROM TagStats
+    ORDER BY question_count DESC
+    LIMIT 10
+),
+TopAnswerers AS (
+    SELECT
+        ut.tag_name                          AS tag,
+        u.DisplayName                        AS answerer,
+        COUNT(a.Id)                          AS answers_count,
+        ROW_NUMBER() OVER (
+            PARTITION BY ut.tag_name
+            ORDER BY COUNT(a.Id) DESC
+        )                                    AS rnk
+    FROM UnnestedTags ut
+    JOIN Posts a
+      ON a.ParentId = ut.question_id
+    JOIN Users u
+      ON u.Id = a.OwnerUserId
+    GROUP BY ut.tag_name, u.DisplayName
+)
+SELECT
+    tt.tag,
+    tt.question_count,
+    tt.avg_response_time,
+    tt.total_positive_answers,
+    tt.avg_asker_badges,
+    tt.avg_comments,
+    tt.total_closed,
+    ARRAY_AGG(ta.answerer ORDER BY ta.answers_count DESC)
+      FILTER (WHERE ta.rnk <= 3)        AS top_answerers,
+    (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.VoteTypeId = 2
+        AND v.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1' YEAR
+    )                                    AS upvotes_last_year,
+    (
+      SELECT COUNT(*)
+      FROM PostLinks pl
+      WHERE pl.LinkTypeId = 3
+        AND pl.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1' YEAR
+    )                                    AS duplicates_last_year
+FROM TopTags tt
+LEFT JOIN TopAnswerers ta
+  ON ta.tag = tt.tag
+ AND ta.rnk <= 3
+GROUP BY
+    tt.tag,
+    tt.question_count,
+    tt.avg_response_time,
+    tt.total_positive_answers,
+    tt.avg_asker_badges,
+    tt.avg_comments,
+    tt.total_closed
+ORDER BY tt.question_count DESC;

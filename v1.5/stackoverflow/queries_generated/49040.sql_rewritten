@@ -1,0 +1,118 @@
+-- {"query": "49040.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1608} 
+WITH UserAnswerTagPerformance AS (
+    -- This CTE aggregates the performance of users on specific tags based on their answers.
+    -- It extracts individual tags from question posts and associates them with the user's answers.
+    SELECT
+        P.OwnerUserId AS UserId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(QP.Tags FROM 2 FOR LENGTH(QP.Tags) - 2), '><')))) AS TagName,
+        COUNT(P.Id) AS TotalAnswers,
+        SUM(P.Score) AS TotalAnswerScore,
+        -- Count answers that were accepted for the corresponding question
+        COUNT(CASE WHEN P.Id = QP.AcceptedAnswerId THEN 1 ELSE NULL END) AS AcceptedAnswersCount,
+        MAX(P.CreationDate) AS LastAnswerDate,
+        AVG(P.Score) AS AvgAnswerScore
+    FROM Posts AS P
+    JOIN Posts AS QP ON P.ParentId = QP.Id
+    WHERE
+        P.PostTypeId = 2 -- Only answers
+        AND P.OwnerUserId IS NOT NULL
+        AND QP.PostTypeId = 1 -- Only questions as parents
+        AND P.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Focus on recent activity (last 3 years)
+        AND P.Score > 0 -- Only consider answers with positive scores
+        AND QP.Tags IS NOT NULL AND LENGTH(QP.Tags) > 2 -- Ensure the parent question has valid tags
+    GROUP BY
+        P.OwnerUserId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(QP.Tags FROM 2 FOR LENGTH(QP.Tags) - 2), '><'))))
+),
+UserOverallActivity AS (
+    -- This CTE summarizes overall user activity, including total posts, comments, votes received,
+    -- and counts of different badge classes.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpvotesGiven, -- Upvotes given by the user
+        U.DownVotes AS TotalDownvotesGiven, -- Downvotes given by the user
+        U.Views AS ProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id ELSE NULL END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id ELSE NULL END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Count various types of votes received on posts owned by the user
+        SUM(CASE WHEN V.VoteTypeId = 2 AND V.PostId = P.Id THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 AND V.PostId = P.Id THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 AND V.PostId = P.Id THEN 1 ELSE 0 END) AS TotalFavoritesReceived,
+        -- Count badges by class
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id ELSE NULL END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id ELSE NULL END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id ELSE NULL END) AS BronzeBadges,
+        MAX(U.LastAccessDate) AS LastSeen
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId -- Joins votes to posts owned by the user
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views
+),
+RankedTagPerformance AS (
+    -- This CTE ranks each user's performance across different tags using window functions.
+    -- It helps identify their strongest areas based on answer score and acceptance rate.
+    SELECT
+        UserId,
+        TagName,
+        TotalAnswers,
+        TotalAnswerScore,
+        AcceptedAnswersCount,
+        AvgAnswerScore,
+        RANK() OVER (PARTITION BY UserId ORDER BY TotalAnswerScore DESC, AcceptedAnswersCount DESC, TotalAnswers DESC) AS TagScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TotalAnswerScore DESC, AcceptedAnswersCount DESC, TotalAnswers DESC) AS TagRankNum
+    FROM UserAnswerTagPerformance
+    WHERE TotalAnswers >= 5 -- Only consider tags where the user has at least 5 answers
+),
+TopTagsPerUser AS (
+    -- This CTE selects the single best-performing tag for each user based on the ranking.
+    SELECT
+        UserId,
+        TagName AS TopTagName,
+        TotalAnswers AS TopTagAnswers,
+        TotalAnswerScore AS TopTagScore,
+        AcceptedAnswersCount AS TopTagAcceptedAnswers,
+        AvgAnswerScore AS TopTagAvgScore
+    FROM RankedTagPerformance
+    WHERE TagRankNum = 1 -- Selects the top-ranked tag
+)
+-- The final query joins the aggregated user activity with their top tag performance
+-- to calculate a composite performance score and identify top contributors.
+SELECT
+    UOA.DisplayName,
+    UOA.Reputation,
+    UOA.TotalPostsCreated,
+    UOA.TotalAnswersCreated,
+    UOA.TotalUpvotesReceived,
+    UOA.TotalFavoritesReceived,
+    TTU.TopTagName,
+    TTU.TopTagScore,
+    TTU.TopTagAcceptedAnswers,
+    TTU.TopTagAvgScore,
+    UOA.GoldBadges,
+    UOA.SilverBadges,
+    UOA.BronzeBadges,
+    UOA.LastSeen,
+    -- A composite score combining various metrics with arbitrary weights to reflect overall contribution
+    (
+        UOA.Reputation * 0.5 +
+        UOA.TotalUpvotesReceived * 0.3 +
+        UOA.TotalFavoritesReceived * 0.1 +
+        TTU.TopTagScore * 0.05 +
+        TTU.TopTagAcceptedAnswers * 0.05 +
+        (UOA.GoldBadges * 100 + UOA.SilverBadges * 10 + UOA.BronzeBadges * 1) * 0.01
+    ) AS CompositePerformanceScore
+FROM UserOverallActivity AS UOA
+JOIN TopTagsPerUser AS TTU ON UOA.UserId = TTU.UserId
+WHERE
+    UOA.Reputation >= 1000 -- Filter for users with at least 1000 reputation
+    AND UOA.TotalAnswersCreated >= 10 -- Only consider users who have provided at least 10 answers
+    AND UOA.LastSeen >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Only consider users active in the last year
+ORDER BY CompositePerformanceScore DESC, UOA.Reputation DESC
+LIMIT 100;

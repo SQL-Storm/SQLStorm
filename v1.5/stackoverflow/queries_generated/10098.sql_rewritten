@@ -1,0 +1,69 @@
+-- {"query": "10098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 584} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName,
+        U.Reputation,
+        U.LastAccessDate,
+        ROW_NUMBER() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    U.DisplayName,
+    U.Reputation,
+    U.LastAccessDate,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High Scoring'
+        ELSE 'Average'
+    END AS ScoreTier,
+    STRING_AGG(T.TagName, ', ') WITHIN GROUP AS ORDER BY T.TagName ASC AS TagList
+FROM 
+    RankedPosts RP
+JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    PostHistory PH ON RP.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+LEFT JOIN 
+    CloseReasonTypes CRT ON PH.Comment = CAST(CRT.Id AS varchar)
+LEFT JOIN 
+    Tags T ON CHARINDEX(',' + CAST(T.Id AS varchar) + ',', ',' + RP.Tags + ',') > 0
+JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+WHERE 
+    (RP.Score > 100 OR RP.ViewCount > 1000)
+    AND BC.BadgeCount > 5
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.Rank, U.DisplayName, U.Reputation, U.LastAccessDate, BC.BadgeCount
+HAVING 
+    SUM(CASE WHEN T.TagName IS NOT NULL THEN 1 ELSE 0 END) > 3
+ORDER BY 
+    RP.Rank;

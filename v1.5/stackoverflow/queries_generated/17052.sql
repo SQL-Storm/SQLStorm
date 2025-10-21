@@ -1,0 +1,138 @@
+-- {"query": "17052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 123755, "output_tokens": 121718} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(CURRENT_TIMESTAMP, u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CURRENT_TIMESTAMP - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagUsageCount,
+        AVG(p.Score) AS AvgTagScore,
+        MAX(p.Score) AS MaxTagScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC, AVG(p.Score) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+),
+EditActivity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7, 8, 9)) AS RollbackCount,
+        COUNT(DISTINCT ph.PostId) AS EditedPostCount,
+        COUNT(DISTINCT DATE(ph.CreationDate)) AS ActiveEditDays,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY LENGTH(ph.Text)) FILTER (WHERE ph.Text IS NOT NULL) AS MedianEditLength
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY ph.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesCast,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesCast,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+        COALESCE(SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8), 0) AS TotalBountyAmount,
+        COUNT(DISTINCT DATE(v.CreationDate)) AS VotingDays,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE v.VoteTypeId = 3) = 0 THEN NULL
+            ELSE CAST(COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS NUMERIC) / 
+                 NULLIF(COUNT(*) FILTER (WHERE v.VoteTypeId = 3), 0)
+        END AS UpDownRatio
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+CommentEngagement AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(LENGTH(c.Text)) AS MaxCommentLength,
+        COUNT(*) FILTER (WHERE c.Score >= 5) AS HighScoreComments,
+        COUNT(DISTINCT c.PostId) AS CommentedPosts
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    UPPER(SUBSTRING(um.Location FROM 1 FOR 3)) || LOWER(SUBSTRING(um.Location FROM 4)) AS FormattedLocation,
+    um.YearsActive || ' years' AS Tenure,
+    um.QuestionCount || '/' || um.AnswerCount AS "Q/A Ratio",
+    ROUND(um.AvgPostScore::NUMERIC, 2) AS AvgPostScore,
+    COALESCE(tt.Tag, 'No Tags') AS TopTag,
+    COALESCE(tt.TagUsageCount, 0) AS TopTagUsage,
+    ROUND(COALESCE(tt.AvgTagScore, 0)::NUMERIC, 2) AS TopTagAvgScore,
+    um.GoldBadges || '/' || um.SilverBadges || '/' || um.BronzeBadges AS "Badge Count (G/S/B)",
+    CASE 
+        WHEN um.GoldBadgeNames IS NOT NULL THEN 
+            SUBSTRING(um.GoldBadgeNames FROM 1 FOR 50) || 
+            CASE WHEN LENGTH(um.GoldBadgeNames) > 50 THEN '...' ELSE '' END
+        ELSE 'None'
+    END AS GoldBadgesSample,
+    COALESCE(ea.EditCount, 0) AS TotalEdits,
+    COALESCE(ea.RollbackCount, 0) AS Rollbacks,
+    ROUND(COALESCE(ea.MedianEditLength, 0)::NUMERIC, 0) AS MedianEditSize,
+    COALESCE(vp.UpvotesCast, 0) || '↑ / ' || COALESCE(vp.DownvotesCast, 0) || '↓' AS VotesCast,
+    ROUND(COALESCE(vp.UpDownRatio, 0)::NUMERIC, 2) AS UpDownVoteRatio,
+    COALESCE(vp.BountiesStarted, 0) AS Bounties,
+    COALESCE(vp.TotalBountyAmount, 0) AS TotalBountyRep,
+    COALESCE(ce.CommentCount, 0) AS Comments,
+    ROUND(COALESCE(ce.AvgCommentScore, 0)::NUMERIC, 2) AS AvgCommentScore,
+    CASE 
+        WHEN um.Reputation > 100000 THEN '★★★★★'
+        WHEN um.Reputation > 50000 THEN '★★★★☆'
+        WHEN um.Reputation > 20000 THEN '★★★☆☆'
+        WHEN um.Reputation > 10000 THEN '★★☆☆☆'
+        WHEN um.Reputation > 5000 THEN '★☆☆☆☆'
+        ELSE '☆☆☆☆☆'
+    END AS ReputationTier,
+    DENSE_RANK() OVER (ORDER BY um.Reputation DESC, um.TotalPostScore DESC) AS OverallRank,
+    PERCENT_RANK() OVER (ORDER BY COALESCE(vp.UpDownRatio, 0)) AS VotingPositivityPercentile,
+    LAG(um.DisplayName) OVER (ORDER BY um.Reputation DESC) AS NextHigherUser,
+    LEAD(um.DisplayName) OVER (ORDER BY um.Reputation DESC) AS NextLowerUser
+FROM UserMetrics um
+LEFT JOIN TopTags tt ON um.Id = tt.OwnerUserId AND tt.TagRank = 1
+LEFT JOIN EditActivity ea ON um.Id = ea.UserId
+LEFT JOIN VotePatterns vp ON um.Id = vp.UserId
+LEFT JOIN CommentEngagement ce ON um.Id = ce.UserId
+WHERE um.PostCount > 10
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 5)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = um.Id 
+            AND ph.PostHistoryTypeId = 12
+            AND ph.CreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days'
+    )
+ORDER BY 
+    um.Reputation DESC,
+    um.TotalPostScore DESC,
+    COALESCE(vp.UpDownRatio, 0) DESC
+LIMIT 100;

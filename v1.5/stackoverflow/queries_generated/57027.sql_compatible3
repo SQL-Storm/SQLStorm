@@ -1,0 +1,132 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM
+        RecentActiveUsers
+    WHERE
+        Reputation > 1000
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS QuestionCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = CAST(SPLIT_PART(p.Tags, '><', 1) AS INTEGER)
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        QuestionCount DESC
+    LIMIT 10
+),
+QuestionsWithHighVotes AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        u.DisplayName AS OwnerName
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 50
+    ORDER BY
+        p.Score DESC
+    LIMIT 50
+),
+ActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.LastActivityDate,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.LastActivityDate
+)
+SELECT
+    hru.UserId,
+    hru.Reputation,
+    hru.ReputationRank,
+    hru.PostCount,
+    hru.CommentCount,
+    hru.VoteCount,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.QuestionCount,
+    qwhv.QuestionId,
+    qwhv.Title,
+    qwhv.Score AS QuestionScore,
+    qwhv.AnswerCount,
+    qwhv.ViewCount AS QuestionViewCount,
+    qwhv.OwnerName,
+    ap.PostId,
+    ap.PostTypeId,
+    ap.CreationDate AS PostCreationDate,
+    ap.Score AS PostScore,
+    ap.ViewCount AS PostViewCount,
+    ap.LastActivityDate AS PostLastActivityDate,
+    ap.CommentCount AS PostCommentCount,
+    ap.VoteCount AS PostVoteCount,
+    ap.UpVoteCount,
+    ap.DownVoteCount
+FROM
+    HighReputationUsers hru
+CROSS JOIN
+    TopTags tt
+LEFT JOIN
+    QuestionsWithHighVotes qwhv ON hru.UserId = qwhv.QuestionId
+LEFT JOIN
+    ActivePosts ap ON hru.UserId = ap.PostId
+ORDER BY
+    hru.Reputation DESC,
+    qwhv.Score DESC,
+    ap.Score DESC;

@@ -1,0 +1,75 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Score,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1
+),
+VoteSummary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+    FROM 
+        Votes v
+    JOIN 
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY 
+        v.PostId
+),
+MergedPosts AS (
+    SELECT
+        r.PostId,
+        r.Title,
+        r.CreationDate,
+        r.UserId,
+        r.DisplayName,
+        r.Score,
+        vs.UpvoteCount,
+        vs.DownvoteCount,
+        COALESCE(vs.UpvoteCount, 0) - COALESCE(vs.DownvoteCount, 0) AS NetVotes
+    FROM
+        RankedPosts r
+    LEFT JOIN
+        VoteSummary vs ON r.PostId = vs.PostId
+)
+SELECT
+    mp.PostId,
+    mp.Title,
+    mp.DisplayName,
+    mp.Score,
+    mp.UpvoteCount,
+    mp.DownvoteCount,
+    mp.NetVotes,
+    COALESCE(b.Name, 'No Badge') AS BadgeName,
+    COUNT(c.Id) AS CommentCount
+FROM
+    MergedPosts mp
+LEFT JOIN 
+    Badges b ON mp.UserId = b.UserId AND b.Class = 1
+LEFT JOIN
+    Comments c ON mp.PostId = c.PostId
+WHERE
+    mp.PostRank = 1
+GROUP BY
+    mp.PostId,
+    mp.Title,
+    mp.DisplayName,
+    mp.Score,
+    mp.UpvoteCount,
+    mp.DownvoteCount,
+    mp.NetVotes,
+    COALESCE(b.Name, 'No Badge')
+HAVING 
+    COUNT(c.Id) > 5
+ORDER BY
+    mp.NetVotes DESC, mp.CreationDate ASC;

@@ -1,0 +1,34 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 1 THEN v.UserId ELSE NULL END) AS AcceptedVotes,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    COUNT(DISTINCT t.Id) AS TagCount
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.PostId
+WHERE 
+    p.PostTypeId = 1 AND p.CreationDate > DATE '2020-01-01'
+GROUP BY 
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+ORDER BY 
+    p.Score DESC, p.ViewCount DESC
+LIMIT 100;

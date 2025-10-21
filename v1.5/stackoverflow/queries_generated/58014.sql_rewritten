@@ -1,0 +1,63 @@
+-- {"query": "58014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1509} 
+WITH ActiveUsers AS (
+    SELECT Id, DisplayName, Reputation, CreationDate
+    FROM Users
+    WHERE Reputation > 10000 AND DATE_PART('year', CreationDate) >= 2020
+), UserPosts AS (
+    SELECT p.OwnerUserId, p.Id AS PostId, p.Score, p.FavoriteCount, p.Tags, p.CreationDate
+    FROM Posts p
+    INNER JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+), PostStats AS (
+    SELECT up.OwnerUserId,
+           AVG(up.Score) AS AvgPostScore,
+           SUM(up.FavoriteCount) AS TotalFavorites,
+           COUNT(DISTINCT up.PostId) AS TotalQuestions,
+           COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id END) AS TotalEdits
+    FROM UserPosts up
+    LEFT JOIN PostHistory ph ON up.PostId = ph.PostId
+    GROUP BY up.OwnerUserId
+), VoteStats AS (
+    SELECT v.PostId,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes
+    FROM Votes v
+    GROUP BY v.PostId
+), UserBadges AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBasedBadges
+    FROM Badges b
+    INNER JOIN ActiveUsers u ON b.UserId = u.Id
+    GROUP BY b.UserId
+)
+SELECT u.Id,
+       u.DisplayName,
+       u.Reputation,
+       ps.AvgPostScore,
+       ps.TotalFavorites,
+       ps.TotalQuestions,
+       ps.TotalEdits,
+       COALESCE(SUM(vs.Upvotes), 0) AS TotalUpvotes,
+       COALESCE(SUM(vs.Downvotes), 0) AS TotalDownvotes,
+       ub.GoldBadges,
+       ub.TagBasedBadges,
+       (SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (SELECT PostId FROM UserPosts WHERE OwnerUserId = u.Id)) AS TotalComments,
+       (SELECT STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.Count DESC LIMIT 3)
+        FROM Tags t
+        WHERE t.Id IN (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(up.Tags, 2, LENGTH(up.Tags)-2), '><'), NULL) FROM UserPosts up WHERE up.OwnerUserId = u.Id)) AS TopTags,
+       RANK() OVER (ORDER BY (ps.AvgPostScore * 0.3 + ps.TotalFavorites * 0.2 + ub.GoldBadges * 0.5) DESC) AS UserRank,
+       CASE
+           WHEN ps.TotalEdits > 50 AND ub.GoldBadges > 10 THEN 'Elite Contributor'
+           WHEN ps.TotalQuestions > 100 AND ub.TagBasedBadges > 5 THEN 'Topic Expert'
+           ELSE 'Active User'
+       END AS UserCategory
+FROM ActiveUsers u
+LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+LEFT JOIN UserPosts up ON u.Id = up.OwnerUserId
+LEFT JOIN VoteStats vs ON up.PostId = vs.PostId
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+GROUP BY u.Id, u.DisplayName, u.Reputation, ps.AvgPostScore, ps.TotalFavorites, ps.TotalQuestions, ps.TotalEdits, ub.GoldBadges, ub.TagBasedBadges
+HAVING ps.TotalQuestions >= 10 AND SUM(vs.Upvotes) > SUM(vs.Downvotes)
+ORDER BY UserRank ASC, TotalFavorites DESC
+LIMIT 100;

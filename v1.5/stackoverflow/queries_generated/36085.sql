@@ -1,0 +1,87 @@
+-- {"query": "36085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 740} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  pt.Name AS PostTypeName,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.FavoriteCount,
+  p.Tags,
+  u.Id AS OwnerId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.ProfileImageUrl,
+  COALESCE(a.CountAnswers, 0) AS AnswerCount,
+  COALESCE(vv.UpVotes, 0) AS NetUpVotes,
+  COALESCE(vv.DownVotes, 0) AS NetDownVotes,
+  COALESCE(b.BadgeCount, 0) AS BadgeCount,
+  COALESCE(ct.CommentCount, 0) AS CommentCount,
+  ARRAY_AGG(DISTINCT tt.Name) FILTER (WHERE tt.Name IS NOT NULL) AS TagsList,
+  COALESCE(pl.LinkedCount, 0) AS LinksToPostCount,
+  COALESCE(pl.DuplicateCount, 0) AS DuplicatesCount
+FROM
+  Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS CountAnswers
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY PostId
+  ) a ON p.Id = a.PostId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vv ON p.Id = vv.PostId
+  LEFT JOIN (
+    SELECT
+      OwnerUserId,
+      COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) b ON u.Id = b.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) ct ON p.Id = ct.PostId
+  LEFT JOIN (
+    SELECT
+      UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName,
+      p.Id AS PostId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) t ON p.Id = t.PostId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS LinkedCount
+    FROM PostLinks
+    GROUP BY PostId
+  ) pl ON p.Id = pl.PostId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS DuplicateCount
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY PostId
+  ) pl2 ON p.Id = pl2.PostId
+GROUP BY
+  p.Id, p.Title, p.PostTypeId, pt.Name, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount,
+  p.FavoriteCount, p.Tags, u.Id, u.DisplayName, u.Reputation, u.ProfileImageUrl,
+  a.CountAnswers, vv.UpVotes, vv.DownVotes, b.BadgeCount, ct.CommentCount, pl.LinkedCount, pl2.DuplicateCount
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 100;

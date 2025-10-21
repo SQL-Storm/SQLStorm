@@ -1,0 +1,107 @@
+WITH TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+    LIMIT 5000
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.Tags,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownVotes,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT pl.Id) as LinkedCount
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+        AND p.Score >= 5
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.Tags
+),
+AnswerQuality AS (
+    SELECT 
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererUserId,
+        COUNT(*) as AnswerCount,
+        AVG(a.Score) as AvgAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) as AcceptedAnswers,
+        MAX(a.Score) as BestAnswerScore
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+    GROUP BY a.ParentId, a.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) as GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) as SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) as BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) as TagBasedBadges
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+    GROUP BY b.UserId
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        COUNT(DISTINCT qm.QuestionId) as RecentQuestionCount,
+        AVG(qm.Score) as AvgQuestionScore,
+        AVG(qm.ViewCount) as AvgViewCount
+    FROM Tags t
+    INNER JOIN QuestionMetrics qm ON qm.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT qm.QuestionId) >= 10
+)
+SELECT 
+    tu.DisplayName as UserName,
+    tu.Reputation,
+    tu.RepRank,
+    COALESCE(ubs.GoldBadges, 0) as GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) as SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) as BronzeBadges,
+    COUNT(DISTINCT qm.QuestionId) as QuestionsAsked,
+    COALESCE(AVG(qm.Score), 0) as AvgQuestionScore,
+    COALESCE(AVG(qm.ViewCount), 0) as AvgQuestionViews,
+    COALESCE(SUM(qm.AnswerCount), 0) as TotalAnswersReceived,
+    COUNT(DISTINCT aq.QuestionId) as QuestionsAnswered,
+    COALESCE(AVG(aq.AvgAnswerScore), 0) as AvgAnswerScore,
+    COALESCE(SUM(aq.AcceptedAnswers), 0) as TotalAcceptedAnswers,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.AvgQuestionScore DESC) FILTER (WHERE tp.RecentQuestionCount >= 20) as TopTags,
+    ROUND(
+        (COALESCE(ubs.GoldBadges, 0) * 50 + 
+         COALESCE(ubs.SilverBadges, 0) * 10 + 
+         COALESCE(ubs.BronzeBadges, 0) * 2 +
+         COALESCE(AVG(qm.Score), 0) * 5 +
+         COALESCE(SUM(aq.AcceptedAnswers), 0) * 15)::numeric, 2
+    ) as InfluenceScore
+FROM TopUsersByReputation Tu
+LEFT JOIN QuestionMetrics qm ON tu.Id = qm.OwnerUserId
+LEFT JOIN AnswerQuality aq ON tu.Id = aq.AnswererUserId
+LEFT JOIN UserBadgeStats ubs ON tu.Id = ubs.UserId
+LEFT JOIN TagPopularity tp ON qm.Tags LIKE '%' || '<' || tp.TagName || '>' || '%'
+GROUP BY 
+    tu.DisplayName, 
+    tu.Reputation, 
+    tu.RepRank,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges
+HAVING COUNT(DISTINCT qm.QuestionId) + COUNT(DISTINCT aq.QuestionId) >= 5
+ORDER BY InfluenceScore DESC, tu.Reputation DESC
+LIMIT 100;

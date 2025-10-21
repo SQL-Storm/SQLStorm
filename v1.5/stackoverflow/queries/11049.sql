@@ -1,0 +1,87 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30' DAY
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        t.TagName
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.ExcerptPostId
+    WHERE 
+        t.IsModeratorOnly = FALSE
+),
+PostActivity AS (
+    SELECT 
+        p.Id, 
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    GROUP BY 
+        p.Id
+)
+SELECT 
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.VoteCount,
+    rp.UpVoteCount,
+    rp.DownVoteCount,
+    STRING_AGG(pt.TagName, ', ') AS Tags,
+    pa.EditCount,
+    pa.CommentCount,
+    COALESCE(RANK() OVER(ORDER BY rp.Score DESC), 0) AS ScoreRank,
+    COALESCE(RANK() OVER(ORDER BY rp.ViewCount DESC), 0) AS ViewCountRank
+FROM 
+    RecentPosts rp
+JOIN 
+    PostTags pt ON rp.Id = pt.Id
+JOIN 
+    PostActivity pa ON rp.Id = pa.Id
+GROUP BY 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.VoteCount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount, 
+    pa.EditCount, 
+    pa.CommentCount
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC
+LIMIT 10;

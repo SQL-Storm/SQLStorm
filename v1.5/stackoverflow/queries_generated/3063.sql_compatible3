@@ -1,0 +1,102 @@
+WITH UserTags AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS TagUsageCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        CROSS JOIN LATERAL (
+            SELECT tag AS TagName
+        ) AS t
+        CROSS APPLY (
+            SELECT unnest(string_to_array(substr(p."Tags", 2, length(p."Tags") - 2), '><')) AS tag
+        ) AS tt
+    GROUP BY
+        u.Id,
+        t.TagName
+),
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgesCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgesCount
+    FROM
+        Users u
+    WHERE
+        u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months'
+),
+PostReplies AS (
+    SELECT
+        p1.Id AS QuestionId,
+        p2.Id AS AnswerId,
+        p2.CreationDate AS AnswerDate,
+        EXTRACT(EPOCH FROM (p2.CreationDate - p1.CreationDate)) AS TimeToAnswerSeconds
+    FROM
+        Posts p1
+        LEFT JOIN Posts p2 ON p2.ParentId = p1.Id AND p2.PostTypeId = 2
+    WHERE
+        p1.PostTypeId = 1
+),
+UserAnswerVoting AS (
+    SELECT
+        u.Id AS UserId,
+        AVG(EXTRACT(EPOCH FROM (p.CreationDate - v.CreationDate))) AS AvgTimeBetweenAnswerAndVote,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesCount
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        LEFT JOIN Posts a ON v.UserId = u.Id AND v.PostId = a.Id AND a.PostTypeId = 2
+    GROUP BY
+        u.Id
+),
+QuestionAnswerCounts AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) AS ActualAnswerCount,
+        (p.AnswerCount = (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)) AS IsAnswerCountAccurate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+)
+SELECT
+    u.UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    jsonb_build_object(
+        'TopTag', (SELECT TagName FROM UserTags ut WHERE ut.UserId = u.UserId AND ut.TagRank = 1 LIMIT 1),
+        'Tags', (SELECT jsonb_agg(TAG_NAME) FROM (SELECT TagName AS TAG_NAME FROM UserTags ut WHERE ut.UserId = u.UserId ORDER BY TagUsageCount DESC LIMIT 10) sub)
+    ) AS UserTags,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.UserId) AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.UserId) AS CommentsCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1 AND p.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AS RecentQuestionsCount,
+    (SELECT AVG(TimeToAnswerSeconds) FROM PostReplies WHERE QuestionId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.UserId AND PostTypeId = 1)) AS AvgResponseTimeSeconds,
+    (SELECT jsonb_object_agg(QuestionId, AnswerCount) FROM QuestionAnswerCounts qac WHERE qac.QuestionId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.UserId AND PostTypeId = 1)) AS QuestionAnswerDistribution,
+    (SELECT AVG(AvgTimeBetweenAnswerAndVote) FROM UserAnswerVoting uav WHERE uav.UserId = u.UserId) AS AvgAnswerVoteTimeSeconds,
+    (SELECT ARRAY_AGG(DISTINCT TagName) FROM Posts p2 WHERE p2.OwnerUserId = u.UserId AND p2.PostTypeId = 1 AND p2.Tags IS NOT NULL) AS UserTagsArray
+FROM
+    ActiveUsers u
+WHERE
+    u.Reputation >= 1000
+    AND EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1)
+ORDER BY
+    u.Reputation DESC
+LIMIT 50;

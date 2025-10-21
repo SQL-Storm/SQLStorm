@@ -1,0 +1,29 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  COUNT(DISTINCT p.Id) AS TotalPosts,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  AVG(p.Score) AS AvgPostScore,
+  MAX(p.LastActivityDate) AS MostRecentActivity,
+  STRING_AGG(DISTINCT t.TagName, ',') OVER (PARTITION BY u.Id) AS TagsTouched,
+  COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+  COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+  MAX(CASE WHEN b.Id IS NOT NULL THEN b.Date ELSE NULL END) AS LastBadgeDate,
+  COUNT(DISTINCT bh.Id) FILTER (WHERE bh.PostHistoryTypeId = 50) AS CommunityBumps,
+  SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentCount,
+  ROUND(AVG(COALESCE(b.Class, 0)), 2) AS AvgBadgeClass
+FROM
+  Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN Tags t ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+LEFT JOIN PostHistory bh ON bh.UserId = u.Id
+GROUP BY
+  u.Id, u.DisplayName
+ORDER BY
+  TotalPosts DESC, MostRecentActivity DESC
+LIMIT 100;

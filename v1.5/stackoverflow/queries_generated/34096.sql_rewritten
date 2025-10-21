@@ -1,0 +1,88 @@
+-- {"query": "34096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 953} 
+WITH TopBadgedUsers AS (
+    SELECT UserId, COUNT(*) AS BadgeCount, MAX(Date) AS LastBadgeDate
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+    HAVING COUNT(*) > 5
+),
+PopularQuestions AS (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.Score > 10
+      AND p.ViewCount > 1000
+      AND p.OwnerUserId IN (SELECT UserId FROM TopBadgedUsers)
+),
+AcceptedAnswers AS (
+    SELECT a.Id, a.ParentId, a.Score, a.CreationDate, a.OwnerUserId,
+           u.Reputation, u.DisplayName, u.Location,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS rn
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2 -- Answers only
+      AND a.ParentId IN (SELECT Id FROM PopularQuestions)
+),
+AnswerCommentStats AS (
+    SELECT c.PostId, COUNT(c.Id) AS CommentCount, AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    WHERE c.PostId IN (SELECT Id FROM AcceptedAnswers WHERE rn = 1)
+    GROUP BY c.PostId
+),
+UserActivity AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location,
+           COUNT(DISTINCT p.Id) AS TotalPosts,
+           COUNT(DISTINCT ph.Id) AS TotalEdits,
+           COUNT(DISTINCT v.Id) AS TotalVotesCast,
+           COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionTagCounts AS (
+    SELECT p.Id AS QuestionId, COUNT(DISTINCT unnest_tags.tag) AS TagCount
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS unnest_tags(tag)
+    WHERE p.PostTypeId = 1 AND p.Id IN (SELECT Id FROM PopularQuestions)
+    GROUP BY p.Id
+),
+FinalAnswerInfo AS (
+    SELECT aa.Id AS AnswerId, aa.ParentId AS QuestionId, aa.Score AS AnswerScore, aa.Reputation AS AnswererReputation,
+           uac.CommentCount, uac.AvgCommentScore
+    FROM AcceptedAnswers aa
+    LEFT JOIN AnswerCommentStats uac ON uac.PostId = aa.Id
+    WHERE aa.rn = 1
+)
+SELECT
+    tq.UserId,
+    u.DisplayName AS UserName,
+    tb.BadgeCount AS GoldBadgeCount,
+    tq.Id AS QuestionId,
+    tq.Title AS QuestionTitle,
+    tq.Score AS QuestionScore,
+    tq.ViewCount AS QuestionViews,
+    qtc.TagCount,
+    fai.AnswerId,
+    fai.AnswerScore,
+    fai.AnswererReputation,
+    COALESCE(fai.CommentCount, 0) AS AnswerCommentCount,
+    COALESCE(fai.AvgCommentScore, 0) AS AnswerAvgCommentScore,
+    ua.TotalPosts,
+    ua.TotalEdits,
+    ua.TotalVotesCast,
+    ua.TotalBadges,
+    u.Location,
+    EXTRACT(YEAR FROM AGE(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) AS UserAgeYears,
+    EXTRACT(YEAR FROM AGE(cast('2024-10-01 12:34:56' as timestamp), tq.CreationDate)) AS QuestionAgeYears
+FROM PopularQuestions tq
+JOIN TopBadgedUsers tb ON tq.OwnerUserId = tb.UserId
+JOIN Users u ON u.Id = tq.OwnerUserId
+LEFT JOIN QuestionTagCounts qtc ON qtc.QuestionId = tq.Id
+LEFT JOIN FinalAnswerInfo fai ON fai.QuestionId = tq.Id
+LEFT JOIN UserActivity ua ON ua.Id = u.Id
+ORDER BY tb.BadgeCount DESC, tq.Score DESC, fai.AnswerScore DESC
+LIMIT 100;

@@ -1,0 +1,101 @@
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+        SUM(p.Score) AS total_score
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2)
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 100
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        SUM(p.Score) AS total_score
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.Id = ANY(string_to_array(p.Tags, '><'))
+    GROUP BY 
+        t.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 50
+),
+top_badges AS (
+    SELECT 
+        b.Name,
+        COUNT(DISTINCT u.Id) AS total_users
+    FROM 
+        Badges b
+    JOIN 
+        Users u ON b.UserId = u.Id
+    GROUP BY 
+        b.Name
+    HAVING 
+        COUNT(DISTINCT u.Id) > 20
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    tu.total_posts,
+    tu.questions,
+    tu.answers,
+    tu.total_score,
+    tt.TagName AS top_tag,
+    tb.Name AS top_badge,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    ph.Comment AS post_history_comment,
+    v.VoteTypeId,
+    vt.Name AS vote_type_name,
+    CASE 
+        WHEN ph.PostHistoryTypeId = 10 THEN 'Closed'
+        WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+        ELSE 'Other'
+    END AS post_history_type
+FROM 
+    Users u
+JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+JOIN 
+    Votes v ON p.Id = v.PostId
+JOIN 
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN 
+    top_users tu ON u.Id = tu.Id
+LEFT JOIN 
+    top_tags tt ON tt.TagName = (
+        SELECT TOP 1 value
+        FROM unnest(string_to_array(p.Tags, '><')) AS value
+    )
+LEFT JOIN 
+    top_badges tb ON tb.Name = (
+        SELECT TOP 1 Name
+        FROM Badges
+        WHERE UserId = u.Id
+    )
+WHERE 
+    p.PostTypeId = 1
+    AND p.Score > 100
+    AND ph.PostHistoryTypeId IN (10, 11)
+    AND v.VoteTypeId IN (2, 3)
+ORDER BY 
+    u.Reputation DESC,
+    tu.total_score DESC,
+    tt.total_score DESC,
+    tb.total_users DESC;

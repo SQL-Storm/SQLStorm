@@ -1,0 +1,214 @@
+with recent_activity as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        dense_rank() over (order by p.LastActivityDate desc nulls last, p.Id desc) as act_rank
+    from Posts p
+),
+top_active as (
+    select *
+    from recent_activity
+    where act_rank <= 5000
+),
+tag_expanded as (
+    select
+        ta.*,
+        lower(trim(both ' ' from unnest(string_to_array(substring(ta.Tags, 2, greatest(length(ta.Tags)-2,0)), '><')))) as tag
+    from top_active ta
+    where ta.PostTypeId = 1
+      and ta.Tags is not null
+),
+answers as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as answer_cnt,
+        avg(a.Score) as avg_answer_score,
+        max(a.Score) as max_answer_score,
+        sum(case when a.Score > 0 then 1 else 0 end) as pos_answers,
+        sum(case when a.Score < 0 then 1 else 0 end) as neg_answers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+comments as (
+    select
+        c.PostId,
+        count(*) as comment_cnt,
+        avg(c.Score) as avg_comment_score,
+        max(c.Score) as max_comment_score
+    from Comments c
+    group by c.PostId
+),
+votes as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_started,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_awarded
+    from Votes v
+    group by v.PostId
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.Views as ProfileViews,
+        u.UpVotes as GivenUpVotes,
+        u.DownVotes as GivenDownVotes,
+        date_part('year', age(u.CreationDate)) as AccountAgeYears,
+        percentile_cont(0.5) within group (order by u.Reputation) over () as GlobalRepMedian
+    from Users u
+),
+history_flags as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as close_or_migrate_events,
+        sum(case when ph.PostHistoryTypeId in (11) then 1 else 0 end) as reopen_events,
+        sum(case when ph.PostHistoryTypeId in (12) then 1 else 0 end) as delete_events,
+        sum(case when ph.PostHistoryTypeId in (13) then 1 else 0 end) as undelete_events,
+        sum(case when ph.PostHistoryTypeId in (24) then 1 else 0 end) as suggested_edits_applied,
+        max(case when ph.PostHistoryTypeId in (10,11,12,13,35,36) then ph.CreationDate else null end) as last_moderation_event
+    from PostHistory ph
+    group by ph.PostId
+),
+duplicate_graph as (
+    select
+        pl.PostId as DuplicateId,
+        pl.RelatedPostId as CanonicalId,
+        pl.CreationDate as LinkCreated
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+dup_agg as (
+    select
+        g.CanonicalId,
+        count(*) as dup_inbound_count,
+        max(g.LinkCreated) as last_dup_link
+    from duplicate_graph g
+    group by g.CanonicalId
+),
+linked_agg as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 1) as linked_out_count,
+        count(*) filter (where pl.LinkTypeId = 3) as duplicate_out_count
+    from PostLinks pl
+    group by pl.PostId
+),
+tag_stats as (
+    select
+        te.tag,
+        count(*) as questions_with_tag,
+        avg(coalesce(te.Score,0)) as avg_score,
+        avg(coalesce(te.ViewCount,0)) as avg_views,
+        percentile_cont(0.9) within group (order by coalesce(te.ViewCount,0)) as p90_views,
+        count(distinct te.OwnerUserId) as distinct_askers
+    from tag_expanded te
+    group by te.tag
+    having count(*) >= 5
+),
+hot_candidates as (
+    select
+        te.PostId,
+        te.tag,
+        te.ViewCount,
+        te.Score,
+        row_number() over (partition by te.tag order by te.ViewCount desc nulls last, te.Score desc nulls last, te.PostId desc) as rn_by_tag
+    from tag_expanded te
+),
+question_core as (
+    select
+        q.Id,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.Title,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.LastActivityDate
+    from Posts q
+    where q.PostTypeId = 1
+)
+select
+    qc.Id as QuestionId,
+    qc.Title,
+    qc.CreationDate,
+    qc.LastActivityDate,
+    qc.Score,
+    qc.ViewCount,
+    qc.AnswerCount,
+    qc.CommentCount,
+    qc.FavoriteCount,
+    us.Reputation,
+    us.AccountAgeYears,
+    case when us.Reputation >= us.GlobalRepMedian then 1 else 0 end as IsAboveMedianRep,
+    coalesce(a.answer_cnt,0) as AnswerCountCalc,
+    coalesce(a.avg_answer_score,0) as AvgAnswerScore,
+    coalesce(a.max_answer_score,0) as MaxAnswerScore,
+    coalesce(c.comment_cnt,0) as CommentCountCalc,
+    coalesce(c.avg_comment_score,0) as AvgCommentScore,
+    coalesce(c.max_comment_score,0) as MaxCommentScore,
+    coalesce(v.upvotes,0) as UpVotes,
+    coalesce(v.downvotes,0) as DownVotes,
+    coalesce(v.favorites,0) as FavoritesVotes,
+    coalesce(v.bounty_started,0) as BountyStartedAmount,
+    coalesce(v.bounty_awarded,0) as BountyAwardedAmount,
+    coalesce(hf.close_or_migrate_events,0) as CloseOrMigrateEvents,
+    coalesce(hf.reopen_events,0) as ReopenEvents,
+    coalesce(hf.delete_events,0) as DeleteEvents,
+    coalesce(hf.undelete_events,0) as UndeleteEvents,
+    coalesce(hf.suggested_edits_applied,0) as SuggestedEditsApplied,
+    hf.last_moderation_event,
+    coalesce(da.dup_inbound_count,0) as DuplicateInboundCount,
+    da.last_dup_link,
+    coalesce(la.linked_out_count,0) as LinkedOutCount,
+    coalesce(la.duplicate_out_count,0) as DuplicateOutCount,
+    ts.tag as DominantTag,
+    ts.questions_with_tag as TagQuestionsCount,
+    ts.avg_views as TagAvgViews,
+    ts.p90_views as TagP90Views,
+    hc.rn_by_tag as HotRankWithinTag
+from question_core qc
+left join user_stats us on us.UserId = qc.OwnerUserId
+left join answers a on a.QuestionId = qc.Id
+left join comments c on c.PostId = qc.Id
+left join votes v on v.PostId = qc.Id
+left join history_flags hf on hf.PostId = qc.Id
+left join dup_agg da on da.CanonicalId = qc.Id
+left join linked_agg la on la.PostId = qc.Id
+left join lateral (
+    select t.tag, t.questions_with_tag, t.avg_views, t.p90_views
+    from tag_expanded te
+    join tag_stats t on t.tag = te.tag
+    where te.PostId = qc.Id
+    order by t.questions_with_tag desc, t.avg_views desc, t.tag
+    limit 1
+) ts on true
+left join lateral (
+    select hc.tag, hc.rn_by_tag
+    from hot_candidates hc
+    where hc.PostId = qc.Id
+    order by hc.rn_by_tag
+    limit 1
+) hc on true
+where qc.Id in (select PostId from top_active)
+order by
+    coalesce(v.upvotes,0) - coalesce(v.downvotes,0) desc,
+    coalesce(a.answer_cnt,0) desc,
+    qc.ViewCount desc,
+    qc.LastActivityDate desc nulls last,
+    qc.Id desc
+limit 2000;

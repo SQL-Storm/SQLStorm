@@ -1,0 +1,105 @@
+-- {"query": "57014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1004} 
+
+WITH ActiveUsers AS (
+    SELECT
+        Id,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes
+    FROM Users
+    WHERE LastAccessDate > NOW() - INTERVAL '30 days'
+),
+PopularPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName
+    FROM Posts p
+    JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.Score > 50
+    AND p.ViewCount > 1000
+),
+RecentComments AS (
+    SELECT
+        c.Id,
+        c.PostId,
+        c.Score,
+        c.CreationDate,
+        c.UserId,
+        c.UserDisplayName,
+        p.Title
+    FROM Comments c
+    JOIN PopularPosts p ON c.PostId = p.Id
+    WHERE c.CreationDate > NOW() - INTERVAL '7 days'
+),
+TopTags AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+    JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE p.Id IN (SELECT Id FROM PopularPosts)
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+UserVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(v.PostId) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN ActiveUsers u ON v.UserId = u.Id
+    GROUP BY v.UserId
+),
+BadgeDistribution AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    JOIN ActiveUsers u ON b.UserId = u.Id
+    GROUP BY b.UserId
+    )
+	SELECT
+	    p.Title,
+	    p.Name,
+	    p.Id,
+	    p.OwnerUserId,
+	    rc.CreationDate as MostRecentComment,
+	    uv.TotalVotes,
+        uv.UpVotes AS UpVotesOnAllPosts,
+        uv.Downvotes AS DownVotesOnAllPosts,
+	    rc.UserId as UserIdOfMostRecentComment,
+		tt.TagName,
+		ba.TotalBadges,
+		ba.GoldBadges,
+	    ba.SilverBadges,
+	    ba.BronzeBadges,
+		p.Score
+	FROM Tags
+	JOIN (SELECT DISTINCT ON (Title) * FROM PopularPosts) p ON
+		(p.Id = Tags.ExcerptPostId)
+	FULL JOIN (Select * from RecentComments) as rc on p.Id = rc.PostId
+	JOIN (Select * From UserVotes) uv on p.OwnerUserId = uv.UserId
+	JOIN BadgeDistribution ba ON uv.UserId = ba.UserId
+	ORDER BY p.Score DESC
+    LIMIT 25;
+

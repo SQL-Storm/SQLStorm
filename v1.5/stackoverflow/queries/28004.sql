@@ -1,0 +1,54 @@
+-- {"query": "28004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1746} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS BadgeClassRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, b.Class
+), PostAnalysis AS (
+    SELECT
+        p.OwnerUserId,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    COALESCE(us.GoldBadges, 0) + COALESCE(us.SilverBadges, 0) * 0.5 + COALESCE(us.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    pa.AvgQuestionScore / NULLIF(pa.AvgAnswerScore, 0) AS QuestionAnswerRatio,
+    (us.UpVotes - us.DownVotes) * LOG(2, u.Reputation + 1) AS ReputationImpact,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)) AS SelfCommentCount,
+    COALESCE(array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'), 1), 0) AS AvgTagsPerPost,
+    CASE 
+        WHEN pa.CloseVotes > pa.ReopenVotes THEN 'Controversial'
+        WHEN pa.TotalUpvotes > pa.TotalDownvotes * 2 THEN 'HighQuality'
+        WHEN ph.Comment LIKE '%101%' THEN 'DuplicateCloser'
+        ELSE 'Neutral'
+    END AS UserCategory
+FROM Users u
+LEFT JOIN UserStats us ON u.Id = us.UserId
+LEFT JOIN PostAnalysis pa ON u.Id = pa.OwnerUserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+WHERE u.Reputation > 1000
+    AND (pa.AvgQuestionScore > 5 OR pa.AvgAnswerScore > 10)
+    AND (us.GoldBadges > 0 OR us.SilverBadges > 5)
+    AND p.ClosedDate IS NULL
+ORDER BY WeightedBadgeScore DESC, ReputationImpact DESC
+LIMIT 100;

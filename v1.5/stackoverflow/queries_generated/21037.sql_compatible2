@@ -1,0 +1,137 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.PostTypeId IN (1, 2) 
+        AND p.DeletionDate IS NULL
+    WHERE u.Reputation >= 100
+        AND u.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.TagBased = FALSE
+    GROUP BY b.UserId
+),
+VoteSummary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 
+                 WHEN v.VoteTypeId = 3 THEN -2 
+                 ELSE 0 END) AS NetScore
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+        AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    GROUP BY v.PostId
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        vs.UpVotes,
+        vs.DownVotes,
+        vs.NetScore,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(LEFT(p.Tags, 50), 'No Tags') AS TagPreview,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            ELSE 'Active'
+        END AS PostStatus,
+        ROW_NUMBER() OVER (ORDER BY vs.NetScore DESC, p.ViewCount DESC) AS ImpactRank,
+        LAG(p.Title) OVER (ORDER BY p.CreationDate DESC) AS PreviousTitle
+    FROM Posts p
+    LEFT JOIN VoteSummary vs ON p.Id = vs.PostId
+    WHERE p.PostTypeId = 1 
+        AND p.DeletionDate IS NULL
+        AND (vs.NetScore > 50 OR p.ViewCount > 10000)
+        AND (p.ClosedDate IS NULL OR p.ClosedDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'))
+),
+UserPostPerformance AS (
+    SELECT 
+        ua.UserId,
+        ua.PostCount,
+        ua.AvgPostScore,
+        COALESCE(SUM(hp.Score), 0) AS TotalPostScore,
+        COUNT(DISTINCT hp.Id) AS HighImpactPostCount,
+        AVG(hp.ImpactRank) AS AvgImpactRank,
+        STRING_AGG(
+            CASE 
+                WHEN hp.PostStatus = 'Closed' THEN 'CLOSED: ' || hp.Title
+                ELSE 'ACTIVE: ' || LEFT(hp.Title, 30)
+            END, 
+            '; ' ORDER BY hp.CreationDate DESC
+        ) AS RecentPostSummary,
+        CASE 
+            WHEN ua.QuestionCount > ua.AnswerCount * 2 THEN 'Question Focused'
+            WHEN ua.AnswerCount > ua.QuestionCount * 2 THEN 'Answer Focused'
+            ELSE 'Balanced'
+        END AS ActivityType
+    FROM UserActivity ua
+    LEFT JOIN HighImpactPosts hp ON ua.UserId = hp.OwnerUserId
+    GROUP BY ua.UserId, ua.PostCount, ua.AvgPostScore, ua.QuestionCount, ua.AnswerCount
+)
+SELECT 
+    upp.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+    upp.PostCount,
+    upp.HighImpactPostCount,
+    ROUND(upp.TotalPostScore / NULLIF(upp.PostCount, 0), 2) AS ScorePerPost,
+    upp.AvgPostScore,
+    COALESCE(upp.AvgImpactRank, 999) AS AvgImpactRank,
+    upp.ActivityType,
+    LEFT(upp.RecentPostSummary, 200) AS RecentPosts,
+    ua.LastPostDate,
+    CASE 
+        WHEN COALESCE(bs.GoldBadges, 0) >= 5 THEN 'Elite'
+        WHEN u.Reputation >= 10000 THEN 'Veteran'
+        WHEN u.Reputation >= 1000 THEN 'Active'
+        ELSE 'Newcomer'
+    END AS UserTier,
+    -- Complex NULL-safe calculation for engagement score
+    GREATEST(
+        COALESCE(upp.TotalPostScore, 0) * 0.4 +
+        COALESCE(upp.HighImpactPostCount, 0) * 25 +
+        (COALESCE(bs.GoldBadges, 0) + COALESCE(bs.SilverBadges, 0) * 0.5) * 10,
+        0
+    ) AS EngagementScore
+FROM UserPostPerformance upp
+INNER JOIN Users u ON upp.UserId = u.Id
+LEFT JOIN BadgeStats bs ON upp.UserId = bs.UserId
+LEFT JOIN UserActivity ua ON upp.UserId = ua.UserId
+WHERE upp.HighImpactPostCount > 0 
+    OR (u.Reputation >= 5000 AND upp.PostCount >= 10)
+    AND (u.Location IS NULL OR u.Location NOT LIKE '%spam%')
+    AND upp.AvgPostScore > (
+        SELECT AVG(AvgPostScore) 
+        FROM UserPostPerformance 
+        WHERE PostCount > 5
+    )
+ORDER BY EngagementScore DESC, u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,104 @@
+-- {"query": "57070.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 942} 
+
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId =2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    WHERE
+        u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        PostCount DESC, AnswerCount DESC, CommentCount DESC
+    LIMIT 100
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        t.TagName
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Tags t ON p.Tags LIKE CONCAT('%><', t.TagName, '>%')
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > DATE_SUB(NOW(), INTERVAL 1 YEAR)
+    ORDER BY
+        p.Score DESC, p.ViewCount DESC, p.AnswerCount DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE CONCAT('%><', t.TagName, '>%')
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        t.TagName
+    ORDER BY
+        PostCount DESC, TotalScore DESC, TotalViews DESC
+    LIMIT 50
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName AS TopUser,
+    tu.Reputation,
+    tu.PostCount AS UserPostCount,
+    tu.AnswerCount AS UserAnswerCount,
+    tu.CommentCount AS UserCommentCount,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.CreationDate AS PostCreationDate,
+    tp.Score AS PostScore,
+    tp.ViewCount AS PostViewCount,
+    tp.AnswerCount AS PostAnswerCount,
+    tp.CommentCount AS PostCommentCount,
+    tp.FavoriteCount AS PostFavoriteCount,
+    tp.OwnerDisplayName,
+    tp.TagName AS PostTagName,
+    at.TagName AS ActiveTag,
+    at.PostCount AS ActiveTagPostCount,
+    at.TotalScore AS ActiveTagTotalScore,
+    at.TotalViews AS ActiveTagTotalViews,
+    at.UniqueVoters AS ActiveTagUniqueVoters
+FROM
+    TopUsers tu
+JOIN
+    TopPosts tp ON tu.UserId = tp.OwnerUserId
+JOIN
+    ActiveTags at ON tp.TagName = at.TagName
+WHERE
+    tp.Score > 50
+    AND tp.ViewCount > 1000
+ORDER BY
+    tp.Score DESC, tp.ViewCount DESC, tu.Reputation DESC, at.PostCount DESC;
+ 

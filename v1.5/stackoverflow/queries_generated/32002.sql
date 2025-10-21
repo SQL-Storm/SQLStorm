@@ -1,0 +1,33 @@
+-- {"query": "32002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 399} 
+
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName AS UserName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+    SUM(v.Score) AS TotalScore,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    COALESCE(SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+    COALESCE(SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+    COALESCE(SUM(CASE WHEN vt.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS FavoritesReceived
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND (v.VoteTypeId = 2 OR v.VoteTypeId = 3)
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes vt ON p.Id = vt.PostId
+GROUP BY 
+    u.Id, u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) >= 5 
+ORDER BY 
+    TotalScore DESC, TotalBadges DESC
+LIMIT 100;

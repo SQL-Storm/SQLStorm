@@ -1,0 +1,159 @@
+WITH
+Q AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         p.OwnerUserId, p.AcceptedAnswerId,
+         regexp_split_to_array(substr(p.Tags, 2, length(p.Tags) - 2), E'><') AS Tags,
+         p.CommentCount, p.FavoriteCount, p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+),
+A AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.CreationDate, a.Score, a.OwnerUserId, a.CommentCount, a.LastActivityDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+),
+U AS (
+  SELECT u.Id,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         u.Views AS UserViews,
+         u.UpVotes, u.DownVotes,
+         CASE
+           WHEN u.Reputation >= 20000 THEN '>=20k'
+           WHEN u.Reputation >= 5000 THEN '5k-19k'
+           WHEN u.Reputation >= 1000 THEN '1k-4k'
+           WHEN u.Reputation >= 100 THEN '100-999'
+           ELSE '<100'
+         END AS RepBucket
+  FROM Users u
+),
+TagExplode AS (
+  SELECT q.Id AS QuestionId, LOWER(TRIM(t)) AS Tag
+  FROM Q q
+  CROSS JOIN LATERAL unnest(q.Tags) AS t
+),
+TagStats AS (
+  SELECT te.Tag,
+         COUNT(*) AS Questions,
+         AVG(q.Score) AS AvgQuestionScore,
+         SUM(q.ViewCount) AS TotalViews
+  FROM TagExplode te
+  JOIN Q q ON q.Id = te.QuestionId
+  GROUP BY te.Tag
+),
+AnswerStats AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(a.Id) AS NumAnswers,
+         MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN a.Score ELSE NULL END) AS AcceptedAnswerScore,
+         AVG(a.Score) FILTER (WHERE a.CreationDate <= q.CreationDate + INTERVAL '7 days') AS AvgScore7d,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS MedianAnswerLatencySec,
+         MIN(a.CreationDate) AS FirstAnswerDate
+  FROM Q q
+  LEFT JOIN A a ON a.ParentId = q.Id
+  GROUP BY q.Id
+),
+PostComments AS (
+  SELECT p.Id AS PostId,
+         SUM(CASE WHEN c.CreationDate <= (p.CreationDate + INTERVAL '7 days') THEN 1 ELSE 0 END) AS CommentsFirst7d,
+         COUNT(c.Id) AS TotalComments
+  FROM (
+    SELECT Id, CreationDate FROM Posts WHERE PostTypeId IN (1,2) AND CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+  ) p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+VoteAgg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+         SUM(CASE WHEN v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days') THEN 1 ELSE 0 END) AS Votes30d
+  FROM Votes v
+  WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+  GROUP BY v.PostId
+),
+LinksAgg AS (
+  SELECT pl.RelatedPostId AS PostId,
+         SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS InboundLinks,
+         SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS InboundDuplicates
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  GROUP BY pl.RelatedPostId
+),
+EnrichedQ AS (
+  SELECT q.*,
+         asx.NumAnswers, asx.MedianAnswerLatencySec, asx.AvgScore7d, asx.AcceptedAnswerScore,
+         ta.CommentsFirst7d, ta.TotalComments,
+         COALESCE(v.UpVotes, 0) AS UpVotes, COALESCE(v.DownVotes, 0) AS DownVotes, COALESCE(v.Favorites, 0) AS Favorites, COALESCE(v.Votes30d, 0) AS Votes30d,
+         COALESCE(l.InboundLinks, 0) AS InboundLinks, COALESCE(l.InboundDuplicates, 0) AS InboundDuplicates,
+         (SELECT array_agg(t ORDER BY ts.Questions DESC NULLS LAST LIMIT 3)
+          FROM unnest(q.Tags) AS t
+          JOIN TagStats ts ON LOWER(TRIM(t)) = ts.Tag) AS Top3TagContext,
+         u.Reputation AS OwnerReputation, u.RepBucket
+  FROM Q q
+  LEFT JOIN AnswerStats asx ON asx.QuestionId = q.Id
+  LEFT JOIN PostComments ta ON ta.PostId = q.Id
+  LEFT JOIN VoteAgg v ON v.PostId = q.Id
+  LEFT JOIN LinksAgg l ON l.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+)
+SELECT
+  eq.Id,
+  eq.Title,
+  eq.CreationDate,
+  eq.Score,
+  eq.ViewCount,
+  eq.NumAnswers,
+  eq.AcceptedAnswerScore,
+  eq.MedianAnswerLatencySec,
+  eq.AvgScore7d,
+  eq.CommentsFirst7d,
+  eq.UpVotes,
+  eq.DownVotes,
+  eq.Votes30d,
+  eq.InboundLinks,
+  eq.InboundDuplicates,
+  eq.OwnerReputation,
+  eq.RepBucket,
+  eq.Top3TagContext,
+  ( (COALESCE(eq.Score, 0) * 2)
+    + LN(1 + GREATEST(eq.ViewCount, 0)) * 1.5
+    + COALESCE(eq.UpVotes, 0) * 3
+    - COALESCE(eq.DownVotes, 0) * 2
+    + COALESCE(eq.NumAnswers, 0) * 5
+    + (CASE WHEN eq.AcceptedAnswerScore IS NOT NULL THEN 20 ELSE 0 END)
+    - COALESCE(eq.InboundDuplicates, 0) * 10
+    + COALESCE(eq.CommentsFirst7d, 0) * 1.2
+  ) AS HotnessScore,
+  ta.TopAnswerId,
+  ta.TopAnswerScore,
+  ta.TopAnswerCommentCount,
+  json_build_object(
+    'top_tags', (SELECT json_agg(json_build_object('tag', t.tag, 'questions', t.questions, 'avg_q_score', ROUND(t.avgquestionscore::numeric, 2)))
+                 FROM (
+                   SELECT ts.tag, ts.questions, ts.avgquestionscore
+                   FROM TagStats ts
+                   WHERE ts.tag = ANY((eq.Top3TagContext::text[])::text[])
+                 ) t),
+    'owner_rep', eq.OwnerReputation,
+    'owner_bucket', eq.RepBucket
+  ) AS Summary
+FROM EnrichedQ eq
+LEFT JOIN LATERAL (
+  SELECT a.Id AS TopAnswerId, a.Score AS TopAnswerScore, COALESCE(pc.TotalComments, 0) AS TopAnswerCommentCount
+  FROM Posts a
+  LEFT JOIN (
+    SELECT p.Id, COUNT(c.Id) AS TotalComments
+    FROM Posts p LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.Id
+  ) pc ON pc.Id = a.Id
+  WHERE a.PostTypeId = 2 AND a.ParentId = eq.Id
+  ORDER BY (a.Score * 3 + COALESCE(pc.TotalComments, 0)) DESC
+  LIMIT 1
+) ta ON TRUE
+WHERE eq.NumAnswers IS NOT NULL
+ORDER BY HotnessScore DESC
+LIMIT 250;

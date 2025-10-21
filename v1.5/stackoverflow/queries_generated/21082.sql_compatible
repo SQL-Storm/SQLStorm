@@ -1,0 +1,139 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) as RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND u.Location IS NOT NULL
+      AND LENGTH(u.Location) > 5
+),
+QuestionStats AS (
+    SELECT p.Id as PostId,
+           p.OwnerUserId,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           p.ClosedDate,
+           COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.Score, 0) as EngagementScore,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevQuestionScore
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+      AND p.DeletionDate IS NULL
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+UserAchievements AS (
+    SELECT au.Id as UserId,
+           COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+           SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) as TagBasedBadges,
+           ROW_NUMBER() OVER (PARTITION BY au.Id ORDER BY COUNT(b.Id) DESC) as BadgeRank
+    FROM ActiveUsers au
+    LEFT JOIN Badges b ON au.Id = b.UserId AND b.Date > au.CreationDate
+    GROUP BY au.Id
+    HAVING COUNT(b.Id) > 0
+),
+PopularTags AS (
+    SELECT t.TagName,
+           t.Count,
+           t.ExcerptPostId,
+           AVG(p.Score) as AvgTagScore
+    FROM Tags t
+    INNER JOIN Posts p ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+    WHERE t.Count > 500
+      AND t.IsModeratorOnly = 0
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId
+    HAVING AVG(p.Score) > 5
+),
+VotePatterns AS (
+    SELECT v.PostId,
+           v.UserId,
+           COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) as UpVotesGiven,
+           COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) as DownVotesGiven,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN v.BountyAmount ELSE 0 END) as TotalUpBounty,
+           AVG(v.CreationDate) as AvgVoteDate
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    INNER JOIN ActiveUsers au ON v.UserId = au.Id
+    WHERE v.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND vt.Name IN ('UpMod', 'DownMod')
+    GROUP BY v.PostId, v.UserId
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    au.RepRank,
+    COALESCE(qs.AnswerCount, 0) as TotalAnswers,
+    COALESCE(qs.EngagementScore, 0) as TotalEngagement,
+    CASE 
+        WHEN ua.GoldBadges > 0 THEN 'Gold Achiever'
+        WHEN ua.SilverBadges > 3 THEN 'Silver Hunter'
+        ELSE 'Bronze Collector'
+    END as AchievementTier,
+    (ua.GoldBadges + ua.SilverBadges * 0.5 + ua.BronzeBadges * 0.1) as WeightedBadges,
+    SUBSTRING(qs.Title, 1, 50) || '...' as TruncatedTitle,
+    GREATEST(0, COALESCE(qs.Score - COALESCE(qs.PrevQuestionScore, 0), 0)) as ScoreImprovement,
+    pt.TagName as MostPopularTag,
+    COALESCE(vp.UpVotesGiven - vp.DownVotesGiven, 0) as NetVotesGiven,
+    CASE 
+        WHEN qs.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN qs.CommunityOwnedDate IS NOT NULL THEN 'Community'
+        WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'Moderated'
+        ELSE 'Active'
+    END as PostStatus,
+    RANK() OVER (ORDER BY COALESCE(qs.EngagementScore, 0) DESC, au.Reputation DESC) as OverallRank,
+    PERCENT_RANK() OVER (ORDER BY au.Reputation) as RepPercentile,
+    COUNT(DISTINCT pl.RelatedPostId) as LinkedPostsCount
+FROM ActiveUsers au
+LEFT JOIN QuestionStats qs ON au.Id = qs.OwnerUserId
+LEFT JOIN UserAchievements ua ON au.Id = ua.UserId
+LEFT JOIN PopularTags pt ON qs.Tags LIKE '%' || pt.TagName || '%'
+LEFT JOIN VotePatterns vp ON au.Id = vp.UserId
+LEFT JOIN Posts p ON qs.PostId = p.Id
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+    AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    AND ph.CreationDate = (
+        SELECT MAX(ph2.CreationDate) 
+        FROM PostHistory ph2 
+        WHERE ph2.PostId = p.Id 
+          AND ph2.PostHistoryTypeId IN (10, 11, 12, 13)
+    )
+WHERE (qs.CreationDate IS NULL OR qs.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months')
+  AND (ua.GoldBadges IS NULL OR ua.GoldBadges + ua.SilverBadges > 0)
+  AND NOT EXISTS (
+      SELECT 1 FROM Votes v2 
+      WHERE v2.PostId = COALESCE(qs.PostId, 0) 
+        AND v2.VoteTypeId = 4  -- Offensive flag
+        AND v2.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 month'
+  )
+  AND (pt.TagName IS NULL OR pt.AvgTagScore > 10)
+UNION ALL
+SELECT 
+    'Aggregate Stats' as DisplayName,
+    SUM(au.Reputation) as Reputation,
+    0 as RepRank,
+    SUM(COALESCE(qs.AnswerCount, 0)) as TotalAnswers,
+    SUM(COALESCE(qs.EngagementScore, 0)) as TotalEngagement,
+    'Community Total' as AchievementTier,
+    AVG(ua.GoldBadges + ua.SilverBadges * 0.5 + ua.BronzeBadges * 0.1) as WeightedBadges,
+    'N/A' as TruncatedTitle,
+    0 as ScoreImprovement,
+    (SELECT TagName FROM PopularTags ORDER BY Count DESC LIMIT 1) as MostPopularTag,
+    SUM(COALESCE(vp.UpVotesGiven - vp.DownVotesGiven, 0)) as NetVotesGiven,
+    'All' as PostStatus,
+    0 as OverallRank,
+    0.0 as RepPercentile,
+    COUNT(DISTINCT pl.RelatedPostId) as LinkedPostsCount
+FROM ActiveUsers au
+LEFT JOIN QuestionStats qs ON au.Id = qs.OwnerUserId
+LEFT JOIN UserAchievements ua ON au.Id = ua.UserId
+LEFT JOIN VotePatterns vp ON au.Id = vp.UserId
+LEFT JOIN Posts p ON qs.PostId = p.Id
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+ORDER BY OverallRank, RepRank
+LIMIT 100;

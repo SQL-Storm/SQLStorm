@@ -1,0 +1,166 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.Id] AS AncestorPath
+    FROM Tags t
+    WHERE t.Id IS NOT NULL
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.AncestorPath || t.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.WikiPostId = r.Id
+    WHERE NOT t.Id = ANY(r.AncestorPath)
+),
+AcceptedAnswerScores AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        q.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY q.CreationDate DESC) AS UserRecentQuestionRank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+LatestPostHistory AS (
+    SELECT ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+),
+TopAnswersWithCommentStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        u.DisplayName AS AnswerOwner,
+        a.Score AS AnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        SUM(CASE WHEN c.Score <= 0 THEN 1 ELSE 0 END) AS NonPositiveComments
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, u.DisplayName, a.Score
+    HAVING a.Score > (
+        SELECT AVG(score) FROM Posts WHERE PostTypeId = 2 AND ParentId = a.ParentId
+    )
+),
+UserPostActivityRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        p.PostTypeId,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS QuestionViews,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY COUNT(p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, p.PostTypeId
+),
+CombinedPostsAndVotes AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        v.VoteTypeId,
+        COUNT(v.Id) AS VoteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, v.VoteTypeId
+),
+DuplicatePostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+ComplexUserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        COALESCE(uba.GoldBadges,0) AS GoldBadges,
+        COALESCE(uba.SilverBadges,0) AS SilverBadges,
+        COALESCE(uba.BronzeBadges,0) AS BronzeBadges,
+        ua.PostCount,
+        ua.QuestionViews,
+        ua.PostCountRank,
+        CASE 
+            WHEN u.Reputation > 10000 AND COALESCE(uba.GoldBadges,0) > 5 THEN 'Veteran'
+            WHEN u.Reputation > 1000 AND COALESCE(uba.SilverBadges,0) > 10 THEN 'Experienced'
+            ELSE 'Newbie'
+        END AS UserTier,
+        STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.Count DESC) AS TopTags
+    FROM Users u
+    LEFT JOIN UserBadgeAgg uba ON uba.UserId = u.Id
+    LEFT JOIN UserPostActivityRanks ua ON ua.Id = u.Id AND ua.PostTypeId = 1
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN RecursiveTagHierarchy rth ON p.Tags LIKE '%' || rth.TagName || '%'
+    LEFT JOIN Tags t ON t.Id = rth.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate, uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges, ua.PostCount, ua.QuestionViews, ua.PostCountRank
+)
+SELECT
+    cqs.QuestionId,
+    cqs.Title,
+    cqs.AcceptedAnswerScore,
+    cqs.ViewCount AS QuestionViewCount,
+    cqs.QuestionScore,
+    cqs.OwnerName AS QuestionOwner,
+    cqs.Reputation AS OwnerReputation,
+    COALESCE(uba.GoldBadges,0) AS OwnerGoldBadges,
+    topa.AnswerId,
+    topa.AnswerOwner,
+    topa.AnswerScore,
+    topa.CommentCount,
+    topa.PositiveComments,
+    topa.NonPositiveComments,
+    upa.PostCount AS OwnerTotalPosts,
+    upa.QuestionViews AS OwnerQuestionViews,
+    upa.PostCountRank AS OwnerPostRank,
+    dpl.RelatedPostId AS DuplicateOfPost,
+    lph.PostHistoryTypeId AS LastStatusChangeType,
+    lph.CreationDate AS LastStatusChangeDate,
+    cus.UserTier,
+    cus.TopTags
+FROM AcceptedAnswerScores cqs
+LEFT JOIN UserBadgeAgg uba ON uba.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = cqs.QuestionId)
+LEFT JOIN TopAnswersWithCommentStats topa ON topa.QuestionId = cqs.QuestionId
+LEFT JOIN UserPostActivityRanks upa ON upa.Id = (SELECT OwnerUserId FROM Posts WHERE Id = cqs.QuestionId) AND upa.PostTypeId = 1
+LEFT JOIN DuplicatePostLinks dpl ON dpl.PostId = cqs.QuestionId
+LEFT JOIN LatestPostHistory lph ON lph.PostId = cqs.QuestionId AND lph.rn = 1
+LEFT JOIN ComplexUserSummary cus ON cus.Id = (SELECT OwnerUserId FROM Posts WHERE Id = cqs.QuestionId)
+WHERE cqs.ViewCount > 10000
+  AND cqs.AcceptedAnswerScore IS NOT NULL
+ORDER BY cqs.ViewCount DESC, topa.AnswerScore DESC
+LIMIT 50;

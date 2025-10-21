@@ -1,0 +1,126 @@
+WITH RecentUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId AS UserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        p.Tags
+    FROM Posts AS p
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+),
+QuestionAcceptanceTime AS (
+    SELECT
+        q.UserId AS QuestionOwnerId,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS SecondsUntilAcceptedAnswer
+    FROM RecentUserPosts q
+    JOIN LATERAL (
+        SELECT *
+        FROM RecentUserPosts a
+        WHERE q.AcceptedAnswerId = a.PostId
+    ) AS a ON TRUE
+    WHERE
+        q.PostTypeId = 1
+        AND a.PostTypeId = 2
+        AND q.AcceptedAnswerId IS NOT NULL
+),
+AvgUserQuestionAcceptanceTime AS (
+    SELECT
+        QuestionOwnerId AS UserId,
+        AVG(SecondsUntilAcceptedAnswer) AS AvgSecondsUntilAcceptedAnswer
+    FROM QuestionAcceptanceTime
+    GROUP BY QuestionOwnerId
+),
+UserDistinctTags AS (
+    SELECT
+        rp.UserId,
+        COUNT(DISTINCT LOWER(unnest(string_to_array(SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2), '><')))) AS DistinctTagCount
+    FROM RecentUserPosts rp
+    WHERE rp.PostTypeId = 1
+        AND rp.Tags IS NOT NULL
+        AND LENGTH(rp.Tags) > 2
+    GROUP BY rp.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges AS b
+    WHERE b.Date >= (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+    GROUP BY b.UserId
+),
+UserPostAggregates AS (
+    SELECT
+        rp.UserId,
+        COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END) AS TotalQuestions,
+        COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN rp.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN rp.Score ELSE 0 END) AS TotalAnswerScore
+    FROM RecentUserPosts rp
+    GROUP BY rp.UserId
+),
+RankedUserPosts AS (
+    SELECT
+        rp.UserId,
+        rp.PostId,
+        rp.PostTypeId,
+        rp.Title,
+        rp.Body,
+        rp.Score,
+        ROW_NUMBER() OVER (PARTITION BY rp.UserId, rp.PostTypeId ORDER BY rp.Score DESC, rp.CreationDate DESC) AS rn
+    FROM RecentUserPosts rp
+),
+TopUserPosts AS (
+    SELECT
+        r.UserId,
+        MAX(CASE WHEN r.PostTypeId = 1 AND r.rn = 1 THEN r.PostId END) AS TopQuestionId,
+        MAX(CASE WHEN r.PostTypeId = 1 AND r.rn = 1 THEN r.Title END) AS TopQuestionTitle,
+        MAX(CASE WHEN r.PostTypeId = 1 AND r.rn = 1 THEN r.Score END) AS TopQuestionScore,
+        MAX(CASE WHEN r.PostTypeId = 2 AND r.rn = 1 THEN r.PostId END) AS TopAnswerId,
+        MAX(CASE WHEN r.PostTypeId = 2 AND r.rn = 1 THEN LEFT(r.Body, 500) END) AS TopAnswerExcerpt,
+        MAX(CASE WHEN r.PostTypeId = 2 AND r.rn = 1 THEN r.Score END) AS TopAnswerScore
+    FROM RankedUserPosts r
+    WHERE r.rn = 1
+    GROUP BY r.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(upa.TotalQuestions, 0) AS TotalQuestionsPosted,
+    COALESCE(upa.TotalAnswers, 0) AS TotalAnswersPosted,
+    COALESCE(upa.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(upa.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesEarned,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadgesEarned,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadgesEarned,
+    COALESCE(udt.DistinctTagCount, 0) AS DistinctTagsContributed,
+    COALESCE(auqat.AvgSecondsUntilAcceptedAnswer / 3600.0, 0) AS AvgHoursUntilAcceptedAnswer,
+    tup.TopQuestionTitle,
+    tup.TopQuestionScore,
+    tup.TopAnswerExcerpt,
+    tup.TopAnswerScore
+FROM Users u
+LEFT JOIN UserPostAggregates upa ON u.Id = upa.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN UserDistinctTags udt ON u.Id = udt.UserId
+LEFT JOIN AvgUserQuestionAcceptanceTime auqat ON u.Id = auqat.UserId
+LEFT JOIN TopUserPosts tup ON u.Id = tup.UserId
+WHERE
+    u.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '3' YEAR)
+    AND (upa.TotalQuestions IS NOT NULL OR upa.TotalAnswers IS NOT NULL)
+ORDER BY
+    u.Reputation DESC,
+    (COALESCE(upa.TotalQuestionScore, 0) + COALESCE(upa.TotalAnswerScore, 0)) DESC,
+    COALESCE(ubs.GoldBadges, 0) DESC,
+    COALESCE(udt.DistinctTagCount, 0) DESC
+LIMIT 50;

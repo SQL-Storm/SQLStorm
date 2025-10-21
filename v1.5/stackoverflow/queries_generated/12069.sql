@@ -1,0 +1,108 @@
+-- {"query": "12069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 798} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        MAX(Score) AS MaxScore,
+        COUNT(Id) AS PostCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 1
+),
+UserBadges AS (
+    SELECT 
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+),
+PostHistorySummary AS (
+    SELECT 
+        PostId,
+        COUNT(CASE WHEN PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN PostHistoryTypeId IN (10, 11) THEN 1 END) AS CloseReopenCount
+    FROM 
+        PostHistory
+    GROUP BY 
+        PostId
+),
+CommentActivity AS (
+    SELECT 
+        PostId,
+        COUNT(Id) AS CommentCount,
+        MAX(CreationDate) AS LastCommentDate
+    FROM 
+        Comments
+    GROUP BY 
+        PostId
+),
+PostTags AS (
+    SELECT 
+        PostId,
+        STRING_AGG(TagName, ', ') AS TagList
+    FROM 
+        Posts P
+    JOIN 
+        Tags T ON P.Tags LIKE '%' || T.TagName || '%'
+    GROUP BY 
+        PostId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    COALESCE(UB.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UB.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UB.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(PHS.EditCount, 0) AS EditCount,
+    COALESCE(PHS.CloseReopenCount, 0) AS CloseReopenCount,
+    COALESCE(CA.CommentCount, 0) AS CommentCount,
+    COALESCE(CA.LastCommentDate, '1970-01-01') AS LastCommentDate,
+    COALESCE(PT.TagList, '') AS TagList
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.OwnerUserId
+LEFT JOIN 
+    UserBadges UB ON RP.OwnerUserId = UB.UserId
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    CommentActivity CA ON RP.Id = CA.PostId
+LEFT JOIN 
+    PostTags PT ON RP.Id = PT.PostId
+WHERE 
+    RP.UserRank <= 3
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

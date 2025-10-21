@@ -1,0 +1,144 @@
+WITH RecentHighRepUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        MAX(U.CreationDate) AS LatestUserCreated
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    WHERE U.Reputation > (
+        SELECT AVG(Reputation) * 2
+        FROM Users
+        WHERE CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    )
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+    HAVING COUNT(P.Id) >= 5
+),
+
+BadgedPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.OwnerUserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount,
+        ARRAY_AGG(DISTINCT B.Name) FILTER (WHERE B.Name IS NOT NULL) AS BadgeNames,
+        MIN(B.Date) AS FirstBadgeDate
+    FROM Posts P
+    LEFT JOIN Badges B ON B.UserId = P.OwnerUserId AND B.Date > P.CreationDate
+    WHERE P.PostTypeId IN (1,2)
+    GROUP BY P.Id, P.Title, P.OwnerUserId
+),
+
+CommentActivity AS (
+    SELECT
+        C.UserId AS CommenterId,
+        C.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(CASE WHEN C.Score > 5 THEN 1 ELSE 0 END) AS HighScoreComments
+    FROM Comments C
+    WHERE C.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY C.UserId, C.PostId
+),
+
+PostVoteStats AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(*) AS TotalVotes
+    FROM Votes V
+    WHERE V.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY V.PostId
+),
+
+TopTags AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count,
+        RANK() OVER (ORDER BY T.Count DESC) AS TagRank
+    FROM Tags T
+),
+
+UserRecentWikis AS (
+    SELECT DISTINCT
+        U.Id AS UserId,
+        P.Id AS WikiPostId,
+        P.CreationDate AS WikiCreated
+    FROM Users U
+    JOIN Posts P ON P.OwnerUserId = U.Id AND P.PostTypeId IN (3,4,5,7)
+    WHERE P.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+
+ClosedQuestionsWithReasons AS (
+    SELECT
+        PH.PostId,
+        MAX(PH.CreationDate) AS ClosedDate,
+        CASE
+            WHEN PH.Comment IS NOT NULL AND PH.PostHistoryTypeId = 10
+            THEN (
+                SELECT CRT.Name
+                FROM CloseReasonTypes CRT
+                WHERE CAST(CRT.Id AS VARCHAR) = SPLIT_PART(PH.Comment, ' ', 1)
+                LIMIT 1
+            )
+            ELSE 'Unknown'
+        END AS CloseReason
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId = 10
+    GROUP BY PH.PostId, PH.Comment, PH.PostHistoryTypeId
+)
+
+SELECT
+    RU.UserId,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.PostCount,
+    RU.LatestUserCreated,
+    BP.PostId,
+    BP.Title,
+    COALESCE(BP.BadgeCount, 0) AS BadgeCount,
+    COALESCE(BP.BadgeNames, ARRAY[]::varchar[]) AS BadgeNames,
+    BP.FirstBadgeDate,
+    PV.Upvotes,
+    PV.Downvotes,
+    PV.TotalVotes,
+    CA.CommentCount,
+    CA.HighScoreComments,
+    CTWR.ClosedDate,
+    CTWR.CloseReason,
+    TT.TagName AS TopTag,
+    TT.TagRank,
+    URW.WikiPostId AS RecentWikiId,
+    URW.WikiCreated
+FROM RecentHighRepUsers RU
+LEFT JOIN Posts P ON P.OwnerUserId = RU.UserId
+LEFT JOIN BadgedPosts BP ON BP.PostId = P.Id
+LEFT JOIN PostVoteStats PV ON PV.PostId = P.Id
+LEFT JOIN CommentActivity CA ON CA.PostId = P.Id AND CA.CommenterId = RU.UserId
+LEFT JOIN (
+    SELECT DISTINCT ON (PT.Id)
+        PT.Id AS PostId,
+        regexp_replace(P.Tags, '[<>]', '', 'g') AS Tag,
+        PT.Name
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.Tags IS NOT NULL
+) PTQ ON PTQ.PostId = P.Id
+LEFT JOIN (
+    SELECT
+        T1.*
+    FROM TopTags T1
+    WHERE T1.TagRank <= 10
+) TT ON TT.TagName = (
+    SELECT unnest(string_to_array(substring(P.Tags,2,length(P.Tags)-2), '><'))
+    LIMIT 1
+)
+LEFT JOIN UserRecentWikis URW ON URW.UserId = RU.UserId
+LEFT JOIN ClosedQuestionsWithReasons CTWR ON CTWR.PostId = P.Id
+WHERE (PV.Upvotes IS NULL OR PV.Upvotes > PV.Downvotes)
+  AND (BP.BadgeCount IS NULL OR BP.BadgeCount > 0)
+  AND (TT.TagRank IS NULL OR TT.TagRank <= 5)
+ORDER BY RU.PostCount DESC, RU.Reputation DESC, BP.BadgeCount DESC, PV.Upvotes DESC NULLS LAST
+LIMIT 100;

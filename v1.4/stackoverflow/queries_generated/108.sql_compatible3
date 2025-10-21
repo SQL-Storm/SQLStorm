@@ -1,0 +1,124 @@
+WITH
+-- 1) Per-user statistics across Posts
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(*) AS TotalPosts,
+    COALESCE(SUM(p.Score), 0) AS ScoreSum,
+    MAX(p.LastActivityDate) AS LastActivityDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.AccountId
+),
+
+-- 2) Badge counts per user (LEFT JOIN to include users with no badges)
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+-- 3) Latest activity per user (latest post creation date, with its title)
+LatestActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC NULLS LAST, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+
+-- 4) Tags reveal per user (up to 5 distinct tags used by the user's posts)
+UserTags AS (
+  SELECT
+    u.Id AS UserId,
+    STRING_AGG(DISTINCT t.TagName, ',') AS TagsUsed
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT TRIM(tag) AS TagName
+    FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS t(tag)
+  ) t ON true
+  GROUP BY u.Id
+)
+
+-- 5) Activity window: last 7 days interactions count (correlated subquery)
+, Last7DaysActivity AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(
+      (SELECT COUNT(*) FROM Votes v
+       WHERE v.UserId = u.Id
+       AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'), 0) AS VotesLast7d,
+    COALESCE(
+      (SELECT COUNT(*) FROM Comments c
+       WHERE c.UserId = u.Id
+       AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'), 0) AS CommentsLast7d
+  FROM Users u
+)
+
+-- 6) Snapshot combining all the above (outer joins included)
+SELECT
+  us.UserId,
+  us.DisplayName,
+  us.Reputation,
+  us.TotalPosts,
+  us.QuestionCount,
+  us.ScoreSum,
+  COALESCE(ub.BadgeCount, 0) AS BadgeCount,
+  la.PostId AS LatestPostId,
+  la.Title AS LatestPostTitle,
+  la.CreationDate AS LatestPostDate,
+  us.LastActivityDate,
+  ut.TagsUsed
+FROM UserStats us
+LEFT JOIN UserBadges ub ON ub.UserId = us.UserId
+LEFT JOIN LatestActivity la ON la.UserId = us.UserId AND la.rn = 1
+LEFT JOIN Last7DaysActivity l7 ON l7.UserId = us.UserId
+LEFT JOIN UserTags ut ON ut.UserId = us.UserId
+ORDER BY us.Reputation DESC NULLS LAST, us.TotalPosts DESC
+LIMIT 200
+
+UNION ALL
+
+-- 7) Benchmark-oriented second facet: top users by recent activity, as a comparative set
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COALESCE(ps.TotalPosts, 0) AS TotalPosts,
+  COALESCE(ps.QuestionCount, 0) AS QuestionCount,
+  COALESCE(ps.ScoreSum, 0) AS ScoreSum,
+  COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+  NULL AS LatestPostId,
+  NULL AS LatestPostTitle,
+  NULL AS LatestPostDate,
+  NULL AS LastActivityDate,
+  NULL AS TagsUsed
+FROM Users u
+LEFT JOIN (
+  SELECT OwnerUserId, COUNT(*) AS TotalPosts, COUNT(*) FILTER (WHERE PostTypeId = 1) AS QuestionCount, COALESCE(SUM(Score),0) AS ScoreSum
+  FROM Posts
+  GROUP BY OwnerUserId
+) ps ON ps.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+) bc ON bc.UserId = u.Id
+WHERE EXISTS (
+  SELECT 1
+  FROM Posts p
+  WHERE p.OwnerUserId = u.Id
+    AND p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+)
+ORDER BY u.Reputation DESC NULLS LAST
+LIMIT 100;

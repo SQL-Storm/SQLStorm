@@ -1,0 +1,67 @@
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    'Question' AS TypeLabel,
+    COALESCE(u.DisplayName, 'Community') AS OwnerName,
+    p.Score AS Score,
+    p.ViewCount AS ViewCount,
+    p.CreationDate AS CreationDate,
+    p.LastActivityDate AS LastActivityDate,
+    (SELECT COALESCE(string_agg(Tag, ','), '')
+       FROM (
+         SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+       ) t
+    ) AS TagList,
+    (SELECT cr.Name
+       FROM PostHistory ph
+       JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS integer)
+       WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+       ORDER BY ph.CreationDate DESC LIMIT 1) AS CloseReason,
+    (SELECT a.Id
+       FROM Posts a
+       WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+       ORDER BY a.Score DESC, a.CreationDate ASC LIMIT 1) AS BestAnswerId,
+    (SELECT a.Score
+       FROM Posts a
+       WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+       ORDER BY a.Score DESC, a.CreationDate ASC LIMIT 1) AS BestAnswerScore,
+    (SELECT a.CreationDate
+       FROM Posts a
+       WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+       ORDER BY a.Score DESC, a.CreationDate ASC LIMIT 1) AS BestAnswerDate,
+    (SELECT hu.DisplayName
+       FROM Posts a
+       JOIN Users hu ON hu.Id = a.OwnerUserId
+       WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+       ORDER BY a.Score DESC, a.CreationDate ASC LIMIT 1) AS BestAnswerOwner
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+  ORDER BY p.Score DESC
+  LIMIT 50
+UNION ALL
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS TypeLabel,
+    COALESCE((SELECT DisplayName FROM Users WHERE Id = p.OwnerUserId), 'Community') AS OwnerName,
+    p.Score AS Score,
+    p.ViewCount AS ViewCount,
+    p.CreationDate AS CreationDate,
+    p.LastActivityDate AS LastActivityDate,
+    (SELECT COALESCE(string_agg(Tag, ','), '')
+       FROM (
+         SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+       ) t
+    ) AS TagList,
+    NULL AS CloseReason,
+    NULL AS BestAnswerId,
+    NULL AS BestAnswerScore,
+    NULL AS BestAnswerDate,
+    NULL AS BestAnswerOwner
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+  ORDER BY p.Score DESC
+  LIMIT 50
+ORDER BY LastActivityDate DESC
+LIMIT 400;

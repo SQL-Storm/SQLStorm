@@ -1,0 +1,130 @@
+-- {"query": "3033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 941} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount
+    FROM 
+        Users u
+    LEFT OUTER JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+AnswerParentQuestions AS (
+    SELECT DISTINCT
+        p1.Id AS AnswerId,
+        p2.Id AS QuestionId,
+        p2.Title AS QuestionTitle,
+        p2.Tags AS QuestionTags
+    FROM 
+        Posts p1
+    INNER JOIN 
+        Posts p2 ON p1.ParentId = p2.Id
+    WHERE 
+        p1.PostTypeId = 2 AND p2.PostTypeId = 1
+),
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.UserId,
+        v.VoteTypeId,
+        v.CreationDate AS VoteDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId, v.UserId ORDER BY v.CreationDate DESC) AS rn
+    FROM
+        Votes v
+),
+HighlightedContent AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        c.Text AS LatestComment,
+        c.CreationDate AS CommentDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON c.PostId = p.Id AND c.CreationDate = (
+            SELECT MAX(CreationDate) FROM Comments WHERE PostId = p.Id
+        )
+    WHERE
+        p.PostTypeId = 1
+),
+TagsAnalysis AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Title AS PostTitle
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.ExcerptPostId = p.Id
+),
+ComplexPredicate AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        CASE WHEN u.Reputation > 1000 AND u.Views > 100 THEN 'ActiveHighReputation' 
+             WHEN u.Reputation <= 1000 AND u.Views <= 50 THEN 'InactiveLowViews' 
+             ELSE 'Other'
+        END AS UserCategory
+    FROM
+        Users u
+),
+FinalData AS (
+    SELECT
+        usp.UserId,
+        usp.DisplayName,
+        usp.TotalPosts,
+        usp.Questions,
+        usp.Answers,
+        usp.AvgScore,
+        usp.LastPostDate,
+        usp.GoldBadgesCount,
+        apq.AnswerId,
+        apq.QuestionId,
+        apq.QuestionTitle,
+        apq.QuestionTags,
+        rv.PostId,
+        rv.UserId AS VoterId,
+        rv.VoteTypeId,
+        rv.VoteDate,
+        hc.PostId AS HighlightedPostId,
+        hc.Title,
+        hc.Body,
+        hc.LatestComment,
+        hc.CommentDate,
+        ta.TagName,
+        ta.PostTitle AS TagPostTitle,
+        cp.UserId AS UserCategoryId,
+        cp.UserCategory
+    FROM
+        UserPostStats usp
+    LEFT JOIN
+        AnswerParentQuestions apq ON usp.UserId = apq.AnswerId
+    LEFT JOIN
+        RecentVotes rv ON usp.UserId = rv.PostId AND rv.rn = 1
+    LEFT JOIN
+        HighlightedContent hc ON usp.UserId = hc.PostId
+    LEFT JOIN
+        TagsAnalysis ta ON ta.TagName IN (SELECT unnest(string_to_array(substring(ta.QuestionTags, 2, length(ta.QuestionTags)-2), '><'))) 
+    LEFT JOIN
+        ComplexPredicate cp ON usp.UserId = cp.UserId
+)
+SELECT
+    *
+FROM
+    FinalData
+WHERE
+    (UserCategory = 'ActiveHighReputation' AND TotalPosts > 50)
+    OR (VoterId IS NOT NULL AND VoteTypeId = 2)
+    OR (HighlightedPostId IS NOT NULL AND CommentDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+ORDER BY
+    LastPostDate DESC
+LIMIT 100;

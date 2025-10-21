@@ -1,0 +1,40 @@
+WITH high_impact_users AS (
+    SELECT
+        Posts.OwnerUserId AS UserId,
+        COUNT(DISTINCT Posts.Id) AS posts_count,
+        AVG(Posts.Score) AS avg_post_score,
+        SUM(Posts.AnswerCount) AS total_answers_received
+    FROM Posts
+    JOIN Users ON Posts.OwnerUserId = Users.Id
+    WHERE Posts.PostTypeId = 1 AND Users.Reputation > 10000
+    GROUP BY Posts.OwnerUserId
+),
+tag_complexity AS (
+    SELECT
+        TRIM(BOTH '"' FROM REGEXP_SUBSTR(Posts.Tags, '.+')) AS tag,
+        COUNT(DISTINCT Posts.Id) AS tag_post_count,
+        AVG(Posts.ViewCount) AS avg_view_count,
+        MAX(Posts.Score) AS max_tag_score
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY TRIM(BOTH '"' FROM REGEXP_SUBSTR(Posts.Tags, '.+'))
+)
+SELECT
+    u.DisplayName,
+    hiu.posts_count,
+    hiu.avg_post_score,
+    hiu.total_answers_received,
+    tc.tag,
+    tc.tag_post_count,
+    tc.avg_view_count
+FROM high_impact_users hiu
+JOIN Users u ON hiu.UserId = u.Id
+JOIN tag_complexity tc ON
+    EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+          AND (',' || REPLACE(p.Tags, '><', ',') || ',') LIKE '%,' || tc.tag || ',%'
+    )
+ORDER BY (hiu.posts_count * tc.tag_post_count) DESC
+LIMIT 100;

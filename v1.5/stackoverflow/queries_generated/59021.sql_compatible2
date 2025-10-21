@@ -1,0 +1,72 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    COUNT(DISTINCT v.Id) AS Votes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+    COUNT(DISTINCT pl.Id) AS PostLinks,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MAX(p.Score) AS HighestScore,
+    AVG(p.Score) AS AverageScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 100 THEN p.Id END) AS HighScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 50 THEN p.Id END) AS HighScoreAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 10 THEN p.Id END) AS QuestionsWithManyComments,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.Id END) AS CloseReopenEvents,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (12, 13) THEN ph.Id END) AS DeleteUndeleteEvents,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 16 THEN ph.Id END) AS CommunityOwnedEvents,
+    COUNT(DISTINCT CASE WHEN u.Location IS NOT NULL AND u.Location <> '' THEN u.Id END) AS UsersWithLocation,
+    COUNT(DISTINCT CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN u.Id END) AS UsersWithWebsite,
+    COUNT(DISTINCT CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 50 THEN u.Id END) AS UsersWithLongAboutMe,
+    COUNT(DISTINCT CASE WHEN u.UpVotes > 1000 THEN u.Id END) AS UsersWithManyUpVotes,
+    COUNT(DISTINCT CASE WHEN u.DownVotes > 1000 THEN u.Id END) AS UsersWithManyDownVotes,
+    COUNT(DISTINCT CASE WHEN u.Views > 10000 THEN u.Id END) AS UsersWithHighViews,
+    COUNT(DISTINCT CASE WHEN u.Reputation > 100000 THEN u.Id END) AS UsersWithHighReputation,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AverageQuestionViews,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AverageQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AverageAnswerScore,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS MaxQuestionViews,
+    MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS MaxAnswerScore
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId OR u.Id = pl.RelatedPostId
+LEFT JOIN (
+    SELECT
+        p2.OwnerUserId AS UserId,
+        tg.TagName
+    FROM Posts p2
+    CROSS JOIN LATERAL (
+        SELECT TRIM(value) AS TagName
+        FROM (
+            SELECT UNNEST(REGEXP_SPLIT_TO_TABLE(p2.Tags, '[><]')) AS value
+        ) AS t
+    ) AS tg
+    WHERE p2.Tags IS NOT NULL AND p2.Tags <> ''
+) t ON u.Id = t.UserId
+WHERE u.Id IS NOT NULL
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC, TotalPosts DESC
+LIMIT 10000;

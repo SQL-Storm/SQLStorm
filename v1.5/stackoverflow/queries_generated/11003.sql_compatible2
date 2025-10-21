@@ -1,0 +1,131 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        Users.Id AS UserId, 
+        Users.DisplayName, 
+        COUNT(Posts.Id) AS PostCount, 
+        COUNT(DISTINCT CASE WHEN Posts.PostTypeId = 1 THEN Posts.Id END) AS QuestionCount, 
+        COUNT(DISTINCT CASE WHEN Posts.PostTypeId = 2 THEN Posts.Id END) AS AnswerCount, 
+        SUM(Posts.Score) AS TotalScore
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    GROUP BY 
+        Users.Id, 
+        Users.DisplayName
+),
+BadgeSummary AS (
+    SELECT 
+        Badges.UserId, 
+        COUNT(Badges.Id) AS BadgeCount, 
+        SUM(CASE WHEN Badges.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount, 
+        SUM(CASE WHEN Badges.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount, 
+        SUM(CASE WHEN Badges.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        Badges.UserId
+),
+PostTags AS (
+    SELECT 
+        Posts.Id, 
+        string_to_array(substr(Posts.Tags, 2, length(Posts.Tags) - 2), ',') AS TagArray
+    FROM 
+        Posts
+    WHERE 
+        Posts.PostTypeId = 1
+),
+TagFrequency AS (
+    SELECT 
+        TagArray[N] AS Tag, 
+        COUNT(*) AS Frequency
+    FROM 
+        PostTags
+        CROSS JOIN LATERAL generate_subscripts(TagArray, 1) AS N
+    GROUP BY 
+        TagArray[N]
+),
+TopTags AS (
+    SELECT 
+        Tag, 
+        Frequency
+    FROM 
+        TagFrequency
+    ORDER BY 
+        Frequency DESC
+    LIMIT 10
+)
+SELECT 
+    RP.Id AS PostId, 
+    RP.PostTypeId, 
+    RP.AcceptedAnswerId, 
+    RP.ParentId, 
+    RP.CreationDate, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.Body, 
+    RP.OwnerUserId, 
+    RP.OwnerDisplayName, 
+    RP.LastEditorUserId, 
+    RP.LastEditorDisplayName, 
+    RP.LastEditDate, 
+    RP.LastActivityDate, 
+    RP.Title, 
+    RP.Tags, 
+    RP.AnswerCount, 
+    RP.CommentCount, 
+    RP.FavoriteCount, 
+    RP.ClosedDate, 
+    RP.CommunityOwnedDate, 
+    RP.ContentLicense, 
+    UA.DisplayName AS UserDisplayName, 
+    UA.PostCount, 
+    UA.QuestionCount, 
+    UA.AnswerCount, 
+    UA.TotalScore, 
+    BS.BadgeCount, 
+    BS.GoldBadgeCount, 
+    BS.SilverBadgeCount, 
+    BS.BronzeBadgeCount, 
+    TT.Tag, 
+    TT.Frequency
+FROM 
+    RecentPosts RP
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.UserId
+LEFT JOIN 
+    BadgeSummary BS ON UA.UserId = BS.UserId
+LEFT JOIN 
+    TopTags TT ON RP.Tags LIKE '%' || TT.Tag || '%'
+ORDER BY 
+    RP.CreationDate DESC, 
+    RP.Score DESC;

@@ -1,0 +1,154 @@
+-- {"query": "20013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1767} 
+WITH UserPostMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1), 0) AS TotalQuestionScore,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2), 0) AS TotalAnswerScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 1), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 2), 0.0) AS AvgAnswerScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalViewCount,
+        SUM(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1) AS TotalFavoriteCount,
+        SUM(p.CommentCount) AS TotalPostCommentCount,
+        COUNT(p.AcceptedAnswerId) FILTER (WHERE p.PostTypeId = 1) AS QuestionsWithAcceptedAnswers
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Id > 0
+    GROUP BY
+        u.Id
+),
+UserBadgeMetrics AS (
+    SELECT
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        SUM(CASE Class WHEN 1 THEN 100 WHEN 2 THEN 25 WHEN 3 THEN 5 ELSE 0 END) AS BadgeScore
+    FROM
+        Badges
+    GROUP BY
+        UserId
+),
+UserInteractionMetrics AS (
+    SELECT
+        UserId,
+        COUNT(*) AS TotalVotesCast,
+        COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotesCast,
+        COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotesCast,
+        SUM(BountyAmount) FILTER (WHERE VoteTypeId = 8) AS TotalBountyAmount
+    FROM
+        Votes
+    WHERE
+        UserId IS NOT NULL
+    GROUP BY
+        UserId
+),
+AggregatedUserData AS (
+    SELECT
+        upm.UserId,
+        upm.DisplayName,
+        upm.Reputation,
+        EXTRACT(YEAR FROM upm.CreationDate) AS CreationYear,
+        COALESCE(ubm.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubm.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubm.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ubm.BadgeScore, 0) AS BadgeScore,
+        upm.QuestionCount,
+        upm.AnswerCount,
+        upm.TotalQuestionScore,
+        upm.TotalAnswerScore,
+        upm.AvgQuestionScore,
+        upm.AvgAnswerScore,
+        upm.TotalViewCount,
+        COALESCE(uim.UpVotesCast, 0) AS UpVotesCast,
+        COALESCE(uim.DownVotesCast, 0) AS DownVotesCast,
+        upm.TotalPostCommentCount,
+        (upm.Reputation / 100.0) * LN(1 + upm.QuestionCount + upm.AnswerCount) + COALESCE(ubm.BadgeScore, 0) * 1.5 AS EngagementScore,
+        (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = upm.UserId AND p.PostTypeId = 1 ORDER BY p.Score DESC, p.CreationDate DESC LIMIT 1) AS BestQuestionTitle,
+        EXISTS (SELECT 1 FROM Posts p WHERE p.LastEditorUserId = upm.UserId AND p.OwnerUserId <> upm.UserId) AS HasEditedOthersPosts
+    FROM
+        UserPostMetrics upm
+    LEFT JOIN
+        UserBadgeMetrics ubm ON upm.UserId = ubm.UserId
+    LEFT JOIN
+        UserInteractionMetrics uim ON upm.UserId = uim.UserId
+    WHERE
+        upm.Reputation > (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY Reputation) FROM Users)
+        AND upm.QuestionCount > 10
+        AND upm.AnswerCount > 20
+        AND COALESCE(ubm.GoldBadges, 0) > 0
+)
+SELECT
+    'Power User' AS UserType,
+    UserId,
+    DisplayName,
+    Reputation,
+    CreationYear,
+    GoldBadges,
+    QuestionCount,
+    AnswerCount,
+    TotalQuestionScore / NULLIF(QuestionCount, 0) AS NormQuestionScore,
+    TotalAnswerScore / NULLIF(AnswerCount, 0) AS NormAnswerScore,
+    UPPER(SUBSTRING(BestQuestionTitle FROM 1 FOR 50)) || '...' AS TruncatedBestTitle,
+    EngagementScore,
+    RANK() OVER (PARTITION BY CreationYear ORDER BY Reputation DESC) AS RankInYear,
+    NTILE(100) OVER (ORDER BY EngagementScore DESC) AS EngagementPercentile,
+    (Reputation - LAG(Reputation, 1, Reputation) OVER (ORDER BY Reputation DESC)) / NULLIF(Reputation, 0) AS RepDiffRatioWithPrevious
+FROM
+    AggregatedUserData
+WHERE
+    EngagementScore > 500 AND BestQuestionTitle IS NOT NULL AND HasEditedOthersPosts
+
+UNION ALL
+
+SELECT
+    'Controversial User' AS UserType,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    EXTRACT(YEAR FROM u.CreationDate),
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1),
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2),
+    NULL,
+    NULL,
+    (SELECT
+        STRING_AGG(CASE crt.Id
+            WHEN 101 THEN 'Dup'
+            WHEN 102 THEN 'Off-T'
+            WHEN 103 THEN 'Clarity'
+            WHEN 104 THEN 'Focus'
+            ELSE 'Other'
+        END, ', ')
+     FROM PostHistory ph
+     JOIN CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id
+     WHERE ph.PostHistoryTypeId = 10 AND ph.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id)
+    ),
+    (u.DownVotes::decimal * 100) / NULLIF(u.UpVotes, 0),
+    NULL,
+    NULL,
+    NULL
+FROM
+    Users u
+WHERE
+    u.DownVotes > u.UpVotes / 4 AND u.Reputation > 10000 AND u.UpVotes > 100
+    AND u.Id IN (
+        SELECT v.UserId
+        FROM Votes v
+        WHERE v.VoteTypeId = 3
+        GROUP BY v.UserId
+        HAVING COUNT(*) > 50
+    )
+ORDER BY
+    UserType, Reputation DESC
+LIMIT 500;

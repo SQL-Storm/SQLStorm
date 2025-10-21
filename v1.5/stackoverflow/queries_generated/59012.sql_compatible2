@@ -1,0 +1,105 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT v.Id) AS Votes,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    COUNT(DISTINCT pl.Id) AS PostLinks,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed,
+    MAX(p.CreationDate) AS LastPostDate,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) AS AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) AS QuestionWithComments,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN p.Id END) AS FavoriteQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 10 THEN p.Id END) AS HighScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 5 THEN p.Id END) AS HighScoreAnswers,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.Id END) AS UpDownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ClosedReopenDeleteHistory,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 16 THEN ph.Id END) AS CommunityOwnedHistory,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateLinks,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS LinkedPosts,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Title) LIKE '%question%' THEN p.Id END) AS QuestionsWithTitleQuestion,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[sql]%' THEN p.Id END) AS SQLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[python]%' THEN p.Id END) AS PythonQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[javascript]%' THEN p.Id END) AS JavaScriptQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[java]%' THEN p.Id END) AS JavaQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[c#]%' THEN p.Id END) AS CSharpQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[php]%' THEN p.Id END) AS PHPQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[html]%' THEN p.Id END) AS HTMLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[css]%' THEN p.Id END) AS CSSQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[android]%' THEN p.Id END) AS AndroidQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[ios]%' THEN p.Id END) AS iOSQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[mysql]%' THEN p.Id END) AS MySQLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[postgresql]%' THEN p.Id END) AS PostgreSQLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[mongodb]%' THEN p.Id END) AS MongoDBQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[redis]%' THEN p.Id END) AS RedisQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[aws]%' THEN p.Id END) AS AWSQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[azure]%' THEN p.Id END) AS AzureQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[docker]%' THEN p.Id END) AS DockerQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[kubernetes]%' THEN p.Id END) AS KubernetesQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[react]%' THEN p.Id END) AS ReactQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[angular]%' THEN p.Id END) AS AngularQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[vue]%' THEN p.Id END) AS VueQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[node.js]%' THEN p.Id END) AS NodeJSQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[django]%' THEN p.Id END) AS DjangoQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[flask]%' THEN p.Id END) AS FlaskQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[spring]%' THEN p.Id END) AS SpringQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[ruby]%' THEN p.Id END) AS RubyQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[rails]%' THEN p.Id END) AS RailsQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[go]%' THEN p.Id END) AS GoQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[rust]%' THEN p.Id END) AS RustQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[swift]%' THEN p.Id END) AS SwiftQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[kotlin]%' THEN p.Id END) AS KotlinQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[typescript]%' THEN p.Id END) AS TypeScriptQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[graphql]%' THEN p.Id END) AS GraphQLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[tensorflow]%' THEN p.Id END) AS TensorFlowQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[pytorch]%' THEN p.Id END) AS PyTorchQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[machine-learning]%' THEN p.Id END) AS MLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[deep-learning]%' THEN p.Id END) AS DeepLearningQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[data-science]%' THEN p.Id END) AS DataScienceQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[ai]%' THEN p.Id END) AS AIQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[nlp]%' THEN p.Id END) AS NLPQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[computer-vision]%' THEN p.Id END) AS ComputerVisionQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[blockchain]%' THEN p.Id END) AS BlockchainQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[iot]%' THEN p.Id END) AS IoTQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[devops]%' THEN p.Id END) AS DevOpsQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[security]%' THEN p.Id END) AS SecurityQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[web-development]%' THEN p.Id END) AS WebDevelopmentQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[mobile-development]%' THEN p.Id END) AS MobileDevelopmentQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND LOWER(p.Tags) LIKE '%[game-development]%' THEN p.Id END) AS GameDevelopmentQuestions
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.Id
+LEFT JOIN (
+    SELECT DISTINCT p2.OwnerUserId AS UserId, tg.TagName
+    FROM Posts p2
+    CROSS JOIN LATERAL (
+        SELECT TRIM(value) AS TagName
+        FROM STRING_SPLIT(REPLACE(REPLACE(p2.Tags, '[', ''), ']', ''), ',')
+    ) AS tg
+) AS tag_user ON u.Id = tag_user.UserId
+LEFT JOIN Tags t ON tag_user.TagName = t.TagName
+WHERE u.Id IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY COUNT(DISTINCT p.Id) DESC
+LIMIT 1000;

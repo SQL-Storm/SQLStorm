@@ -1,0 +1,130 @@
+-- {"query": "16021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 51370, "output_tokens": 46918} 
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+            EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS TenureMonths,
+        CASE 
+            WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 1
+            ELSE 0
+        END AS HasLocation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Views) AS ViewPercentile
+    FROM Users u
+    WHERE u.Reputation > 100
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 3600 AS ActivitySpanHours,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS RollingAvgScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+TagInfluence AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        AVG(p.Score) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::FLOAT / 
+            NULLIF(COUNT(*), 0) AS AcceptanceRate
+    FROM Tags t
+    INNER JOIN Posts p ON SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 50
+    GROUP BY t.TagName, t.Count
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoriteCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TenureMonths,
+    ROUND(uem.ViewPercentile::numeric, 4) AS ViewPercentile,
+    pp.PostId,
+    pp.Score AS PostScore,
+    pp.ViewCount,
+    COALESCE(vp.UpvoteCount, 0) - COALESCE(vp.DownvoteCount, 0) AS NetVotesOnPost,
+    pp.HasAcceptedAnswer,
+    ROUND(pp.RollingAvgScore::numeric, 2) AS UserRollingAvgScore,
+    ARRAY_LENGTH(pp.TagArray, 1) AS TagCount,
+    COALESCE((
+        SELECT ti.AvgPostScore
+        FROM TagInfluence ti
+        WHERE ti.TagName = pp.TagArray[1]
+    ), 0) AS PrimaryTagAvgScore,
+    CASE 
+        WHEN pp.PreviousPostScore IS NULL THEN 'FIRST_POST'
+        WHEN pp.Score > pp.PreviousPostScore THEN 'IMPROVING'
+        WHEN pp.Score < pp.PreviousPostScore THEN 'DECLINING'
+        ELSE 'STABLE'
+    END AS PerformanceTrend,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.PostId = pp.PostId
+            AND c.Score > 0
+            AND c.Text LIKE '%thank%'
+    ) AS PositiveCommentCount,
+    (
+        SELECT STRING_AGG(DISTINCT b.Name, ', ')
+        FROM Badges b
+        WHERE b.UserId = uem.Id
+            AND b.Class = 1
+            AND b.Date >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    ) AS RecentGoldBadges,
+    ROUND(
+        (pp.Score::FLOAT + COALESCE(pp.ViewCount, 0)::FLOAT / 100 + pp.AnswerCount * 5) / 
+        NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - pp.ActivitySpanHours * INTERVAL '1 hour')) / 86400, 0),
+        3
+    ) AS EngagementVelocity,
+    EXISTS(
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = pp.PostId
+            AND pl.LinkTypeId = 3
+    ) AS IsDuplicate
+FROM UserEngagementMetrics uem
+LEFT JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId
+LEFT JOIN VotingPatterns vp ON pp.PostId = vp.PostId
+WHERE uem.ReputationRank <= 10000
+    AND pp.PostId IS NOT NULL
+    AND (pp.Score > 5 OR pp.ViewCount > 1000)
+    AND ARRAY_LENGTH(pp.TagArray, 1) BETWEEN 1 AND 5
+ORDER BY 
+    CASE 
+        WHEN pp.HasAcceptedAnswer = 1 THEN pp.Score * 1.5
+        ELSE pp.Score
+    END DESC,
+    uem.Reputation DESC,
+    pp.ViewCount DESC NULLS LAST
+LIMIT 500;

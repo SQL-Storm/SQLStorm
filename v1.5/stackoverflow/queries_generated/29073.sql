@@ -1,0 +1,302 @@
+-- {"query": "29073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2785} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        COALESCE(p.ParentId, 0) as ParentId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(100) OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScore,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as CumulativeScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalPosts,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as TagsNormalized,
+        LENGTH(COALESCE(p.Body, '')) as BodyLength,
+        CASE 
+            WHEN p.Body LIKE '%<code>%' THEN 'HasCode'
+            WHEN p.Body LIKE '%```%' THEN 'HasCode'
+            ELSE 'NoCode'
+        END as CodePresence,
+        CAST(EXTRACT(DAY FROM (CURRENT_TIMESTAMP - p.CreationDate)) AS INTEGER) as DaysSinceCreation,
+        CAST(EXTRACT(DAY FROM (p.LastActivityDate - p.CreationDate)) AS INTEGER) as DaysToActivity,
+        REPEAT('*', CAST(p.Score / 5 AS INTEGER)) as ScoreStars
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)  -- Questions and Answers
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.WebsiteUrl,
+        COUNT(DISTINCT ps.Id) as TotalPosts,
+        SUM(ps.Score) as TotalScore,
+        AVG(ps.Score) as AverageScore,
+        MAX(ps.Score) as MaxScore,
+        MIN(ps.Score) as MinScore,
+        COUNT(DISTINCT ps.AnswerCount) as AnswerCountVariation,
+        MAX(ps.CreationDate) as LatestPost,
+        CAST(COUNT(DISTINCT ps.Id) * 100.0 / NULLIF(COUNT(DISTINCT ps.Id) + COUNT(DISTINCT ps.AnswerCount), 0) AS DECIMAL(5,2)) as PostActivityRatio,
+        CASE 
+            WHEN u.Reputation > 5000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 500 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Medium'
+            WHEN t.Count > 10 THEN 'Novel'
+            ELSE 'Rare'
+        END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as DensityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PrevCount,
+        LEAD(t.Count) OVER (ORDER BY t.Count DESC) as NextCount,
+        (t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC)) as CountChange,
+        CAST(t.Count * 100.0 / (SELECT MAX(Count) FROM Tags) AS DECIMAL(5,2)) as CountPercentage,
+        IIF(t.Count > (SELECT AVG(Count) FROM Tags), 1, 0) as AboveAverage
+    FROM Tags t
+),
+PostWithTags AS (
+    SELECT 
+        ps.Id,
+        ps.Title,
+        ps.Tags,
+        ps.Score,
+        ps.OwnerUserId,
+        CASE 
+            WHEN ps.Tags IS NOT NULL AND ps.Tags != '' THEN 
+                LENGTH(ps.Tags) - LENGTH(REPLACE(ps.Tags, '>', '')) + 1
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN ps.Tags IS NOT NULL THEN 
+                TRIM(BOTH '<>' FROM ps.Tags)
+            ELSE ''
+        END as TagList,
+        STRING_AGG(
+            CASE 
+                WHEN t.TagName IS NOT NULL THEN t.TagName
+                ELSE 'Unknown'
+            END, 
+            ', ' 
+            ORDER BY 
+                CASE WHEN t.TagName IS NOT NULL THEN 0 ELSE 1 END
+        ) as NormalizedTags
+    FROM PostStats ps
+    LEFT JOIN Tags t ON ps.Tags LIKE '%' || t.TagName || '%'
+    WHERE ps.PostTypeId = 1  -- Questions only
+    GROUP BY ps.Id, ps.Title, ps.Tags, ps.Score, ps.OwnerUserId
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id,
+        ps.Title,
+        ps.Score,
+        ps.OwnerUserId,
+        ps.ScoreCategory,
+        ps.ScorePercentile,
+        ps.UserPostRank,
+        ps.ScoreRank,
+        ps.DaysSinceCreation,
+        ps.DaysToActivity,
+        ps.BodyLength,
+        ps.CodePresence,
+        ps.ScoreStars,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.ViewCount,
+        ps.Tags as OriginalTags,
+        IFNULL(pa.NormalizedTags, 'None') as ProcessedTags,
+        ps.TagsNormalized,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.LastEditDate,
+        ps.ParentId,
+        ps.AcceptedAnswerId,
+        ps.PostTypeId,
+        CAST(
+            CASE 
+                WHEN ps.AnswerCount > 10 THEN 100
+                WHEN ps.AnswerCount > 5 THEN 50
+                WHEN ps.AnswerCount > 0 THEN 10
+                ELSE 0
+            END * 
+            CASE 
+                WHEN ps.ViewCount > 1000 THEN 100
+                WHEN ps.ViewCount > 100 THEN 50
+                ELSE 10
+            END * 
+            CASE 
+                WHEN ps.FavoriteCount > 10 THEN 100
+                ELSE 10
+            END AS INTEGER
+        ) as EngagementScore,
+        CASE 
+            WHEN ps.AnswerCount > 0 AND ps.Score > 10 THEN 1
+            ELSE 0
+        END as HasAnswersAndPopularity,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AcceptedAnswerId > 0 THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        CAST(ps.Score AS DECIMAL(10,2)) / 
+        (CASE 
+            WHEN ps.AnswerCount > 0 THEN ps.AnswerCount
+            ELSE 1
+        END) as ScorePerAnswer,
+        CASE 
+            WHEN (ps.CommentCount * 100.0 / NULLIF(ps.ViewCount, 0)) > 5 THEN 'HighCommentRate'
+            WHEN (ps.CommentCount * 100.0 / NULLIF(ps.ViewCount, 0)) > 1 THEN 'MediumCommentRate'
+            ELSE 'LowCommentRate'
+        END as CommentRateCategory,
+        LTRIM(RTRIM(UPPER(ps.Title))) as CleanTitle,
+        UPPER(SUBSTRING(ps.Title, 1, 10)) as ShortTitle,
+        ps.AcceptedAnswerId as AnswerId,
+        (ps.ViewCount + ps.Score + ps.AnswerCount + ps.CommentCount + ps.FavoriteCount) as CombinedMetric,
+        CASE 
+            WHEN ps.Title LIKE '%help%' OR ps.Title LIKE '%question%' OR ps.Title LIKE '%problem%' THEN 1
+            ELSE 0
+        END as HelpRequest,
+        CASE 
+            WHEN ps.Tags LIKE '%java%' OR ps.Tags LIKE '%javascript%' OR ps.Tags LIKE '%python%' THEN 1
+            ELSE 0
+        END as TechFocus,
+        NULLIF(ps.Score - ps.PrevScore, 0) as ScoreChange,
+        NULLIF(ps.NextScore - ps.Score, 0) as ScoreFutureChange,
+        ps.AvgScore as UserAverageScore,
+        ps.CumulativeScore as UserCumulativeScore,
+        ps.TotalPosts as UserTotalPosts,
+        ps.BodyLength as ContentLength,
+        ps.DaysSinceCreation >= 30 as OldPost,
+        ps.ScorePercentile > 90 as HighPercentile,
+        ps.UserPostRank <= 5 as TopUserPost
+    FROM PostStats ps
+    LEFT JOIN PostWithTags pa ON ps.Id = pa.Id
+    WHERE ps.PostTypeId IN (1, 2)
+),
+FinalAnalysis AS (
+    SELECT 
+        cpa.Id,
+        cpa.Title,
+        cpa.Score,
+        cpa.OwnerUserId,
+        cpa.ScoreCategory,
+        cpa.ScorePercentile,
+        cpa.UserPostRank,
+        cpa.ScoreRank,
+        cpa.DaysSinceCreation,
+        cpa.DaysToActivity,
+        cpa.BodyLength,
+        cpa.CodePresence,
+        cpa.ScoreStars,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.ViewCount,
+        cpa.OriginalTags,
+        cpa.ProcessedTags,
+        cpa.TagsNormalized,
+        cpa.CreationDate,
+        cpa.LastActivityDate,
+        cpa.LastEditDate,
+        cpa.ParentId,
+        cpa.AcceptedAnswerId,
+        cpa.PostTypeId,
+        cpa.EngagementScore,
+        cpa.HasAnswersAndPopularity,
+        cpa.HasAcceptedAnswer,
+        cpa.ScorePerAnswer,
+        cpa.CommentRateCategory,
+        cpa.CleanTitle,
+        cpa.ShortTitle,
+        cpa.AnswerId,
+        cpa.CombinedMetric,
+        cpa.HelpRequest,
+        cpa.TechFocus,
+        cpa.ScoreChange,
+        cpa.ScoreFutureChange,
+        cpa.UserAverageScore,
+        cpa.UserCumulativeScore,
+        cpa.UserTotalPosts,
+        cpa.ContentLength,
+        cpa.OldPost,
+        cpa.HighPercentile,
+        cpa.TopUserPost,
+        COALESCE(ua.DisplayName, 'User Not Found') as DisplayName,
+        COALESCE(ua.Reputation, 0) as Reputation,
+        COALESCE(ua.TotalPosts, 0) as UserTotalPostsAnalyzed,
+        COALESCE(ua.TotalScore, 0) as UserTotalScore,
+        COALESCE(ua.AverageScore, 0) as UserAverageScoreAnalyzed,
+        COALESCE(ua.ReputationTier, 'Unknown') as ReputationTier,
+        COALESCE(ta.TagName, 'NoTag') as MostRelevantTag,
+        COALESCE(ta.TagPopularity, 'Unknown') as TagPopularityLevel,
+        COALESCE(ta.TagCount, 0) as TagCountFromTagAnalysis
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN UserActivity ua ON cpa.OwnerUserId = ua.Id
+    LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+        SELECT TRIM(BOTH '<>' FROM split_part(cpa.OriginalTags, '>', n))
+        FROM generate_series(1, 10) as n
+        WHERE split_part(cpa.OriginalTags, '>', n) != ''
+    )
+    WHERE cpa.Id IS NOT NULL
+)
+SELECT 
+    *
+FROM FinalAnalysis
+WHERE 
+    (EngagementScore > 1000 OR HasAnswersAndPopularity = 1 OR HasAcceptedAnswer = 1)
+    AND (
+        (HelpRequest = 1 AND TechFocus = 1) 
+        OR (CommentRateCategory IN ('HighCommentRate', 'MediumCommentRate'))
+    )
+    AND (
+        (Score > 20) 
+        OR (ScorePerAnswer > 5.0)
+        OR Reputation > 1000
+    )
+ORDER BY 
+    EngagementScore DESC,
+    Reputation DESC,
+    Score DESC,
+    CombinedMetric DESC
+LIMIT 10000;

@@ -1,0 +1,92 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.LastActivityDate DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+LastEd AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.CreationDate,
+    ra.Score,
+    ra.ViewCount,
+    u.DisplayName AS OwnerDisplayName,
+    ra.LastActivityDate,
+    le.DisplayName AS LastEditorDisplayName
+  FROM RecentActivity ra
+  LEFT JOIN Users u ON ra.OwnerUserId = u.Id
+  LEFT JOIN Users le ON ra.LastEditorUserId = le.Id
+  WHERE ra.rn = 1
+),
+Metrics AS (
+  SELECT
+    la.PostId,
+    la.Title,
+    la.CreationDate,
+    la.Score,
+    la.ViewCount,
+    la.OwnerDisplayName,
+    la.LastActivityDate,
+    la.LastEditorDisplayName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = la.PostId) AS CommentCount,
+    (SELECT COUNT(*) FROM Posts child WHERE child.ParentId = la.PostId AND child.PostTypeId = 2) AS AnswerCount,
+    (SELECT COALESCE(SUM(v.BountyAmount),0)
+     FROM Votes v
+     WHERE v.PostId = la.PostId AND v.VoteTypeId IN (2,3)) AS NetVotes
+  FROM LastEd la
+),
+TagInfluence AS (
+  SELECT
+    m.PostId,
+    m.Title,
+    m.CommentCount,
+    m.AnswerCount,
+    m.NetVotes,
+    (
+      SELECT STRING_AGG(t.TagName, ',')
+      FROM Tags t
+      JOIN Posts p ON p.Id = m.PostId
+      WHERE
+        p.Tags LIKE '%' || t.TagName || '%'
+        OR t.TagName IN (
+          SELECT TRIM(value) FROM UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '<', ' '), '>', ' '), ' ')) AS value
+        )
+    ) AS TagList
+  FROM Metrics m
+),
+Final AS (
+  SELECT
+    ti.PostId,
+    ti.Title,
+    ti.CreationDate,
+    ti.ViewCount,
+    ti.Score,
+    ti.CommentCount,
+    ti.AnswerCount,
+    ti.NetVotes,
+    ti.TagList,
+    ti.OwnerDisplayName,
+    ti.LastEditorDisplayName,
+    CASE
+      WHEN ti.ViewCount IS NULL THEN 0
+      ELSE (ti.ViewCount * 3) + (COALESCE(ti.Score,0) * 5) + (COALESCE(ti.CommentCount,0) * 7)
+    END AS BenchmarkScore
+  FROM TagInfluence ti
+  WHERE
+    ti.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+    AND ti.TagList IS NOT NULL
+  ORDER BY BenchmarkScore DESC
+)
+SELECT
+  *
+FROM Final
+LIMIT 100;

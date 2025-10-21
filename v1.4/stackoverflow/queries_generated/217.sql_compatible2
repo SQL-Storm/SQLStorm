@@ -1,0 +1,91 @@
+WITH
+user_metrics AS (
+  SELECT
+     u.Id AS UserId,
+     u.DisplayName
+  FROM Users u
+),
+recent_posts AS (
+  SELECT
+     p.Id AS PostId,
+     p.OwnerUserId,
+     p.Title,
+     p.ViewCount,
+     p.Score,
+     p.LastActivityDate,
+     ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+    AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+),
+post_stats AS (
+  SELECT
+     rp.PostId,
+     rp.OwnerUserId,
+     rp.Title,
+     rp.ViewCount,
+     rp.Score,
+     rp.LastActivityDate,
+     COALESCE(pv.Upvotes,0) AS UpvotesFromVotes,
+     COALESCE(pv.Downvotes,0) AS DownvotesFromVotes
+  FROM recent_posts rp
+  LEFT JOIN (
+     SELECT PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+     FROM Votes
+     GROUP BY PostId
+  ) pv ON pv.PostId = rp.PostId
+  WHERE rp.rn <= 5
+),
+tag_datasets AS (
+  SELECT
+     t.TagName,
+     t.Count AS TagCount,
+     (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1) AS AvgQuestionScore
+  FROM Tags t
+  WHERE t.IsModeratorOnly = B'0'
+),
+unioned AS (
+  SELECT u.DisplayName AS UserOrTagContext,
+         p.PostId,
+         p.Title,
+         p.ViewCount,
+         p.Score,
+         p.LastActivityDate
+  FROM user_metrics u
+  JOIN post_stats p ON p.OwnerUserId = u.UserId
+  WHERE p.LastActivityDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+  LIMIT 100
+
+  UNION ALL
+
+  SELECT t.TagName AS UserOrTagContext,
+         NULL::INTEGER AS PostId,
+         t.TagName AS Title,
+         t.TagCount AS ViewCount,
+         COALESCE(CAST(t.AvgQuestionScore AS INTEGER), 0) AS Score,
+         NULL::TIMESTAMP AS LastActivityDate
+  FROM tag_datasets t
+)
+SELECT
+  a.UserOrTagContext,
+  a.PostId,
+  a.Title,
+  a.ViewCount,
+  a.Score,
+  a.LastActivityDate,
+  (SELECT string_agg(
+            CASE v2.VoteTypeId
+              WHEN 2 THEN 'up'
+              WHEN 3 THEN 'down'
+            END, ',')
+   FROM Votes v2
+   WHERE v2.PostId = a.PostId) AS VoteDirections,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.PostId) AS CommentCount,
+  COALESCE((SELECT array_agg(DISTINCT u.DisplayName)
+            FROM Votes v3
+            JOIN Users u ON v3.UserId = u.Id
+            WHERE v3.PostId = a.PostId AND v3.VoteTypeId = 2), ARRAY[]::text[]) AS UpvoterNames
+FROM unioned a
+ORDER BY a.Score DESC NULLS LAST, a.LastActivityDate DESC NULLS LAST;

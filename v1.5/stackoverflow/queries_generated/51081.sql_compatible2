@@ -1,0 +1,155 @@
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        u.CreationDate AS user_creation,
+        COUNT(p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        SUM(p.ViewCount) AS total_views,
+        COUNT(DISTINCT ph.Id) AS edit_count,
+        COUNT(DISTINCT c.Id) AS comment_count
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.DeletionDate IS NULL
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.PostId = p.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+user_badges AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+active_users AS (
+    SELECT 
+        ua.user_id,
+        ua.Reputation,
+        ua.user_creation,
+        ua.post_count,
+        ua.question_count,
+        ua.answer_count,
+        ua.avg_post_score,
+        ua.total_views,
+        ua.edit_count,
+        ua.comment_count,
+        COALESCE(ub.gold_badges, 0) AS gold_badges,
+        COALESCE(ub.silver_badges, 0) AS silver_badges,
+        COALESCE(ub.bronze_badges, 0) AS bronze_badges,
+        ub.badge_names,
+        DATEDIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), ua.user_creation) AS user_age_days,
+        CASE 
+            WHEN ua.post_count > 1000 AND ua.Reputation > 10000 THEN 'Elite'
+            WHEN ua.post_count > 100 AND ua.Reputation > 1000 THEN 'Active'
+            WHEN ua.post_count > 10 THEN 'Regular'
+            ELSE 'Casual'
+        END AS user_tier
+    FROM user_activity ua
+    LEFT JOIN user_badges ub ON ub.UserId = ua.user_id
+    WHERE ua.user_creation < TIMESTAMPADD(DAY, -30, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+question_engagement AS (
+    SELECT 
+        p.Id AS question_id,
+        p.OwnerUserId,
+        p.CreationDate AS q_creation,
+        p.Score AS q_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CommentCount,
+        COUNT(v.Id) AS total_votes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts,
+        LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) AS tag_count,
+        AVG(DATEDIFF('day', a.CreationDate, p.CreationDate)) AS avg_answer_time
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id 
+        AND v.VoteTypeId IN (2, 3) 
+        AND v.CreationDate >= p.CreationDate
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    WHERE p.PostTypeId = 1 
+        AND p.DeletionDate IS NULL
+        AND p.CreationDate >= TIMESTAMPADD(DAY, -365, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, 
+             p.AnswerCount, p.FavoriteCount, p.CommentCount, p.Tags
+),
+tag_performance AS (
+    SELECT 
+        tt.TagName,
+        COUNT(qe.question_id) AS questions_with_tag,
+        AVG(qe.q_score) AS avg_question_score,
+        AVG(qe.ViewCount) AS avg_views,
+        AVG(qe.AnswerCount) AS avg_answers,
+        AVG(qe.total_votes) AS avg_votes,
+        SUM(qe.upvotes) AS total_upvotes,
+        MAX(qe.q_creation) AS latest_activity
+    FROM top_tags tt
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', tt.TagName, '>%')
+    JOIN question_engagement qe ON qe.question_id = p.Id
+    WHERE tt.tag_rank <= 50
+    GROUP BY tt.TagName
+)
+SELECT 
+    au.user_tier,
+    au.user_age_days,
+    AVG(au.Reputation) AS avg_reputation,
+    AVG(au.post_count) AS avg_posts,
+    AVG(au.question_count) AS avg_questions,
+    AVG(au.answer_count) AS avg_answers,
+    AVG(au.total_views) AS avg_total_views,
+    AVG(au.avg_post_score) AS avg_post_score,
+    AVG(au.edit_count) AS avg_edits,
+    AVG(au.comment_count) AS avg_comments,
+    AVG(au.gold_badges) AS avg_gold_badges,
+    AVG(au.silver_badges) AS avg_silver_badges,
+    AVG(au.bronze_badges) AS avg_bronze_badges,
+    COUNT(au.user_id) AS user_count,
+    SUM(au.post_count) AS total_user_posts,
+    -- Tag-based insights
+    tp.TagName AS top_tag,
+    tp.questions_with_tag,
+    tp.avg_question_score,
+    tp.avg_views,
+    -- Engagement correlation
+    CORR(au.Reputation, qe.q_score) AS reputation_score_correlation,
+    CORR(au.total_views, qe.ViewCount) AS views_engagement_correlation,
+    -- Time-based trends
+    AVG(qe.avg_answer_time) AS avg_time_to_answer,
+    -- Complex aggregation
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY au.Reputation) AS p90_reputation,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qe.ViewCount) AS median_views
+FROM active_users au
+LEFT JOIN question_engagement qe ON qe.OwnerUserId = au.user_id
+LEFT JOIN tag_performance tp ON tp.TagName = SUBSTRING_INDEX(SUBSTRING_INDEX(qe.Tags, '>', 1), '<', -1)
+WHERE au.post_count > 5
+    AND qe.question_id IS NOT NULL
+GROUP BY 
+    au.user_tier, 
+    au.user_age_days, 
+    tp.TagName, 
+    tp.questions_with_tag, 
+    tp.avg_question_score, 
+    tp.avg_views,
+    qe.Tags
+HAVING AVG(au.Reputation) > 100
+ORDER BY 
+    avg_reputation DESC,
+    user_count DESC,
+    tp.questions_with_tag DESC
+LIMIT 1000;

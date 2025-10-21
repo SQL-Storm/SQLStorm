@@ -1,0 +1,289 @@
+-- {"query": "8053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2683} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+badge_rank as (
+    select b.userid,
+           count(*) filter (where b.class = 1) as golds,
+           count(*) filter (where b.class = 2) as silvers,
+           count(*) filter (where b.class = 3) as bronzes,
+           max(b.date) as last_badge_date,
+           row_number() over (partition by b.userid order by max(b.date) desc, count(*) desc) as rn
+    from badges b
+    where b.date >= now() - interval '5 years'
+    group by b.userid
+),
+user_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           sum(coalesce(p.score,0)) as post_score,
+           sum(coalesce(p.viewcount,0)) as views,
+           max(p.lastactivitydate) as last_activity
+    from posts p
+    where p.creationdate >= now() - interval '5 years'
+      and p.owneruserid is not null
+    group by p.owneruserid
+),
+vote_sums as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+           count(*) filter (where v.votetypeid = 8) as bounties_started,
+           count(*) filter (where v.votetypeid = 9) as bounties_awarded
+    from votes v
+    where v.creationdate >= now() - interval '5 years'
+    group by v.postid
+),
+question_metrics as (
+    select q.id as question_id,
+           q.owneruserid as asker_id,
+           q.score as q_score,
+           q.viewcount as q_views,
+           q.answercount,
+           q.acceptedanswerid,
+           (select sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end)
+            from votes v where v.postid = q.id) as q_net_votes,
+           (select count(*) from comments c where c.postid = q.id) as q_comments,
+           array_length(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,''))-2,0)), '><'), 1) as tag_count
+    from posts q
+    where q.posttypeid = 1
+      and q.creationdate >= now() - interval '5 years'
+),
+answer_metrics as (
+    select a.parentid as question_id,
+           count(*) as answers,
+           sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as accepted_present,
+           avg(a.score) as avg_answer_score,
+           max(a.score) as max_answer_score
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.creationdate >= now() - interval '5 years'
+    group by a.parentid
+),
+link_dupes as (
+    select pl.postid as question_id,
+           count(*) filter (where pl.linktypeid = 3) as dup_count,
+           count(*) filter (where pl.linktypeid = 1) as linked_count,
+           max(pl.creationdate) as last_link_date
+    from postlinks pl
+    group by pl.postid
+),
+edits_cte as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+           max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+           max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) else null end) as last_close_reason_id
+    from posthistory ph
+    where ph.creationdate >= now() - interval '5 years'
+    group by ph.postid
+),
+tag_popularity as (
+    select t.tagname,
+           t.count as tag_total_count,
+           ntile(5) over (order by t.count desc nulls last) as popularity_quintile
+    from tags t
+),
+question_primary_tag as (
+    select q.id as question_id,
+           lower(coalesce(split_part(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><', 1), '')) as primary_tag
+    from posts q
+    where q.posttypeid = 1
+),
+questions_with_tag_rank as (
+    select qmt.question_id,
+           tp.tag_total_count,
+           tp.popularity_quintile
+    from question_primary_tag qpt
+    left join tag_popularity tp
+      on tp.tagname = qpt.primary_tag
+    right join question_metrics qmt
+      on qmt.question_id = qpt.question_id
+),
+user_quality as (
+    select ra.user_id,
+           case
+               when ua.post_score >= 1000 and coalesce(br.golds,0) >= 3 then 'elite'
+               when ua.post_score >= 200 and coalesce(br.silvers,0) >= 2 then 'strong'
+               when ua.post_score is null then 'inactive'
+               else 'regular'
+           end as quality_band,
+           coalesce(br.golds,0) as golds,
+           coalesce(br.silvers,0) as silvers,
+           coalesce(br.bronzes,0) as bronzes,
+           ua.q_count,
+           ua.a_count,
+           ua.post_score,
+           ua.views,
+           ua.last_activity,
+           ra.region_hint
+    from recent_users ra
+    left join user_activity ua on ua.user_id = ra.user_id
+    left join badge_rank br on br.userid = ra.user_id and br.rn = 1
+),
+per_question as (
+    select qm.question_id,
+           qm.asker_id,
+           qm.q_score,
+           qm.q_views,
+           qm.answercount,
+           qm.acceptedanswerid,
+           qm.q_net_votes,
+           qm.q_comments,
+           qm.tag_count,
+           coalesce(am.answers, 0) as answers,
+           coalesce(am.accepted_present, 0) as accepted_present,
+           coalesce(am.avg_answer_score, 0) as avg_answer_score,
+           coalesce(am.max_answer_score, 0) as max_answer_score,
+           coalesce(ld.dup_count, 0) as dup_count,
+           coalesce(ld.linked_count, 0) as linked_count,
+           ld.last_link_date,
+           coalesce(ed.edit_count, 0) as edit_count,
+           ed.last_edit_date,
+           coalesce(ed.close_events, 0) as close_events,
+           ed.last_close_reason_id,
+           coalesce(qtr.tag_total_count, 0) as tag_total_count,
+           qtr.popularity_quintile
+    from question_metrics qm
+    left join answer_metrics am on am.question_id = qm.question_id
+    left join link_dupes ld on ld.question_id = qm.question_id
+    left join edits_cte ed on ed.postid = qm.question_id
+    left join questions_with_tag_rank qtr on qtr.question_id = qm.question_id
+),
+scored_questions as (
+    select pq.*,
+           /* composite score mixing engagement, quality, and difficulty signals */
+           (
+             0.30 * coalesce(pq.q_views,0)
+           + 0.40 * coalesce(pq.q_net_votes,0)
+           + 0.50 * coalesce(pq.answers,0)
+           + 0.60 * case when pq.accepted_present > 0 then 5 else 0 end
+           + 0.20 * coalesce(pq.edit_count,0)
+           - 0.50 * coalesce(pq.dup_count,0)
+           + 0.10 * coalesce(pq.tag_count,0)
+           + 0.05 * coalesce(pq.popularity_quintile,3)
+           )::numeric(20,4) as composite_score
+    from per_question pq
+),
+user_question_join as (
+    select sq.*,
+           u.displayname,
+           u.reputation,
+           uq.quality_band,
+           uq.golds, uq.silvers, uq.bronzes,
+           uq.q_count, uq.a_count,
+           uq.post_score as user_post_score,
+           uq.views as user_views,
+           uq.region_hint
+    from scored_questions sq
+    left join users u on u.id = sq.asker_id
+    left join user_quality uq on uq.user_id = sq.asker_id
+),
+ranked as (
+    select *,
+           row_number() over (
+               partition by coalesce(quality_band,'unknown')
+               order by composite_score desc nulls last, q_views desc nulls last, q_score desc nulls last
+           ) as band_rank,
+           dense_rank() over (order by composite_score desc nulls last) as global_rank,
+           percentile_cont(0.5) within group (order by composite_score) over () as median_score
+    from user_question_join
+),
+outliers as (
+    select r.*,
+           case
+             when r.composite_score > r.median_score * 3 then 'high-outlier'
+             when r.composite_score < r.median_score / nullif(3,0) then 'low-outlier'
+             else 'normal'
+           end as outlier_flag
+    from ranked r
+),
+final_union as (
+    select
+        'TOP' as bucket,
+        o.question_id,
+        o.displayname,
+        o.reputation,
+        coalesce(o.quality_band,'unknown') as quality_band,
+        o.global_rank,
+        o.band_rank,
+        o.composite_score,
+        o.q_views,
+        o.q_net_votes,
+        o.answers,
+        o.accepted_present,
+        o.edit_count,
+        o.dup_count,
+        o.tag_count,
+        o.popularity_quintile,
+        o.region_hint,
+        o.outlier_flag
+    from outliers o
+    where o.global_rank <= 100
+
+    union all
+
+    select
+        'SAMPLE' as bucket,
+        o.question_id,
+        o.displayname,
+        o.reputation,
+        coalesce(o.quality_band,'unknown') as quality_band,
+        o.global_rank,
+        o.band_rank,
+        o.composite_score,
+        o.q_views,
+        o.q_net_votes,
+        o.answers,
+        o.accepted_present,
+        o.edit_count,
+        o.dup_count,
+        o.tag_count,
+        o.popularity_quintile,
+        o.region_hint,
+        o.outlier_flag
+    from outliers o
+    where o.global_rank % 100 = 1
+
+    union all
+
+    select
+        'NULLS' as bucket,
+        o.question_id,
+        coalesce(o.displayname, '[deleted]') as displayname,
+        coalesce(o.reputation, -1) as reputation,
+        coalesce(o.quality_band,'unknown') as quality_band,
+        o.global_rank,
+        o.band_rank,
+        coalesce(o.composite_score, 0) as composite_score,
+        coalesce(o.q_views, 0) as q_views,
+        coalesce(o.q_net_votes, 0) as q_net_votes,
+        coalesce(o.answers, 0) as answers,
+        coalesce(o.accepted_present, 0) as accepted_present,
+        coalesce(o.edit_count, 0) as edit_count,
+        coalesce(o.dup_count, 0) as dup_count,
+        coalesce(o.tag_count, 0) as tag_count,
+        coalesce(o.popularity_quintile, 3) as popularity_quintile,
+        coalesce(o.region_hint, 'Unknown') as region_hint,
+        coalesce(o.outlier_flag, 'normal') as outlier_flag
+    from outliers o
+    where o.displayname is null or o.composite_score is null
+)
+select *
+from final_union
+order by
+  case bucket
+    when 'TOP' then 1
+    when 'SAMPLE' then 2
+    when 'NULLS' then 3
+    else 4
+  end,
+  global_rank,
+  band_rank;

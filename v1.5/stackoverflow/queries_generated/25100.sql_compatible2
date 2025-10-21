@@ -1,0 +1,129 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.Id                             AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                         AS question_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                         AS answer_cnt,
+            SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS self_accepted_cnt,
+            COALESCE(SUM(p.Score), 0)                                            AS total_score,
+            MAX(p.CreationDate)                                                 AS last_post_dt
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    badge_counts AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    tag_contrib AS (
+        SELECT
+            u.Id                                 AS user_id,
+            t.TagName,
+            COUNT(*)                             AS contrib_cnt
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag_name
+        ) AS pt
+        JOIN Tags t ON t.TagName = pt.tag_name
+        GROUP BY u.Id, t.TagName
+    ),
+    top_tags AS (
+        SELECT
+            tc.user_id,
+            STRING_AGG(tc.TagName, ', ' ORDER BY tc.contrib_cnt DESC) AS top_tags
+        FROM tag_contrib tc
+        GROUP BY tc.user_id
+    ),
+    recent_votes AS (
+        SELECT
+            v.UserId,
+            MAX(v.CreationDate) AS last_vote_dt
+        FROM Votes v
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ),
+    user_rank AS (
+        SELECT
+            us.user_id,
+            us.DisplayName,
+            us.Reputation,
+            us.question_cnt,
+            us.answer_cnt,
+            us.self_accepted_cnt,
+            us.total_score,
+            COALESCE(bc.gold_cnt, 0)   AS gold_cnt,
+            COALESCE(bc.silver_cnt, 0) AS silver_cnt,
+            COALESCE(bc.bronze_cnt, 0) AS bronze_cnt,
+            COALESCE(tt.top_tags, '')  AS top_tags,
+            COALESCE(rv.last_vote_dt, us.last_post_dt) AS last_activity,
+            RANK()     OVER (ORDER BY us.Reputation DESC, us.total_score DESC) AS reputation_rank,
+            ROW_NUMBER() OVER (
+                PARTITION BY CASE
+                                 WHEN us.Reputation >= 10000 THEN 'high'
+                                 WHEN us.Reputation >= 2000  THEN 'mid'
+                                 ELSE 'low'
+                             END
+                ORDER BY us.total_score DESC
+            ) AS score_row_in_bucket
+        FROM user_stats us
+        LEFT JOIN badge_counts bc ON bc.UserId = us.user_id
+        LEFT JOIN top_tags tt    ON tt.user_id = us.user_id
+        LEFT JOIN recent_votes rv ON rv.UserId = us.user_id
+    )
+SELECT
+    ur.user_id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.question_cnt,
+    ur.answer_cnt,
+    ur.self_accepted_cnt,
+    ur.total_score,
+    ur.gold_cnt,
+    ur.silver_cnt,
+    ur.bronze_cnt,
+    ur.top_tags,
+    ur.last_activity,
+    ur.reputation_rank,
+    ur.score_row_in_bucket,
+    CASE
+        WHEN ur.reputation_rank <= 10  THEN 'Top10'
+        WHEN ur.reputation_rank <= 100 THEN 'Top100'
+        ELSE 'Other'
+    END AS reputation_tier,
+    COALESCE(NULLIF(CAST(ur.gold_cnt AS VARCHAR), '0'), 'None') || '-' ||
+    COALESCE(NULLIF(CAST(ur.silver_cnt AS VARCHAR), '0'), '0') || '-' ||
+    COALESCE(NULLIF(CAST(ur.bronze_cnt AS VARCHAR), '0'), '0') AS badge_signature
+FROM user_rank ur
+WHERE ur.Reputation IS NOT NULL
+ORDER BY ur.reputation_rank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL         AS user_id,
+    'Aggregated Summary' AS DisplayName,
+    SUM(ur.Reputation) AS Reputation,
+    SUM(ur.question_cnt) AS question_cnt,
+    SUM(ur.answer_cnt)   AS answer_cnt,
+    SUM(ur.self_accepted_cnt) AS self_accepted_cnt,
+    SUM(ur.total_score)  AS total_score,
+    SUM(ur.gold_cnt)   AS gold_cnt,
+    SUM(ur.silver_cnt) AS silver_cnt,
+    SUM(ur.bronze_cnt) AS bronze_cnt,
+    NULL               AS top_tags,
+    MAX(ur.last_activity) AS last_activity,
+    NULL               AS reputation_rank,
+    NULL               AS score_row_in_bucket,
+    'Summary'          AS reputation_tier,
+    NULL               AS badge_signature
+FROM user_rank ur
+WHERE ur.reputation_rank <= 1000;

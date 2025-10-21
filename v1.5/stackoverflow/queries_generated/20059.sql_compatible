@@ -1,0 +1,143 @@
+WITH UserContributionDetails AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(DISTINCT q.ViewCount), 0) AS TotalQuestionViews,
+        COALESCE(SUM(DISTINCT a.Score), 0) AS TotalAnswerScore,
+        COALESCE(AVG(a.Score), 0) AS AverageAnswerScore,
+        SUM(CASE WHEN a.Id = q_parent.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        MIN(a.CreationDate) AS FirstAnswerDate,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Posts q_parent ON a.ParentId = q_parent.Id
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    WHERE
+        u.Reputation > 1500 AND u.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.AboutMe
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (
+            SELECT ph.CreationDate
+            FROM PostHistory ph
+            WHERE ph.UserId = b.UserId AND ph.PostHistoryTypeId = 24
+            ORDER BY ph.CreationDate ASC
+            LIMIT 1
+        ) AS FirstApprovedEditDate,
+        RANK() OVER (PARTITION BY b.Class ORDER BY COUNT(*) DESC) AS RankInClass
+    FROM
+        Badges b
+    WHERE
+        b.UserId IN (SELECT UserId FROM UserContributionDetails)
+    GROUP BY
+        b.UserId, b.Class
+),
+UserPrimaryTag AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        TotalTagScore
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            t.tag,
+            SUM(p.Score) AS TotalTagScore,
+            ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC, COUNT(t.tag) DESC) AS rn
+        FROM
+            Posts p
+        CROSS JOIN LATERAL
+            (
+                SELECT tag
+                FROM unnest(string_to_array(substring(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+            ) AS t
+        WHERE
+            p.PostTypeId = 1
+            AND p.OwnerUserId IS NOT NULL
+            AND p.Tags IS NOT NULL
+        GROUP BY
+            p.OwnerUserId, t.tag
+    ) AS TagScores
+    WHERE rn = 1
+)
+SELECT
+    ucd.DisplayName,
+    ucd.Reputation,
+    ucd.QuestionCount,
+    ucd.AnswerCount,
+    ucd.TotalQuestionViews,
+    ucd.TotalAnswerScore,
+    CAST(ucd.AverageAnswerScore AS DECIMAL(10, 2)) AS AverageAnswerScore,
+    CASE
+        WHEN ucd.AnswerCount > 0 THEN CAST(ucd.AcceptedAnswers AS DECIMAL(10, 6)) / ucd.AnswerCount
+        ELSE 0
+    END AS AcceptedAnswerRate,
+    COALESCE(ubr_gold.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubr_silver.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubr_bronze.BronzeBadges, 0) AS BronzeBadges,
+    upt.Tag AS PrimaryTag,
+    upt.TotalTagScore AS PrimaryTagScore,
+    (
+        (ucd.TotalAnswerScore * 0.4) +
+        (ucd.TotalQuestionViews / 1000.0 * 0.1) +
+        (ucd.AcceptedAnswers * 15 * 0.2) +
+        (COALESCE(ubr_gold.GoldBadges, 0) * 100 * 0.15) +
+        (COALESCE(ubr_silver.SilverBadges, 0) * 20 * 0.1) +
+        (ucd.CommentCount * 0.05) -
+        (EXTRACT(YEAR FROM AGE(CAST('2024-10-01' AS DATE), ucd.CreationDate)) * 10)
+    ) AS ContributionScore,
+    (
+        SELECT p.Title
+        FROM Posts p
+        WHERE p.OwnerUserId = ucd.UserId
+          AND p.CommentCount > 20
+          AND p.Score < 0
+        ORDER BY p.LastActivityDate DESC
+        LIMIT 1
+    ) AS LastControversialPost,
+    UPPER(SUBSTRING(COALESCE(ucd.Location, 'LOCATION_UNKNOWN'), 1, 15)) || '...' AS FormattedLocation,
+    EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.UserId = ucd.UserId AND v.VoteTypeId = 8
+        UNION ALL
+        SELECT 1
+        FROM Votes v
+        WHERE v.UserId = ucd.UserId AND v.VoteTypeId = 5
+    ) AS HasPlacedBountyOrFavorite
+FROM
+    UserContributionDetails ucd
+LEFT JOIN
+    UserBadgeRanks ubr_gold ON ucd.UserId = ubr_gold.UserId AND ubr_gold.RankInClass = 1
+LEFT JOIN
+    UserBadgeRanks ubr_silver ON ucd.UserId = ubr_silver.UserId AND ubr_silver.RankInClass = 2
+LEFT JOIN
+    UserBadgeRanks ubr_bronze ON ucd.UserId = ubr_bronze.UserId AND ubr_bronze.RankInClass = 3
+LEFT JOIN
+    UserPrimaryTag upt ON ucd.UserId = upt.OwnerUserId
+WHERE
+    ucd.AnswerCount > ucd.QuestionCount
+    AND (ucd.LastAnswerDate > ucd.FirstAnswerDate + INTERVAL '1 year')
+    AND LENGTH(ucd.AboutMe) > 100
+ORDER BY
+    ContributionScore DESC,
+    ucd.Reputation DESC
+LIMIT 250;

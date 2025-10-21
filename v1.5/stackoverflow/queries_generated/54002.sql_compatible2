@@ -1,0 +1,94 @@
+WITH
+tag_list AS (
+    SELECT TagName
+    FROM Tags
+    WHERE TagName IN ('python', 'sql', 'performance', 'database')
+),
+tag_posts AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id)          AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answers,
+        AVG(p.Score)                    AS avg_score,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_answers
+    FROM tag_list t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+),
+votes AS (
+    SELECT
+        p.Id          AS PostId,
+        v.VoteTypeId,
+        COUNT(*)      AS vote_cnt
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, v.VoteTypeId
+),
+tag_votes AS (
+    SELECT
+        t.TagName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN v.vote_cnt ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN v.vote_cnt ELSE 0 END) AS downvotes
+    FROM tag_list t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    JOIN votes v
+      ON v.PostId = p.Id
+    GROUP BY t.TagName
+),
+comments AS (
+    SELECT
+        p.Id          AS PostId,
+        COUNT(c.Id)   AS comment_cnt,
+        SUM(c.Score)  AS comment_score
+    FROM Posts p
+    JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+tag_comments AS (
+    SELECT
+        t.TagName,
+        SUM(c.comment_cnt) AS total_comments,
+        SUM(c.comment_score) AS total_comment_score
+    FROM tag_list t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    JOIN comments c ON c.PostId = p.Id
+    GROUP BY t.TagName
+),
+top_commenters AS (
+    SELECT
+        t.TagName,
+        u.Id          AS UserId,
+        u.DisplayName,
+        COUNT(c.Id)   AS user_comment_cnt,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY COUNT(c.Id) DESC) AS rn
+    FROM tag_list t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    JOIN Comments c ON c.PostId = p.Id
+    JOIN Users u ON c.UserId = u.Id
+    GROUP BY t.TagName, u.Id, u.DisplayName
+)
+SELECT
+    tp.TagName,
+    tp.total_posts,
+    tp.questions,
+    tp.answers,
+    tp.avg_score,
+    tp.accepted_answers,
+    COALESCE(tv.upvotes, 0) AS upvotes,
+    COALESCE(tv.downvotes, 0) AS downvotes,
+    COALESCE(tc.total_comments, 0) AS total_comments,
+    COALESCE(tc.total_comment_score, 0) AS total_comment_score,
+    tc_user.UserId         AS top_commenter_id,
+    tc_user.DisplayName    AS top_commenter_name,
+    tc_user.user_comment_cnt AS top_user_comment_count
+FROM tag_posts tp
+LEFT JOIN tag_votes tv ON tv.TagName = tp.TagName
+LEFT JOIN tag_comments tc ON tc.TagName = tp.TagName
+LEFT JOIN top_commenters tc_user
+     ON tc_user.TagName = tp.TagName AND tc_user.rn = 1
+ORDER BY tp.questions DESC;

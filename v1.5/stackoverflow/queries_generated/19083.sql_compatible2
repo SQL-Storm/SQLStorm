@@ -1,0 +1,200 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalAnswersReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersForQuestions,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM Posts A WHERE A.Id = P.AcceptedAnswerId AND A.OwnerUserId = U.Id) THEN 1 ELSE 0 END) AS AcceptedAnswersByThisUser,
+        GREATEST(0, (EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400.0)) AS DaysSinceCreation,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM
+        Users U
+        LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+        LEFT JOIN Comments C ON U.Id = C.UserId
+        LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.Views,
+        U.LastAccessDate
+    HAVING
+        COUNT(DISTINCT P.Id) + COUNT(DISTINCT C.Id) > 10
+),
+PostEditHistory AS (
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) AS InitialCreationDate,
+        MAX(PH.CreationDate) AS LastEditOrActivityDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 END) AS CloseDeleteCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (11, 13) THEN 1 END) AS ReopenUndeleteCount,
+        STRING_AGG(DISTINCT CASE
+                                WHEN PH.Comment IS NOT NULL AND PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$'
+                                    THEN COALESCE(CRT.Name, 'Reason ID: ' || PH.Comment)
+                                WHEN PH.Comment IS NOT NULL THEN PH.Comment
+                                ELSE NULL
+                            END, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 OR PH.Comment IS NOT NULL) AS CloseAndHistoryComments,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 16 THEN 'Yes' ELSE 'No' END) AS WasCommunityOwned,
+        COALESCE(AVG(ABS(LENGTH(PH.Text) - LAG(LENGTH(PH.Text), 1, LENGTH(PH.Text)) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))), 0) AS AvgBodyLengthChange
+    FROM
+        PostHistory PH
+        LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' AND CRT.Id = CAST(PH.Comment AS INTEGER)
+    GROUP BY
+        PH.PostId
+),
+SignificantQuestions AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Body,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (CASE
+            WHEN P.Tags IS NOT NULL THEN
+                (SELECT array_to_string(array(SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) LIMIT 1), '')
+            ELSE ''
+        END) AS PrimaryTag,
+        LENGTH(P.Body) AS BodyLength,
+        'Question' AS PostCategory
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.Score >= 10
+      AND P.ViewCount >= 1000
+),
+SignificantAnswers AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Body,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        COALESCE(P.ViewCount, 0) AS ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        -1 AS AcceptedAnswerId,
+        (CASE
+            WHEN QP.Tags IS NOT NULL THEN
+                (SELECT array_to_string(array(SELECT UNNEST(string_to_array(SUBSTRING(QP.Tags FROM 2 FOR LENGTH(QP.Tags) - 2), '><')) LIMIT 1), '')
+            ELSE ''
+        END) AS PrimaryTag,
+        LENGTH(P.Body) AS BodyLength,
+        'Answer' AS PostCategory
+    FROM Posts P
+    JOIN Posts QP ON P.ParentId = QP.Id AND QP.PostTypeId = 1
+    WHERE P.PostTypeId = 2
+      AND P.Score >= 25
+),
+CombinedSignificantPosts AS (
+    SELECT
+        T.*,
+        (SELECT C.Text FROM Comments C WHERE C.PostId = T.PostId ORDER BY C.CreationDate DESC LIMIT 1) AS LatestCommentText,
+        T.Score - AVG(T.Score) OVER (PARTITION BY T.PostTypeId) AS ScoreRelativeToTypeAvg
+    FROM (
+        SELECT * FROM SignificantQuestions
+        UNION ALL
+        SELECT * FROM SignificantAnswers
+    ) AS T
+),
+RelatedPostMetrics AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostCount,
+        MAX(PH.CreationDate) FILTER (WHERE PH.Text LIKE '%OriginalQuestionIds%') AS LastDuplicateDecisionDate
+    FROM PostLinks PL
+    LEFT JOIN PostHistory PH ON PL.PostId = PH.PostId
+                             AND PH.PostHistoryTypeId = 10
+    GROUP BY PL.PostId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.TotalBadges,
+    UE.UserProfileViews,
+    UE.DaysSinceCreation,
+    CSP.PostId,
+    CSP.PostCategory,
+    CSP.Title,
+    CSP.PostCreationDate,
+    CSP.Score,
+    CSP.ViewCount,
+    CSP.AnswerCount,
+    CSP.CommentCount,
+    CSP.FavoriteCount,
+    CSP.PrimaryTag,
+    CSP.BodyLength,
+    PEH.EditCount,
+    PEH.InitialCreationDate,
+    PEH.LastEditOrActivityDate,
+    PEH.CloseDeleteCount,
+    PEH.ReopenUndeleteCount,
+    PEH.CloseAndHistoryComments,
+    PEH.WasCommunityOwned,
+    PEH.AvgBodyLengthChange,
+    COALESCE(RPM.LinkedPostCount, 0) AS LinkedPostCount,
+    COALESCE(RPM.DuplicatePostCount, 0) AS DuplicatePostCount,
+    COALESCE(RPM.LastDuplicateDecisionDate, TIMESTAMP '1900-01-01 00:00:00') AS EffectiveLastDuplicateDecisionDate,
+    CSP.LatestCommentText,
+    CSP.ScoreRelativeToTypeAvg,
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY CSP.Score DESC, CSP.ViewCount DESC, CSP.PostCreationDate DESC) AS UserPostRank,
+    SUM(CSP.Score) OVER (PARTITION BY UE.UserId ORDER BY CSP.PostCreationDate) AS CumulativePostScore,
+    CASE
+        WHEN CSP.ClosedDate IS NOT NULL AND PEH.ReopenUndeleteCount = 0 THEN 'Permanently Closed'
+        WHEN PEH.ReopenUndeleteCount > 0 AND PEH.CloseDeleteCount > 0 THEN 'Closed and Reopened'
+        WHEN CSP.PostCreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AND PEH.LastEditOrActivityDate IS NULL THEN 'Dormant Old Post'
+        WHEN CSP.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months') AND COALESCE(PEH.EditCount, 0) = 0 THEN 'New Unedited Post'
+        ELSE 'Active/Evolving Post'
+    END AS PostLifecycleStatus,
+    TRIM(SUBSTRING(COALESCE(CSP.Title, '[No Title]') || ' - ' || COALESCE(CSP.LatestCommentText, '[No Recent Comment]') || ' (' || COALESCE(CSP.PrimaryTag, 'untagged') || ')', 1, 150)) AS ContentSummary,
+    (
+        SELECT COUNT(B.Id) > 0
+        FROM Badges B
+        WHERE B.UserId = UE.UserId
+          AND B.TagBased = TRUE
+          AND LOWER(B.Name) = LOWER(CSP.PrimaryTag)
+    ) AS HasTagBadge,
+    (CSP.Score * 0.7 + COALESCE(CSP.FavoriteCount, 0) * 0.5 + COALESCE(CSP.CommentCount, 0) * 0.3 + COALESCE(CSP.ViewCount, 0) * 0.01) *
+    (CASE WHEN PEH.WasCommunityOwned = 'Yes' THEN 0.8 ELSE 1.0 END) /
+    (CASE WHEN COALESCE(PEH.CloseDeleteCount, 0) > 0 THEN 2.0 ELSE 1.0 END) AS CalculatedImpactScore
+FROM
+    UserEngagement UE
+    JOIN CombinedSignificantPosts CSP ON UE.UserId = CSP.OwnerUserId
+    LEFT JOIN PostEditHistory PEH ON CSP.PostId = PEH.PostId
+    LEFT JOIN RelatedPostMetrics RPM ON CSP.PostId = RPM.PostId
+WHERE
+    UE.Reputation > 5000
+    AND CSP.ScoreRelativeToTypeAvg > 0
+    AND UE.DaysSinceCreation >= 180
+    AND CSP.PostCategory = 'Question'
+    AND (CSP.Title IS NOT NULL AND CSP.Title <> '')
+    AND (CSP.PrimaryTag IS NOT NULL AND CSP.PrimaryTag <> '')
+    AND CSP.PostCreationDate BETWEEN TIMESTAMP '2015-01-01' AND TIMESTAMP '2023-01-01'
+ORDER BY
+    CalculatedImpactScore DESC, UE.Reputation DESC, UserPostRank ASC
+LIMIT 1000;

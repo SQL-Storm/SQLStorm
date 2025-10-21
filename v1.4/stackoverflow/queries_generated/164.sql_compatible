@@ -1,0 +1,96 @@
+WITH TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+RecentQuestions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC, p.Score DESC) AS rn_by_owner,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesFromVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesFromVotes
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+JoinedLinks AS (
+  SELECT
+    rq.Id AS QuestionId,
+    rq.Title AS QuestionTitle,
+    rq.Tags AS QuestionTags,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.OwnerUserId,
+    rq.OwnerDisplayName,
+    rq.Reputation,
+    rq.CommentCount,
+    rq.UpVotesFromVotes,
+    rq.DownVotesFromVotes,
+    pl.Id AS LinkId,
+    pl.CreationDate AS LinkCreationDate,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    rp.Id AS RelatedPostId,
+    rp.Title AS RelatedPostTitle,
+    rp.OwnerUserId AS RelatedOwnerId,
+    rp.OwnerDisplayName AS RelatedOwnerDisplayName
+  FROM RecentQuestions rq
+  LEFT JOIN PostLinks pl ON pl.PostId = rq.Id
+  LEFT JOIN Posts rp ON pl.RelatedPostId = rp.Id
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+TagProfiles AS (
+  SELECT
+    jt.QuestionId,
+    jt.QuestionTitle,
+    t.TagName,
+    COUNT(*) OVER (PARTITION BY t.TagName) AS TagPopularity
+  FROM JoinedLinks jt
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(jt.QuestionTags, 2, length(jt.QuestionTags) - 2), '><')) AS TagName
+  ) t
+)
+SELECT
+  jn.QuestionId,
+  jn.QuestionTitle,
+  jn.QuestionTags,
+  jn.CreationDate,
+  jn.Score,
+  jn.ViewCount,
+  jn.OwnerUserId,
+  jn.OwnerDisplayName,
+  jn.Reputation,
+  jn.CommentCount,
+  jn.UpVotesFromVotes,
+  jn.DownVotesFromVotes,
+  jn.LinkId,
+  jn.LinkCreationDate,
+  jn.RelatedPostId,
+  jn.LinkTypeId,
+  jn.LinkTypeName,
+  jn.RelatedPostTitle,
+  jn.RelatedOwnerId,
+  jn.RelatedOwnerDisplayName,
+  tp.TagName,
+  tp.TagPopularity
+FROM JoinedLinks jn
+LEFT JOIN TagProfiles tp ON tp.QuestionId = jn.QuestionId
+WHERE jn.LinkTypeName IS NOT NULL
+  OR jn.RelatedPostId IS NOT NULL
+ORDER BY jn.Score DESC NULLS LAST, jn.ViewCount DESC NULLS LAST
+LIMIT 300;

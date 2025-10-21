@@ -1,0 +1,424 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.reputation,
+        u.creationdate as user_created,
+        u.displayname,
+        u.location,
+        u.upvotes,
+        u.downvotes,
+        sum(case when rp.posttypeid = 1 then 1 else 0 end) filter (where rp.posttypeid = 1) as q_count,
+        sum(case when rp.posttypeid = 2 then 1 else 0 end) filter (where rp.posttypeid = 2) as a_count,
+        count(*) as total_posts
+    from users u
+    left join recent_posts rp on rp.owneruserid = u.id
+    group by u.id, u.reputation, u.creationdate, u.displayname, u.location, u.upvotes, u.downvotes
+),
+vote_summaries as (
+    select
+        v.postid,
+        count(*) filter (where cast(v.votetypeid as integer) = 2) as upvotes,
+        count(*) filter (where cast(v.votetypeid as integer) = 3) as downvotes,
+        count(*) filter (where cast(v.votetypeid as integer) = 5) as favorites,
+        count(*) filter (where v.votetypeid in (8,9)) as bounties,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount
+    from votes v
+    where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+    group by v.postid
+),
+comment_summaries as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+    group by c.postid
+),
+post_link_summaries as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    where pl.creationdate >= (select max(creationdate) - interval '365 days' from postlinks)
+    group by pl.postid
+),
+edits_cte as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+        count(*) filter (where ph.posthistorytypeid in (10)) as closed_events,
+        count(*) filter (where ph.posthistorytypeid in (11)) as reopened_events,
+        count(*) filter (where ph.posthistorytypeid in (12)) as deleted_events,
+        count(*) filter (where ph.posthistorytypeid in (13)) as undeleted_events,
+        max(ph.creationdate) as last_edit_at
+    from posthistory ph
+    where ph.creationdate >= (select max(creationdate) - interval '365 days' from posthistory)
+    group by ph.postid
+),
+tag_explosion as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substr(p.tags, 2, length(p.tags)-2), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+tag_rank as (
+    select
+        te.post_id,
+        te.tag,
+        t.count as global_tag_count,
+        row_number() over (partition by te.post_id order by coalesce(t.count,0) desc, te.tag) as tag_rank_by_popularity
+    from tag_explosion te
+    left join tags t on t.tagname = te.tag
+),
+post_quality as (
+    select
+        rp.id as post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.answercount,
+        rp.is_closed,
+        vs.upvotes,
+        vs.downvotes,
+        vs.favorites,
+        vs.bounties,
+        vs.bounty_amount,
+        cs.comment_count,
+        cs.positive_comments,
+        cs.last_comment_at,
+        pls.linked_count,
+        pls.duplicate_count,
+        pls.last_link_at,
+        ec.edit_count,
+        ec.closed_events,
+        ec.reopened_events,
+        ec.deleted_events,
+        ec.undeleted_events,
+        ec.last_edit_at,
+        coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0) as net_votes,
+        case
+            when rp.viewcount is null or rp.viewcount = 0 then null
+            else (coalesce(vs.upvotes,0)::numeric / nullif(rp.viewcount,0))
+        end as upvotes_per_view,
+        case
+            when rp.answercount is null or rp.answercount = 0 then 0
+            else 1
+        end as has_answers,
+        case
+            when rp.score is null then 0
+            when rp.score >= 10 then 3
+            when rp.score >= 5 then 2
+            when rp.score >= 1 then 1
+            else 0
+        end as score_bucket
+    from recent_posts rp
+    left join vote_summaries vs on vs.postid = rp.id
+    left join comment_summaries cs on cs.postid = rp.id
+    left join post_link_summaries pls on pls.postid = rp.id
+    left join edits_cte ec on ec.postid = rp.id
+),
+accepted_answer_age as (
+    select
+        q.id as question_id,
+        a.id as answer_id,
+        a.creationdate - q.creationdate as time_to_first_answer,
+        aa.creationdate - q.creationdate as time_to_accepted_answer
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    left join posts aa on aa.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+user_post_engagement as (
+    select
+        rp.owneruserid as user_id,
+        count(*) as posts_count,
+        sum(coalesce(pq.net_votes,0)) as sum_net_votes,
+        avg(coalesce(pq.upvotes_per_view,0)) as avg_upvotes_per_view,
+        sum(coalesce(pq.comment_count,0)) as sum_comments,
+        sum(coalesce(pq.edit_count,0)) as sum_edits,
+        sum(case when pq.has_answers = 1 then 1 else 0 end) as posts_with_answers
+    from recent_posts rp
+    join post_quality pq on pq.post_id = rp.id
+    group by rp.owneruserid
+),
+user_rank as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.location,
+        ua.q_count,
+        ua.a_count,
+        ua.total_posts,
+        coalesce(ub.total_badges,0) as total_badges,
+        coalesce(ub.gold_badges,0) as gold_badges,
+        coalesce(ub.silver_badges,0) as silver_badges,
+        coalesce(ub.bronze_badges,0) as bronze_badges,
+        upe.posts_count,
+        upe.sum_net_votes,
+        upe.avg_upvotes_per_view,
+        upe.sum_comments,
+        upe.sum_edits,
+        upe.posts_with_answers,
+        dense_rank() over (
+            order by
+                ua.reputation desc,
+                coalesce(ub.total_badges,0) desc,
+                coalesce(upe.sum_net_votes,0) desc
+        ) as global_rank
+    from user_activity ua
+    left join user_badges ub on ub.userid = ua.user_id
+    left join user_post_engagement upe on upe.user_id = ua.user_id
+),
+question_enrichment as (
+    select
+        pq.post_id,
+        pq.posttypeid,
+        pq.creationdate,
+        pq.score,
+        pq.viewcount,
+        pq.answercount,
+        pq.is_closed,
+        pq.upvotes,
+        pq.downvotes,
+        pq.favorites,
+        pq.bounties,
+        pq.bounty_amount,
+        pq.comment_count,
+        pq.positive_comments,
+        pq.last_comment_at,
+        pq.linked_count,
+        pq.duplicate_count,
+        pq.last_link_at,
+        pq.edit_count,
+        pq.closed_events,
+        pq.reopened_events,
+        pq.deleted_events,
+        pq.undeleted_events,
+        pq.last_edit_at,
+        pq.net_votes,
+        pq.upvotes_per_view,
+        pq.has_answers,
+        pq.score_bucket,
+        aa.time_to_first_answer,
+        aa.time_to_accepted_answer,
+        min(case when tr.tag_rank_by_popularity = 1 then tr.tag end) as top_tag,
+        sum(case when tr.tag_rank_by_popularity <= 3 then coalesce(tr.global_tag_count,0) else 0 end) as top3_tag_popularity
+    from post_quality pq
+    left join accepted_answer_age aa on aa.question_id = pq.post_id
+    left join tag_rank tr on tr.post_id = pq.post_id
+    group by
+        pq.post_id, pq.posttypeid, pq.creationdate, pq.score, pq.viewcount, pq.answercount, pq.is_closed,
+        pq.upvotes, pq.downvotes, pq.favorites, pq.bounties, pq.bounty_amount, pq.comment_count, pq.positive_comments, pq.last_comment_at,
+        pq.linked_count, pq.duplicate_count, pq.last_link_at, pq.edit_count, pq.closed_events, pq.reopened_events, pq.deleted_events, pq.undeleted_events,
+        pq.last_edit_at, pq.net_votes, pq.upvotes_per_view, pq.has_answers, pq.score_bucket, aa.time_to_first_answer, aa.time_to_accepted_answer
+),
+question_owner as (
+    select
+        p.id as post_id,
+        coalesce(u.displayname, p.ownerdisplayname, '[community]') as owner_name,
+        u.id as owner_id,
+        ur.global_rank as owner_rank,
+        u.reputation as owner_reputation,
+        coalesce(ub.gold_badges,0) as owner_gold,
+        coalesce(ub.silver_badges,0) as owner_silver,
+        coalesce(ub.bronze_badges,0) as owner_bronze
+    from posts p
+    left join users u on u.id = p.owneruserid
+    left join user_rank ur on ur.user_id = u.id
+    left join user_badges ub on ub.userid = u.id
+),
+duplicate_resolution as (
+    select
+        q.post_id,
+        case
+            when qe.duplicate_count > 0 then 'duplicate'
+            when qe.is_closed = 1 then 'closed'
+            when qe.score <= 0 and qe.viewcount < 50 then 'low_engagement'
+            else 'active'
+        end as status_bucket
+    from question_enrichment qe
+    join post_quality q on q.post_id = qe.post_id
+),
+question_final as (
+    select
+        qe.post_id,
+        qe.posttypeid,
+        qe.creationdate,
+        qe.score,
+        qe.viewcount,
+        qe.answercount,
+        qe.is_closed,
+        qe.upvotes,
+        qe.downvotes,
+        qe.favorites,
+        qe.bounties,
+        qe.bounty_amount,
+        qe.comment_count,
+        qe.positive_comments,
+        qe.last_comment_at,
+        qe.linked_count,
+        qe.duplicate_count,
+        qe.last_link_at,
+        qe.edit_count,
+        qe.closed_events,
+        qe.reopened_events,
+        qe.deleted_events,
+        qe.undeleted_events,
+        qe.last_edit_at,
+        qe.net_votes,
+        qe.upvotes_per_view,
+        qe.has_answers,
+        qe.score_bucket,
+        qe.time_to_first_answer,
+        qe.time_to_accepted_answer,
+        qe.top_tag,
+        qe.top3_tag_popularity,
+        qo.owner_name,
+        qo.owner_id,
+        qo.owner_rank,
+        qo.owner_reputation,
+        qo.owner_gold,
+        qo.owner_silver,
+        qo.owner_bronze,
+        dr.status_bucket,
+        row_number() over (order by
+            qe.net_votes desc nulls last,
+            qe.viewcount desc nulls last,
+            qe.creationdate desc
+        ) as popularity_rownum
+    from question_enrichment qe
+    left join question_owner qo on qo.post_id = qe.post_id
+    left join duplicate_resolution dr on dr.post_id = qe.post_id
+    where qe.posttypeid = 1
+),
+hard_cases as (
+    select * from question_final where status_bucket in ('duplicate','closed')
+    union all
+    select * from question_final where favorites > 10 and upvotes_per_view is not null
+    union all
+    select * from question_final where owner_rank <= 100
+),
+scored as (
+    select
+        hc.*,
+        (
+            coalesce(hc.net_votes,0) * 3
+            + coalesce(hc.favorites,0) * 2
+            + coalesce(hc.comment_count,0) * 0.5
+            + case when hc.is_closed = 1 then -10 else 0 end
+            + case when hc.duplicate_count > 0 then -5 else 0 end
+            + coalesce(hc.bounty_amount,0) * 0.01
+            + case when hc.top3_tag_popularity > 0 then least(hc.top3_tag_popularity / 1000.0, 10) else 0 end
+            + case when hc.time_to_accepted_answer is null then 0 else greatest(5 - extract(epoch from hc.time_to_accepted_answer)/86400.0, -5) end
+            + case when hc.upvotes_per_view is null then 0 else hc.upvotes_per_view * 100 end
+            + case when hc.owner_rank is null then 0 else greatest(50 - hc.owner_rank, 0) * 0.2 end
+        ) as composite_score
+    from hard_cases hc
+),
+ranked as (
+    select
+        s.*,
+        ntile(20) over (order by s.composite_score desc nulls last) as ventile,
+        rank() over (order by s.composite_score desc nulls last, s.popularity_rownum) as overall_rank,
+        lag(s.composite_score) over (order by s.composite_score desc nulls last) as prev_score,
+        s.composite_score - lag(s.composite_score) over (order by s.composite_score desc nulls last) as delta_prev
+    from scored s
+)
+select
+    r.post_id,
+    r.owner_id,
+    r.owner_name,
+    r.owner_rank,
+    r.owner_reputation,
+    r.top_tag,
+    r.status_bucket,
+    r.score,
+    r.viewcount,
+    r.answercount,
+    r.net_votes,
+    r.favorites,
+    r.comment_count,
+    r.edit_count,
+    r.duplicate_count,
+    r.bounty_amount,
+    r.upvotes_per_view,
+    r.time_to_first_answer,
+    r.time_to_accepted_answer,
+    r.composite_score,
+    r.ventile,
+    r.overall_rank,
+    r.delta_prev,
+    case
+        when r.is_closed = 1 and r.duplicate_count > 0 then 'closed_duplicate'
+        when r.is_closed = 1 then 'closed_other'
+        when r.score_bucket >= 2 and r.upvotes_per_view is not null and r.upvotes_per_view > 0.02 then 'hot_quality'
+        when r.bounty_amount > 0 then 'bounty_interest'
+        when r.comment_count >= 10 and r.edit_count >= 3 then 'contentious'
+        else 'normal'
+    end as category_label,
+    trim(both ' ' from coalesce(r.owner_name,'') || ' [' || coalesce(r.top_tag,'no-tag') || ']') as labeled_owner,
+    (
+        select min(p2.title)
+        from tags t2
+        join posts p2 on p2.id = t2.wikipostid
+        where t2.tagname = r.top_tag
+    ) as top_tag_wiki_title,
+    (
+        select string_agg(substring(c.text from 1 for 80), ' | ' order by c.creationdate desc)
+        from comments c
+        where c.postid = r.post_id
+        order by c.creationdate desc
+        limit 3
+    ) as last_comments_sample
+from ranked r
+where
+    (
+        (r.status_bucket in ('duplicate','closed') and r.net_votes <= 5)
+        or (r.status_bucket = 'active' and r.net_votes >= 10 and coalesce(r.upvotes_per_view,0) > 0.01)
+        or (r.owner_rank is not null and r.owner_rank <= 500 and r.favorites >= 5)
+    )
+    and (
+        r.top_tag is null
+        or length(r.top_tag) between 2 and 35
+    )
+    and (
+        r.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    )
+order by
+    r.overall_rank
+limit 500;

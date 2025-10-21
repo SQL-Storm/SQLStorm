@@ -1,0 +1,135 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+UserInfluence AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.LastAccessDate,
+    u.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY u.Location
+      ORDER BY u.Reputation DESC, u.UpVotes DESC
+    ) AS loc_rank
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+PostEdges AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+ComputedScores AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.Tags,
+    rp.ViewCount,
+    rp.Score,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    CASE
+      WHEN rp.Score >= 0 THEN 'Positive'
+      ELSE 'Negative'
+    END AS ScoreSentiment,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId = 8) AS AvgBounty
+  FROM RecentActivePosts rp
+),
+CorrelatedRevisions AS (
+  SELECT
+    c.PostId,
+    c.CreationDate,
+    c.UserId,
+    c.Text,
+    c.Comment
+  FROM PostHistory c
+  WHERE c.PostHistoryTypeId IN (2,5,6,10,16,24)
+),
+FinalOutput AS (
+  SELECT
+    ce.PostId,
+    ce.PostTypeId,
+    pu.DisplayName AS OwnerDisplayName,
+    pu.Reputation,
+    ce.Title,
+    ce.Tags,
+    ce.ViewCount,
+    ce.Score,
+    ce.AnswerCount,
+    ce.CommentCount,
+    ce.FavoriteCount,
+    ce.ScoreSentiment,
+    os.TagName AS TopTag,
+    up.Location,
+    up.Reputation AS UserReputation,
+    er.RelatedPostId,
+    er.LinkTypeName,
+    cr.CreationDate AS RevisionDate,
+    cr.UserDisplayName AS RevisionUser
+  FROM ComputedScores ce
+  LEFT JOIN Users pu ON ce.OwnerUserId = pu.Id
+  LEFT JOIN UserInfluence up ON pu.Id = up.UserId
+  LEFT JOIN PostEdges er ON ce.PostId = er.PostId
+  LEFT JOIN TopTags tt ON tt.rn = 1
+  LEFT JOIN Tags os ON os.TagName = tt.TagName
+  LEFT JOIN CorrelatedRevisions cr ON ce.PostId = cr.PostId
+  WHERE ce.ViewCount > 0
+    AND ce.Score IS NOT NULL
+)
+SELECT
+  PostId,
+  PostTypeId,
+  OwnerDisplayName,
+  Reputation AS OwnerReputation,
+  Title,
+  Tags,
+  ViewCount,
+  Score,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  ScoreSentiment,
+  COALESCE(TopTag, 'untagged') AS PrimaryTag,
+  COALESCE(Location, 'unknown') AS UserLocation,
+  UserReputation,
+  RelatedPostId,
+  LinkTypeName,
+  RevisionDate,
+  RevisionUser
+FROM FinalOutput
+ORDER BY Score DESC NULLS LAST, ViewCount DESC
+LIMIT 200;

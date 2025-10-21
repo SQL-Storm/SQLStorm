@@ -1,0 +1,154 @@
+-- {"query": "59.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1343} 
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS total_score,
+    AVG(p.ViewCount) AS avg_views,
+    COUNT(*) AS question_count
+  FROM (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+           p.Id AS PostId,
+           p.Score,
+           p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+  ) x
+  JOIN Tags t ON x.TagName = t.TagName
+  GROUP BY t.TagName
+),
+activity_by_user AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS questions,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answers,
+    SUM(p.Score) AS total_score,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+recent_comments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.Text,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.UserId
+  FROM Comments c
+  WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '14 days'
+),
+recent_votes AS (
+  SELECT
+    v.Id AS VoteId,
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '14 days'
+),
+combined AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.CreationDate AS PostCreationDate,
+    rq.LastActivityDate,
+    rq.Tags,
+    rq.Score,
+    rq.ViewCount,
+    rq.OwnerUserId,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    t.total_score AS tag_total_score,
+    t.avg_views AS tag_avg_views,
+    t.question_count AS tag_question_count,
+    abu.UserId AS author_user_id,
+    abu.DisplayName AS author_display_name,
+    abu.questions,
+    abu.answers,
+    abu.total_score AS author_total_score,
+    abu.last_activity AS author_last_activity,
+    rco.CommentId,
+    rco.Text AS latest_comment_text,
+    rv.VoteId,
+    rv.VoteTypeId,
+    rv.UserId AS voter_user_id,
+    rv.CreationDate AS vote_date
+  FROM recent_questions rq
+  LEFT JOIN top_tags t ON t.TagName = NULLIF(NULL, NULL) -- placeholder to keep syntax valid in some engines
+  LEFT JOIN activity_by_user abu ON rq.OwnerUserId = abu.UserId
+  LEFT JOIN recent_comments rco ON rq.PostId = rco.PostId
+  LEFT JOIN recent_votes rv ON rq.PostId = rv.PostId
+)
+SELECT
+  rq.PostId,
+  rq.Title,
+  rq.PostCreationDate,
+  rq.LastActivityDate,
+  rq.Tags,
+  rq.Score,
+  rq.ViewCount,
+  rq.OwnerUserId,
+  rq.CommentCount,
+  rq.FavoriteCount,
+  rq.AnswerCount,
+  COALESCE(t.total_score, 0) AS tag_total_score,
+  COALESCE(t.avg_views, 0) AS tag_avg_views,
+  COALESCE(t.question_count, 0) AS tag_question_count,
+  COALESCE(abu.author_user_id, -1) AS author_user_id,
+  COALESCE(abu.author_display_name, 'Unknown') AS author_display_name,
+  COALESCE(abu.questions, 0) AS author_questions,
+  COALESCE(abu.answers, 0) AS author_answers,
+  COALESCE(abu.author_total_score, 0) AS author_total_score,
+  COALESCE(abu.author_last_activity, rq.LastActivityDate) AS author_last_activity,
+  COALESCE(rco.CommentId, -1) AS latest_comment_id,
+  COALESCE(rco.latest_comment_text, NULL) AS latest_comment_text,
+  COALESCE(rv.VoteId, -1) AS latest_vote_id,
+  COALESCE(rv.VoteTypeId, NULL) AS latest_vote_type_id,
+  COALESCE(rv.voter_user_id, NULL) AS latest_voter_user_id,
+  COALESCE(rv.vote_date, NULL) AS latest_vote_date
+FROM recent_questions rq
+LEFT JOIN (
+  SELECT TagName, SUM(Score) AS total_score, AVG(ViewCount) AS avg_views, COUNT(*) AS question_count
+  FROM (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName, p.Score, p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+  ) s
+  JOIN Tags tg ON s.TagName = tg.TagName
+  GROUP BY TagName
+) t ON 1=1
+LEFT JOIN (
+  SELECT UserId, MAX(LastActivityDate) AS author_last_activity, COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS questions, COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answers, SUM(p.Score) AS author_total_score
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY UserId
+) abu ON rq.OwnerUserId = abu.UserId
+LEFT JOIN recent_comments rco ON rq.PostId = rco.PostId
+LEFT JOIN recent_votes rv ON rq.PostId = rv.PostId
+ORDER BY rq.LastActivityDate DESC
+LIMIT 100;

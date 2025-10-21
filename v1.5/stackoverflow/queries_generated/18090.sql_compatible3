@@ -1,0 +1,118 @@
+WITH
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.ViewCount) AS AvgViewCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  CommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  UserBadgeCounts AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgeCount
+    FROM Badges b
+    GROUP BY
+      b.UserId
+  ),
+  HighActivityUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      ups.PostCount,
+      ups.TotalScore,
+      ups.AvgViewCount,
+      ca.CommentCount,
+      ca.AvgCommentScore,
+      ubc.GoldBadgeCount,
+      ubc.SilverBadgeCount,
+      ubc.BronzeBadgeCount,
+      CAST(DATEDIFF(DATE '1970-01-01', u.CreationDate) AS INTEGER) AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN UserPostStats ups
+      ON u.Id = ups.OwnerUserId
+    LEFT JOIN CommentActivity ca
+      ON u.Id = ca.UserId
+    LEFT JOIN UserBadgeCounts ubc
+      ON u.Id = ubc.UserId
+    WHERE
+      u.Id NOT IN (
+        SELECT
+          UserId
+        FROM PostHistory
+        WHERE
+          PostHistoryTypeId = 12 -- Post Deleted
+          AND UserId IS NOT NULL
+      )
+      AND u.Views > 1000
+      AND COALESCE(ups.PostCount, 0) > 50
+      AND COALESCE(ca.CommentCount, 0) > 100
+  )
+SELECT
+  hau.DisplayName,
+  hau.Reputation,
+  hau.AccountAgeDays,
+  hau.PostCount,
+  hau.TotalScore,
+  hau.AvgViewCount,
+  hau.CommentCount,
+  hau.AvgCommentScore,
+  hau.GoldBadgeCount,
+  hau.SilverBadgeCount,
+  hau.BronzeBadgeCount,
+  CASE
+    WHEN hau.AvgViewCount > 10000 THEN 'High Engagement'
+    WHEN hau.AvgViewCount > 1000 THEN 'Medium Engagement'
+    ELSE 'Low Engagement'
+  END AS EngagementLevel,
+  LAG(hau.DisplayName) OVER (ORDER BY hau.Reputation DESC, hau.PostCount DESC) AS PreviousUserDisplayName,
+  LEAD(hau.DisplayName) OVER (ORDER BY hau.Reputation DESC, hau.PostCount DESC) AS NextUserDisplayName,
+  CASE
+    WHEN hau.GoldBadgeCount > 5 THEN 'Elite'
+    WHEN hau.SilverBadgeCount > 10 THEN 'Distinguished'
+    ELSE 'Regular'
+  END AS BadgeTier
+FROM HighActivityUsers hau
+WHERE
+  ROW_NUMBER() OVER (ORDER BY hau.Reputation DESC, hau.PostCount DESC) <= 50
+UNION ALL
+SELECT
+  '--- Total Averages ---' AS DisplayName,
+  AVG(hau.Reputation) AS Reputation,
+  AVG(hau.AccountAgeDays) AS AccountAgeDays,
+  AVG(hau.PostCount) AS PostCount,
+  AVG(hau.TotalScore) AS TotalScore,
+  AVG(hau.AvgViewCount) AS AvgViewCount,
+  AVG(hau.CommentCount) AS CommentCount,
+  AVG(hau.AvgCommentScore) AS AvgCommentScore,
+  AVG(hau.GoldBadgeCount) AS GoldBadgeCount,
+  AVG(hau.SilverBadgeCount) AS SilverBadgeCount,
+  AVG(hau.BronzeBadgeCount) AS BronzeBadgeCount,
+  NULL AS EngagementLevel,
+  NULL AS PreviousUserDisplayName,
+  NULL AS NextUserDisplayName,
+  NULL AS BadgeTier
+FROM HighActivityUsers hau
+WHERE
+  ROW_NUMBER() OVER (ORDER BY hau.Reputation DESC, hau.PostCount DESC) <= 50;

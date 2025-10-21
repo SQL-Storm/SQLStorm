@@ -1,0 +1,139 @@
+-- {"query": "16002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 7005, "output_tokens": 6585} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Advanced'
+            WHEN u.Reputation BETWEEN 100 AND 999 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserTier,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY u.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)) AS MedianYearlyReputation
+    FROM Users u
+    WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.Title, LEFT(p.Body, 50)) AS PostIdentifier,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS UserPostRank,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    LEFT OUTER JOIN Votes v ON p.Id = v.PostId AND v.CreationDate >= TIMESTAMP '2015-01-01'
+    LEFT OUTER JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= TIMESTAMP '2015-01-01'
+        AND (p.OwnerUserId IS NOT NULL OR p.OwnerDisplayName LIKE '%User%')
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.Title, p.Body, p.CreationDate
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ' ORDER BY CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END) AS GoldBadgeNames,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2015-01-01'
+    GROUP BY b.UserId
+),
+ComplexAnswerMetrics AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        MAX(a.Score) AS BestAnswerScore,
+        MIN(a.Score) FILTER (WHERE a.Score > 0) AS LowestPositiveAnswerScore,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0) AS AvgAnswerTimeHours,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 
+                (SELECT Score FROM Posts WHERE Id = q.AcceptedAnswerId)
+            ELSE NULL
+        END AS AcceptedAnswerScore
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.CreationDate >= TIMESTAMP '2015-01-01'
+    GROUP BY q.Id, q.OwnerUserId, q.AcceptedAnswerId
+    HAVING COUNT(DISTINCT a.Id) >= 2
+)
+SELECT 
+    uem.DisplayName,
+    uem.UserTier,
+    uem.Reputation,
+    uem.NetVotes,
+    uem.YearlyRank,
+    ROUND(uem.MedianYearlyReputation::numeric, 2) AS MedianYearlyRep,
+    COALESCE(ba.GoldBadges, 0) AS GoldCount,
+    COALESCE(ba.SilverBadges, 0) AS SilverCount,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeCount,
+    COALESCE(SUBSTRING(ba.GoldBadgeNames, 1, 100), 'None') AS TopGoldBadges,
+    COUNT(DISTINCT pp.PostId) AS TotalPosts,
+    AVG(pp.Score) AS AvgPostScore,
+    MAX(pp.Score) AS BestPostScore,
+    SUM(COALESCE(pp.ViewCount, 0)) AS TotalViews,
+    AVG(EXTRACT(EPOCH FROM (pp.PrevPostDate - LAG(pp.PrevPostDate) OVER (PARTITION BY uem.Id ORDER BY pp.PrevPostDate)))/86400.0) AS AvgDaysBetweenPosts,
+    COUNT(DISTINCT cam.QuestionId) AS QuestionsWithMultipleAnswers,
+    AVG(cam.AvgAnswerTimeHours) AS AvgTimeToAnswerHours,
+    CASE 
+        WHEN AVG(cam.AcceptedAnswerScore) > AVG(cam.BestAnswerScore) * 0.8 THEN 'Good Acceptance'
+        WHEN AVG(cam.AcceptedAnswerScore) IS NULL THEN 'No Acceptances'
+        ELSE 'Suboptimal Acceptance'
+    END AS AcceptanceQuality,
+    (SELECT COUNT(*) FROM PostHistory ph 
+     WHERE ph.UserId = uem.Id 
+     AND ph.PostHistoryTypeId IN (4, 5, 6)
+     AND ph.CreationDate >= TIMESTAMP '2015-01-01') AS EditCount,
+    ROUND(COALESCE(uem.Reputation::numeric / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - uem.CreationDate))/86400.0, 0), 0), 2) AS ReputationPerDay
+FROM UserEngagementMetrics uem
+LEFT JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId AND pp.UserPostRank <= 20
+LEFT JOIN BadgeAchievements ba ON uem.Id = ba.UserId
+LEFT JOIN ComplexAnswerMetrics cam ON cam.QuestionOwnerId = uem.Id
+WHERE uem.YearlyRank <= 100
+    AND EXISTS (
+        SELECT 1 FROM Posts p2 
+        WHERE p2.OwnerUserId = uem.Id 
+        AND p2.Score >= 5
+        AND p2.CreationDate >= TIMESTAMP '2016-01-01'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v2
+        WHERE v2.UserId = uem.Id
+        AND v2.VoteTypeId IN (4, 12)
+        HAVING COUNT(*) > 10
+    )
+GROUP BY uem.Id, uem.DisplayName, uem.UserTier, uem.Reputation, uem.NetVotes, uem.YearlyRank, 
+         uem.MedianYearlyReputation, uem.CreationDate, ba.GoldBadges, ba.SilverBadges, 
+         ba.BronzeBadges, ba.GoldBadgeNames
+HAVING COUNT(DISTINCT pp.PostId) >= 3
+    AND AVG(pp.Score) > 0
+ORDER BY 
+    CASE 
+        WHEN uem.UserTier = 'Elite' THEN 1
+        WHEN uem.UserTier = 'Advanced' THEN 2
+        WHEN uem.UserTier = 'Intermediate' THEN 3
+        ELSE 4
+    END,
+    AVG(pp.Score) DESC NULLS LAST,
+    COUNT(DISTINCT pp.PostId) DESC
+LIMIT 500;

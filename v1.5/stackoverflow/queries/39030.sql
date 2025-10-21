@@ -1,0 +1,113 @@
+-- {"query": "39030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 1150} 
+WITH
+-- Identify top-scoring questions per month with their accepted answers and answer stats
+MonthlyTopQuestions AS (
+    SELECT
+        DATE_TRUNC('month', q.CreationDate)                     AS month_bucket,
+        q.Id                                                    AS question_id,
+        q.Title                                                 AS question_title,
+        q.Score                                                 AS question_score,
+        COUNT(a.Id)                                             AS total_answers,
+        SUM(a.Score)                                           AS sum_answer_scores,
+        MAX(a.Score)                                           AS max_answer_score,
+        MIN(a.Score)                                           AS min_answer_score,
+        qa.Id                                                   AS accepted_answer_id,
+        ua.DisplayName                                         AS accepted_by
+    FROM Posts q
+    LEFT JOIN Posts a
+        ON a.ParentId = q.Id
+    LEFT JOIN Posts qa
+        ON qa.Id = q.AcceptedAnswerId
+    LEFT JOIN Users ua
+        ON ua.Id = qa.OwnerUserId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months'
+    GROUP BY 1,2,3,4, qa.Id, ua.DisplayName
+),
+-- Compute user badge performance metrics
+UserBadgeStats AS (
+    SELECT
+        u.Id                                                    AS user_id,
+        u.DisplayName                                          AS user_name,
+        COUNT(b.Id)                                            AS badge_count,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)           AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)           AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)           AS bronze_badges,
+        AVG(EXTRACT(EPOCH FROM (b.Date - u.CreationDate))/86400) AS avg_days_to_badge
+    FROM Users u
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+    WHERE u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+    GROUP BY 1,2
+),
+-- Find hot tags by recent question activity and average score
+TagActivity AS (
+    SELECT
+        tg.TagName                                             AS tag,
+        COUNT(p.Id)                                            AS question_count,
+        AVG(p.Score)                                          AS avg_question_score,
+        MAX(p.ViewCount)                                      AS peak_views,
+        MIN(p.CreationDate)                                   AS first_seen,
+        MAX(p.CreationDate)                                   AS last_seen
+    FROM Posts p
+    CROSS JOIN LATERAL
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tg(TagName)
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+    GROUP BY 1
+),
+-- Combine monthly top questions with badge achievers and hot tag activity
+JoinedOverview AS (
+    SELECT
+        mt.month_bucket,
+        mt.question_id,
+        mt.question_title,
+        mt.question_score,
+        mt.total_answers,
+        mt.sum_answer_scores,
+        mt.max_answer_score,
+        mt.min_answer_score,
+        COALESCE(mt.accepted_by, '—')                         AS accepted_by,
+        ubs.user_name,
+        ubs.badge_count,
+        ubs.gold_badges,
+        ubs.silver_badges,
+        ubs.bronze_badges,
+        ta.tag,
+        ta.question_count,
+        ta.avg_question_score,
+        ta.peak_views
+    FROM MonthlyTopQuestions mt
+    LEFT JOIN UserBadgeStats ubs
+        ON ubs.user_id = (
+            SELECT OwnerUserId FROM Posts WHERE Id = mt.question_id
+        )
+    LEFT JOIN TagActivity ta
+        ON ta.tag = (
+            SELECT unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><'))
+            FROM Posts WHERE Id = mt.question_id LIMIT 1
+        )
+)
+SELECT
+    month_bucket,
+    question_id,
+    question_title,
+    question_score,
+    total_answers,
+    sum_answer_scores,
+    max_answer_score,
+    min_answer_score,
+    accepted_by,
+    user_name                AS question_owner,
+    badge_count,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    tag                       AS example_tag,
+    question_count            AS tag_q_count,
+    ROUND(avg_question_score, 2) AS tag_avg_score,
+    peak_views,
+    RANK() OVER (PARTITION BY month_bucket ORDER BY question_score DESC) AS monthly_rank
+FROM JoinedOverview
+ORDER BY month_bucket DESC, monthly_rank
+LIMIT 100;

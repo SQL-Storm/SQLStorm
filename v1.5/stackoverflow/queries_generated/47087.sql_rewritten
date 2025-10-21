@@ -1,0 +1,141 @@
+-- {"query": "47087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 199578, "output_tokens": 176524} 
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        1 as Level,
+        CAST(t.TagName AS VARCHAR(1000)) as TagPath
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.TagName,
+        t2.Count,
+        th.Level + 1,
+        CAST(th.TagPath || ' -> ' || t2.TagName AS VARCHAR(1000))
+    FROM Tags t2
+    INNER JOIN TagHierarchy th ON 1=1
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    INNER JOIN Posts p2 ON p2.Id = p1.Id AND p2.Tags LIKE '%<' || t2.TagName || '>%'
+    WHERE th.Level < 3
+    AND t2.Count > 5000
+    AND t2.TagName != th.TagName
+    AND th.TagPath NOT LIKE '%' || t2.TagName || '%'
+),
+UserExpertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2) as PrimaryTag,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        COUNT(DISTINCT CASE WHEN p.Score >= 10 THEN p.Id END) as GreatAnswers,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = p.Id THEN p.Id END) as AcceptedAnswers,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) as EditCount,
+        MIN(p.CreationDate) as FirstAnswer,
+        MAX(p.CreationDate) as LastAnswer,
+        EXTRACT(DAY FROM MAX(p.CreationDate) - MIN(p.CreationDate)) as DaysActive
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.Score > 0
+    AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2)
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+QuestionQuality AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        q.CreationDate as QuestionDate,
+        q.Tags,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN q.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'Unanswered'
+        END as Status,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as Upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as Downvotes,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 3) as DuplicateLinks,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.Score > 5) as HighScoreComments,
+        EXTRACT(HOUR FROM q.CreationDate) as PostHour,
+        EXTRACT(DOW FROM q.CreationDate) as PostDayOfWeek,
+        LENGTH(q.Body) as BodyLength,
+        (LENGTH(q.Body) - LENGTH(REPLACE(q.Body, '<code>', ''))) / 6 as CodeBlockCount
+    FROM Posts q
+    LEFT JOIN Votes v ON q.Id = v.PostId
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    WHERE q.PostTypeId = 1
+    AND q.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, 
+             q.FavoriteCount, q.CommentCount, q.CreationDate, q.Tags,
+             q.ClosedDate, q.AcceptedAnswerId, q.Body
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        b.TagBased,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as PreviousBadgeDate,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as NextBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) as BadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) as TotalBadgesInClass,
+        DENSE_RANK() OVER (ORDER BY b.Date) as GlobalBadgeRank
+    FROM Badges b
+    WHERE b.Date >= cast('2024-10-01' as date) - INTERVAL '6 months'
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.PrimaryTag,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ROUND(ue.AvgScore, 2) as AvgAnswerScore,
+    ue.MedianScore,
+    ue.GreatAnswers,
+    ue.AcceptedAnswers,
+    ROUND(100.0 * ue.AcceptedAnswers / NULLIF(ue.AnswerCount, 0), 2) as AcceptanceRate,
+    ue.DaysActive,
+    ROUND(ue.AnswerCount * 1.0 / NULLIF(ue.DaysActive, 0), 2) as AnswersPerDay,
+    COUNT(DISTINCT qq.QuestionId) as QuestionsAsked,
+    AVG(qq.QuestionScore) as AvgQuestionScore,
+    AVG(qq.ViewCount) as AvgViewCount,
+    AVG(qq.AnswerCount) as AvgAnswersReceived,
+    SUM(CASE WHEN qq.Status = 'Answered' THEN 1 ELSE 0 END) as QuestionsWithAcceptedAnswer,
+    SUM(qq.Upvotes) as TotalQuestionUpvotes,
+    AVG(qq.BodyLength) as AvgQuestionLength,
+    AVG(qq.CodeBlockCount) as AvgCodeBlocks,
+    COUNT(DISTINCT bp.BadgeName) FILTER (WHERE bp.BadgeClass = 1) as GoldBadges,
+    COUNT(DISTINCT bp.BadgeName) FILTER (WHERE bp.BadgeClass = 2) as SilverBadges,
+    COUNT(DISTINCT bp.BadgeName) FILTER (WHERE bp.BadgeClass = 3) as BronzeBadges,
+    MAX(bp.BadgeDate) as MostRecentBadge,
+    STRING_AGG(DISTINCT th.TagPath, ' | ' ORDER BY th.TagPath) as RelatedTagPaths,
+    RANK() OVER (ORDER BY ue.TotalScore DESC) as ScoreRank,
+    RANK() OVER (ORDER BY ue.Reputation DESC) as ReputationRank,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY qq.ViewCount) OVER (PARTITION BY ue.PrimaryTag) as Tag90thPercentileViews
+FROM UserExpertise ue
+LEFT JOIN QuestionQuality qq ON ue.UserId = qq.OwnerUserId
+LEFT JOIN BadgeProgression bp ON ue.UserId = bp.UserId
+LEFT JOIN TagHierarchy th ON ue.PrimaryTag = th.TagName
+WHERE ue.Reputation > 1000
+GROUP BY 
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.PrimaryTag, 
+    ue.AnswerCount, ue.TotalScore, ue.AvgScore, ue.MedianScore,
+    ue.GreatAnswers, ue.AcceptedAnswers, ue.DaysActive
+HAVING COUNT(DISTINCT qq.QuestionId) > 0
+ORDER BY ue.TotalScore DESC, ue.Reputation DESC
+LIMIT 100;

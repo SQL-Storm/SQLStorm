@@ -1,0 +1,131 @@
+-- {"query": "9069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3544} 
+
+WITH RecentQuestions AS (
+    SELECT
+        p.Id           AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / (60*60*24) AS AgeDays
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+     AND pt.Name = 'Question'
+    LEFT JOIN Users u
+      ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= NOW() - INTERVAL '7 days'
+),
+AnswerStats AS (
+    SELECT
+        ParentId            AS QuestionId,
+        COUNT(*)            AS AnswerCount,
+        SUM(CASE WHEN Score>0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+        AVG(Score)          AS AvgAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*)                    AS CommentCount,
+        MAX(char_length(c.Text))    AS MaxCommentLength,
+        AVG(char_length(c.Text))    AS AvgCommentLength
+    FROM Comments c
+    GROUP BY c.PostId
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RankedQuestions AS (
+    SELECT
+        rq.*,
+        COALESCE(a.AnswerCount,0)      AS AnswerCount,
+        COALESCE(c.CommentCount,0)     AS CommentCount,
+        COALESCE(c.MaxCommentLength,0) AS MaxCommentLength,
+        COALESCE(b.GoldBadges,0)       AS GoldBadges,
+        COALESCE(b.SilverBadges,0)     AS SilverBadges,
+        COALESCE(b.BronzeBadges,0)     AS BronzeBadges,
+        ROW_NUMBER() OVER (
+            ORDER BY
+              COALESCE(a.AnswerCount,0) DESC,
+              COALESCE(c.CommentCount,0) DESC
+        ) AS PopularityRank
+    FROM RecentQuestions rq
+    LEFT JOIN AnswerStats    a ON rq.QuestionId = a.QuestionId
+    LEFT JOIN CommentStats   c ON rq.QuestionId = c.PostId
+    LEFT JOIN BadgeSummary   b ON rq.OwnerUserId = b.UserId
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.DisplayName,
+    rq.CreationDate,
+    rq.AgeDays,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.MaxCommentLength,
+    rq.GoldBadges || '/' || rq.SilverBadges || '/' || rq.BronzeBadges AS BadgeTriplet,
+    rq.PopularityRank,
+    (
+      SELECT COUNT(*)
+      FROM (
+        SELECT unnest(
+                 string_to_array(
+                   substring(rq.Tags,2,length(rq.Tags)-2)
+                 , '><')
+               ) AS tag
+      ) AS sub
+      JOIN Tags t ON sub.tag = t.TagName
+    ) AS TagMatchCount
+FROM RankedQuestions rq
+WHERE rq.PopularityRank <= 100
+
+UNION
+
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.DisplayName,
+    rq.CreationDate,
+    rq.AgeDays,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.MaxCommentLength,
+    rq.GoldBadges || '/' || rq.SilverBadges || '/' || rq.BronzeBadges,
+    rq.PopularityRank,
+    0
+FROM RankedQuestions rq
+WHERE rq.OwnerUserId IN (
+    SELECT u.Id
+    FROM Users u
+    WHERE u.Reputation > 10000
+)
+
+EXCEPT
+
+SELECT
+    QuestionId,
+    Title,
+    DisplayName,
+    CreationDate,
+    AgeDays,
+    AnswerCount,
+    CommentCount,
+    MaxCommentLength,
+    BadgeTriplet,
+    PopularityRank,
+    TagMatchCount
+FROM RankedQuestions
+WHERE AgeDays > 3
+
+ORDER BY PopularityRank, AgeDays DESC
+LIMIT 200;

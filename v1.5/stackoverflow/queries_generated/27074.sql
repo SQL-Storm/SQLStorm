@@ -1,0 +1,126 @@
+-- {"query": "27074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1581} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COALESCE(LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) AS PreviousPostScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.LastActivityDate, p.Title, p.Tags
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) AS PreviousTagCount
+    FROM
+        Tags t
+    WHERE
+        t.Count > 0
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalPostScore,
+    ua.TotalUpvotesGiven,
+    ua.TotalDownvotesGiven,
+    pa.PostId,
+    pa.PostTypeId,
+    pa.PostCreationDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.TotalComments,
+    pa.TotalVotes,
+    pa.TotalUpvotes,
+    pa.TotalDownvotes,
+    pa.LastEditDate,
+    pa.PreviousPostScore,
+    pa.PreviousPostDate,
+    tt.TagName,
+    tt.TagRank,
+    tt.PreviousTagCount,
+    SUBSTRING(pa.Tags, 2, LENGTH(pa.Tags) - 2) AS FormattedTags,
+    STRING_AGG(DISTINCT pl.RelatedPostId, ', ') WITHIN GROUP (ORDER BY pl.RelatedPostId) AS RelatedPosts,
+    COALESCE(ph.Comment, 'No Comment') AS LastEditComment,
+    CASE
+        WHEN ua.TotalQuestions > 10 THEN 'Active Questioner'
+        WHEN ua.TotalAnswers > 10 THEN 'Active Answerer'
+        ELSE 'Casual User'
+    END AS UserActivityLevel
+FROM
+    UserActivity ua
+JOIN
+    PostActivity pa ON ua.UserId = pa.OwnerUserId
+LEFT JOIN
+    TopTags tt ON pa.Tags LIKE CONCAT('%<', tt.TagName, '>%')
+LEFT JOIN
+    PostLinks pl ON pa.PostId = pl.PostId
+LEFT JOIN
+    PostHistory ph ON pa.PostId = ph.PostId AND ph.PostHistoryTypeId = 5
+WHERE
+    ua.Reputation > 1000
+    AND pa.Score > 0
+    AND pa.PostCreationDate > '2023-01-01'
+    AND tt.TagRank <= 10
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.TotalPosts, ua.TotalQuestions, ua.TotalAnswers, ua.TotalPostScore, ua.TotalUpvotesGiven, ua.TotalDownvotesGiven,
+    pa.PostId, pa.PostTypeId, pa.PostCreationDate, pa.Score, pa.ViewCount, pa.TotalComments, pa.TotalVotes, pa.TotalUpvotes, pa.TotalDownvotes, pa.LastEditDate, pa.PreviousPostScore, pa.PreviousPostDate,
+    tt.TagName, tt.TagRank, tt.PreviousTagCount, ph.Comment
+ORDER BY
+    ua.Reputation DESC,
+    pa.Score DESC,
+    tt.TagRank ASC;

@@ -1,0 +1,224 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(CASE
+                    WHEN 1=1 THEN  DAY
+                 END, u.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Legendary'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Master'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as PostingExperience
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        NTILE(4) OVER (ORDER BY t.Count DESC) as TagQuartile
+    FROM Tags t
+),
+UserPostPerformance AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score >= 10 THEN 'HighlyVotedQuestion'
+            WHEN p.PostTypeId = 1 AND p.Score < 10 THEN 'RegularQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score >= 5 THEN 'HighlyVotedAnswer'
+            WHEN p.PostTypeId = 2 AND p.Score < 5 THEN 'RegularAnswer'
+            ELSE 'Other'
+        END as PostCategory,
+        DATEDIFF(DAY, p.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) as DaysSinceCreation,
+        CASE 
+            WHEN p.ViewCount >= 1000 THEN 'Viral'
+            WHEN p.ViewCount >= 100 THEN 'Popular'
+            WHEN p.ViewCount >= 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel
+    FROM Posts p
+),
+QualifiedUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.ReputationTier,
+        uas.PostingExperience
+    FROM UserActivityStats uas
+    WHERE uas.Reputation >= 100 
+      AND uas.TotalPosts >= 10
+      AND uas.AccountAgeDays >= 30
+),
+UserPostStats AS (
+    SELECT 
+        upp.OwnerUserId,
+        COUNT(*) as TotalPosts,
+        AVG(upp.Score) as AvgScore,
+        MAX(upp.Score) as MaxScore,
+        MIN(upp.Score) as MinScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY upp.Score) as MedianScore,
+        SUM(upp.ViewCount) as TotalViews,
+        AVG(upp.ViewCount) as AvgViews,
+        SUM(upp.AnswerCount) as TotalAnswers,
+        SUM(upp.CommentCount) as TotalComments,
+        STRING_AGG(upp.Title, ' | ') as AllTitles,
+        STRING_AGG(upp.Tags, ' | ') as AllTags,
+        STRING_AGG(CAST(upp.Score as VARCHAR), ', ') as ScoreList,
+        COUNT(CASE WHEN upp.PostCategory LIKE '%HighlyVoted%' THEN 1 END) as HighVotedPosts,
+        COUNT(CASE WHEN upp.PopularityLevel = 'Viral' THEN 1 END) as ViralPosts,
+        MAX(CASE WHEN upp.PostCategory = 'HighlyVotedQuestion' THEN upp.Score END) as BestQuestionScore,
+        MAX(CASE WHEN upp.PostCategory = 'HighlyVotedAnswer' THEN upp.Score END) as BestAnswerScore
+    FROM UserPostPerformance upp
+    GROUP BY upp.OwnerUserId
+),
+CombinedStats AS (
+    SELECT 
+        qu.UserId,
+        qu.DisplayName,
+        qu.Reputation,
+        qu.TotalPosts,
+        qu.Questions,
+        qu.Answers,
+        qu.ReputationTier,
+        qu.PostingExperience,
+        ups.TotalPosts as UserPostCount,
+        ups.AvgScore,
+        ups.MaxScore,
+        ups.MinScore,
+        ups.MedianScore,
+        ups.TotalViews,
+        ups.AvgViews,
+        ups.TotalAnswers,
+        ups.TotalComments,
+        ups.AllTitles,
+        ups.AllTags,
+        ups.ScoreList,
+        ups.HighVotedPosts,
+        ups.ViralPosts,
+        ups.BestQuestionScore,
+        ups.BestAnswerScore,
+        CASE 
+            WHEN ups.TotalViews > 0 THEN (ups.TotalPosts * 100.0) / ups.TotalViews
+            ELSE 0 
+        END as PostToViewRatio,
+        CASE 
+            WHEN ups.TotalComments > 0 THEN (ups.TotalPosts * 100.0) / ups.TotalComments
+            ELSE 0 
+        END as PostToCommentRatio,
+        CASE 
+            WHEN ups.AvgScore > 0 THEN (ups.MaxScore * 100.0) / ups.AvgScore
+            ELSE 0 
+        END as ScorePerformanceIndex
+    FROM QualifiedUsers qu
+    INNER JOIN UserPostStats ups ON qu.UserId = ups.OwnerUserId
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.TotalPosts,
+    cs.Questions,
+    cs.Answers,
+    cs.ReputationTier,
+    cs.PostingExperience,
+    cs.UserPostCount,
+    ROUND(cs.AvgScore, 2) as AvgScore,
+    cs.MaxScore,
+    cs.MinScore,
+    ROUND(cs.MedianScore, 2) as MedianScore,
+    cs.TotalViews,
+    ROUND(cs.AvgViews, 2) as AvgViews,
+    cs.TotalAnswers,
+    cs.TotalComments,
+    cs.HighVotedPosts,
+    cs.ViralPosts,
+    cs.BestQuestionScore,
+    cs.BestAnswerScore,
+    ROUND(cs.PostToViewRatio, 2) as PostToViewRatio,
+    ROUND(cs.PostToCommentRatio, 2) as PostToCommentRatio,
+    ROUND(cs.ScorePerformanceIndex, 2) as ScorePerformanceIndex,
+    ROW_NUMBER() OVER (ORDER BY cs.Reputation DESC, cs.TotalViews DESC) as RankByReputation,
+    RANK() OVER (ORDER BY cs.ScorePerformanceIndex DESC) as RankByScorePerformance,
+    DENSE_RANK() OVER (ORDER BY cs.PostToViewRatio DESC) as RankByViewEfficiency,
+    NTILE(10) OVER (ORDER BY cs.TotalViews DESC) as ViewDecile,
+    CASE 
+        WHEN cs.ReputationTier = 'Elite' AND cs.PostingExperience = 'Legendary' THEN 'Superstar'
+        WHEN cs.ReputationTier = 'Veteran' AND cs.TotalPosts > 500 THEN 'Veteran'
+        WHEN cs.ReputationTier = 'Member' AND cs.ViralPosts > 5 THEN 'Contender'
+        ELSE 'Regular'
+    END as UserClassification,
+    CASE 
+        WHEN cs.Reputation = (SELECT MAX(Reputation) FROM Users WHERE Id IN (SELECT UserId FROM QualifiedUsers)) THEN 'Highest Reputation'
+        WHEN cs.TotalViews = (SELECT MAX(TotalViews) FROM CombinedStats) THEN 'Most Viewed'
+        WHEN cs.HighVotedPosts = (SELECT MAX(HighVotedPosts) FROM CombinedStats) THEN 'Most Highly Voted'
+        ELSE 'Standard User'
+    END as PerformanceStatus,
+    CASE 
+        WHEN cs.TotalViews > (SELECT AVG(TotalViews) FROM CombinedStats) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as ViewPerformance,
+    CASE 
+        WHEN cs.ScorePerformanceIndex > (SELECT AVG(ScorePerformanceIndex) FROM CombinedStats) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as ScorePerformance,
+    NULLIF(cs.AllTitles, '') as Titles,
+    NULLIF(cs.AllTags, '') as Tags,
+    CASE 
+        WHEN cs.ScoreList LIKE '%100%' OR cs.ScoreList LIKE '%50%' THEN 'High Scoring'
+        WHEN cs.AvgScore > 10 THEN 'Good Scoring'  
+        WHEN cs.AvgScore > 0 THEN 'Moderate Scoring'
+        WHEN cs.AvgScore < 0 THEN 'Low Scoring'
+        ELSE 'No Score'
+    END as ScoreCategory,
+    CASE 
+        WHEN cs.PostToViewRatio > 50 THEN 'Excellent Engagement'
+        WHEN cs.PostToViewRatio > 25 THEN 'Good Engagement' 
+        WHEN cs.PostToViewRatio > 10 THEN 'Moderate Engagement'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    CAST(CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS TIMESTAMP) as ReportGeneratedAt
+FROM CombinedStats cs
+WHERE cs.TotalPosts > 0
+  AND cs.Reputation >= 100
+  AND cs.TotalViews IS NOT NULL
+  AND cs.AvgScore IS NOT NULL
+ORDER BY cs.Reputation DESC, cs.TotalViews DESC, cs.ScorePerformanceIndex DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

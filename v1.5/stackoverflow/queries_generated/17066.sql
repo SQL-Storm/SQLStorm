@@ -1,0 +1,154 @@
+-- {"query": "17066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 156445, "output_tokens": 155255} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+TopAnswerers AS (
+    SELECT 
+        p.OwnerUserId,
+        q.Id AS QuestionId,
+        p.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS GlobalAnswerRank,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevAnswerScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextAnswerScore
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2 
+        AND p.Score > 0
+        AND p.OwnerUserId IS NOT NULL
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames,
+        MAX(b.Date) AS LastBadgeDate,
+        MIN(b.Date) AS FirstBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+EditHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorId,
+        COUNT(*) AS EditCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS UniqueEditTypes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS LastEditDate,
+        BOOL_OR(ph.PostHistoryTypeId IN (7,8,9)) AS HasRollback
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId BETWEEN 1 AND 20
+    GROUP BY ph.PostId, ph.UserId
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    UPPER(SUBSTRING(COALESCE(NULLIF(TRIM(uam.Location), ''), 'NOWHERE') FROM 1 FOR 20)) AS LocationShort,
+    uam.PostCount,
+    uam.QuestionCount,
+    uam.AnswerCount,
+    ROUND(uam.AvgPostScore::numeric, 2) AS AvgPostScore,
+    uam.MaxPostScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.1 AS WeightedBadgeScore,
+    ba.GoldBadgeNames,
+    EXTRACT(DAY FROM CURRENT_DATE - ba.FirstBadgeDate) AS DaysSinceFirstBadge,
+    (SELECT COUNT(*) 
+     FROM TopAnswerers ta 
+     WHERE ta.OwnerUserId = uam.Id 
+       AND ta.AnswerRank = 1) AS BestAnswerCount,
+    (SELECT AVG(ta.AnswerScore - ta.PrevAnswerScore)
+     FROM TopAnswerers ta 
+     WHERE ta.OwnerUserId = uam.Id
+       AND ta.PrevAnswerScore > 0) AS AvgScoreImprovement,
+    (SELECT COUNT(DISTINCT c.Id)
+     FROM Comments c
+     WHERE c.UserId = uam.Id
+       AND c.Score > 5
+       AND EXISTS (
+           SELECT 1 
+           FROM Posts p2 
+           WHERE p2.Id = c.PostId 
+             AND p2.OwnerUserId != uam.Id
+       )) AS HighScoredCommentsOnOthers,
+    CASE 
+        WHEN uam.Reputation > 10000 AND ba.GoldBadges > 5 THEN 'Elite'
+        WHEN uam.Reputation > 5000 OR ba.GoldBadges > 2 THEN 'Expert'
+        WHEN uam.Reputation > 1000 OR ba.SilverBadges > 10 THEN 'Experienced'
+        WHEN uam.Reputation > 500 THEN 'Regular'
+        ELSE 'Novice'
+    END AS UserTier,
+    EXISTS (
+        SELECT 1
+        FROM EditHistory eh
+        WHERE eh.EditorId = uam.Id
+          AND eh.EditCount > 10
+          AND eh.HasRollback = true
+    ) AS IsActiveEditor,
+    (SELECT COUNT(*)
+     FROM Votes v
+     INNER JOIN Posts vp ON v.PostId = vp.Id
+     WHERE v.UserId = uam.Id
+       AND v.VoteTypeId = 2
+       AND vp.OwnerUserId != uam.Id
+       AND vp.Score < 0) AS UpvotesOnNegativePosts,
+    LEFT(uam.AllTags, 100) AS TopTagsUsed
+FROM UserActivityMetrics uam
+LEFT OUTER JOIN BadgeAnalysis ba ON uam.Id = ba.UserId
+WHERE uam.PostCount > 0
+    AND (uam.QuestionCount > 0 OR uam.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph2
+        WHERE ph2.UserId = uam.Id
+          AND ph2.PostHistoryTypeId = 12
+        GROUP BY ph2.UserId
+        HAVING COUNT(*) > 5
+    )
+UNION ALL
+SELECT 
+    'COMMUNITY AVERAGE' AS DisplayName,
+    AVG(u.Reputation)::int AS Reputation,
+    'GLOBAL' AS LocationShort,
+    COUNT(DISTINCT p.Id) / NULLIF(COUNT(DISTINCT u.Id), 0) AS PostCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) / NULLIF(COUNT(DISTINCT u.Id), 0) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) / NULLIF(COUNT(DISTINCT u.Id), 0) AS AnswerCount,
+    ROUND(AVG(COALESCE(p.Score, 0))::numeric, 2) AS AvgPostScore,
+    MAX(p.Score) AS MaxPostScore,
+    AVG(b2.badge_count) AS WeightedBadgeScore,
+    NULL AS GoldBadgeNames,
+    NULL AS DaysSinceFirstBadge,
+    0 AS BestAnswerCount,
+    NULL AS AvgScoreImprovement,
+    0 AS HighScoredCommentsOnOthers,
+    'AVERAGE' AS UserTier,
+    false AS IsActiveEditor,
+    0 AS UpvotesOnNegativePosts,
+    NULL AS TopTagsUsed
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS badge_count 
+    FROM Badges 
+    WHERE UserId = u.Id
+) b2 ON true
+WHERE u.Reputation > 100
+GROUP BY 1
+ORDER BY Reputation DESC, WeightedBadgeScore DESC NULLS LAST
+LIMIT 100;

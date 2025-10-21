@@ -1,0 +1,134 @@
+WITH RECURSIVE RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Name) AS rn
+    FROM Users AS u
+    LEFT JOIN Badges AS b
+        ON b.UserId = u.Id
+        AND b.Class IN (1, 2, 3)
+    WHERE u.Reputation > 1000
+),
+LatestPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        STRING_AGG(DISTINCT lt.Name, ',') FILTER (WHERE lt.Name IS NOT NULL) AS LinkTypesNames
+    FROM Posts AS p
+    LEFT JOIN PostLinks AS pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes AS lt ON lt.Id = pl.LinkTypeId
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeAnswers,
+        SUM(CASE WHEN p.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswerCount
+    FROM Posts AS p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+Closures AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseCount,
+        BOOL_OR(ph.PostHistoryTypeId = 10) AS IsClosed,
+        MAX((SELECT Name
+             FROM CloseReasonTypes crt
+             WHERE crt.Id = CAST(ph.Comment AS INTEGER))) AS CloseReason
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+RankedQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.ViewCount DESC NULLS LAST,
+                     p.Score DESC NULLS LAST,
+                     p.CreationDate DESC
+        ) AS Rnk
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount IS NOT NULL
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ARRAY_AGG(DISTINCT rqb.Tags) FILTER (WHERE rqb.Rnk <= 3) AS Top3Tags,
+    rb.BadgeName AS MostRecentBadge,
+    rb.Class AS BadgeClass,
+    lp.Id AS RecentHighViewPostId,
+    lp.Title AS RecentHighViewPostTitle,
+    lp.ViewCount AS RecentHighViewPostViews,
+    asn.TotalAnswers,
+    asn.AvgAnswerScore,
+    asn.NegativeAnswers,
+    c.IsClosed,
+    c.CloseCount,
+    c.CloseReason,
+    CASE
+        WHEN POSITION('<sql>' IN lp.Tags) > 0 THEN 'Contains <sql> tag'
+        WHEN POSITION('<performance>' IN lp.Tags) > 0 THEN 'Contains <performance> tag'
+        ELSE 'Other Tags'
+    END AS TagCategory,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = lp.Id AND v.VoteTypeId = 2) AS UpVotesOnPost,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = lp.Id AND v.VoteTypeId = 3) AS DownVotesOnPost
+FROM Users AS u
+LEFT JOIN UserActivity AS ua ON ua.UserId = u.Id
+LEFT JOIN RecursiveUserBadges AS rb ON rb.UserId = u.Id AND rb.rn = 1
+LEFT JOIN RankedQuestions AS rqb ON rqb.OwnerUserId = u.Id AND rqb.Rnk = 1
+LEFT JOIN LatestPosts AS lp ON lp.Id = rqb.Id
+LEFT JOIN AnswerStats ASN ON ASN.QuestionId = rqb.Id
+LEFT JOIN Closures AS c ON c.PostId = rqb.Id
+WHERE u.Reputation > 1000
+  AND ua.QuestionsPosted > 0
+  AND (c.IsClosed IS NULL OR c.IsClosed = FALSE)
+  AND (lp.ViewCount > 1000 OR lp.ViewCount IS NULL)
+ORDER BY ua.QuestionsPosted DESC NULLS LAST, u.Reputation DESC NULLS LAST
+LIMIT 50;

@@ -1,0 +1,91 @@
+-- {"query": "48026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1131} 
+
+WITH RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.ViewCount AS QuestionViewCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.CreationDate >= DATE('now', '-30 days')
+),
+TopAnswers AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 END) AS IsAcceptedAnswerCount
+    FROM Posts a
+    JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2 -- Answers
+      AND a.CreationDate >= DATE('now', '-30 days')
+    GROUP BY a.ParentId
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+ActivityMetrics AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+        SUM(CASE WHEN PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+        SUM(CASE WHEN PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+        SUM(CASE WHEN PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseVotes,
+        SUM(CASE WHEN PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeletionVotes,
+        SUM(CASE WHEN PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS UndeletionVotes
+    FROM PostHistory
+    WHERE CreationDate >= DATE('now', '-30 days')
+    GROUP BY PostId
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.QuestionCreationDate,
+    rq.OwnerDisplayName,
+    rq.OwnerUserId,
+    rq.QuestionScore,
+    rq.AnswerCount AS QuestionAnswerCount,
+    ta.AnswerCount AS TotalAnswersProvided,
+    ta.TotalAnswerScore,
+    ta.AverageAnswerScore,
+    ta.MaxAnswerScore,
+    ta.IsAcceptedAnswerCount,
+    rq.QuestionViewCount,
+    rq.CommentCount AS QuestionCommentCount,
+    rq.DuplicateLinkCount,
+    COALESCE(am.TitleEdits, 0) AS TotalTitleEdits,
+    COALESCE(am.BodyEdits, 0) AS TotalBodyEdits,
+    COALESCE(am.TagEdits, 0) AS TotalTagEdits,
+    COALESCE(am.CloseVotes, 0) AS TotalCloseVotes,
+    COALESCE(am.DeletionVotes, 0) AS TotalDeletionVotes,
+    COALESCE(am.UndeletionVotes, 0) AS TotalUndeletionVotes,
+    hr.DisplayName AS HighRepOwnerDisplayName,
+    hr.Reputation AS HighRepOwnerReputation,
+    hr.GoldBadges AS HighRepOwnerGoldBadges,
+    hr.SilverBadges AS HighRepOwnerSilverBadges,
+    hr.BronzeBadges AS HighRepOwnerBronzeBadges
+FROM RecentQuestions rq
+LEFT JOIN TopAnswers ta ON rq.QuestionId = ta.QuestionId
+LEFT JOIN ActivityMetrics am ON rq.QuestionId = am.PostId
+LEFT JOIN HighReputationUsers hr ON rq.OwnerUserId = hr.Id
+WHERE rq.QuestionScore > 0 OR ta.TotalAnswerScore > 0 OR rq.QuestionViewCount > 1000
+ORDER BY rq.QuestionCreationDate DESC, rq.QuestionScore DESC, ta.TotalAnswerScore DESC
+LIMIT 1000;

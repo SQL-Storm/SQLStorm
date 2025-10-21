@@ -1,0 +1,89 @@
+WITH
+RecentPosts AS (
+  SELECT p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.LastEditDate, p.Score, p.Tags, p.LastActivityDate
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+UserPostStats AS (
+  SELECT rp.OwnerUserId AS UserId,
+         COUNT(*) AS PostCount,
+         SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         AVG(rp.Score) AS AvgScore,
+         MAX(rp.LastActivityDate) AS LastActivityDate365
+  FROM RecentPosts rp
+  GROUP BY rp.OwnerUserId
+),
+UserComments AS (
+  SELECT UserId, COUNT(*) AS CommentCount
+  FROM Comments
+  WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  GROUP BY UserId
+),
+UserBadges AS (
+  SELECT UserId, COUNT(*) AS Badges
+  FROM Badges
+  GROUP BY UserId
+),
+UserVotes AS (
+  SELECT UserId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes365,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes365
+  FROM Votes
+  WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  GROUP BY UserId
+),
+TagUniverse AS (
+  SELECT rp.OwnerUserId AS UserId,
+         t.tagname,
+         COUNT(*) AS TagCount
+  FROM RecentPosts rp
+  CROSS JOIN LATERAL unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) AS t(tagname)
+  WHERE rp.Tags IS NOT NULL
+  GROUP BY rp.OwnerUserId, t.tagname
+),
+TopTags AS (
+  SELECT t.UserId, json_agg(t.tagname) AS TopTags
+  FROM (
+    SELECT tu.UserId, tu.tagname,
+           ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY tu.TagCount DESC) AS rn
+    FROM TagUniverse tu
+  ) t
+  WHERE t.rn <= 3
+  GROUP BY t.UserId
+),
+LastActivity AS (
+  SELECT ups.UserId,
+         MAX(ups.LastActivityDate365) AS LastActivity365
+  FROM UserPostStats ups
+  GROUP BY ups.UserId
+),
+Final AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(ups.PostCount, 0) AS Last365_PostCount,
+    COALESCE(ups.QuestionCount, 0) AS Last365_QuestionCount,
+    COALESCE(ups.AnswerCount, 0) AS Last365_AnswerCount,
+    COALESCE(ups.AvgScore, 0) AS Last365_AvgScore,
+    COALESCE(uc.CommentCount, 0) AS Last365_CommentCount,
+    COALESCE(ub.Badges, 0) AS Badges,
+    COALESCE(uv.UpVotes365, 0) AS UpVotes365,
+    COALESCE(uv.DownVotes365, 0) AS DownVotes365,
+    COALESCE(la.LastActivity365, u.LastAccessDate) AS LastActivity365,
+    COALESCE(tt.TopTags, '[]'::json) AS TopTags
+  FROM Users u
+  LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+  LEFT JOIN UserComments uc ON uc.UserId = u.Id
+  LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+  LEFT JOIN UserVotes uv ON uv.UserId = u.Id
+  LEFT JOIN TopTags tt ON tt.UserId = u.Id
+  LEFT JOIN LastActivity la ON la.UserId = u.Id
+)
+SELECT *
+FROM Final
+ORDER BY Reputation DESC
+LIMIT 200;

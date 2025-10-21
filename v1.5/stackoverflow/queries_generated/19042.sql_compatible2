@@ -1,0 +1,200 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    WHERE
+        U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostActivityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.FavoriteCount,
+        P.CommentCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        P.LastEditDate,
+        P.ClosedDate,
+        (P.Score * 0.5 + P.ViewCount * 0.05 + COALESCE(P.AnswerCount, 0) * 0.3 + P.CommentCount * 0.2 + COALESCE(P.FavoriteCount, 0) * 0.8) AS WeightedEngagementScore,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.Score > 50 AND P.FavoriteCount > 10 AND P.AcceptedAnswerId IS NOT NULL THEN 'High Impact Question with Accepted Answer'
+            WHEN P.PostTypeId = 1 AND P.Score > 50 AND P.FavoriteCount > 10 THEN 'High Impact Question'
+            WHEN P.PostTypeId = 2 AND P.Score > 75 AND P.AcceptedAnswerId IS NOT NULL THEN 'Accepted High Quality Answer'
+            WHEN P.Score > 20 AND P.ViewCount > 1000 THEN 'Popular Content'
+            ELSE 'Standard Content'
+        END AS ContentCategory,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByPopularity
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years')
+        AND P.Body IS NOT NULL
+),
+PostRevisionAnalysis AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS RevisionDate,
+        PH.UserId AS EditorUserId,
+        PH.Text AS RevisionText,
+        LAG(PH.Text, 1, '') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousRevisionText,
+        LAG(PH.UserId, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditorUserId,
+        RANK() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS RevisionRankDesc,
+        COUNT(PH.Id) OVER (PARTITION BY PH.PostId) AS TotalRevisions
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId IN (2, 5, 8)
+),
+FrequentTagUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><')) AS TagName,
+        COUNT(DISTINCT P.Id) AS TagPostCount
+    FROM
+        Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        P.Tags IS NOT NULL
+        AND P.PostTypeId = 1
+    GROUP BY
+        U.Id, U.DisplayName, UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><'))
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName AS UserName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    UES.AvgPostScore,
+    UES.TotalComments,
+    COALESCE(BA.GoldBadges, 0) AS GoldBadges,
+    COALESCE(BA.SilverBadges, 0) AS SilverBadges,
+    COALESCE(BA.BronzeBadges, 0) AS BronzeBadges,
+    PAM.PostId,
+    PAM.Title AS PostTitle,
+    PAM.PostCreationDate,
+    PAM.ContentCategory,
+    PAM.WeightedEngagementScore,
+    PRA.TotalRevisions,
+    PRA.RevisionDate AS LastBodyRevisionDate,
+    PRA.PreviousRevisionText,
+    PRA.RevisionText AS CurrentRevisionText,
+    LE.DisplayName AS LastEditorDisplayName,
+    LE.Reputation AS LastEditorReputation,
+    LENGTH(PAM.Body) AS BodyLength,
+    LENGTH(PAM.Title) AS TitleLength,
+    (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - PAM.PostCreationDate) / INTERVAL '1 day' AS DaysSincePostCreation,
+    SPLIT_PART(PAM.Title, ' ', 1) AS FirstTitleWord,
+    UPPER(LEFT(COALESCE(UES.DisplayName, 'UNKNOWN'), 3)) AS UserInitialHash,
+    EXISTS (
+        SELECT 1
+        FROM Comments C
+        JOIN PostActivityMetrics PAM_sub ON C.PostId = PAM_sub.PostId
+        WHERE C.UserId = UES.UserId
+          AND PAM_sub.ContentCategory LIKE 'High Impact Question%'
+          AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+        LIMIT 1
+    ) AS CommentedOnHighImpactQuestionRecently,
+    (
+        SELECT COUNT(DISTINCT PL_sub.RelatedPostId)
+        FROM PostLinks PL_sub
+        WHERE PL_sub.PostId = PAM.PostId
+          AND PL_sub.LinkTypeId = 3
+          AND EXISTS (
+              SELECT 1
+              FROM Posts P_sub
+              WHERE P_sub.Id = PL_sub.RelatedPostId
+                AND P_sub.OwnerUserId = UES.UserId
+                AND P_sub.PostTypeId = PAM.PostTypeId
+          )
+    ) AS NumLinkedDuplicatesBySameUser,
+    AVG(PAM.WeightedEngagementScore) OVER (PARTITION BY UES.UserId) AS AvgUserPostEngagementScore,
+    DENSE_RANK() OVER (ORDER BY UES.TotalPostScore DESC, UES.Reputation DESC) AS OverallUserPostScoreRank,
+    COALESCE(T.TagName, 'UNKNOWN_TAG') AS MostFrequentTag,
+    T.TagPostCount AS MostFrequentTagCount,
+    (UES.Reputation > 50000 AND COALESCE(BA.GoldBadges, 0) > 0 AND UES.AvgPostScore > 100) AS IsHighlyInfluential,
+    PAM.ClosedDate IS NOT NULL AND (PAM.LastEditDate < PAM.ClosedDate - INTERVAL '1 month') AS EditedBeforeClosure,
+    PAM.Body LIKE '%performance%' AND PAM.Body LIKE '%optimization%' AND PAM.Body NOT LIKE '%database%' AS ContainsSpecificTechKeywords
+FROM
+    UserEngagementSummary UES
+LEFT JOIN (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+) BA ON UES.UserId = BA.UserId
+LEFT JOIN PostActivityMetrics PAM ON UES.UserId = PAM.OwnerUserId
+LEFT JOIN (
+    SELECT
+        PostId,
+        RevisionDate,
+        RevisionText,
+        PreviousRevisionText,
+        TotalRevisions,
+        RevisionRankDesc,
+        EditorUserId
+    FROM PostRevisionAnalysis
+    WHERE RevisionRankDesc = 1
+) PRA ON PAM.PostId = PRA.PostId
+LEFT JOIN Users LE ON PRA.EditorUserId = LE.Id
+LEFT JOIN (
+    SELECT
+        UserId,
+        TagName,
+        TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagPostCount DESC) AS rn
+    FROM FrequentTagUsers
+) T ON UES.UserId = T.UserId AND T.rn = 1
+WHERE
+    UES.Reputation > 1000
+    AND UES.TotalPosts > 5
+    AND UES.AvgPostScore >= 5.0
+    AND (PAM.ContentCategory LIKE 'High Impact Question%' OR PAM.ContentCategory = 'Accepted High Quality Answer')
+    AND (
+        UES.TotalQuestions > 2
+        OR EXISTS (
+            SELECT 1
+            FROM Badges B_sub
+            WHERE B_sub.UserId = UES.UserId AND B_sub.Class = 1
+        )
+    )
+    AND (PRA.TotalRevisions > 1 OR PAM.LastEditDate IS NULL)
+    AND COALESCE(LE.Reputation, 0) > 100
+    AND (PRA.RevisionText IS NOT NULL AND PRA.PreviousRevisionText IS NOT NULL AND LENGTH(PRA.RevisionText) - LENGTH(PRA.PreviousRevisionText) > 50)
+    AND UES.DisplayName IS NOT NULL
+    AND PAM.RankByPopularity <= 1000
+    AND NOT (PAM.Body LIKE '%spam%' OR PAM.Title LIKE '%clickbait%')
+ORDER BY
+    OverallUserPostScoreRank ASC, UES.LastAccessDate DESC, PAM.WeightedEngagementScore DESC
+LIMIT 1000;

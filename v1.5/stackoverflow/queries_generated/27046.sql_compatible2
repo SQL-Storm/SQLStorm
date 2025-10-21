@@ -1,0 +1,143 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.DisplayName,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.DisplayName
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.LastActivityDate,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.CreationDate >= DATE_TRUNC('month', CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - INTERVAL '1 month'
+),
+HighEngagementUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.TotalPostScore,
+        ua.TotalPosts,
+        ua.TotalQuestions,
+        ua.TotalAnswers,
+        ua.TotalComments,
+        ua.TotalVotes,
+        ua.TotalBadges,
+        rp.PostId,
+        rp.PostTypeId,
+        rp.PostCreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.OwnerDisplayName,
+        rp.PreviousPostScore,
+        rp.NextPostScore,
+        rp.LastActivityDate,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        COUNT(DISTINCT v.Id) AS TotalBounties
+    FROM
+        UserActivity ua
+    JOIN
+        RecentPosts rp ON ua.UserId = rp.OwnerUserId
+    LEFT JOIN
+        Votes v ON rp.PostId = v.PostId AND v.VoteTypeId = 8
+    GROUP BY
+        ua.UserId, ua.DisplayName, ua.TotalPostScore, ua.TotalPosts, ua.TotalQuestions, ua.TotalAnswers, ua.TotalComments, ua.TotalVotes, ua.TotalBadges, rp.PostId, rp.PostTypeId, rp.PostCreationDate, rp.Score, rp.ViewCount, rp.Title, rp.Tags, rp.AnswerCount, rp.CommentCount, rp.OwnerDisplayName, rp.PreviousPostScore, rp.NextPostScore, rp.LastActivityDate
+    HAVING
+        ua.TotalPosts > 10 AND ua.TotalPostScore > 500
+)
+SELECT
+    heu.UserId,
+    heu.DisplayName,
+    heu.TotalPostScore,
+    heu.TotalPosts,
+    heu.TotalQuestions,
+    heu.TotalAnswers,
+    heu.TotalComments,
+    heu.TotalVotes,
+    heu.TotalBadges AS incorporating_bounties,
+    heu.PostId,
+    heu.PostTypeId,
+    pht.Name AS PostHistoryType,
+    heu.PostCreationDate,
+    heu.Score,
+    heu.ViewCount,
+    heu.Title,
+    heu.Tags,
+    heu.AnswerCount,
+    heu.CommentCount,
+    heu.OwnerDisplayName,
+    heu.PreviousPostScore,
+    heu.NextPostScore,
+    heu.LastActivityDate,
+    heu.TotalBountyAmount,
+    heu.TotalBounties,
+    ph.PostId AS HistoryPostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryCreationDate,
+    ph.UserId AS HistoryUserId,
+    ph.UserDisplayName AS HistoryUserDisplayName,
+    ph.Comment AS HistoryComment,
+    CASE
+        WHEN ph.PostHistoryTypeId = 10 THEN crt.Name
+        ELSE NULL
+    END AS CloseReason,
+    COALESCE(JSON_VALUE(ph.Text, '$.OriginalQuestionIds'), '') AS OriginalQuestionIds,
+    COALESCE(JSON_VALUE(ph.Text, '$.MigrationDetails'), '') AS MigrationDetails,
+    substr(ph.Text, POSITION('OSpam' IN ph.Text), 8) as actuallUserOSpamID
+FROM
+    HighEngagementUsers heu
+JOIN Posts p ON heu.PostId = p.Id
+LEFT JOIN
+    PostHistory ph ON heu.PostId = ph.PostId
+LEFT JOIN
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN
+    CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+WHERE
+    heu.PostCreationDate BETWEEN DATE_TRUNC('month', CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - INTERVAL '6 months' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+    AND (heu.TotalBountyAmount > 0 OR heu.TotalBounties > 0)
+    AND ph.PostHistoryTypeId IS NOT NULL
+ORDER BY
+    heu.TotalPostScore DESC,
+    heu.PostCreationDate DESC,
+    heu.Score DESC;

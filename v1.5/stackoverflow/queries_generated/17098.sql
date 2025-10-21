@@ -1,0 +1,181 @@
+-- {"query": "17098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 231165, "output_tokens": 228417} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Name) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Views) AS ViewsPercentile,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400.0 AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '5 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.Views, u.CreationDate
+),
+QuestionEngagement AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.CreationDate AS QuestionDate,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        MAX(a.Score) AS BestAnswerScore,
+        MIN(a.CreationDate) AS FirstAnswerTime,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+        SUM(CASE WHEN a.Score < 0 THEN 1 ELSE 0 END) AS NegativeAnswers,
+        BOOL_OR(a.Id = q.AcceptedAnswerId) AS HasAcceptedAnswer,
+        LAG(q.ViewCount, 1, 0) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PrevQuestionViews,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', q.CreationDate) ORDER BY q.Score DESC) AS MonthlyRank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.ClosedDate IS NULL
+        AND q.Score >= 0
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.Tags, q.CreationDate, q.AcceptedAnswerId, q.OwnerUserId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScoreForTag,
+        STDDEV(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS ScoreStdDev,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        FIRST_VALUE(u.DisplayName) OVER (
+            PARTITION BY t.TagName 
+            ORDER BY SUM(p.Score) DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS TopContributor,
+        CASE 
+            WHEN t.Count > 10000 THEN 'Popular'
+            WHEN t.Count > 1000 THEN 'Common'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagCategory
+    FROM Tags t
+    INNER JOIN LATERAL (
+        SELECT p2.*
+        FROM Posts p2
+        WHERE p2.Tags LIKE '%<' || t.TagName || '>%'
+        LIMIT 1000
+    ) p ON TRUE
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.WikiPostId IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.WikiPostId
+),
+UserActivity AS (
+    SELECT 
+        ph.UserId,
+        DATE_TRUNC('week', ph.CreationDate) AS ActivityWeek,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (2, 5, 8)) AS EditActions,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenActions,
+        ARRAY_AGG(DISTINCT ph.PostHistoryTypeId ORDER BY ph.PostHistoryTypeId) AS ActionTypes,
+        MAX(ph.CreationDate) AS LastActivityDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '180 days'
+    GROUP BY ph.UserId, DATE_TRUNC('week', ph.CreationDate)
+)
+SELECT DISTINCT
+    um.DisplayName,
+    um.Reputation,
+    um.ReputationRank,
+    ROUND(um.ViewsPercentile::numeric * 100, 2) || '%' AS ViewsPercentile,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(um.GoldBadges, 'None') AS GoldBadges,
+    ROUND(um.AccountAgeDays::numeric / 365.25, 1) AS AccountYears,
+    qe.Title AS TopQuestion,
+    qe.QuestionScore,
+    qe.ViewCount,
+    SUBSTRING(qe.Tags FROM 2 FOR POSITION('>' IN qe.Tags) - 2) AS PrimaryTag,
+    qe.TotalAnswers,
+    COALESCE(qe.BestAnswerScore, -999) AS BestAnswerScore,
+    CASE 
+        WHEN qe.FirstAnswerTime IS NOT NULL 
+        THEN EXTRACT(EPOCH FROM (qe.FirstAnswerTime - qe.QuestionDate)) / 3600.0 
+        ELSE NULL 
+    END AS HoursToFirstAnswer,
+    qe.MedianAnswerScore,
+    qe.HasAcceptedAnswer,
+    GREATEST(qe.ViewCount - qe.PrevQuestionViews, 0) AS ViewGrowth,
+    ta.TagName,
+    ta.TagCategory,
+    ROUND(ta.AvgScoreForTag::numeric, 2) AS TagAvgScore,
+    ROUND(COALESCE(ta.ScoreStdDev, 0)::numeric, 2) AS TagScoreStdDev,
+    ta.UniqueContributors,
+    COALESCE(ta.TopContributor, 'Anonymous') AS TagTopContributor,
+    ua.ActivityWeek,
+    ua.EditActions + ua.CloseReopenActions AS TotalModActions,
+    ARRAY_LENGTH(ua.ActionTypes, 1) AS DistinctActionTypes,
+    CASE 
+        WHEN v.VoteTypeId = 2 THEN 'Upvoted'
+        WHEN v.VoteTypeId = 3 THEN 'Downvoted'
+        WHEN v.VoteTypeId IS NULL THEN 'No Vote'
+        ELSE 'Other'
+    END AS VoteStatus,
+    COALESCE(c.CommentCount, 0) AS UserComments,
+    CASE 
+        WHEN pl.LinkTypeId = 3 THEN 'Has Duplicates'
+        WHEN pl.LinkTypeId = 1 THEN 'Has Links'
+        ELSE 'No Links'
+    END AS LinkStatus,
+    CASE
+        WHEN um.Location LIKE '%United States%' OR um.Location LIKE '%USA%' THEN 'US'
+        WHEN um.Location LIKE '%India%' THEN 'India'
+        WHEN um.Location LIKE '%United Kingdom%' OR um.Location LIKE '%UK%' THEN 'UK'
+        WHEN LENGTH(um.Location) > 0 THEN 'Other'
+        ELSE 'Not Specified'
+    END AS LocationGroup,
+    NTILE(10) OVER (ORDER BY um.Reputation * COALESCE(qe.QuestionScore, 1)) AS PerformanceDecile
+FROM UserMetrics um
+INNER JOIN QuestionEngagement qe ON qe.MonthlyRank <= 3
+LEFT JOIN TagAnalysis ta ON ta.TagName = SUBSTRING(qe.Tags FROM 2 FOR POSITION('>' IN qe.Tags) - 2)
+LEFT JOIN UserActivity ua ON um.Id = ua.UserId
+LEFT JOIN LATERAL (
+    SELECT v2.PostId, v2.VoteTypeId
+    FROM Votes v2
+    WHERE v2.PostId = qe.QuestionId
+        AND v2.UserId = um.Id
+        AND v2.VoteTypeId IN (2, 3)
+    ORDER BY v2.CreationDate DESC
+    LIMIT 1
+) v ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS CommentCount
+    FROM Comments c2
+    WHERE c2.UserId = um.Id
+        AND c2.PostId = qe.QuestionId
+) c ON TRUE
+LEFT JOIN PostLinks pl ON pl.PostId = qe.QuestionId
+WHERE um.Reputation > 500
+    AND qe.ViewCount > 100
+    AND (ta.TagUsageCount > 50 OR ta.TagUsageCount IS NULL)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph2
+        WHERE ph2.PostId = qe.QuestionId
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate > qe.QuestionDate + INTERVAL '7 days'
+    )
+    AND (
+        um.QuestionCount > 5 
+        OR um.AnswerCount > 10 
+        OR um.GoldBadges IS NOT NULL
+    )
+ORDER BY 
+    um.ReputationRank,
+    qe.QuestionScore DESC,
+    qe.ViewCount DESC
+LIMIT 100;

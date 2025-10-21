@@ -1,0 +1,152 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank,
+        AVG(u.Reputation) OVER (PARTITION BY SUBSTRING(u.Location, 1, 10)) AS LocationAvgRep
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND u.Location IS NOT NULL
+      AND u.Location <> ''
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ClosedDate,
+        COALESCE(p.AnswerCount, 0) * p.Score AS EngagementScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+        NTILE(4) OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS ViewQuartile,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AnswerCount >= 3 THEN 'Popular'
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            ELSE 'Standard'
+        END AS PostCategory
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+      AND (p.DeletionDate IS NULL OR p.DeletionDate IS NULL)
+),
+UserActivitySummary AS (
+    SELECT 
+        au.UserId,
+        au.Reputation,
+        au.Location,
+        au.LocationRank,
+        COUNT(qs.PostId) AS QuestionCount,
+        SUM(qs.ViewCount) AS TotalViews,
+        AVG(qs.EngagementScore) AS AvgEngagement,
+        MAX(qs.PostCreationDate) AS LatestPostDate,
+        STRING_AGG(DISTINCT qs.PostCategory, ', ' ORDER BY qs.PostCreationDate DESC) AS PostCategories,
+        SUM(CASE WHEN qs.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestions
+    FROM ActiveUsers au
+    LEFT OUTER JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId
+    GROUP BY au.UserId, au.Reputation, au.Location, au.LocationRank
+    HAVING COUNT(qs.PostId) > 0
+      OR au.LocationRank <= 5
+),
+TopPostsByLink AS (
+    SELECT DISTINCT
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) OVER (PARTITION BY pl.PostId) AS LinkCount,
+        AVG(p.Score) OVER (PARTITION BY pl.PostId) AS AvgLinkedScore
+    FROM PostLinks pl
+    INNER JOIN Posts p ON pl.RelatedPostId = p.Id
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name IN ('Linked', 'Duplicate')
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 months')
+)
+SELECT 
+    uas.UserId,
+    u.DisplayName,
+    uas.Reputation,
+    uas.Location,
+    uas.LocationRank,
+    uas.QuestionCount,
+    uas.TotalViews,
+    uas.AvgEngagement,
+    uas.LatestPostDate,
+    uas.PostCategories,
+    uas.ClosedQuestions,
+    COALESCE(tpp.LinkCount, 0) AS OutboundLinks,
+    COALESCE(tpp.AvgLinkedScore, 0) AS AvgLinkedPostScore,
+    (uas.AvgEngagement * 1.0 / NULLIF(uas.QuestionCount, 0)) AS EngagementPerQuestion,
+    CASE 
+        WHEN uas.ClosedQuestions > 0 THEN 'Has Closures'
+        WHEN uas.QuestionCount >= 10 AND uas.LocationRank <= 3 THEN 'Top Local Power User'
+        WHEN uas.TotalViews > 100000 THEN 'High Visibility User'
+        ELSE 'Regular Active User'
+    END AS UserTier,
+    CONCAT(
+        'User from ', 
+        COALESCE(SUBSTRING(uas.Location, 1, 20), 'Unknown'), 
+        ' with ', 
+        CAST(uas.QuestionCount AS VARCHAR), 
+        ' questions'
+    ) AS SummaryString,
+    GREATEST(
+        0, 
+        uas.Reputation - 
+        COALESCE(
+            (SELECT AVG(badges_per_user.Reputation) 
+             FROM (SELECT UserId, AVG(Reputation) AS Reputation 
+                   FROM UserActivitySummary GROUP BY UserId) badges_per_user 
+             WHERE badges_per_user.UserId = uas.UserId), 
+            uas.LocationAvgRep
+        )
+    ) AS RepDeviationFromLocalAvg
+FROM UserActivitySummary uas
+INNER JOIN Users u ON uas.UserId = u.Id
+LEFT OUTER JOIN TopPostsByLink tpp ON EXISTS (
+    SELECT 1 FROM QuestionStats qs2 
+    WHERE qs2.OwnerUserId = uas.UserId 
+      AND qs2.PostId = tpp.PostId
+      AND tpp.LinkCount > (SELECT AVG(pl2.LinkCount) FROM TopPostsByLink pl2 WHERE pl2.PostId != tpp.PostId)
+)
+LEFT OUTER JOIN Badges b ON uas.UserId = b.UserId AND b.Class = 1
+WHERE uas.LocationRank <= 10
+  AND (uas.ClosedQuestions = 0 OR uas.Reputation > 5000)
+  AND NOT EXISTS (
+      SELECT 1 FROM Comments c 
+      WHERE c.UserId = uas.UserId 
+        AND c.Score < -5 
+        AND c.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+  )
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Aggregate Stats' AS DisplayName,
+    SUM(uas.Reputation) AS Reputation,
+    'Global' AS Location,
+    1 AS LocationRank,
+    SUM(uas.QuestionCount) AS QuestionCount,
+    SUM(uas.TotalViews) AS TotalViews,
+    AVG(uas.AvgEngagement) AS AvgEngagement,
+    MAX(uas.LatestPostDate) AS LatestPostDate,
+    STRING_AGG(DISTINCT uas.PostCategories, '; ') AS PostCategories,
+    SUM(uas.ClosedQuestions) AS ClosedQuestions,
+    AVG(COALESCE(tpp.LinkCount, 0)) AS OutboundLinks,
+    AVG(COALESCE(tpp.AvgLinkedScore, 0)) AS AvgLinkedPostScore,
+    NULL AS EngagementPerQuestion,
+    'Global Aggregate' AS UserTier,
+    CONCAT('Total users analyzed: ', CAST(COUNT(*) OVER() AS VARCHAR)) AS SummaryString,
+    NULL AS RepDeviationFromLocalAvg
+FROM UserActivitySummary uas
+LEFT OUTER JOIN TopPostsByLink tpp ON uas.UserId = (SELECT MIN(qs.OwnerUserId) FROM QuestionStats qs WHERE qs.PostId = tpp.PostId)
+WHERE uas.QuestionCount > 0
+ORDER BY 
+    CASE WHEN UserId IS NULL THEN 0 ELSE 1 END,
+    uas.Reputation DESC,
+    uas.TotalViews DESC
+LIMIT 100;

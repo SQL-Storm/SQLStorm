@@ -1,0 +1,203 @@
+-- {"query": "19075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3135} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p_accepted.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS TotalAcceptedAnswersReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts p_accepted ON p.AcceptedAnswerId = p_accepted.Id -- for accepted answers *received* by the user
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostEngagementEvents AS (
+    -- Set operator UNION ALL to combine different types of post activities into a unified event stream
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS EventInitiatorUserId,
+        ph.UserDisplayName AS EventInitiatorDisplayName,
+        'PostHistory' AS EventType,
+        ph.PostHistoryTypeId AS SpecificEventTypeId,
+        ph.Comment AS EventSummary,
+        LENGTH(ph.Text) AS EventTextLength
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20) -- Initial content, edits, close/reopen/delete/lock/protect actions
+    UNION ALL
+    SELECT
+        c.PostId,
+        c.CreationDate AS EventDate,
+        c.UserId AS EventInitiatorUserId,
+        c.UserDisplayName AS EventInitiatorDisplayName,
+        'Comment' AS EventType,
+        NULL AS SpecificEventTypeId,
+        SUBSTRING(c.Text, 1, 100) || CASE WHEN LENGTH(c.Text) > 100 THEN '...' ELSE '' END AS EventSummary, -- Truncate for summary
+        LENGTH(c.Text) AS EventTextLength
+    FROM Comments c
+    WHERE c.Score > 0 -- Only comments with positive score
+),
+PostEvolutionDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.ViewCount,
+        p.FavoriteCount,
+        COALESCE(p.Score, 0) AS InitialScore,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1) AS TagCount,
+        LENGTH(p.Body) AS InitialBodyLength,
+        -- Correlated subquery to fetch the *actual* initial body text (PostHistoryTypeId = 2, first entry)
+        (SELECT ph_init.Text FROM PostHistory ph_init WHERE ph_init.PostId = p.Id AND ph_init.PostHistoryTypeId = 2 ORDER BY ph_init.CreationDate ASC LIMIT 1) AS InitialRawBody,
+        -- Correlated subquery to fetch the *latest* body edit text (PostHistoryTypeId = 5)
+        (SELECT ph_latest.Text FROM PostHistory ph_latest WHERE ph_latest.PostId = p.Id AND ph_latest.PostHistoryTypeId = 5 ORDER BY ph_latest.CreationDate DESC LIMIT 1) AS LatestRawBodyEdit,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastMajorEditDate,
+        COUNT(DISTINCT pee.EventDate || '_' || pee.EventType) AS TotalPostInteractionEvents, -- Count unique events from combined stream
+        MAX(pee.EventDate) AS LastInteractionEventDate,
+        -- Correlated subquery for average score of related posts (specifically duplicates)
+        (
+            SELECT AVG(p_related.Score)
+            FROM PostLinks pl
+            JOIN Posts p_related ON pl.RelatedPostId = p_related.Id
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate links
+        ) AS AvgDuplicatePostScore
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostEngagementEvents pee ON p.Id = pee.PostId -- Join to the combined events for overall activity
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.ClosedDate, p.ViewCount, p.FavoriteCount, p.Score, p.Tags
+),
+TagPerformanceMetrics AS (
+    SELECT
+        unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1 -- Only consider questions for tag performance
+),
+AggregatedTagStats AS (
+    SELECT
+        tpm.TagName,
+        COUNT(tpm.PostId) AS QuestionsUsingTag,
+        AVG(tpm.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxQuestionViewCountForTag,
+        MIN(p.CreationDate) AS EarliestTagUsage,
+        MAX(p.CreationDate) AS LatestTagUsage
+    FROM TagPerformanceMetrics tpm
+    JOIN Posts p ON tpm.PostId = p.Id
+    GROUP BY tpm.TagName
+    HAVING COUNT(tpm.PostId) > 10 -- Only consider tags used in more than 10 questions to filter noise
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate AS UserRegistrationDate,
+    u.LastAccessDate,
+    u.Views AS UserProfileViews,
+    u.UpVotes AS UserUpVotesGiven,
+    u.DownVotes AS UserDownVotesGiven,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalCommentsMade,
+    uas.TotalAcceptedAnswersReceived,
+    uas.TotalBadges,
+    uas.TotalPostScore AS SumOfAllPostScores,
+    uas.LatestPostDate,
+    uas.EarliestPostDate,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank, -- Window function for user reputation ranking
+    NTILE(10) OVER (ORDER BY u.CreationDate) AS UserCreationDecile, -- Window function to categorize users by age
+    ROUND(CAST(uas.TotalPostScore AS NUMERIC) / NULLIF(uas.TotalPosts, 0), 2) AS AvgScorePerPost, -- Null logic for division by zero
+    COALESCE(u.Location, 'Unspecified Location') AS UserLocation, -- NULL logic for user location
+    UPPER(SUBSTRING(u.WebsiteUrl FROM '^(?:https?://)?(?:www\\.)?([^/]+)')) AS WebsiteDomain, -- String expression to extract and format domain
+    LENGTH(u.AboutMe) AS AboutMeLength,
+    CASE -- Complicated predicate/expression for user categorization
+        WHEN u.WebsiteUrl IS NOT NULL AND u.AboutMe IS NOT NULL AND u.Reputation > 500 AND uas.TotalPosts > 100
+            THEN 'Established & Highly Engaged'
+        WHEN u.Reputation > 200 AND uas.TotalPosts > 50
+            THEN 'Active Contributor'
+        WHEN u.CreationDate > (NOW() - INTERVAL '6 months') AND uas.TotalPosts > 5
+            THEN 'Promising New User'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    -- Details about the user's questions
+    p.Id AS QuestionId,
+    p.Title AS QuestionTitle,
+    p.CreationDate AS QuestionCreationDate,
+    p.ViewCount AS QuestionViewCount,
+    p.Score AS QuestionScore,
+    p.FavoriteCount AS QuestionFavoriteCount,
+    ped.InitialBodyLength AS QuestionInitialBodyLength,
+    ped.LatestRawBodyEdit AS QuestionLatestBodyEdit,
+    ped.MajorEditCount AS QuestionMajorEditCount,
+    ped.LastMajorEditDate AS QuestionLastMajorEditDate,
+    ped.AvgDuplicatePostScore,
+    ped.TotalPostInteractionEvents AS QuestionTotalInteractionEvents,
+    ped.LastInteractionEventDate AS QuestionLastInteractionDate,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.CreationDate DESC) AS UserQuestionScoreRank, -- Window function: rank of question by score for the user
+    -- Correlated subquery for user's highest scored answer to this question (if any)
+    (
+        SELECT MAX(a.Score)
+        FROM Posts a
+        WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.OwnerUserId = u.Id
+    ) AS UsersHighestAnswerScoreForQuestion,
+    -- Correlated subquery for average comment score on this specific question
+    (
+        SELECT AVG(c_q.Score)
+        FROM Comments c_q
+        WHERE c_q.PostId = p.Id
+    ) AS AvgCommentScoreOnQuestion,
+    -- Check if question has a "duplicate" link (using EXISTS correlated subquery)
+    EXISTS (SELECT 1 FROM PostLinks pl_dup WHERE pl_dup.PostId = p.Id AND pl_dup.LinkTypeId = 3) AS HasDuplicateLink,
+    -- Complicated calculation for "activity factor" per day
+    ROUND(
+        CAST(COALESCE(p.ViewCount, 0) * 0.5 + COALESCE(p.Score, 0) * 10 + COALESCE(p.CommentCount, 0) * 5 + COALESCE(p.FavoriteCount, 0) * 20 AS NUMERIC) /
+        NULLIF(EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / (3600.0 * 24.0), 0), 2
+    ) AS QuestionActivityFactorPerDay,
+    -- String expressions for text analysis on question body
+    (LENGTH(p.Body) - LENGTH(REPLACE(LOWER(p.Body), '```', '')))/3 AS CodeBlockCount, -- Rough estimation of code blocks
+    LOWER(p.Title) LIKE '%performance%' OR LOWER(p.Body) LIKE '%benchmark%' OR LOWER(p.Body) LIKE '%optimize%' AS ContainsPerformanceKeywords,
+    -- Tag analysis from AggregatedTagStats
+    ats.AvgQuestionScore AS TagAvgScore,
+    ats.QuestionsUsingTag AS TagQuestionCount,
+    ats.LatestTagUsage,
+    -- String expression for transforming tags
+    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.Tags, '<sql>', '[SQL]'), '<javascript>', '[JS]'), '<python>', '[PY]'), '<c#>', '[CS]'), '<java>', '[JV]') AS TransformedTags
+FROM Users u
+JOIN UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 -- Outer join to questions, only select questions
+LEFT JOIN PostEvolutionDetails ped ON p.Id = ped.PostId
+LEFT JOIN LATERAL unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS q_tag ON TRUE -- Lateral join for unnesting tags
+LEFT JOIN AggregatedTagStats ats ON q_tag = ats.TagName
+WHERE
+    u.Reputation > 1000 -- Filter for higher reputation users
+    AND u.LastAccessDate > (NOW() - INTERVAL '1 year') -- Active users in the last year
+    AND u.AboutMe IS NOT NULL -- Users with an "About Me" section
+    AND u.Id IN ( -- Correlated subquery: users who have edited a post body in the last 2 years
+        SELECT DISTINCT ph_inner.UserId
+        FROM PostHistory ph_inner
+        WHERE ph_inner.PostHistoryTypeId = 5
+        AND ph_inner.CreationDate > (NOW() - INTERVAL '2 years')
+    )
+    AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate > (NOW() - INTERVAL '3 years')) -- Correlated subquery: questions with score above recent average
+    AND p.ViewCount > 500
+    AND p.CommentCount > 5
+    AND p.ClosedDate IS NULL -- Only open questions (NULL logic)
+ORDER BY
+    u.Reputation DESC,
+    QuestionActivityFactorPerDay DESC NULLS LAST, -- NULL logic in ordering
+    ped.LastMajorEditDate DESC NULLS LAST
+LIMIT 500;

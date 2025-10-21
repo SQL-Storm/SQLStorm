@@ -1,0 +1,150 @@
+-- {"query": "5054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1352} 
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName, 
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.LastAccessDate > NOW() - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+TopRecentUsers AS (
+    SELECT * FROM RecentActiveUsers WHERE rn <= 100
+),
+UserQuestionStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END) AS AnsweredQuestions,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxQuestionViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY p.OwnerUserId
+),
+UserAnswerStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM Posts pq WHERE pq.Id = p.ParentId AND pq.AcceptedAnswerId = p.Id
+        ) THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY p.OwnerUserId
+),
+UserVoteActivity AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpvotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownvotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS FavoritesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+      AND v.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY v.UserId
+),
+FlaggedComments AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS FlaggedCommentCount,
+        MAX(c.CreationDate) AS LastFlaggedCommentDate
+    FROM Comments c
+    WHERE c.Score < -2
+      AND c.UserId IS NOT NULL
+      AND c.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY c.UserId
+),
+ClosedQuestions AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS ClosedQuestions,
+        MIN(ph.CreationDate) AS FirstClose,
+        MAX(ph.CreationDate) AS LastClose
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10 -- Closed
+      AND ph.CreationDate > NOW() - INTERVAL '1 year'
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT
+    u.UserId,
+    COALESCE(NULLIF(u.DisplayName, ''), '<anonymous>') AS DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+
+    q.QuestionCount,
+    q.AnsweredQuestions,
+    ROUND(q.AvgQuestionScore, 2) AS AvgQuestionScore,
+    q.MaxQuestionViews,
+
+    a.AnswerCount,
+    a.AvgAnswerScore,
+    a.AcceptedAnswers,
+
+    v.UpvotesGiven, v.DownvotesGiven, v.FavoritesGiven,
+
+    fc.FlaggedCommentCount,
+    fc.LastFlaggedCommentDate,
+
+    cq.ClosedQuestions,
+    cq.FirstClose,
+    cq.LastClose,
+
+    st.TopTag list_top_tags,
+    (CASE 
+        WHEN q.QuestionCount IS NOT NULL AND q.QuestionCount > 0 
+        THEN ROUND((a.AcceptedAnswers * 100.0) / NULLIF(a.AnswerCount,0),1)
+        ELSE 0 
+     END) AS AcceptedAnswerRate,
+
+    CASE
+        WHEN u.GoldBadges = 0 AND u.SilverBadges = 0 AND u.BronzeBadges = 0 THEN 'No Badges'
+        WHEN u.GoldBadges > 2 THEN 'Gold Star'
+        WHEN u.SilverBadges > 5 THEN 'Silver Collector'
+        WHEN u.BronzeBadges > 10 THEN 'Bronze Hoarder'
+        ELSE 'Mixed'
+    END AS BadgeStatus
+
+FROM TopRecentUsers u
+LEFT JOIN UserQuestionStats q ON q.OwnerUserId = u.UserId
+LEFT JOIN UserAnswerStats a ON a.OwnerUserId = u.UserId
+LEFT JOIN UserVoteActivity v ON v.UserId = u.UserId
+LEFT JOIN FlaggedComments fc ON fc.UserId = u.UserId
+LEFT JOIN ClosedQuestions cq ON cq.UserId = u.UserId
+LEFT JOIN LATERAL (
+    SELECT 
+        string_agg(tag_tagname, ', ' ORDER BY tag_count DESC) AS TopTag
+    FROM (
+        SELECT 
+            TRIM(BOTH ' ' FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS tag_tagname,
+            COUNT(*) AS tag_count
+        FROM Posts p
+        WHERE p.OwnerUserId = u.UserId
+          AND p.PostTypeId = 1
+          AND p.CreationDate > NOW() - INTERVAL '1 year'
+          AND p.Tags IS NOT NULL
+        GROUP BY tag_tagname
+        ORDER BY tag_count DESC
+        LIMIT 3
+    ) tag_summary
+) st ON TRUE
+ORDER BY u.Reputation DESC, u.GoldBadges DESC, u.LastAccessDate DESC
+LIMIT 50;

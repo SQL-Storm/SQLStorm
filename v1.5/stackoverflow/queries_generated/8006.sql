@@ -1,0 +1,297 @@
+-- {"query": "8006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2814} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           u.websiteurl,
+           coalesce(nullif(trim(split_part(u.websiteurl, '/', 3)), ''), 'no-domain') as website_domain
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 year' from users)
+),
+question_posts as (
+    select p.id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.answercount,
+           p.favoritecount,
+           p.commentcount,
+           p.closeddate,
+           case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select p.id,
+           p.parentid as question_id,
+           p.owneruserid,
+           p.creationdate,
+           p.score
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select ru.user_id,
+           count(distinct qp.id) filter (where qp.creationdate >= now() - interval '180 day') as questions_180d,
+           count(distinct ap.id) filter (where ap.creationdate >= now() - interval '180 day') as answers_180d,
+           count(distinct c.id)  filter (where c.creationdate  >= now() - interval '180 day') as comments_180d,
+           count(distinct qp.id) as total_questions,
+           count(distinct ap.id) as total_answers,
+           count(distinct c.id)  as total_comments,
+           sum(qp.score) as q_score_sum,
+           sum(ap.score) as a_score_sum,
+           sum(c.score) as c_score_sum
+    from recent_users ru
+    left join question_posts qp on qp.owneruserid = ru.user_id
+    left join answer_posts   ap on ap.owneruserid = ru.user_id
+    left join comments       c  on c.userid = ru.user_id
+    group by ru.user_id
+),
+post_engagement as (
+    select q.id as question_id,
+           q.owneruserid as asker_id,
+           q.creationdate as q_created,
+           q.viewcount,
+           q.score as q_score,
+           q.answercount,
+           q.favoritecount,
+           q.commentcount as q_commentcount,
+           q.is_closed,
+           count(distinct a.id) as answers_actual,
+           max(a.score) as top_answer_score,
+           avg(a.score) as avg_answer_score,
+           max(a.creationdate) as last_answer_date
+    from question_posts q
+    left join answer_posts a on a.question_id = q.id
+    group by q.id, q.owneruserid, q.creationdate, q.viewcount, q.score, q.answercount, q.favoritecount, q.commentcount, q.is_closed
+),
+tag_extracted as (
+    select q.id as question_id,
+           unnest(string_to_array(coalesce(nullif(substring(q.tags, 2, greatest(length(q.tags)-2,0)), ''), ''), '><')) as tagname
+    from question_posts q
+),
+tag_stats as (
+    select te.question_id,
+           count(*) as tag_count,
+           string_agg(te.tagname, ',' order by te.tagname) as tag_list,
+           sum(t.count) as total_tag_popularity
+    from tag_extracted te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+    group by te.question_id
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_legacy,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+close_reasons as (
+    select ph.postid,
+           min(ph.creationdate) as first_close_date,
+           max(ph.creationdate) as last_close_date,
+           min((ph.comment)::varchar) filter (where ph.posthistorytypeid = 10) as first_close_reason_id,
+           max((ph.comment)::varchar) filter (where ph.posthistorytypeid = 10) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11,12,13,35)
+    group by ph.postid
+),
+linked_duplicates as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as original_id,
+           count(*) filter (where pl.linktypeid = 3) as dup_links,
+           count(*) filter (where pl.linktypeid = 1) as related_links
+    from postlinks pl
+    group by pl.postid, pl.relatedpostid
+),
+user_badges as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+activity_rank as (
+    select ua.user_id,
+           ua.total_questions,
+           ua.total_answers,
+           ua.total_comments,
+           row_number() over (order by coalesce(ua.total_answers,0) desc, coalesce(ua.total_questions,0) desc, coalesce(ua.total_comments,0) desc, ua.user_id) as activity_rank_desc
+    from user_activity ua
+),
+domain_peers as (
+    select ru.website_domain,
+           count(distinct ru.user_id) as domain_users,
+           percentile_cont(0.5) within group (order by u.reputation) as median_rep_domain
+    from recent_users ru
+    join users u on u.id = ru.user_id
+    where ru.website_domain is not null
+    group by ru.website_domain
+),
+answerer_speeds as (
+    select a.question_id,
+           percentile_cont(0.5) within group (order by extract(epoch from (a.creationdate - q.creationdate))) as median_answer_seconds,
+           min(extract(epoch from (a.creationdate - q.creationdate))) as fastest_answer_seconds
+    from answer_posts a
+    join posts q on q.id = a.question_id
+    group by a.question_id
+),
+question_windows as (
+    select q.id as question_id,
+           q.owneruserid,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           row_number() over (partition by q.owneruserid order by q.creationdate desc, q.id desc) as rn_recent,
+           lag(q.score) over (partition by q.owneruserid order by q.creationdate) as prev_q_score,
+           avg(q.score) over (partition by q.owneruserid rows between 4 preceding and current row) as moving_avg_last5_score
+    from question_posts q
+),
+qualified_questions as (
+    select qw.question_id
+    from question_windows qw
+    where qw.rn_recent <= 50
+),
+heavy_questions as (
+    select pe.question_id,
+           pe.asker_id,
+           pe.q_created,
+           pe.viewcount,
+           pe.q_score,
+           pe.answercount,
+           pe.favoritecount,
+           pe.q_commentcount,
+           pe.is_closed,
+           ts.tag_count,
+           ts.tag_list,
+           ts.total_tag_popularity,
+           va.upvotes,
+           va.downvotes,
+           va.favorites_legacy,
+           va.bounty_total,
+           cr.first_close_date,
+           cr.last_close_date,
+           cr.first_close_reason_id,
+           cr.last_close_reason_id,
+           coalesce(dp.domain_users, 0) as domain_users,
+           dp.median_rep_domain,
+           aspeed.median_answer_seconds,
+           aspeed.fastest_answer_seconds
+    from post_engagement pe
+    left join tag_stats ts on ts.question_id = pe.question_id
+    left join votes_agg va on va.postid = pe.question_id
+    left join close_reasons cr on cr.postid = pe.question_id
+    left join posts q on q.id = pe.question_id
+    left join users u on u.id = pe.asker_id
+    left join recent_users ru on ru.user_id = pe.asker_id
+    left join domain_peers dp on dp.website_domain = ru.website_domain
+    left join answerer_speeds aspeed on aspeed.question_id = pe.question_id
+    where pe.viewcount is not null
+)
+select
+    hq.question_id,
+    coalesce(p.title, '[no title]') as title,
+    p.creationdate as created,
+    u.displayname as asker,
+    u.reputation,
+    ua.q_score_sum,
+    ua.a_score_sum,
+    ua.c_score_sum,
+    ab.total_badges,
+    ab.gold_badges,
+    ab.silver_badges,
+    ab.bronze_badges,
+    ar.activity_rank_desc,
+    hq.viewcount,
+    hq.q_score,
+    hq.answercount,
+    hq.favoritecount,
+    hq.q_commentcount,
+    hq.is_closed,
+    hq.first_close_date,
+    hq.last_close_date,
+    hq.first_close_reason_id,
+    hq.last_close_reason_id,
+    hq.tag_count,
+    hq.tag_list,
+    hq.total_tag_popularity,
+    hq.upvotes,
+    hq.downvotes,
+    hq.favorites_legacy,
+    hq.bounty_total,
+    hq.domain_users,
+    hq.median_rep_domain,
+    hq.median_answer_seconds,
+    hq.fastest_answer_seconds,
+    qw.prev_q_score,
+    qw.moving_avg_last5_score,
+    coalesce(ld.dup_links,0) as duplicate_links,
+    coalesce(ld.related_links,0) as related_links,
+    case
+        when hq.tag_count = 0 or hq.tag_list is null then 'untagged'
+        when position('sql' in lower(hq.tag_list)) > 0 then 'sql'
+        when position('python' in lower(hq.tag_list)) > 0 then 'python'
+        else 'other'
+    end as tag_bucket,
+    case
+        when hq.viewcount >= 100000 then 'ultra'
+        when hq.viewcount >= 10000 then 'high'
+        when hq.viewcount >= 1000 then 'medium'
+        else 'low'
+    end as view_tier,
+    case when p.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer,
+    coalesce(
+        (select max(a2.score) from answer_posts a2 where a2.question_id = hq.question_id),
+        0
+    ) as best_answer_score_correlated,
+    coalesce(
+        (select count(*) from comments c2 where c2.postid = hq.question_id and c2.creationdate >= hq.q_created - interval '7 day'),
+        0
+    ) as comments_near_creation
+from heavy_questions hq
+join posts p on p.id = hq.question_id
+left join users u on u.id = p.owneruserid
+left join user_activity ua on ua.user_id = u.id
+left join user_badges ab on ab.userid = u.id
+left join activity_rank ar on ar.user_id = u.id
+left join question_windows qw on qw.question_id = hq.question_id
+left join linked_duplicates ld on ld.dup_post_id = hq.question_id
+where exists (select 1 from qualified_questions qq where qq.question_id = hq.question_id)
+  and coalesce(hq.q_score, 0) + coalesce(hq.upvotes, 0) - coalesce(hq.downvotes, 0) >= 0
+  and (
+        (hq.is_closed = 0 and (hq.viewcount >= 1000 or hq.answercount >= 3)) or
+        (hq.is_closed = 1 and hq.favoritecount >= 5)
+      )
+  and (
+        u.location is null
+        or u.location ilike '%USA%'
+        or u.location ilike '%India%'
+        or u.location ilike '%UK%'
+      )
+  and (
+        p.creationdate >= now() - interval '5 year'
+        or (hq.bounty_total > 0 and hq.viewcount > 500)
+      )
+  and not exists (
+        select 1
+        from posthistory phx
+        where phx.postid = hq.question_id
+          and phx.posthistorytypeid = 14
+      )
+order by
+    hq.viewcount desc nulls last,
+    hq.q_score desc nulls last,
+    hq.answercount desc nulls last,
+    hq.favoritecount desc nulls last
+limit 500;

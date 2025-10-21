@@ -1,0 +1,140 @@
+-- {"query": "16032.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 77055, "output_tokens": 71967} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) AS YearsActive,
+        CASE 
+            WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 
+            THEN SUBSTRING(u.Location, 1, POSITION(',' IN u.Location || ',') - 1)
+            ELSE 'Unknown'
+        END AS PrimaryLocation,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) AS RepPercentile
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(v.CreationDate) AS LastVoteDate,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostScoreRank,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'Unanswered'
+        END AS PostStatus
+    FROM Posts p
+    LEFT OUTER JOIN Votes v ON p.Id = v.PostId
+    LEFT OUTER JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate >= '2020-01-01'
+        AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, p.ClosedDate, p.AcceptedAnswerId, p.CreationDate
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0) AS AcceptanceRate,
+        STRING_AGG(DISTINCT COALESCE(u.DisplayName, 'Anonymous'), ', ' ORDER BY COALESCE(u.DisplayName, 'Anonymous')) 
+            FILTER (WHERE u.Reputation > 10000) AS TopContributors
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT OUTER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count > 100
+        AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 50
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeTypes,
+        MAX(b.Date) AS MostRecentBadgeDate,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    WHERE b.Date >= '2018-01-01'
+    GROUP BY b.UserId
+)
+SELECT 
+    uem.DisplayName,
+    uem.PrimaryLocation,
+    uem.Reputation,
+    uem.YearlyRepRank,
+    ROUND(uem.RepPercentile::numeric, 4) AS ReputationPercentile,
+    COUNT(DISTINCT pp.PostId) AS TotalPosts,
+    COALESCE(SUM(pp.UpvoteCount), 0) AS TotalUpvotes,
+    COALESCE(SUM(pp.DownvoteCount), 0) AS TotalDownvotes,
+    ROUND(AVG(pp.ViewCount)::numeric, 2) AS AvgViews,
+    ROUND(AVG(EXTRACT(EPOCH FROM (pp.PrevPostDate - pp.LastVoteDate)) / 86400)::numeric, 2) AS AvgDaysBetweenActivity,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.BronzeBadges,
+    COALESCE(ba.UniqueBadgeTypes, 0) AS UniqueBadges,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+     WHERE pl.PostId IN (SELECT PostId FROM PostPerformance WHERE OwnerUserId = uem.Id)
+       AND pl.LinkTypeId = 3) AS DuplicateLinksReceived,
+    (SELECT STRING_AGG(DISTINCT tp.TagName, '; ' ORDER BY tp.TagName)
+     FROM TagPopularity tp
+     INNER JOIN Posts p3 ON p3.Tags LIKE '%<' || tp.TagName || '>%'
+     WHERE p3.OwnerUserId = uem.Id
+       AND tp.AvgScore > 5
+     LIMIT 5) AS TopPerformingTags,
+    CASE 
+        WHEN uem.Reputation > 50000 AND ba.GoldBadges >= 5 THEN 'Elite'
+        WHEN uem.Reputation > 10000 AND ba.GoldBadges >= 1 THEN 'Expert'
+        WHEN uem.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    COALESCE(
+        (SELECT AVG(CHAR_LENGTH(ph.Text))
+         FROM PostHistory ph
+         WHERE ph.PostId IN (SELECT PostId FROM PostPerformance WHERE OwnerUserId = uem.Id)
+           AND ph.PostHistoryTypeId IN (2, 5)
+           AND ph.Text IS NOT NULL), 
+        0
+    ) AS AvgPostEditLength,
+    EXISTS(
+        SELECT 1 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = uem.Id 
+          AND p4.PostTypeId = 1 
+          AND p4.Score > 100
+    ) AS HasHighScoringQuestion
+FROM UserEngagementMetrics uem
+INNER JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId
+LEFT OUTER JOIN BadgeAnalysis ba ON uem.Id = ba.UserId
+WHERE uem.YearsActive >= 1
+    AND pp.UserPostScoreRank <= 20
+    AND (pp.PostStatus != 'Closed' OR pp.Score > 0)
+GROUP BY uem.Id, uem.DisplayName, uem.PrimaryLocation, uem.Reputation, 
+         uem.YearlyRepRank, uem.RepPercentile, ba.GoldBadges, ba.SilverBadges, 
+         ba.BronzeBadges, ba.UniqueBadgeTypes
+HAVING COUNT(DISTINCT pp.PostId) >= 5
+    AND SUM(pp.UpvoteCount) > SUM(pp.DownvoteCount) * 3
+ORDER BY uem.Reputation DESC, TotalUpvotes DESC
+LIMIT 100;

@@ -1,0 +1,185 @@
+-- {"query": "34071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1872} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS AncestorTags,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        r.AncestorTags || t2.TagName,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON array_position(r.AncestorTags, t2.TagName) IS NULL
+    WHERE r.Level < 3 AND t2.IsModeratorOnly = 0 AND t2.IsRequired = 0
+),
+UserBadgeAggregate AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END),0) AS QuestionViews,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END),0) AS AnswerScore,
+        MAX(u.Reputation) AS MaxReputation,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopActiveQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        u.DisplayName AS OwnerName,
+        array_to_string(STRING_TO_ARRAY(substring(p.Tags from 2 for length(p.Tags)-2), '><'), ',') AS ParsedTags
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    ORDER BY p.ViewCount DESC
+    LIMIT 50
+),
+QuestionAnswerDetails AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.CreationDate AS QuestionCreationDate,
+        q.ViewCount AS QuestionViews,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        au.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.QuestionId ORDER BY a.Score DESC) AS AnswerRank
+    FROM TopActiveQuestions q
+    LEFT JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+    LEFT JOIN Users au ON au.Id = a.OwnerUserId
+),
+AnswerWithVotes AS (
+    SELECT
+        qad.*,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END), 0) AS BountySum
+    FROM QuestionAnswerDetails qad
+    LEFT JOIN Votes v ON v.PostId = qad.AnswerId
+    GROUP BY qad.QuestionId, qad.Title, qad.OwnerUserId, qad.OwnerName, qad.QuestionCreationDate, qad.QuestionViews, qad.QuestionScore, qad.AnswerCount, qad.AnswerId, qad.AnswerCreationDate, qad.AnswerScore, qad.AnswerOwnerUserId, qad.AnswerOwnerName, qad.AnswerRank
+),
+TopAnswersPerQuestion AS (
+    SELECT *
+    FROM AnswerWithVotes
+    WHERE AnswerRank = 1
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersProvided,
+        SUM(p.Score) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+JoinedPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.PostTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName AS EditorName,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- title, body, tags edits
+),
+PostEditFrequency AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - lag(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))/3600) AS AvgHoursBetweenEdits
+    FROM JoinedPostHistory ph
+    GROUP BY ph.PostId
+),
+UserTagParticipation AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostsInTag
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><') AS tagname (TagName)
+    JOIN Tags t ON t.TagName = tagname.TagName
+    GROUP BY u.Id, u.DisplayName, t.TagName
+),
+ComplexAggregate AS (
+    SELECT
+        utp.UserId,
+        utp.DisplayName,
+        COUNT(DISTINCT q.QuestionId) AS ParticipatedQuestions,
+        COUNT(DISTINCT a.AnswerId) AS ProvidedAnswers,
+        AVG(a.AnswerScore) AS AvgAnswerScore,
+        SUM(a.UpVotesCount) AS TotalAnswerUpVotes,
+        SUM(COALESCE(pb.ViewCount,0)) AS TotalQuestionViews,
+        MAX(pb.Score) AS MaxQuestionScore,
+        MAX(u.Reputation) AS UserReputation
+    FROM UserTagParticipation utp
+    LEFT JOIN TopActiveQuestions pb ON pb.OwnerUserId = utp.UserId
+    LEFT JOIN AnswerWithVotes a ON a.AnswerOwnerUserId = utp.UserId
+    LEFT JOIN Users u ON u.Id = utp.UserId
+    GROUP BY utp.UserId, utp.DisplayName
+),
+FinalOutput AS (
+    SELECT
+        c.UserId,
+        c.DisplayName,
+        c.ParticipatedQuestions,
+        c.ProvidedAnswers,
+        ROUND(c.AvgAnswerScore,2) AS AverageAnswerScore,
+        c.TotalAnswerUpVotes,
+        c.TotalQuestionViews,
+        c.MaxQuestionScore,
+        c.UserReputation,
+        ua.QuestionsAsked,
+        ua.AnswersProvided,
+        ua.CommentsMade,
+        ua.LastActivity,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM ComplexAggregate c
+    JOIN UserActivitySummary ua ON ua.Id = c.UserId
+    LEFT JOIN Badges b ON b.UserId = c.UserId
+    GROUP BY c.UserId, c.DisplayName, c.ParticipatedQuestions, c.ProvidedAnswers, c.AvgAnswerScore, c.TotalAnswerUpVotes, c.TotalQuestionViews, c.MaxQuestionScore, c.UserReputation, ua.QuestionsAsked, ua.AnswersProvided, ua.CommentsMade, ua.LastActivity
+    ORDER BY c.UserReputation DESC, c.TotalAnswerUpVotes DESC
+    LIMIT 20
+)
+SELECT
+    *
+FROM FinalOutput;

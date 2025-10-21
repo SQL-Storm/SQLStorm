@@ -1,0 +1,132 @@
+WITH
+CTE_TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+CTE_QuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id) AS AnswerCountSub,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts q
+    LEFT JOIN Votes v
+        ON v.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.CreationDate
+),
+
+CTE_HotTags AS (
+    SELECT
+        UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS QCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY 1
+    HAVING COUNT(*) > 100
+),
+
+CTE_Summary AS (
+    SELECT
+        u.Id           AS UserId,
+        u.DisplayName,
+        COALESCE(qs.QuestionId, -1)     AS LatestQuestionId,
+        COALESCE(qs.AnswerCountSub, 0)  AS AnswerCountSub,
+        t.GoldBadges,
+        t.SilverBadges,
+        t.BronzeBadges
+    FROM Users u
+    LEFT JOIN CTE_TopUsers t
+        ON t.Id = u.Id
+    LEFT JOIN CTE_QuestionStats qs
+        ON qs.OwnerUserId = u.Id
+)
+
+SELECT
+    s.UserId,
+    s.DisplayName,
+    s.LatestQuestionId,
+    s.AnswerCountSub,
+    s.GoldBadges,
+    s.SilverBadges,
+    s.BronzeBadges,
+    CASE
+        WHEN s.AnswerCountSub > (SELECT AVG(AnswerCountSub) FROM CTE_Summary)
+            THEN 'AboveAverage'
+        ELSE 'BelowOrEqualAvg'
+    END AS AnswerPerformance,
+    h.Tag AS PopularTag
+FROM CTE_Summary s
+LEFT JOIN LATERAL (
+    SELECT ht.Tag
+    FROM CTE_HotTags ht
+    WHERE ht.Tag IN (
+        SELECT UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+        FROM Posts p
+        WHERE p.OwnerUserId = s.UserId
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) h ON TRUE
+WHERE (s.GoldBadges + s.SilverBadges + s.BronzeBadges) > 0
+
+UNION ALL
+
+SELECT
+    s.UserId,
+    s.DisplayName,
+    s.LatestQuestionId,
+    s.AnswerCountSub,
+    s.GoldBadges,
+    s.SilverBadges,
+    s.BronzeBadges,
+    CASE WHEN s.AnswerCountSub > 5 THEN 'HighActivity' ELSE 'LowActivity' END,
+    NULL
+FROM CTE_Summary s
+WHERE s.GoldBadges > 5
+
+EXCEPT
+
+SELECT
+    s.UserId,
+    s.DisplayName,
+    s.LatestQuestionId,
+    s.AnswerCountSub,
+    s.GoldBadges,
+    s.SilverBadges,
+    s.BronzeBadges,
+    'Excluded',
+    NULL
+FROM CTE_Summary s
+WHERE s.BronzeBadges = 0
+
+INTERSECT
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    CAST(NULL AS INTEGER),
+    0,
+    0,
+    0,
+    0,
+    'MetaSeed',
+    NULL
+FROM Users u
+WHERE u.Location ILIKE '%USA%'
+
+ORDER BY 1 DESC, 5 DESC NULLS LAST;

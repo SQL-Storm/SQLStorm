@@ -1,0 +1,254 @@
+-- {"query": "29072.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2359} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), MAX(p.CreationDate))
+            ELSE NULL 
+        END as DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT c.Id) > 0 THEN DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), MAX(c.CreationDate))
+            ELSE NULL 
+        END as DaysSinceLastComment,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(COALESCE(p.Score, 0)) as TotalPostScore,
+        AVG(COALESCE(p.Score, 0)) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, ',') as AllTagsUsed
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsersByReputation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        TotalPostScore,
+        AvgPostScore,
+        AllTagsUsed,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) as RepRank,
+        RANK() OVER (ORDER BY PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as BadgeRank
+    FROM UserActivityStats
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.ViewCount, 0) as ViewCount,
+        COALESCE(p.Score, 0) as Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            WHEN p.ViewCount > 0 THEN 'Low View'
+            ELSE 'No Views'
+        END as ViewCategory,
+        CASE 
+            WHEN p.Score > 10 THEN 'High Score'
+            WHEN p.Score > 0 THEN 'Positive Score'
+            WHEN p.Score < 0 THEN 'Negative Score'
+            ELSE 'Zero Score'
+        END as ScoreCategory,
+        STRING_TO_ARRAY(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><') as TagArray,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Posts p2 
+            WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2
+        ), 0) as DirectAnswerCount,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 4, 5, 6)
+        ), 0) as EditCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexTagAnalysis AS (
+    SELECT 
+       pta.PostId,
+        pta.Title,
+        pta.Tags,
+        pta.AnswerCount,
+        pta.ViewCount,
+        pta.Score,
+        pta.OwnerUserId,
+        pta.CreationDate,
+        pta.PostTypeCategory,
+        pta.ViewCategory,
+        pta.ScoreCategory,
+        pta.TagArray,
+        pta.DirectAnswerCount,
+        pta.EditCount,
+        COALESCE(ROW_NUMBER() OVER (PARTITION BY pta.OwnerUserId ORDER BY pta.CreationDate), 0) as UserPostSequence,
+        COALESCE(
+            AVG(pta.Score) OVER (PARTITION BY pta.OwnerUserId), 
+            0
+        ) as OwnerAvgScore,
+        COALESCE(
+            COUNT(*) OVER (PARTITION BY pta.OwnerUserId), 
+            0
+        ) as OwnerPostCount,
+        CASE 
+            WHEN pta.Score > (SELECT AVG(Score) + STDDEV(Score) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Above Average'
+            WHEN pta.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Average or Above'
+            ELSE 'Below Average'
+        END as ScorePerformance,
+        CASE 
+            WHEN pta.ViewCount > (SELECT AVG(ViewCount) + STDDEV(ViewCount) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Above Average Views'
+            WHEN pta.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Average or Above Views'
+            ELSE 'Below Average Views'
+        END as ViewPerformance
+    FROM PostTagAnalysis pta
+),
+TagFrequencyStats AS (
+    SELECT 
+        tag,
+        COUNT(*) as Frequency,
+        AVG(p.Score) as AvgScore,
+        AVG(p.ViewCount) as AvgViews,
+        COUNT(DISTINCT p.OwnerUserId) as UniquePosters,
+        STRING_AGG(DISTINCT u.DisplayName, ' | ') as TagUsers
+    FROM ComplexTagAnalysis p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(p.TagArray) as tag
+    ) AS tags
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE LENGTH(tag) > 0
+    GROUP BY tag
+    HAVING COUNT(*) > 1
+),
+FinalAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        COALESCE(tu.RepRank, -1) as RepRank,
+        COALESCE(tu.PostRank, -1) as PostRank,
+        COALESCE(tu.BadgeRank, -1) as BadgeRank,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        CASE 
+            WHEN tu.RepRank <= 10 THEN 'Top 10 Reputation'
+            WHEN tu.RepRank <= 50 THEN 'Top 50 Reputation'
+            WHEN tu.RepRank <= 100 THEN 'Top 100 Reputation'
+            ELSE 'Below Top 100'
+        END as RepRankCategory,
+        CASE 
+            WHEN tu.PostRank <= 10 THEN 'Top 10 Poster'
+            WHEN tu.PostRank <= 50 THEN 'Top 50 Poster'
+            WHEN tu.PostRank <= 100 THEN 'Top 100 Poster'
+            ELSE 'Below Top 100 Poster'
+        END as PostRankCategory,
+        CASE 
+            WHEN tu.BadgeRank <= 10 THEN 'Top 10 Badge Holder'
+            WHEN tu.BadgeRank <= 50 THEN 'Top 50 Badge Holder'
+            WHEN tu.BadgeRank <= 100 THEN 'Top 100 Badge Holder'
+            ELSE 'Below Top 100 Badge Holder'
+        END as BadgeRankCategory,
+        STRING_AGG(
+            CASE 
+                WHEN cta.ScorePerformance = 'Above Average' THEN CONCAT(cta.Title, ' (High Score)')
+                WHEN cta.ViewPerformance = 'Above Average Views' THEN CONCAT(cta.Title, ' (High Views)')
+                ELSE cta.Title
+            END, 
+            ' | ' 
+            ORDER BY 
+                CASE 
+                    WHEN cta.ScorePerformance = 'Above Average' THEN 1
+                    WHEN cta.ViewPerformance = 'Above Average Views' THEN 2
+                    ELSE 3
+                END
+        ) as NotablePosts,
+        COALESCE((
+            SELECT STRING_AGG(tag, ', ')
+            FROM TagFrequencyStats tfs
+            WHERE tfs.Frequency >= 3
+            ORDER BY tfs.Frequency DESC
+            LIMIT 5
+        ), 'No popular tags') as PopularTags,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.ParentId IN (SELECT Id FROM Posts WHERE OwnerUserId = tu.UserId)
+        ), 0) as AnsweredByUser,
+        CASE 
+            WHEN tu.PostCount > 0 THEN COALESCE(tu.TotalPostScore, 0) / tu.PostCount
+            ELSE 0 
+        END as AvgUserPostScore
+    FROM TopUsersByReputation tu
+    LEFT JOIN ComplexTagAnalysis cta ON tu.UserId = cta.OwnerUserId
+    GROUP BY 
+        tu.UserId, tu.DisplayName, tu.Reputation, tu.PostCount, tu.CommentCount, 
+        tu.BadgeCount, tu.RepRank, tu.PostRank, tu.BadgeRank, tu.LastPostDate, 
+        tu.LastCommentDate, tu.TotalPostScore
+)
+SELECT 
+    COUNT(*) as TotalUsers,
+    COUNT(CASE WHEN RepRankCategory = 'Top 10 Reputation' THEN 1 END) as Top10Reputation,
+    COUNT(CASE WHEN PostRankCategory = 'Top 10 Poster' THEN 1 END) as Top10Posters,
+    COUNT(CASE WHEN BadgeRankCategory = 'Top 10 Badge Holder' THEN 1 END) as Top10BadgeHolders,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPosts,
+    AVG(CommentCount) as AvgComments,
+    AVG(BadgeCount) as AvgBadges,
+    STRING_AGG(
+        CASE 
+            WHEN RepRank <= 5 THEN CONCAT(DisplayName, ' (Rep: ', Reputation, ')')
+            ELSE NULL
+        END, 
+        ' | ' 
+        ORDER BY RepRank
+    ) as Top5Users,
+    STRING_AGG(
+        CASE 
+            WHEN PostRank <= 5 THEN CONCAT(DisplayName, ' (Posts: ', PostCount, ')')
+            ELSE NULL
+        END, 
+        ' | ' 
+        ORDER BY PostRank
+    ) as Top5Posters,
+    STRING_AGG(
+        CASE 
+            WHEN BadgeRank <= 5 THEN CONCAT(DisplayName, ' (Badges: ', BadgeCount, ')')
+            ELSE NULL
+        END, 
+        ' | ' 
+        ORDER BY BadgeRank
+    ) as Top5BadgeHolders
+FROM FinalAnalysis
+WHERE RepRank <= 100 AND PostRank <= 100 AND BadgeRank <= 100;

@@ -1,0 +1,137 @@
+-- {"query": "20020.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1288} 
+
+WITH UserContributionStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.FavoriteCount) AS MaxFavoriteCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(*) > 50
+),
+AnswerQualityTimeline AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ParentId,
+        p.Body,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS AnswerSequence,
+        AVG(p.Score) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousAnswerScore,
+        (p.Score - AVG(p.Score) OVER(PARTITION BY p.OwnerUserId)) / NULLIF(STDDEV(p.Score) OVER(PARTITION BY p.OwnerUserId), 0) AS ZScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.OwnerUserId IN (SELECT OwnerUserId FROM UserContributionStats)
+),
+UserPrimaryTag AS (
+    SELECT DISTINCT ON (UserId)
+        UserId,
+        Tag,
+        TagAnswerCount
+    FROM (
+        SELECT
+            a.OwnerUserId AS UserId,
+            UNNEST(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS Tag,
+            COUNT(*) AS TagAnswerCount
+        FROM
+            Posts a
+        JOIN
+            Posts q ON a.ParentId = q.Id
+        WHERE
+            a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL AND q.Tags IS NOT NULL
+        GROUP BY
+            a.OwnerUserId, Tag
+    ) AS UserTagCounts
+    ORDER BY
+        UserId, TagAnswerCount DESC
+),
+ProblemSolvers AS (
+    SELECT
+        'Solver' AS UserRole,
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ucs.AnswerCount,
+        upt.Tag AS PrimaryTag,
+        aqt.MovingAvgScore,
+        aqt.ZScore,
+        ph.Comment AS CloseReason,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL THEN 'Has Website'
+            ELSE 'No Website'
+        END AS ProfileStatus,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear
+    FROM
+        Users u
+    JOIN
+        UserContributionStats ucs ON u.Id = ucs.OwnerUserId
+    JOIN
+        AnswerQualityTimeline aqt ON u.Id = aqt.OwnerUserId
+    LEFT JOIN
+        UserPrimaryTag upt ON u.Id = upt.UserId
+    LEFT JOIN
+        PostHistory ph ON aqt.ParentId = ph.PostId AND ph.PostHistoryTypeId = 10 -- Post Closed
+    WHERE
+        u.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000)
+        AND ucs.AnswerCount > ucs.QuestionCount
+        AND aqt.AnswerSequence = (SELECT MAX(AnswerSequence) FROM AnswerQualityTimeline aqt2 WHERE aqt2.OwnerUserId = u.Id) -- only latest answer
+        AND EXISTS (
+            SELECT 1
+            FROM Badges b
+            WHERE b.UserId = u.Id AND b.Class = 1 -- Has at least one Gold badge
+        )
+)
+-- Main query combining different user profiles
+SELECT
+    ps.UserRole,
+    ps.DisplayName,
+    ps.Reputation,
+    ps.PrimaryTag,
+    ps.MovingAvgScore,
+    ps.ZScore,
+    ps.CloseReason,
+    ps.ProfileStatus,
+    ps.JoinYear
+FROM
+    ProblemSolvers ps
+WHERE
+    ps.MovingAvgScore > 10 OR ps.ZScore > 1.5
+
+UNION ALL
+
+SELECT
+    'Curator' AS UserRole,
+    u.DisplayName,
+    u.Reputation,
+    vt.Name AS MostCommonVote,
+    AVG(v.BountyAmount) AS AvgBounty,
+    NULL AS ZScore,
+    NULL AS CloseReason,
+    COALESCE(u.Location, 'Unknown') AS ProfileStatus,
+    EXTRACT(YEAR FROM u.CreationDate) AS JoinYear
+FROM
+    Users u
+JOIN
+    Votes v ON u.Id = v.UserId
+JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+WHERE
+    u.DownVotes > u.UpVotes
+    AND u.Id IN (
+        SELECT DISTINCT UserId
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (10, 11, 12, 13) -- Close, Reopen, Delete, Undelete
+    )
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, vt.Name
+HAVING
+    COUNT(v.Id) > 200 AND COUNT(DISTINCT v.VoteTypeId) > 3
+ORDER BY
+    Reputation DESC, MovingAvgScore DESC NULLS LAST
+LIMIT 500;

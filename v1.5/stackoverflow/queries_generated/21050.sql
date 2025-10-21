@@ -1,0 +1,150 @@
+-- {"query": "21050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1431} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS PositivePosts,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativePosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2) AND p.CreationDate > u.CreationDate - INTERVAL '1 year'
+    WHERE u.Reputation > 100 
+        AND (u.Location IS NOT NULL AND u.Location != '') 
+        AND u.LastAccessDate > CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(p.Id) >= 5 
+       OR SUM(p.Score) > 100
+),
+HighActivityPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        COALESCE(p.Tags, '') AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC) AS UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND (p.ViewCount > 1000 OR p.Score > 50)
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '1 month')
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TotalPosts,
+        AVG(COALESCE(hp.Score, 0)) AS AvgScore,
+        COUNT(DISTINCT hp.OwnerUserId) AS ActiveUsersWithTag
+    FROM Tags t
+    LEFT JOIN (
+        SELECT 
+            STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS tag_array,
+            p.OwnerUserId,
+            p.Score
+        FROM Posts p 
+        WHERE p.Tags IS NOT NULL 
+            AND LENGTH(p.Tags) > 2 
+            AND p.PostTypeId = 1
+    ) parsed ON true
+    LEFT JOIN HighActivityPosts hp ON hp.OwnerUserId = parsed.OwnerUserId 
+        AND hp.PostId IN (
+            SELECT DISTINCT unnest(parsed.tag_array)::int AS tag_id 
+            FROM Posts p2 
+            WHERE p2.Tags IS NOT NULL 
+                AND LENGTH(p2.Tags) > 2
+        )
+    WHERE t.Count > 10
+    GROUP BY t.TagName, t.Count
+)
+SELECT 
+    au.UserId,
+    au.Reputation,
+    au.PositivePosts,
+    au.NegativePosts,
+    hap.PostId,
+    hap.Title,
+    hap.Score AS PostScore,
+    hap.ViewCount,
+    hap.UserPostRank,
+    CASE 
+        WHEN hap.UserPostRank = 1 AND hap.PrevPostScore IS NOT NULL 
+        THEN hap.Score - hap.PrevPostScore 
+        ELSE 0 
+    END AS ScoreImprovement,
+    ts.TagName,
+    ts.AvgScore,
+    LENGTH(COALESCE(hap.Tags, '')) AS TagLength,
+    CASE 
+        WHEN hap.PostTypeId = 1 AND hap.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) 
+        THEN 'High Answers' 
+        WHEN hap.PostTypeId = 2 AND hap.ParentId IN (SELECT Id FROM Posts WHERE Score > 10) 
+        THEN 'High Parent Score' 
+        ELSE 'Standard' 
+    END AS PostCategory,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT c.Text, ' | ' ORDER BY c.CreationDate DESC LIMIT 3)
+         FROM Comments c 
+         WHERE c.PostId = hap.PostId 
+            AND c.Score > 0 
+            AND c.Text ILIKE ANY (ARRAY['%good%', '%thanks%', '%useful%'])
+        ), 
+        'No positive comments'
+    ) AS TopComments,
+    RANK() OVER (ORDER BY hap.ViewCount DESC, au.Reputation DESC) AS OverallRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY hap.Score) OVER (PARTITION BY au.UserId) AS MedianUserScore,
+    CASE 
+        WHEN au.NegativePosts > 0 THEN 
+            ROUND(100.0 * au.PositivePosts / (au.PositivePosts + au.NegativePosts), 2) 
+        ELSE 100.00 
+    END AS PositiveRatio
+FROM ActiveUsers au
+INNER JOIN HighActivityPosts hap ON hap.OwnerUserId = au.UserId 
+    AND hap.UserPostRank <= 3 
+    AND (hap.Score > 0 OR hap.ViewCount > 5000)
+LEFT OUTER JOIN TagStats ts ON ts.TagName = ANY(
+    STRING_TO_ARRAY(
+        SUBSTRING(hap.Tags FROM 2 FOR LENGTH(hap.Tags) - 2), 
+        '><'
+    )
+) 
+    AND ts.ActiveUsersWithTag >= 5
+WHERE (ts.AvgScore > 10 OR ts.TagName IS NULL)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.PostId = hap.PostId 
+            AND ph.PostHistoryTypeId = 12  -- Deleted
+            AND ph.CreationDate > hap.CreationDate
+    )
+    AND (hap.CreationDate BETWEEN au.UserCreationDate AND au.UserCreationDate + INTERVAL '2 years')
+UNION ALL
+SELECT 
+    au.UserId,
+    au.Reputation,
+    0 AS PositivePosts,
+    au.NegativePosts,
+    NULL AS PostId,
+    'Summary User' AS Title,
+    NULL AS PostScore,
+    SUM(hap.ViewCount) OVER (PARTITION BY au.UserId) AS TotalViews,
+    NULL AS UserPostRank,
+    NULL AS ScoreImprovement,
+    NULL AS TagName,
+    AVG(ts.AvgScore) OVER () AS GlobalAvgTagScore,
+    0 AS TagLength,
+    'Summary' AS PostCategory,
+    NULL AS TopComments,
+    NULL AS OverallRank,
+    NULL AS MedianUserScore,
+    au.PositiveRatio
+FROM ActiveUsers au
+INNER JOIN HighActivityPosts hap ON hap.OwnerUserId = au.UserId
+LEFT JOIN TagStats ts ON true
+GROUP BY au.UserId, au.Reputation, au.PositivePosts, au.NegativePosts, au.PositiveRatio
+HAVING COUNT(hap.PostId) > 1
+ORDER BY OverallRank, Reputation DESC, ViewCount DESC
+LIMIT 1000;

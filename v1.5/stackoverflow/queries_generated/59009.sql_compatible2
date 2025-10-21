@@ -1,0 +1,152 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        0 AS Depth,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+    
+    UNION ALL
+    
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.Depth + 1,
+        ph.Path || ',' || CAST(p.Id AS VARCHAR(1000))
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.Id
+    WHERE ph.Depth < 5
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS PostOwners
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+ComplexQueryResults AS (
+    SELECT 
+        ph.Id,
+        ph.ParentId,
+        ph.Score,
+        ph.ViewCount,
+        ph.OwnerUserId,
+        ph.Depth,
+        ph.Path,
+        uas.DisplayName AS OwnerDisplayName,
+        uas.Reputation AS OwnerReputation,
+        uas.TotalPosts AS OwnerTotalPosts,
+        uas.AvgPostScore AS OwnerAvgPostScore,
+        uas.LastPostDate AS OwnerLastPostDate,
+        tp.TagName,
+        tp.TagCount,
+        tp.AvgScore AS TagAvgScore,
+        tp.TotalViews AS TagTotalViews,
+        tp.PostCount AS TagPostCount,
+        tp.PostOwners,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.ContentLicense,
+        pv.VoteType,
+        pv.VoteCount
+    FROM PostHierarchy ph
+    LEFT JOIN UserActivityStats uas ON ph.OwnerUserId = uas.UserId
+    LEFT JOIN (
+        SELECT 
+            p.Id AS PostId,
+            t.TagName,
+            t.Count AS TagCount,
+            AVG(p.Score) AS AvgScore,
+            SUM(p.ViewCount) AS TotalViews,
+            COUNT(DISTINCT p.Id) AS PostCount,
+            STRING_AGG(DISTINCT u.DisplayName, ', ') AS PostOwners
+        FROM Posts p
+        INNER JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE p.PostTypeId = 1
+        GROUP BY p.Id, t.TagName, t.Count
+    ) tp ON ph.Id = tp.PostId
+    LEFT JOIN Posts p ON ph.Id = p.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            vt.Name AS VoteType,
+            COUNT(v.Id) AS VoteCount
+        FROM Votes v
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE vt.Id IN (1, 2, 3, 5)
+        GROUP BY v.PostId, vt.Name
+    ) pv ON ph.Id = pv.PostId
+    WHERE ph.Depth <= 3
+    AND uas.Reputation > 1000
+    AND (tp.TagCount > 50 OR tp.TagName IS NULL)
+)
+SELECT 
+    COUNT(*) AS TotalResults,
+    COUNT(DISTINCT Id) AS UniquePosts,
+    COUNT(DISTINCT OwnerUserId) AS UniqueOwners,
+    COUNT(DISTINCT TagName) AS UniqueTags,
+    AVG(Score) AS AvgScore,
+    AVG(ViewCount) AS AvgViews,
+    AVG(OwnerReputation) AS AvgOwnerReputation,
+    MAX(OwnerTotalPosts) AS MaxOwnerPosts,
+    MAX(OwnerAvgPostScore) AS MaxOwnerAvgScore,
+    COUNT(DISTINCT CASE WHEN pv.VoteType = 'UpMod' THEN tp.PostId END) AS UpVoteCount,
+    COUNT(DISTINCT CASE WHEN pv.VoteType = 'DownMod' THEN tp.PostId END) AS DownVoteCount,
+    COUNT(DISTINCT CASE WHEN pv.VoteType = 'Favorite' THEN tp.PostId END) AS FavoriteCount,
+    STRING_AGG(DISTINCT OwnerDisplayName, ', ') AS AllOwners,
+    STRING_AGG(DISTINCT TagName, '; ') AS AllTags
+FROM ComplexQueryResults
+GROUP BY 
+    CASE WHEN COUNT(*) > 1000 THEN 1 ELSE 0 END
+HAVING COUNT(*) >= 100
+ORDER BY MAX(OwnerReputation) DESC
+LIMIT 1000;

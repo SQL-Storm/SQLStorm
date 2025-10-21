@@ -1,0 +1,92 @@
+-- {"query": "23037.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 986} 
+WITH TopTags AS (
+    SELECT 
+        t.TagName, 
+        t.Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+UserBadgeSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+    HAVING COUNT(b.Id) > 5 OR MAX(b.Date) > '2020-01-01'
+),
+PostMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(p.FavoriteCount, 0) + COALESCE(p.AnswerCount, 0) AS EngagementScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        STRING_AGG(SPLIT_PART(tag, '><', 1), ', ') AS TagList  -- Assuming tags are like <tag1><tag2>
+    FROM Posts p
+    CROSS JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag
+    WHERE p.PostTypeId = 1  -- Questions
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate
+),
+CorrelatedEdits AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS EditCount,
+        (SELECT AVG(Score) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId IN (2,3)) AS AvgVoteScore
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)  -- Edits
+    GROUP BY ph.PostId
+)
+SELECT DISTINCT 
+    u.DisplayName,
+    u.Reputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    pm.PostId,
+    pm.Score,
+    pm.EngagementScore,
+    CASE 
+        WHEN pm.PreviousScore IS NULL THEN 'First Post'
+        WHEN pm.Score > pm.PreviousScore THEN 'Improved'
+        ELSE 'Declined'
+    END AS ScoreTrend,
+    tt.TagName AS TopTag,
+    ce.EditCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pm.PostId AND c.Score > 0) AS PositiveComments,
+    COALESCE(pl.RelatedPostId, -1) AS RelatedPostId,  -- NULL logic
+    UPPER(SUBSTRING(p.Title, 1, 10)) || '...' AS TitleSnippet
+FROM Users u
+INNER JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT OUTER JOIN PostMetrics pm ON u.Id = pm.OwnerUserId
+INNER JOIN Posts p ON pm.PostId = p.Id
+LEFT OUTER JOIN CorrelatedEdits ce ON p.Id = ce.PostId
+LEFT OUTER JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3  -- Duplicates
+INNER JOIN TopTags tt ON tt.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+WHERE u.Reputation > 10000
+  AND (pm.EngagementScore > 50 OR ce.EditCount > 3)
+  AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate > p.CreationDate + INTERVAL '1 day')
+UNION
+SELECT 
+    'Anonymous' AS DisplayName,
+    0 AS Reputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    p.Id AS PostId,
+    p.Score,
+    COALESCE(p.FavoriteCount, 0) + COALESCE(p.AnswerCount, 0) AS EngagementScore,
+    'N/A' AS ScoreTrend,
+    NULL AS TopTag,
+    0 AS EditCount,
+    0 AS PositiveComments,
+    -1 AS RelatedPostId,
+    'Untitled' AS TitleSnippet
+FROM Posts p
+WHERE p.OwnerUserId IS NULL AND p.PostTypeId = 1 AND p.Score > 100
+ORDER BY Reputation DESC, Score DESC
+LIMIT 1000;

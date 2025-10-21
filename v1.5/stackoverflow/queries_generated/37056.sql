@@ -1,0 +1,128 @@
+-- {"query": "37056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1649} 
+WITH
+-- recent active questions with tag exploded and computed metrics
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerUserId,
+         p.AnswerCount,
+         p.AcceptedAnswerId,
+         p.CommentCount,
+         p.FavoriteCount,
+         COALESCE(p.Tags,'') AS RawTags,
+         regexp_split_to_table( substring(COALESCE(p.Tags,''), 2, greatest(length(COALESCE(p.Tags,'')) - 2,0) ), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '3 years'
+),
+-- aggregate answers per question with top answer metrics
+AnswerStats AS (
+  SELECT a.ParentId AS QuestionId,
+         count(*) FILTER (WHERE a.DeletionDate IS NULL OR true) AS TotalAnswers,
+         max(a.Score) AS MaxAnswerScore,
+         avg(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+         sum(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted,
+         max(a.CreationDate) FILTER (WHERE a.Score = (SELECT max(b.Score) FROM Posts b WHERE b.ParentId = a.ParentId)) AS TopAnswerDate
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+-- recent activity counts from PostHistory and Comments
+Activity AS (
+  SELECT ph.PostId AS QuestionId,
+         count(*) FILTER (WHERE ph.CreationDate >= now() - interval '180 days') AS RecentHistoryEvents,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35,36) AND ph.CreationDate >= now() - interval '365 days') AS ModerationEventsLastYear
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+-- votes and favorites aggregates for questions and their answers
+VoteAgg AS (
+  SELECT v.PostId,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         sum(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+-- tag popularity and tag-based aggregates
+TagStats AS (
+  SELECT t.TagName,
+         t.Count AS GlobalTagCount,
+         count(distinct qb.QuestionId) AS QuestionsInSample,
+         avg(qb.Score) AS AvgQuestionScore,
+         avg(coalesce(as_.AvgAnswerScore,0)) AS AvgAnswerScoreForTag
+  FROM Tags t
+  LEFT JOIN QuestionBase qb ON qb.Tag = t.TagName
+  LEFT JOIN AnswerStats as_ ON as_.QuestionId = qb.QuestionId
+  GROUP BY t.TagName, t.Count
+),
+-- users who asked these questions with reputation and badge signal
+UserSignal AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate AS UserCreated,
+         count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         sum(case when b.TagBased = B'1' then 1 else 0 end) AS TagBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+)
+-- final heavy query: window functions, joins, heuristics, ranking and sampler
+SELECT
+  q.QuestionId,
+  q.Title,
+  q.Tag,
+  q.CreationDate,
+  q.Score AS QuestionScore,
+  COALESCE(vq.UpVotes,0) AS QuestionUpVotes,
+  COALESCE(vq.DownVotes,0) AS QuestionDownVotes,
+  COALESCE(as_.TotalAnswers,0) AS TotalAnswers,
+  COALESCE(as_.MaxAnswerScore,0) AS MaxAnswerScore,
+  COALESCE(as_.AvgAnswerScore,0)::numeric(10,3) AS AvgAnswerScore,
+  COALESCE(act.RecentHistoryEvents,0) AS RecentHistoryEvents,
+  COALESCE(act.ModerationEventsLastYear,0) AS ModerationEventsLastYear,
+  us.Reputation AS AskerReputation,
+  us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+  ts.GlobalTagCount,
+  ts.QuestionsInSample,
+  ts.AvgQuestionScore AS TagAvgQuestionScore,
+  -- composite engagement score (synthetic, for benchmarking)
+  ( (q.Score::numeric * 2)
+    + coalesce(vq.UpVotes,0)
+    - coalesce(vq.DownVotes,0) * 0.5
+    + coalesce(as_.TotalAnswers,0) * 3
+    + coalesce(as_.AvgAnswerScore,0) * 2
+    + GREATEST(0, LEAST(100, (q.ViewCount::numeric / 100))) * 0.5
+    - coalesce(act.ModerationEventsLastYear,0) * 2
+    + log(GREATEST(1,1 + coalesce(us.Reputation,0))) * 1.5
+    + (coalesce(us.GoldBadges,0) * 5 + coalesce(us.SilverBadges,0) * 2 + coalesce(us.BronzeBadges,0) * 0.5)
+  ) AS EngagementScore,
+  row_number() OVER (PARTITION BY q.Tag ORDER BY
+      ( (q.Score::numeric * 2)
+        + coalesce(vq.UpVotes,0)
+        - coalesce(vq.DownVotes,0) * 0.5
+        + coalesce(as_.TotalAnswers,0) * 3
+        + coalesce(as_.AvgAnswerScore,0) * 2
+        + GREATEST(0, LEAST(100, (q.ViewCount::numeric / 100))) * 0.5
+        - coalesce(act.ModerationEventsLastYear,0) * 2
+        + log(GREATEST(1,1 + coalesce(us.Reputation,0))) * 1.5
+        + (coalesce(us.GoldBadges,0) * 5 + coalesce(us.SilverBadges,0) * 2 + coalesce(us.BronzeBadges,0) * 0.5)
+      ) DESC
+  ) AS TagRank,
+  dense_rank() OVER (ORDER BY ( (q.Score::numeric * 2) + coalesce(vq.UpVotes,0) + coalesce(as_.TotalAnswers,0) ) DESC) AS GlobalRank
+FROM QuestionBase q
+LEFT JOIN AnswerStats as_ ON as_.QuestionId = q.QuestionId
+LEFT JOIN Activity act ON act.QuestionId = q.QuestionId
+LEFT JOIN VoteAgg vq ON vq.PostId = q.QuestionId
+LEFT JOIN UserSignal us ON us.UserId = q.OwnerUserId
+LEFT JOIN TagStats ts ON ts.TagName = q.Tag
+WHERE q.RawTags <> ''
+  AND (q.ViewCount > 500 OR q.Score >= 5 OR coalesce(as_.TotalAnswers,0) >= 2)
+ORDER BY EngagementScore DESC
+LIMIT 100;

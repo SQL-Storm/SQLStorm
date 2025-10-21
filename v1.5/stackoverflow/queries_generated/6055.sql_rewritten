@@ -1,0 +1,151 @@
+-- {"query": "6055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1070} 
+WITH QualifiedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.ParentId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+HotTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.VoteTypeId IN (2, 3, 10, 11, 12, 16)
+    AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+CommentSummaries AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+LinkedPosts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    p.Title AS RelatedPostTitle
+  FROM PostLinks pl
+  JOIN Posts p ON pl.RelatedPostId = p.Id
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.LinkTypeId IN (1, 3) -- Linked or Duplicate
+),
+WindowedPosts AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    q.PostTypeId,
+    q.ParentId,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.Body,
+    q.LastEditorUserId,
+    q.LastEditDate,
+    q.ContentLicense,
+    u.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY q.OwnerUserId
+      ORDER BY q.LastActivityDate DESC, q.Score DESC
+    ) AS UserPostRank
+  FROM QualifiedPosts q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+)
+SELECT
+  wp.Id AS PostId,
+  wp.Title,
+  wp.OwnerUserId,
+  wp.OwnerDisplayName,
+  wp.CreationDate,
+  wp.LastActivityDate,
+  wp.Score,
+  wp.ViewCount,
+  wp.Tags,
+  wp.PostTypeId,
+  wp.ParentId,
+  wp.AnswerCount,
+  wp.CommentCount,
+  wp.FavoriteCount,
+  wp.Body,
+  wp.LastEditorUserId,
+  wp.LastEditDate,
+  wp.ContentLicense,
+  bo.Reputation AS OwnerReputation,
+  cmt.CommentCount AS TotalComments,
+  v2.BountyAmount AS Bounty,
+  ht.TagName AS TopTag,
+  (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = wp.Id) AS LinkCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = wp.Id AND v.VoteTypeId = 2) AS UpModCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = wp.Id AND v.VoteTypeId = 3) AS DownModCount,
+  ROW_NUMBER() OVER (
+    ORDER BY wp.LastActivityDate DESC, wp.Score DESC
+  ) AS GlobalRank
+FROM WindowedPosts wp
+LEFT JOIN (SELECT UserId, Reputation FROM Users) bo ON wp.OwnerUserId = bo.UserId
+LEFT JOIN CommentSummaries cmt ON wp.Id = cmt.PostId
+LEFT JOIN (SELECT PostId, BountyAmount FROM Votes WHERE VoteTypeId = 8) v2 ON wp.Id = v2.PostId
+LEFT JOIN HotTags ht ON wp.Tags LIKE '%' || ht.TagName || '%' -- approximate association
+LEFT JOIN LinkedPosts lp ON wp.Id = lp.PostId
+WHERE
+  wp.LastActivityDate IS NOT NULL
+  AND wp.Tags IS NOT NULL
+  AND wp.UserPostRank = 1
+ORDER BY GlobalRank
+LIMIT 100;

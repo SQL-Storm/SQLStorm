@@ -1,0 +1,95 @@
+-- {"query": "21016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1252} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(DISTINCT p.Id) AS total_posts,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+    WHERE u.Reputation >= 100 AND u.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+QuestionStats AS (
+    SELECT p.Id AS question_id, p.Title, p.CreationDate AS q_creation,
+           p.Score AS q_score, p.ViewCount, p.AnswerCount,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+           AVG(ph.CreationDate - p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS avg_edit_delay,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 10), ', ' ORDER BY t.TagName) AS top_tags
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (5, 8) -- Edits
+    LEFT JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0 AND p.PostTypeId = 1
+    WHERE p.PostTypeId = 1 
+      AND p.ClosedDate IS NULL 
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+      AND (p.ViewCount > 100 OR p.AnswerCount > 3)
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId
+),
+HighEngagementQuestions AS (
+    SELECT qs.question_id, qs.Title, qs.upvotes - COALESCE(qs.downvotes, 0) AS net_votes,
+           qs.AnswerCount * 10 + qs.ViewCount / 100 AS engagement_score
+    FROM QuestionStats qs
+    WHERE qs.upvotes > qs.downvotes * 2
+      OR (qs.AnswerCount >= 5 AND qs.q_score >= 10)
+),
+AcceptedAnswers AS (
+    SELECT DISTINCT a.Id AS answer_id, a.ParentId AS question_id,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate DESC) AS answer_rank,
+           CASE 
+               WHEN a.Score > 5 THEN 'Highly Upvoted'
+               WHEN a.Score BETWEEN 0 AND 5 THEN 'Accepted'
+               ELSE 'Low Engagement'
+           END AS answer_category,
+           LENGTH(COALESCE(a.Body, '')) > 500 AS is_detailed
+    FROM Posts a
+    WHERE a.PostTypeId = 2 
+      AND a.ParentId IN (SELECT Id FROM Posts WHERE PostTypeId = 1 AND AcceptedAnswerId IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND q.AcceptedAnswerId = a.Id)
+),
+UserContributions AS (
+    SELECT au.Id, au.DisplayName,
+           SUM(COALESCE(haq.engagement_score, 0)) AS total_engagement,
+           COUNT(DISTINCT haq.question_id) AS high_engagement_questions,
+           AVG(haq.net_votes) AS avg_net_votes,
+           COUNT(DISTINCT aa.answer_id) FILTER (WHERE aa.answer_category = 'Highly Upvoted' AND aa.is_detailed) AS detailed_high_answers,
+           STRING_AGG(DISTINCT COALESCE(pt.Name, 'Unknown'), ' | ' ORDER BY pt.Name) AS post_types_contributed
+    FROM ActiveUsers au
+    LEFT JOIN HighEngagementQuestions haq ON au.Id = (SELECT OwnerUserId FROM Posts WHERE Id = haq.question_id)
+    LEFT JOIN AcceptedAnswers aa ON au.Id = (SELECT OwnerUserId FROM Posts WHERE Id = aa.answer_id)
+    LEFT JOIN Posts p ON au.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY au.Id, au.DisplayName
+)
+SELECT uc.DisplayName AS user_name,
+       uc.total_engagement,
+       uc.high_engagement_questions,
+       uc.avg_net_votes,
+       uc.detailed_high_answers,
+       uc.post_types_contributed,
+       RANK() OVER (ORDER BY uc.total_engagement DESC, uc.high_engagement_questions DESC) AS engagement_rank,
+       CASE 
+           WHEN uc.total_engagement > 10000 THEN 'Power User'
+           WHEN uc.total_engagement > 1000 THEN 'Active Contributor' 
+           ELSE 'Emerging User'
+       END AS user_tier,
+       COALESCE(b.Name, 'No Badges') AS top_badge
+FROM UserContributions uc
+LEFT JOIN (
+    SELECT UserId, Name,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class ASC, Date DESC) AS rn
+    FROM Badges
+    WHERE Class = 1 -- Gold badges only
+) b ON uc.Id = b.UserId AND b.rn = 1
+WHERE uc.total_engagement > 50
+  AND (uc.high_engagement_questions > 0 OR uc.detailed_high_answers > 0)
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph 
+      WHERE ph.UserId = uc.Id 
+        AND ph.PostHistoryTypeId = 12 -- Deleted posts
+        AND ph.CreationDate >= CURRENT_DATE - INTERVAL '3 months'
+  )
+ORDER BY uc.total_engagement DESC, uc.DisplayName
+LIMIT 100;

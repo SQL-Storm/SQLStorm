@@ -1,0 +1,101 @@
+WITH
+UserPostStats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(p.Id) AS PostCount,
+         COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+         COALESCE(SUM(p.Score), 0) AS TotalScore,
+         MAX(p.LastActivityDate) AS LastActivityDate,
+         AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+         (SELECT COUNT(*) FROM Comments c JOIN Posts pr ON c.PostId = pr.Id WHERE pr.OwnerUserId = u.Id) AS TotalCommentCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeStats AS (
+  SELECT UserId,
+         MAX(LastBadgeDate) AS LastBadgeDate,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges
+  GROUP BY UserId
+),
+UserVotes AS (
+  SELECT UserId,
+         COUNT(*) AS VotesCast,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast
+  FROM Votes
+  GROUP BY UserId
+),
+PostWeighted AS (
+  SELECT p.Id AS PostId,
+         p.OwnerUserId,
+         p.Title,
+         p.Score,
+         p.ViewCount,
+         p.CommentCount,
+         (p.Score * 2.0 + p.ViewCount * 0.5 + COALESCE(p.CommentCount, 0) * 3.0) AS WeightedScore,
+         p.LastActivityDate,
+         p.Tags
+  FROM Posts p
+),
+PostTagNames AS (
+  SELECT pw.PostId,
+         pw.OwnerUserId,
+         pw.Title,
+         pw.WeightedScore,
+         pw.LastActivityDate,
+         pw.Tags,
+         COALESCE(string_agg(DISTINCT t.TagName, ','), '') AS TagNamesList,
+         COUNT(DISTINCT t.TagName) AS TagCount
+  FROM PostWeighted pw
+  LEFT JOIN LATERAL UNNEST(string_to_array(substr(pw.Tags, 2, length(pw.Tags) - 2), '><')) AS tn(tagname) ON true
+  LEFT JOIN Tags t ON t.TagName = tn.tagname
+  GROUP BY pw.PostId, pw.OwnerUserId, pw.Title, pw.WeightedScore, pw.LastActivityDate, pw.Tags
+),
+TopPostPerUser AS (
+  SELECT PostId,
+         OwnerUserId,
+         Title,
+         WeightedScore,
+         LastActivityDate,
+         Tags,
+         TagNamesList,
+         TagCount,
+         ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY WeightedScore DESC, LastActivityDate DESC) AS rn
+  FROM PostTagNames
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  usp.PostCount,
+  usp.TotalViews,
+  usp.TotalScore,
+  usp.LastActivityDate,
+  usp.AvgPostScore,
+  usp.TotalCommentCount,
+  COALESCE(usb.GoldBadges, 0) AS GoldBadges,
+  COALESCE(usb.SilverBadges, 0) AS SilverBadges,
+  COALESCE(usb.BronzeBadges, 0) AS BronzeBadges,
+  COALESCE(uv.VotesCast, 0) AS VotesCast,
+  COALESCE(uv.UpVotesCast, 0) AS UpVotesCast,
+  COALESCE(uv.DownVotesCast, 0) AS DownVotesCast,
+  (SELECT Title FROM TopPostPerUser tpp WHERE tpp.OwnerUserId = u.Id AND tpp.rn = 1) AS TopPostTitle,
+  (SELECT TagNamesList FROM TopPostPerUser tpp WHERE tpp.OwnerUserId = u.Id AND tpp.rn = 1) AS TopPostTags,
+  (SELECT LastBadgeDate FROM UserBadgeStats ub WHERE ub.UserId = u.Id) AS LastBadgeDate,
+  CASE
+     WHEN usp.PostCount > 50 AND COALESCE(usb.GoldBadges, 0) > 0 THEN 'Power User'
+     WHEN usp.PostCount > 20 THEN 'Active'
+     ELSE 'Newbie'
+  END AS UserTier,
+  (CASE WHEN usp.TotalCommentCount > 0 THEN CAST(usp.TotalCommentCount AS FLOAT) / NULLIF(usp.PostCount, 0) ELSE NULL END) AS CommentsPerPost
+FROM Users u
+LEFT JOIN UserPostStats usp ON usp.UserId = u.Id
+LEFT JOIN UserBadgeStats usb ON usb.UserId = u.Id
+LEFT JOIN UserVotes uv ON uv.UserId = u.Id
+ORDER BY usp.TotalViews DESC NULLS LAST
+LIMIT 100;

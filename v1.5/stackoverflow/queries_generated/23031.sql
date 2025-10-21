@@ -1,0 +1,56 @@
+-- {"query": "23031.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 820} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS RankInLocation,
+           COUNT(DISTINCT p.Id) AS PostCount,
+           SUM(COALESCE(p.Score, 0)) AS TotalScore
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate > '2010-01-01' AND (u.Reputation > 1000 OR u.UpVotes > 500)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT b.UserId, COUNT(b.Id) AS BadgeCount,
+           STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ') AS GoldBadges,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = 0
+    GROUP BY b.UserId
+),
+QuestionAnalytics AS (
+    SELECT p.Id AS QuestionId, p.Title, p.ViewCount,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+           COALESCE((SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8), 0) AS AvgBounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags LIKE '%sql%'
+    UNION
+    SELECT p.Id, p.Title, p.ViewCount,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+           COALESCE((SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8), 0) AS AvgBounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags LIKE '%performance%'
+),
+CombinedData AS (
+    SELECT au.*, bs.BadgeCount, bs.GoldBadges, bs.LatestBadgeDate,
+           qa.QuestionId, qa.Title, qa.ViewCount, qa.PositiveComments, qa.AvgBounty,
+           CASE WHEN ph.PostHistoryTypeId IS NULL THEN 'No Edits' ELSE 'Edited' END AS EditStatus,
+           DENSE_RANK() OVER (ORDER BY au.TotalScore DESC NULLS LAST) AS OverallRank
+    FROM ActiveUsers au
+    LEFT OUTER JOIN BadgeSummary bs ON au.Id = bs.UserId
+    INNER JOIN Posts p ON au.Id = p.OwnerUserId AND p.PostTypeId = 2
+    LEFT OUTER JOIN QuestionAnalytics qa ON p.ParentId = qa.QuestionId
+    LEFT OUTER JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4,5,6)
+    WHERE au.RankInLocation <= 5
+      AND (qa.AvgBounty > 50 OR qa.PositiveComments > 10)
+      AND NOT EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3 AND v.CreationDate > DATEADD(MONTH, -1, GETDATE()))
+)
+SELECT cd.DisplayName, cd.Reputation, cd.PostCount, cd.TotalScore, cd.BadgeCount,
+       COALESCE(cd.GoldBadges, 'None') AS GoldBadges,
+       cd.LatestBadgeDate, cd.QuestionId, UPPER(cd.Title) AS UpperTitle,
+       cd.ViewCount * 1.5 AS AdjustedViewCount, cd.PositiveComments, cd.AvgBounty,
+       cd.EditStatus, cd.OverallRank
+FROM CombinedData cd
+WHERE cd.OverallRank <= 100
+ORDER BY cd.OverallRank, cd.Reputation DESC;

@@ -1,0 +1,85 @@
+-- {"query": "39093.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 2397} 
+WITH
+TopQuestioners AS (
+    SELECT
+        u.Id           AS UserId,
+        u.DisplayName,
+        COUNT(*)       AS QuestionsAsked,
+        SUM(p.Score)   AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC, SUM(p.Score) DESC) AS RankByQuestions
+    FROM Posts p
+    JOIN Users u
+      ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)    AS QuestionCount,
+        AVG(p.Score)   AS AvgScore
+    FROM Tags t
+    JOIN Posts p
+      ON p.PostTypeId = 1
+     AND p.Tags LIKE '%<' || t.TagName || '>%'
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b
+      ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserLastActivity AS (
+    SELECT
+        OwnerUserId AS UserId,
+        MAX(LastActivityDate) AS LastActivity
+    FROM Posts
+    GROUP BY OwnerUserId
+)
+SELECT
+    tq.RankByQuestions,
+    tq.DisplayName,
+    tq.QuestionsAsked,
+    tq.TotalScore,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    to_char(ula.LastActivity, 'YYYY‑MM') AS LastActiveMonth,
+    COUNT(p.Id) OVER (PARTITION BY to_char(p.CreationDate, 'YYYY‑MM')) AS PostsThisMonth,
+    json_agg(
+      json_build_object(
+        'tag',   ts.TagName,
+        'count', ts.QuestionCount,
+        'avgScore', ROUND(ts.AvgScore,2)
+      )
+      ORDER BY ts.QuestionCount DESC
+    ) FILTER (WHERE ts.TagName IS NOT NULL) AS TopTags
+FROM TopQuestioners tq
+JOIN UserBadgeStats ubs
+  ON ubs.UserId = tq.UserId
+JOIN UserLastActivity ula
+  ON ula.UserId = tq.UserId
+JOIN Posts p
+  ON p.OwnerUserId = tq.UserId
+LEFT JOIN TagStats ts
+  ON TRUE
+WHERE tq.RankByQuestions <= 50
+GROUP BY
+    tq.RankByQuestions,
+    tq.DisplayName,
+    tq.QuestionsAsked,
+    tq.TotalScore,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    to_char(ula.LastActivity, 'YYYY‑MM')
+ORDER BY
+    tq.RankByQuestions,
+    LastActiveMonth DESC;

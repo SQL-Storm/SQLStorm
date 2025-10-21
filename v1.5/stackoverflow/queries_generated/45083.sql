@@ -1,0 +1,32 @@
+-- {"query": "45083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 190402, "output_tokens": 33385} 
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    u.DisplayName,
+    u.Reputation,
+    t.TagName,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    AVG(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1.0 ELSE 0.0 END) AS EditFrequency,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.CreationDate) AS MedianVoteTime
+FROM 
+    Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT DISTINCT PostId, TagName 
+    FROM Posts, UNNEST(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS TagName
+) t ON p.Id = t.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    p.PostTypeId = 1
+    AND u.Reputation > 1000
+    AND p.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+GROUP BY 
+    p.Id, p.Title, u.DisplayName, u.Reputation, t.TagName
+HAVING 
+    COUNT(DISTINCT v.Id) > 5
+ORDER BY 
+    VoteCount DESC, Reputation DESC
+LIMIT 100;

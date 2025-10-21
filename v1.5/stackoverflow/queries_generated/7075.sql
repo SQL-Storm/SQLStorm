@@ -1,0 +1,201 @@
+-- {"query": "7075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2277} 
+with
+-- recent activity per post with weighted scoring and complex string/tag parsing
+recent_activity as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.tags,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    coalesce(p.answercount,0) as answercount,
+    greatest(coalesce(p.lastactivitydate,p.creationdate), coalesce(p.lasteditdate,p.creationdate)) as activity_ts,
+    -- compute a synthetic popularity score mixing views, score, answers, recency (days)
+    ((coalesce(p.viewcount,0)::numeric / nullif(greatest(date_part('day', now() - p.creationdate),1),0)) * 0.2
+     + coalesce(p.score,0) * 5
+     + coalesce(p.answercount,0) * 10
+     + (case when p.acceptedanswerid is not null then 50 else 0 end)
+    ) as popularity_raw,
+    -- explode tags into an array (handles tags like '<tag1><tag2>'), allow null-safe parsing
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array
+  from posts p
+  where p.posttypeid in (1,2) -- questions and answers
+    and p.creationdate > now() - interval '5 years'
+),
+-- compute user aggregates and badge-weighted reputation influence
+user_stats as (
+  select
+    u.id as userid,
+    u.reputation,
+    u.creationdate,
+    u.displayname,
+    u.views as profile_views,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    -- badge influence score (gold=50, silver=10, bronze=2)
+    (count(distinct b.id) filter (where b.class = 1) * 50
+     + count(distinct b.id) filter (where b.class = 2) * 10
+     + count(distinct b.id) filter (where b.class = 3) * 2
+    ) as badge_influence
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.reputation, u.creationdate, u.displayname, u.views
+),
+-- aggregate votes by type per post with conditional logic and correlated subquery for last vote date
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    max(v.creationdate) as last_vote_date,
+    -- correlated: time since last vote in days
+    greatest(date_part('day', now() - max(v.creationdate)),0) as days_since_last_vote
+  from votes v
+  group by v.postid
+),
+-- comment density and sentiment-ish proxy (length, score)
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(length(c.text))::numeric as avg_comment_len,
+    sum(coalesce(c.score,0)) as comment_score_sum
+  from comments c
+  group by c.postid
+),
+-- CTE to compute duplicate clusters via PostLinks (LinkTypeId = 3 indicates duplicate)
+duplicate_clusters as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    min(pl.id) over (partition by coalesce(pl.postid,pl.relatedpostid)) as cluster_lead,
+    row_number() over (partition by coalesce(pl.postid,pl.relatedpostid) order by pl.id) as rn
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+-- windowed ranking of questions by adjusted popularity, with complex NULL logic and case expressions
+ranked_questions as (
+  select
+    ra.*,
+    va.upvotes, va.downvotes, va.favorites, va.bounty_total, va.last_vote_date, va.days_since_last_vote,
+    ca.comment_count, ca.avg_comment_len, ca.comment_score_sum,
+    us.reputation as owner_reputation,
+    us.badge_influence,
+    -- adjusted popularity: penalize downvotes, boost owner reputation and badge influence, reduce weight for stale activity
+    (
+      ra.popularity_raw
+      + coalesce(va.upvotes,0) * 10
+      - coalesce(va.downvotes,0) * 15
+      + least(coalesce(us.reputation,0)::numeric,10000) / 100 * 3
+      + coalesce(us.badge_influence,0) * 1.5
+      - (case when ra.activity_ts < now() - interval '1 year' then 30 else 0 end)
+      - (coalesce(va.days_since_last_vote,0) / 365.0) * 20
+    ) as adjusted_popularity,
+    -- tag-based boost for "hot" tags (determined by presence of 'sql', 'performance', 'postgresql' etc.)
+    (case
+       when ra.tag_array && array['sql','postgresql','performance','optimization','indexes'] then 40
+       when ra.tag_array && array['python','java','c#'] then 10
+       else 0
+     end) as tag_boost
+  from recent_activity ra
+  left join vote_agg va on va.postid = ra.id
+  left join comment_agg ca on ca.postid = ra.id
+  left join user_stats us on us.userid = ra.owneruserid
+  where ra.posttypeid = 1 -- focus on questions for ranking
+),
+-- final scoring with window and dense ranking; include correlated subquery to fetch top answer metrics for each question
+final_scores as (
+  select
+    rq.id as question_id,
+    rq.title,
+    rq.owneruserid,
+    rq.owner_reputation,
+    rq.reputation,
+    rq.tag_array,
+    rq.creationdate,
+    rq.adjusted_popularity + rq.tag_boost as final_score,
+    rq.adjusted_popularity,
+    rq.tag_boost,
+    rq.upvotes, rq.downvotes, rq.favorites, rq.bounty_total,
+    rq.comment_count, rq.avg_comment_len,
+    -- correlated subquery: best answer id by score that is not deleted (PostTypeId=2 and parentid = question)
+    (select a.id
+     from posts a
+     where a.parentid = rq.id and a.posttypeid = 2
+     order by coalesce(a.score,0) desc, coalesce(a.creationdate, a.lastactivitydate) asc
+     limit 1
+    ) as top_answer_id,
+    -- correlated: compute answer acceptance ratio across all answers to this question
+    (select count(*) filter (where a.id = rq.acceptedanswerid) from posts a where a.parentid = rq.id and a.posttypeid = 2) as has_accepted_answer,
+    -- dense rank over final_score
+    dense_rank() over (order by (rq.adjusted_popularity + rq.tag_boost) desc) as popularity_rank,
+    rank() over (order by (rq.adjusted_popularity + rq.tag_boost) desc) as popularity_rank_with_gaps,
+    row_number() over (partition by (case when rq.owner_reputation > 10000 then 'senior' when rq.owner_reputation between 1000 and 10000 then 'mid' else 'junior' end) order by rq.adjusted_popularity + rq.tag_boost desc) as bucket_rank
+  from ranked_questions rq
+),
+-- unioned set of anomalies: questions with high views but low score, or high downvotes relative to upvotes
+anomalies as (
+  select
+    f.*,
+    'high_views_low_score' as anomaly_type
+  from final_scores f
+  join posts p on p.id = f.question_id
+  where p.viewcount > 50000 and (f.adjusted_popularity < 100 or f.final_score < 50)
+
+  union
+
+  select
+    f.*,
+    'downvote_spike' as anomaly_type
+  from final_scores f
+  where coalesce(f.downvotes,0) > greatest(5, coalesce(f.upvotes,0) * 2)
+),
+-- sample window to stress ordering and partitioning
+sampled as (
+  select
+    f.*,
+    -- complex boolean expression combining null-safe checks, IN subquery, and regex on title for SQL keywords
+    (
+      (f.final_score > 200 and f.owner_reputation > 5000)
+      or (f.tag_array is not null and 'sql' = any(f.tag_array))
+      or exists (select 1 from tags t where t.excerptpostid = f.top_answer_id)
+      or f.title ~* 'performance|slow|optimi(se|z)e|index'
+    ) as is_high_priority,
+    -- string fingerprint of tags: join sorted tags, fallback to 'untagged' and handle nulls
+    (case when array_length(f.tag_array,1) is null then 'untagged' else array_to_string(array_agg(distinct unnest(f.tag_array) order by 1),',') end) as tag_signature
+  from final_scores f
+)
+select
+  s.question_id,
+  left(s.title, 200) as title_snippet,
+  s.owneruserid,
+  s.owner_reputation,
+  s.final_score,
+  s.adjusted_popularity,
+  s.tag_boost,
+  s.upvotes,
+  s.downvotes,
+  s.favorites,
+  s.bounty_total,
+  s.comment_count,
+  s.avg_comment_len,
+  s.top_answer_id,
+  s.has_accepted_answer,
+  s.popularity_rank,
+  s.popularity_rank_with_gaps,
+  s.bucket_rank,
+  s.is_high_priority,
+  s.tag_signature,
+  a.anomaly_type
+from sampled s
+left join anomalies a on a.question_id = s.question_id
+where s.popularity_rank <= 500
+order by s.final_score desc, s.popularity_rank asc, s.owner_reputation desc
+limit 500;

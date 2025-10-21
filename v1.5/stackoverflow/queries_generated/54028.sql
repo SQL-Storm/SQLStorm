@@ -1,0 +1,85 @@
+-- {"query": "54028.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1535} 
+
+WITH
+-- Break down post tags into separate rows
+tagged_questions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        unnest(
+            string_to_array(
+                substring(p.Tags, 2, length(p.Tags)-2),
+                '><'
+            )
+        ) AS TagName
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+
+-- Aggregate statistics for each tag
+tag_stats AS (
+    SELECT
+        tq.TagName,
+        COUNT(DISTINCT tq.QuestionId)                           AS QuestionCount,
+        AVG(v.Score)                                            AS AvgAnswerScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.Score)    AS MedianAnswerScore,
+        COUNT(DISTINCT u.Id)                                     AS ContributorCount,
+        MAX(u.Reputation)                                       AS MaxRep,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)       AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)       AS TotalDownVotes
+    FROM
+        tagged_questions tq
+        LEFT JOIN Posts p ON p.Id = tq.QuestionId
+        LEFT JOIN Votes v ON v.PostId = p.Id
+                        AND v.VoteTypeId IN (2,3)      -- up/down votes only
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY
+        tq.TagName
+),
+
+-- Detailed user activity with voting counts
+user_activity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(v.Id)                                          AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)    AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)    AS DownVotes
+    FROM
+        Users u
+        LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+)
+
+SELECT
+    ts.TagName,
+    ts.QuestionCount,
+    ts.AvgAnswerScore,
+    ts.MedianAnswerScore,
+    ts.ContributorCount,
+    ts.MaxRep,
+    ts.TotalUpVotes,
+    ts.TotalDownVotes,
+    ua.Id                AS PopularUserId,
+    ua.DisplayName       AS PopularUserName,
+    ua.Reputation        AS PopularUserReputation,
+    ua.VoteCount         AS PopularUserVoteCount,
+    ua.UpVotes           AS PopularUserUpVotes,
+    ua.DownVotes         AS PopularUserDownVotes
+FROM
+    tag_stats ts
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM user_activity
+        ORDER BY Reputation DESC
+        LIMIT 1
+    ) ua ON true
+ORDER BY
+    ts.AvgAnswerScore DESC,
+    ts.QuestionCount DESC
+LIMIT 25;

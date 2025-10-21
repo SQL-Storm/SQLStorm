@@ -1,0 +1,68 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS PostScoreRank,
+        COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS UserVoteDiff,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS IsClosed
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE p.PostTypeId = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TagQuestionCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(CASE WHEN rp.UserVoteDiff > 10 THEN 1 ELSE 0 END) AS HighlyVotedQuestions
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    JOIN RankedUserPosts rp ON p.Id = rp.PostId
+    GROUP BY t.TagName
+)
+SELECT 
+    rp.UserId,
+    rp.DisplayName,
+    rp.PostId,
+    rp.Title,
+    rp.Score,
+    rp.PostScoreRank,
+    rp.UserVoteDiff,
+    ta.TagName,
+    ta.TagQuestionCount,
+    ta.AvgTagScore,
+    ta.HighlyVotedQuestions,
+    CASE 
+        WHEN rp.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS ScoreCategory,
+    ROUND(
+        rp.ViewCount * 
+        (1.0 + COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId), 
+            0
+        ) / 10.0), 
+        2
+    ) AS AdjustedViewCount
+FROM RankedUserPosts rp
+JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.Id = rp.PostId AND p.Tags LIKE '%' || ta.TagName || '%'
+)
+WHERE 
+    rp.PostScoreRank <= 3 
+    AND rp.UserVoteDiff > 5 
+    AND ta.TagQuestionCount > 100
+ORDER BY 
+    rp.Score DESC, 
+    ta.HighlyVotedQuestions DESC
+LIMIT 500;

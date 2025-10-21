@@ -1,0 +1,101 @@
+-- {"query": "25095.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2333} 
+
+WITH
+    top_users AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)               AS rn,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS gold_badges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS silver_badges
+        FROM Users u
+        WHERE u.Reputation IS NOT NULL
+    ),
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                AS question_count,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                AS answer_count,
+            SUM(p.Score)                                              AS total_score,
+            AVG(p.ViewCount)                                          AS avg_views
+        FROM Tags t
+        LEFT JOIN Posts p
+               ON p.Tags LIKE '%' || t.TagName || '%'
+        GROUP BY t.TagName
+    ),
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)                AS upvotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)                AS downvotes,
+            MAX(v.CreationDate)                                      AS last_vote_date
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY v.PostId
+    ),
+    post_hierarchy AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.PostTypeId,
+            p.OwnerUserId,
+            COALESCE(p.ParentId, 0)                                   AS root_id,
+            CASE
+                WHEN p.PostTypeId = 1 THEN p.Id
+                ELSE p.ParentId
+            END                                                       AS question_id,
+            ROW_NUMBER() OVER (
+                PARTITION BY CASE
+                                 WHEN p.PostTypeId = 1 THEN p.Id
+                                 ELSE p.ParentId
+                             END
+                ORDER BY p.CreationDate
+            )                                                         AS seq_in_thread
+        FROM Posts p
+        WHERE p.PostTypeId IN (1, 2)
+    )
+SELECT
+    tu.rn                                   AS user_rank,
+    tu.DisplayName,
+    tu.gold_badges,
+    tu.silver_badges,
+    ph.Title,
+    ph.PostTypeId,
+    ph.seq_in_thread,
+    COALESCE(rv.upvotes, 0)                 AS recent_upvotes,
+    COALESCE(rv.downvotes, 0)               AS recent_downvotes,
+    rv.last_vote_date,
+    ts.question_count,
+    ts.answer_count,
+    ts.total_score,
+    ts.avg_views,
+    CASE
+        WHEN ph.PostTypeId = 1 THEN
+            (SELECT STRING_AGG(DISTINCT lt.Name, ',')
+             FROM PostLinks pl
+             JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+             WHERE pl.PostId = ph.Id)
+        ELSE NULL
+    END                                      AS link_types,
+    CASE
+        WHEN ph.PostTypeId = 2 THEN
+            (SELECT COUNT(*)
+             FROM Comments c
+             WHERE c.PostId = ph.Id AND c.Score > 0)
+        ELSE NULL
+    END                                      AS positive_comments
+FROM top_users tu
+LEFT JOIN post_hierarchy ph
+       ON ph.OwnerUserId = tu.Id
+LEFT JOIN recent_votes rv
+       ON rv.PostId = ph.Id
+LEFT JOIN tag_stats ts
+       ON ts.TagName = ANY (
+              STRING_TO_ARRAY(
+                  REPLACE(REPLACE(ph.Title, '<', ''), '>', ''),
+                  ' '
+              )
+          )
+WHERE tu.rn <= 100
+ORDER BY tu.rn, ph.seq_in_thread;

@@ -1,0 +1,101 @@
+-- {"query": "55072.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1289} 
+
+WITH top_tags AS (
+    SELECT TagName
+    FROM Tags
+    WHERE Count > 1000
+    ORDER BY Count DESC
+    LIMIT 10
+),
+question_tags AS (
+    SELECT
+        p.Id AS QuestionId,
+        trim(both '<>' FROM p.Tags) AS RawTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+expanded_tags AS (
+    SELECT
+        qt.QuestionId,
+        UNNEST(string_to_array(qt.RawTags, '><')) AS TagName
+    FROM question_tags qt
+),
+question_stats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.Id AS OwnerUserId,
+        u.Reputation,
+        array_agg(et.TagName) FILTER (WHERE et.TagName IS NOT NULL) AS TagList,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN expanded_tags et ON p.Id = et.QuestionId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, u.Id
+),
+vote_summary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END) AS NetScore,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS AcceptedVoteCount
+    FROM Votes v
+    GROUP BY v.PostId
+),
+recent_comments AS (
+    SELECT
+        c.PostId,
+        json_agg(
+            json_build_object(
+                'UserId', c.UserId,
+                'UserDisplayName', c.UserDisplayName,
+                'Text', c.Text,
+                'CreationDate', c.CreationDate
+            )
+            ORDER BY c.CreationDate DESC
+        ) FILTER (WHERE c.CreationDate >= NOW() - INTERVAL '30 days') AS RecentComments30d
+    FROM Comments c
+    GROUP BY c.PostId
+),
+post_links AS (
+    SELECT
+        pl.PostId,
+        json_agg(
+            json_build_object(
+                'RelatedPostId', pl.RelatedPostId,
+                'LinkType', lt.Name
+            )
+        ) AS Links
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.Reputation,
+    qs.TagList,
+    vs.NetScore,
+    vs.FavoriteCount,
+    vs.AcceptedVoteCount,
+    qs.CommentCount,
+    rc.RecentComments30d,
+    pl.Links
+FROM question_stats qs
+LEFT JOIN vote_summary vs      ON qs.QuestionId = vs.PostId
+LEFT JOIN recent_comments rc   ON qs.QuestionId = rc.PostId
+LEFT JOIN post_links pl        ON qs.QuestionId = pl.PostId
+WHERE qs.TagList && (SELECT array_agg(TagName) FROM top_tags)  -- at least one top tag
+  AND qs.Score > 0
+ORDER BY vs.NetScore DESC NULLS LAST, qs.ViewCount DESC
+LIMIT 100;

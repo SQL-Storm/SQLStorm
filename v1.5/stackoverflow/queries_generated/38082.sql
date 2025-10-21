@@ -1,0 +1,287 @@
+-- {"query": "38082.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2794} 
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+qa as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_date,
+    q.score as question_score,
+    q.viewcount,
+    q.tags,
+    q.answercount,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_date,
+    a.score as answer_score,
+    (a.id = q.acceptedanswerid)::int as is_accepted
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+tag_expanded as (
+  select
+    qa.*,
+    lower(trim(t)) as tag
+  from qa
+  cross join lateral unnest(string_to_array(substring(coalesce(qa.tags, ''), 2, greatest(length(coalesce(qa.tags,'')) - 2, 0)), '><')) as t
+),
+tag_stats as (
+  select
+    tag,
+    count(distinct question_id) as questions,
+    count(*) filter (where is_accepted = 1) as accepted_answers,
+    avg(answer_score) as avg_answer_score,
+    percentile_cont(0.5) within group (order by answer_score) as p50_answer_score,
+    avg(question_score) as avg_question_score,
+    avg(viewcount) as avg_views,
+    avg(extract(epoch from (answer_date - question_date))/3600.0) as avg_time_to_answer_hours
+  from tag_expanded
+  group by tag
+  having count(distinct question_id) >= 50
+),
+power_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as questions_authored,
+    coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as answers_authored,
+    coalesce(sum(p.score),0) as total_post_score,
+    coalesce(sum(p.viewcount),0) as total_views
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+answer_quality as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers,
+    avg(a.score) as avg_answer_score,
+    count(*) filter (where a.id = q.acceptedanswerid) as accepted_count,
+    avg(extract(epoch from (a.creationdate - q.creationdate))/3600.0) as avg_answer_latency_hours
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+comment_activity as (
+  select
+    c.userid as user_id,
+    count(*) as comments,
+    avg(c.score) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+vote_activity as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    count(*) filter (where v.votetypeid in (8,9)) as bounties_touch,
+    coalesce(sum(v.bountyamount) filter (where v.votetypeid in (8,9)),0) as bounty_amount
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+hotness as (
+  select
+    q.id as question_id,
+    q.creationdate,
+    q.viewcount,
+    q.score,
+    q.answercount,
+    coalesce(vu.upvotes,0) as upvotes,
+    coalesce(vd.downvotes,0) as downvotes,
+    (q.viewcount * 0.001 + q.score * 2 + coalesce(vu.upvotes,0) * 0.5 - coalesce(vd.downvotes,0) * 0.7 + least(q.answercount,10) * 0.8) as hot_score
+  from posts q
+  left join lateral (
+    select count(*) as upvotes from votes v where v.postid = q.id and v.votetypeid = 2
+  ) vu on true
+  left join lateral (
+    select count(*) as downvotes from votes v where v.postid = q.id and v.votetypeid = 3
+  ) vd on true
+  where q.posttypeid = 1 and q.creationdate >= now() - interval '3 years'
+),
+user_engagement as (
+  select
+    u.id as user_id,
+    count(distinct q.id) as questions_touched,
+    count(distinct a.id) as answers_touched,
+    count(distinct c.id) as comments_touched
+  from users u
+  left join posts q on q.owneruserid = u.id and q.posttypeid = 1
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+post_edit_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+    max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  group by ph.postid
+),
+question_closure as (
+  select
+    ph.postid as question_id,
+    min(ph.creationdate) as first_closed_date,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+duplicates as (
+  select
+    pl.postid as dupe_id,
+    pl.relatedpostid as original_id,
+    min(pl.creationdate) as dupe_link_date
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+question_summary as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    coalesce(pe.edit_events,0) as edit_events,
+    pe.last_edit_date,
+    coalesce(qc.close_events,0) as close_events,
+    coalesce(qc.reopen_events,0) as reopen_events,
+    coalesce(h.hot_score,0) as hot_score,
+    case when d.dupe_id is not null then 1 else 0 end as is_duplicate
+  from posts q
+  left join post_edit_events pe on pe.postid = q.id
+  left join question_closure qc on qc.question_id = q.id
+  left join hotness h on h.question_id = q.id
+  left join duplicates d on d.dupe_id = q.id
+  where q.posttypeid = 1
+),
+user_rollup as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(pu.questions_authored,0) as questions_authored,
+    coalesce(pu.answers_authored,0) as answers_authored,
+    coalesce(pu.total_post_score,0) as total_post_score,
+    coalesce(pu.total_views,0) as total_views,
+    coalesce(aq.answers,0) as answers_count,
+    coalesce(aq.avg_answer_score,0) as avg_answer_score,
+    coalesce(aq.accepted_count,0) as accepted_count,
+    coalesce(aq.avg_answer_latency_hours,0) as avg_answer_latency_hours,
+    coalesce(ca.comments,0) as comments_count,
+    coalesce(ca.avg_comment_score,0) as avg_comment_score,
+    coalesce(va.upvotes_cast,0) as upvotes_cast,
+    coalesce(va.downvotes_cast,0) as downvotes_cast,
+    coalesce(va.bounties_touch,0) as bounties_touch,
+    coalesce(va.bounty_amount,0) as bounty_amount,
+    ue.questions_touched,
+    ue.answers_touched,
+    ue.comments_touched
+  from users u
+  left join power_users pu on pu.user_id = u.id
+  left join answer_quality aq on aq.user_id = u.id
+  left join comment_activity ca on ca.user_id = u.id
+  left join vote_activity va on va.user_id = u.id
+  left join user_engagement ue on ue.user_id = u.id
+),
+tag_per_user as (
+  select
+    a.owneruserid as user_id,
+    lower(trim(t)) as tag,
+    count(*) as answers_in_tag,
+    avg(a.score) as avg_answer_score_tag,
+    count(*) filter (where a.id = q.acceptedanswerid) as accepted_in_tag
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  cross join lateral unnest(string_to_array(substring(coalesce(q.tags, ''), 2, greatest(length(coalesce(q.tags,'')) - 2, 0)), '><')) as t
+  where a.posttypeid = 2
+  group by a.owneruserid, lower(trim(t))
+),
+user_top_tags as (
+  select user_id, tag, answers_in_tag, avg_answer_score_tag, accepted_in_tag,
+         row_number() over (partition by user_id order by answers_in_tag desc, avg_answer_score_tag desc) as rn
+  from tag_per_user
+),
+final as (
+  select
+    ts.tag,
+    ts.questions,
+    ts.accepted_answers,
+    ts.avg_answer_score,
+    ts.p50_answer_score,
+    ts.avg_question_score,
+    ts.avg_views,
+    ts.avg_time_to_answer_hours,
+    u.user_id,
+    u.displayname,
+    u.reputation,
+    u.questions_authored,
+    u.answers_authored,
+    u.total_post_score,
+    u.total_views,
+    u.answers_count,
+    u.avg_answer_score as user_avg_answer_score,
+    u.accepted_count,
+    u.avg_answer_latency_hours as user_avg_answer_latency_hours,
+    u.comments_count,
+    u.avg_comment_score,
+    u.upvotes_cast,
+    u.downvotes_cast,
+    u.bounties_touch,
+    u.bounty_amount,
+    ut.tag as user_top_tag,
+    ut.answers_in_tag as user_top_tag_answers,
+    ut.avg_answer_score_tag as user_top_tag_avg_score,
+    ut.accepted_in_tag as user_top_tag_accepted,
+    qs_total.total_questions_last_year,
+    qs_total.total_hot_score_last_year,
+    qs_total.avg_edits_per_question_last_year
+  from tag_stats ts
+  join (
+    select
+      te.tag,
+      au.user_id,
+      sum(te.is_accepted) as accepted_by_user_in_tag,
+      count(*) as answers_by_user_in_tag,
+      avg(te.answer_score) as user_avg_score_in_tag
+    from tag_expanded te
+    join posts a on a.id = te.answer_id
+    join users u2 on u2.id = a.owneruserid
+    join power_users au on au.user_id = u2.id
+    group by te.tag, au.user_id
+    having count(*) >= 10
+  ) tag_user on tag_user.tag = ts.tag
+  join user_rollup u on u.user_id = tag_user.user_id
+  left join user_top_tags ut on ut.user_id = u.user_id and ut.rn = 1
+  left join (
+    select
+      lower(trim(t2)) as tag,
+      count(distinct q2.id) as total_questions_last_year,
+      sum(h.hot_score) as total_hot_score_last_year,
+      avg(pe.edit_events) as avg_edits_per_question_last_year
+    from posts q2
+    left join post_edit_events pe on pe.postid = q2.id
+    left join hotness h on h.question_id = q2.id
+    cross join lateral unnest(string_to_array(substring(coalesce(q2.tags, ''), 2, greatest(length(coalesce(q2.tags,'')) - 2, 0)), '><')) as t2
+    where q2.posttypeid = 1 and q2.creationdate >= now() - interval '365 days'
+    group by lower(trim(t2))
+  ) qs_total on qs_total.tag = ts.tag
+)
+select *
+from final
+where reputation >= 1000
+order by ts.avg_answer_score desc, accepted_by_user_in_tag desc, total_hot_score_last_year desc
+limit 200;

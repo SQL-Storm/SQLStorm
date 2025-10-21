@@ -1,0 +1,69 @@
+SELECT
+  p.Id,
+  p.Title,
+  COALESCE(u.DisplayName, 'Community') AS OwnerDisplayName,
+  ('Post by ' || COALESCE(u.DisplayName, 'Community') || ' on ' || TO_CHAR(p.CreationDate, 'YYYY-MM-DD')) AS MetaString,
+  TO_CHAR(p.CreationDate, 'YYYY-MM-DD HH24:MI:SS') AS CreationDateTime,
+  p.ViewCount,
+  (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) AS NetVotes,
+  COALESCE(c.CommentCount,0) AS CommentCount,
+  COALESCE(l.LinkedPostCount,0) AS LinkedCount,
+  COALESCE(l.DuplicateCount,0) AS DuplicateCount,
+  COALESCE(t.TagPopularity,0) AS TagPopularity,
+  ((COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) 
+     + 0.7 * COALESCE(p.ViewCount,0) 
+     + 0.55 * COALESCE(t.TagPopularity,0)) AS WeightedScore,
+  ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY
+                     ((COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) 
+                      + 0.7 * COALESCE(p.ViewCount,0) 
+                      + 0.55 * COALESCE(t.TagPopularity,0)) DESC) AS RankWithinType,
+  TIMESTAMP '2024-10-01 12:34:56' AS BenchmarkTime
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY PostId
+) v ON v.PostId = p.Id
+LEFT JOIN (
+  SELECT
+    PostId,
+    COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY PostId
+) c ON c.PostId = p.Id
+LEFT JOIN (
+  SELECT
+    PostId,
+    SUM(CASE WHEN pl.LinkTypeId IN (1,3) THEN 1 ELSE 0 END) AS LinkedPostCount,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateCount
+  FROM PostLinks pl
+  GROUP BY PostId
+) l ON l.PostId = p.Id
+LEFT JOIN (
+  SELECT
+    t2.TagName,
+    t2Ref.ReferencedPost,
+    COALESCE(SUM(t2.Count),0) AS TagPopularity
+  FROM (
+    SELECT
+      p.Id AS PostId,
+      TRIM(BOTH '>' FROM TRIM(BOTH ' ' FROM REGEXP_REPLACE(p.Tags, '^\\[|\\]$', '', 'g'))) AS taglist
+    FROM Posts p
+  ) AS src
+  CROSS JOIN LATERAL REGEXP_SPLIT_TO_TABLE(coalesce(substring(p.Tags, 2, length(p.Tags) - 2), ''), '><') AS t(tag)
+  LEFT JOIN Tags t2 ON LOWER(t2.TagName) = LOWER(t.tag)
+  LEFT JOIN (
+    SELECT
+      p.Id AS ReferencedPost
+    FROM Posts p
+  ) t2Ref ON TRUE
+  GROUP BY t2Ref.ReferencedPost
+) t ON t.ReferencedPost = p.Id
+WHERE p.PostTypeId IN (1,2)
+  AND (p.ClosedDate IS NULL OR p.ClosedDate > TIMESTAMP '2024-10-01 12:34:56')
+ORDER BY WeightedScore DESC
+LIMIT 300;

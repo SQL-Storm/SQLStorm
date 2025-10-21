@@ -1,0 +1,72 @@
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL AND b.Class IN (1,2,3) THEN b.Id END) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+PostActivity AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        MAX(p.LastActivityDate) AS MostRecentActivity,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        MAX(tags.TagName) AS TopTag
+    FROM Posts p
+    CROSS APPLY (
+        SELECT TRIM(value) AS TagName
+        FROM (SELECT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2) AS InnerTags) AS s
+        CROSS APPLY (
+            SELECT CAST('<t>' || REPLACE(InnerTags, '><', '</t><t>') || '</t>' AS XML).value('(//t/text())[1]', 'VARCHAR(100)') AS TagValue
+        ) AS ttags
+        CROSS APPLY (SELECT TagValue) AS t
+    ) AS tags
+    JOIN Tags t ON t.TagName = tags.TagName
+    GROUP BY p.OwnerUserId
+)
+
+SELECT 
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    pa.PostCount,
+    pa.QuestionCount,
+    pa.AnswerCount,
+    pa.TotalScore,
+    COALESCE(tt.TopTag, NULL) AS TopTag,
+    CASE 
+        WHEN pa.PostCount > 0 THEN 
+            ROUND(pa.TotalScore * 1.0 / pa.PostCount, 2)
+        ELSE NULL 
+    END AS AvgPostScore,
+    RANK() OVER (
+        ORDER BY 
+            (ubc.GoldBadges * 3 + ubc.SilverBadges * 2 + ubc.BronzeBadges) DESC, 
+            pa.TotalScore DESC
+    ) AS UserRank
+FROM UserBadgeCounts ubc
+JOIN PostActivity pa ON ubc.UserId = pa.OwnerUserId
+LEFT JOIN TopTags tt ON ubc.UserId = tt.OwnerUserId
+WHERE 
+    ubc.BadgeRank <= 1000
+    AND pa.PostCount > 5
+    AND (pa.MostRecentActivity > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+ORDER BY UserRank
+LIMIT 100;

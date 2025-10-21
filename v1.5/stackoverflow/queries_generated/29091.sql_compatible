@@ -1,0 +1,456 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as RowNum,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.ViewCount) OVER (ORDER BY p.CreationDate) as NextViewCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as AvgScoreWindow,
+        NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        MAX(p.CreationDate) as LastActivity,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ActivityLevel,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) / NULLIF(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0), 0) as ScoreRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as TagPercentile,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PrevTagCount,
+        SUM(t.Count) OVER (ORDER BY t.Count DESC ROWS UNBOUNDED PRECEDING) as CumulativeTagCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        COALESCE(p.AnswerCount, 0) as AnswerCountNormalized,
+        COALESCE(p.CommentCount, 0) as CommentCountNormalized,
+        POWER(p.ViewCount, 0.5) as ViewSquareRoot,
+        LOG(p.Score + 1) as ScoreLog
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+AggregatedMetrics AS (
+    SELECT 
+        SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) as TotalQuestions,
+        SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) as TotalAnswers,
+        AVG(ps.Score) as AvgScore,
+        AVG(ps.ViewCount) as AvgViews,
+        MAX(ps.Score) as MaxScore,
+        MIN(ps.ViewCount) as MinViews,
+        COUNT(DISTINCT ps.ParentId) as UniqueParentPosts,
+        COUNT(DISTINCT ps.Id) as TotalPosts,
+        AVG(ps.AnswerCount) as AvgAnswers,
+        AVG(ps.CommentCount) as AvgComments,
+        AVG(ps.FavoriteCount) as AvgFavorites
+    FROM PostStats ps
+),
+UserScoreRankings AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY ua.TotalQuestionScore DESC) as TopQuestionScore,
+        RANK() OVER (ORDER BY ua.TotalAnswerScore DESC) as TopAnswerScore,
+        DENSE_RANK() OVER (ORDER BY ua.Reputation DESC) as ReputationRank
+    FROM UserActivity ua
+),
+TempPostHistory AS (
+    SELECT 
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN 'ModAction'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 'Edit'
+            ELSE 'Other'
+        END as HistoryType,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as RecentEdit,
+        COUNT(*) OVER (PARTITION BY ph.PostId) as TotalEdits
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))
+)
+SELECT 
+    a.TotalQuestions,
+    a.TotalAnswers,
+    a.AvgScore,
+    a.AvgViews,
+    a.MaxScore,
+    a.MinViews,
+    a.UniqueParentPosts,
+    a.TotalPosts,
+    a.AvgAnswers,
+    a.AvgComments,
+    a.AvgFavorites,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank <= 10 THEN rs.Id END) as Top10RankedPosts,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank > 10 AND rs.ScoreRank <= 100 THEN rs.Id END) as Top100RankedPosts,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank > 100 THEN rs.Id END) as LowerRankedPosts,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank <= 10 AND rs.PostTypeId = 1 THEN rs.Id END) as Top10Questions,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank <= 10 AND rs.PostTypeId = 2 THEN rs.Id END) as Top10Answers,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank <= 100 AND rs.PostTypeId = 1 THEN rs.Id END) as Top100Questions,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank <= 100 AND rs.PostTypeId = 2 THEN rs.Id END) as Top100Answers,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank > 100 AND rs.PostTypeId = 1 THEN rs.Id END) as LowerQuestions,
+    COUNT(DISTINCT CASE WHEN rs.ScoreRank > 100 AND rs.PostTypeId = 2 THEN rs.Id END) as LowerAnswers,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        JOIN Users u ON p.OwnerUserId = u.Id 
+        WHERE p.PostTypeId = 1 AND p.Score > 100
+    ) as HighScoreQuestions,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        JOIN Users u ON p.OwnerUserId = u.Id 
+        WHERE p.PostTypeId = 2 AND p.Score > 100
+    ) as HighScoreAnswers,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.ViewCount > 1000
+    ) as HighViewQuestions,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        WHERE p.PostTypeId = 2 AND p.ViewCount > 1000
+    ) as HighViewAnswers,
+    (SELECT COUNT(*) FROM TagAnalysis WHERE TagCount > 1000) as PopularTags,
+    (SELECT COUNT(*) FROM TagAnalysis WHERE TagCount > 5000) as VeryPopularTags,
+    (SELECT AVG(TagCount) FROM TagAnalysis) as AvgTagCount,
+    (SELECT MAX(TagCount) FROM TagAnalysis) as MaxTagCount,
+    (
+        SELECT COUNT(*) FROM Posts p1 
+        JOIN Posts p2 ON p1.Id = p2.ParentId 
+        WHERE p1.PostTypeId = 1 AND p2.PostTypeId = 2
+    ) as QnAConnections,
+    (
+        SELECT COUNT(*) FROM Posts p1 
+        JOIN Posts p2 ON p1.Id = p2.ParentId 
+        WHERE p1.PostTypeId = 1 AND p2.PostTypeId = 2 AND p2.Score > 100
+    ) as HighScoreQnA,
+    (
+        SELECT COUNT(*) FROM Posts p1 
+        JOIN Posts p2 ON p1.Id = p2.ParentId 
+        WHERE p1.PostTypeId = 1 AND p2.PostTypeId = 2 AND p1.Score > 100
+    ) as HighScoreQuestionsWithAnswers,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) as EditedPosts,
+    (
+        SELECT COUNT(*) FROM TempPostHistory 
+        WHERE RecentEdit = 1 AND HistoryType = 'Edit'
+    ) as MostRecentEdits,
+    (
+        SELECT COUNT(*) FROM TempPostHistory 
+        WHERE RecentEdit = 1 AND HistoryType = 'ModAction'
+    ) as RecentModActions,
+    (
+        SELECT COUNT(*) FROM TempPostHistory 
+        WHERE TotalEdits > 5
+    ) as FrequentEdits,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Tags t ON p.Tags LIKE CONCAT('%', t.TagName, '%') 
+        WHERE t.Count > 10000
+    ) as QuestionsWithPopularTags,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE ph.UserId IS NOT NULL AND ph.CreationDate >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+    ) as ActiveEditsLast30Days,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE p.PostTypeId = 1 AND ph.PostHistoryTypeId = 10 AND ph.Comment LIKE '%duplicate%'
+    ) as DuplicateClosures,
+    (
+        SELECT AVG(AgeInDays) FROM PostStats 
+        WHERE PostTypeId = 1
+    ) as AvgQuestionAge,
+    (
+        SELECT AVG(AgeInDays) FROM PostStats 
+        WHERE PostTypeId = 2
+    ) as AvgAnswerAge,
+    (
+        SELECT AVG(Score) FROM PostStats 
+        WHERE ScoreLevel = 'High' AND PostTypeId = 1
+    ) as HighScoreQuestionsAvg,
+    (
+        SELECT AVG(Score) FROM PostStats 
+        WHERE ScoreLevel = 'High' AND PostTypeId = 2
+    ) as HighScoreAnswersAvg,
+    (
+        SELECT SUM(Score) FROM PostStats 
+        WHERE ScoreLevel = 'High' AND PostTypeId = 1
+    ) as HighScoreQuestionTotal,
+    (
+        SELECT SUM(Score) FROM PostStats 
+        WHERE ScoreLevel = 'High' AND PostTypeId = 2
+    ) as HighScoreAnswerTotal,
+    (
+        SELECT MAX(Views) FROM UserActivity
+    ) as MaxUserViews,
+    (
+        SELECT MIN(Reputation) FROM UserActivity
+    ) as MinUserReputation,
+    (
+        SELECT AVG(Reputation) FROM UserActivity
+    ) as AvgUserReputation,
+    (
+        SELECT AVG(TotalQuestionScore) FROM UserActivity
+    ) as AvgQuestionScorePerUser,
+    (
+        SELECT AVG(TotalAnswerScore) FROM UserActivity
+    ) as AvgAnswerScorePerUser,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE PostCount > 50
+    ) as ActiveUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE PostCount > 200
+    ) as VeryActiveUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE ActivityLevel = 'High'
+    ) as HighActivityUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE ActivityLevel = 'Medium'
+    ) as MediumActivityUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE ActivityLevel = 'Low'
+    ) as LowActivityUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE Reputation > 100000
+    ) as SuperUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE Reputation > 10000
+    ) as ExpertUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE Reputation BETWEEN 1000 AND 9999
+    ) as IntermediateUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE Reputation BETWEEN 100 AND 999
+    ) as BeginnerUsers,
+    (
+        SELECT COUNT(*) FROM UserActivity 
+        WHERE Reputation BETWEEN 0 AND 99
+    ) as NewUsers,
+    (
+        SELECT COUNT(DISTINCT UserId) 
+        FROM Votes v 
+        JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.PostTypeId = 1 AND v.VoteTypeId = 2
+    ) as UpvotersOnQuestions,
+    (
+        SELECT COUNT(DISTINCT UserId) 
+        FROM Votes v 
+        JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.PostTypeId = 2 AND v.VoteTypeId = 2
+    ) as UpvotersOnAnswers,
+    (
+        SELECT COUNT(*) FROM Votes v 
+        JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.PostTypeId = 1 AND v.VoteTypeId = 2 AND v.CreationDate >= DATEADD(month, -3, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentQuestionUpvotes,
+    (
+        SELECT COUNT(*) FROM Votes v 
+        JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.PostTypeId = 2 AND v.VoteTypeId = 2 AND v.CreationDate >= DATEADD(month, -3, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentAnswerUpvotes,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.AnswerCount = 0
+    ) as UnansweredQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.AnswerCount > 0
+    ) as AnsweredQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.AnswerCount > 10
+    ) as HighlyAnsweredQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Comments c ON p.Id = c.PostId 
+        WHERE p.PostTypeId = 1
+    ) as QuestionsWithComments,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Comments c ON p.Id = c.PostId 
+        WHERE p.PostTypeId = 2
+    ) as AnswersWithComments,
+    (
+        SELECT AVG(CommentCount) 
+        FROM Posts 
+        WHERE PostTypeId = 1
+    ) as AvgCommentsPerQuestion,
+    (
+        SELECT AVG(CommentCount) 
+        FROM Posts 
+        WHERE PostTypeId = 2
+    ) as AvgCommentsPerAnswer,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+    ) as TaggedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.Tags IS NULL
+    ) as UntaggedQuestions,
+    (
+        SELECT COUNT(DISTINCT p.Id) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE ph.PostHistoryTypeId = 10
+    ) as ClosedQuestions,
+    (
+        SELECT COUNT(DISTINCT p.Id) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE ph.PostHistoryTypeId = 11
+    ) as ReopenedQuestions,
+    (
+        SELECT COUNT(DISTINCT p.Id) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE ph.PostHistoryTypeId = 12
+    ) as DeletedQuestions,
+    (
+        SELECT COUNT(DISTINCT p.Id) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE ph.PostHistoryTypeId IN (10, 11, 12)
+    ) as ChangedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN PostLinks pl ON p.Id = pl.PostId 
+        WHERE pl.LinkTypeId = 1
+    ) as LinkedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN PostLinks pl ON p.Id = pl.RelatedPostId 
+        WHERE pl.LinkTypeId = 3
+    ) as DuplicatePosts,
+    (
+        SELECT COUNT(DISTINCT p.Id) 
+        FROM Posts p 
+        JOIN PostLinks pl ON p.Id = pl.PostId 
+        WHERE pl.LinkTypeId = 1 AND pl.RelatedPostId IS NOT NULL
+    ) as LinkedWithOthers,
+    (
+        SELECT COUNT(*) 
+        FROM TempPostHistory 
+        WHERE Text LIKE '%markdown%'
+    ) as MarkdownEdits,
+    (
+        SELECT COUNT(*) 
+        FROM TempPostHistory 
+        WHERE Text LIKE '%HTML%'
+    ) as HTMLEdits,
+    (
+        SELECT COUNT(*) 
+        FROM TempPostHistory 
+        WHERE Text NOT LIKE '%markdown%' AND Text NOT LIKE '%HTML%'
+    ) as OtherEdits,
+    (
+        SELECT COUNT(DISTINCT ph.UserId)
+        FROM PostHistory ph
+        WHERE ph.CreationDate >= DATEADD(month, -3, cast('2024-10-01 12:34:56' as timestamp))
+    ) as ActiveEditorsLast3Months,
+    (
+        SELECT COUNT(DISTINCT ph.UserId)
+        FROM PostHistory ph
+        WHERE ph.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+    ) as ActiveEditorsLastYear
+FROM AggregatedMetrics a
+CROSS JOIN (
+    SELECT COUNT(*) as DummyCount FROM Posts
+) dummy
+LEFT JOIN RankedPosts rs ON 1=1
+WHERE rs.RowNum <= 1000
+GROUP BY a.TotalQuestions, a.TotalAnswers, a.AvgScore, a.AvgViews, a.MaxScore, a.MinViews, 
+         a.UniqueParentPosts, a.TotalPosts, a.AvgAnswers, a.AvgComments, a.AvgFavorites
+HAVING COUNT(*) > 0
+ORDER BY a.TotalQuestions DESC
+LIMIT 1;

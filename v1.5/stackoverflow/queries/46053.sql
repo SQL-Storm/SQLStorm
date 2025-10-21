@@ -1,0 +1,113 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+      AND p.Score > 5
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerPerformance AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN q.AcceptedAnswerId = a.Id THEN a.Id END) AS AcceptedCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianScore
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 
+      AND a.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY a.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate
+    FROM Badges
+    WHERE Date >= TIMESTAMP '2020-01-01'
+    GROUP BY UserId
+),
+TagEngagement AS (
+    SELECT 
+        p.OwnerUserId,
+        t.tag,
+        COUNT(DISTINCT p.Id) AS PostsInTag,
+        AVG(p.Score) AS TagAvgScore
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS t(tag)
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.OwnerUserId, t.tag
+),
+TopTagsPerUser AS (
+    SELECT 
+        OwnerUserId,
+        tag AS TopTag,
+        PostsInTag,
+        TagAvgScore,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY PostsInTag DESC, TagAvgScore DESC) AS TagRank
+    FROM TagEngagement
+),
+InteractionMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentsReceived,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    tqa.OwnerUserId,
+    tqa.DisplayName,
+    tqa.QuestionCount,
+    ROUND(tqa.AvgScore, 2) AS AvgQuestionScore,
+    tqa.TotalViews,
+    COALESCE(ap.AnswerCount, 0) AS AnswerCount,
+    COALESCE(ap.AcceptedCount, 0) AS AcceptedAnswers,
+    ROUND(COALESCE(ap.AvgAnswerScore, 0), 2) AS AvgAnswerScore,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ubs.GoldBadges, 0) AS Gold,
+    COALESCE(ubs.SilverBadges, 0) AS Silver,
+    COALESCE(ubs.BronzeBadges, 0) AS Bronze,
+    COALESCE(ttu.TopTag, 'None') AS PrimaryTag,
+    COALESCE(ttu.PostsInTag, 0) AS PostsInPrimaryTag,
+    COALESCE(im.CommentsReceived, 0) AS CommentsReceived,
+    COALESCE(im.Upvotes, 0) AS Upvotes,
+    COALESCE(im.Downvotes, 0) AS Downvotes,
+    ROUND(
+        CASE 
+            WHEN COALESCE(im.Upvotes, 0) + COALESCE(im.Downvotes, 0) > 0
+            THEN (COALESCE(im.Upvotes, 0)) / (COALESCE(im.Upvotes, 0) + COALESCE(im.Downvotes, 0))
+            ELSE 0
+        END * 100, 2
+    ) AS PositiveVotePercentage,
+    ROUND(
+        (tqa.QuestionCount + COALESCE(ap.AnswerCount, 0))
+        / GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - TIMESTAMP '2020-01-01')) / 86400.0, 1),
+        2
+    ) AS AvgPostsPerDay
+FROM TopQuestionAuthors tqa
+LEFT JOIN AnswerPerformance ap ON tqa.OwnerUserId = ap.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON tqa.OwnerUserId = ubs.UserId
+LEFT JOIN TopTagsPerUser ttu ON tqa.OwnerUserId = ttu.OwnerUserId AND ttu.TagRank = 1
+LEFT JOIN InteractionMetrics im ON tqa.OwnerUserId = im.OwnerUserId
+ORDER BY 
+    (tqa.QuestionCount * 2 + COALESCE(ap.AcceptedCount, 0) * 5 + COALESCE(ubs.GoldBadges, 0) * 10) DESC,
+    tqa.TotalViews DESC
+LIMIT 100;

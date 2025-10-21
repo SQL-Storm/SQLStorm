@@ -1,0 +1,78 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(p.CreationDate) FILTER (WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        pt.UserId,
+        (CASE WHEN p.Tags IS NULL THEN NULL
+              ELSE unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))
+         END) AS TagName,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    JOIN ( SELECT Id AS UserId FROM Users ) pt ON p.OwnerUserId = pt.UserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY pt.UserId, TagName
+),
+UserTopTags AS (
+    SELECT UserId, TagName, TagCount,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS TagRank
+    FROM TopTags
+),
+UserAcceptedAnswerStats AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        COUNT(*) AS AnswersAccepted,
+        AVG(a.Score) AS AvgAcceptedAnswerScore
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.AcceptedAnswerId IS NOT NULL AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesCast
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    COALESCE(uas.AnswersAccepted, 0) AS AnswersAccepted,
+    COALESCE(uas.AvgAcceptedAnswerScore, 0) AS AvgAcceptedAnswerScore,
+    ua.AvgPostScore,
+    ua.LastPostDate,
+    uv.UpVotesCast,
+    uv.DownVotesCast,
+    ARRAY_AGG(utt.TagName ORDER BY utt.TagRank) FILTER (WHERE utt.TagRank <= 3) AS Top3Tags
+FROM UserActivity ua
+LEFT JOIN UserAcceptedAnswerStats uas ON ua.UserId = uas.UserId
+LEFT JOIN UserVoteStats uv ON ua.UserId = uv.UserId
+LEFT JOIN UserTopTags utt ON ua.UserId = utt.UserId AND utt.TagRank <= 3
+GROUP BY 
+    ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, 
+    ua.BadgesEarned, uas.AnswersAccepted, uas.AvgAcceptedAnswerScore, ua.AvgPostScore, 
+    ua.LastPostDate, uv.UpVotesCast, uv.DownVotesCast
+HAVING SUM(ua.QuestionsAsked) + SUM(ua.AnswersGiven) + SUM(ua.CommentsMade) > 50
+ORDER BY COALESCE(uas.AnswersAccepted, 0) DESC, ua.Reputation DESC NULLS LAST
+LIMIT 100;

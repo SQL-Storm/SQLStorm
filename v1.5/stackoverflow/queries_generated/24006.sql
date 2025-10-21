@@ -1,0 +1,75 @@
+-- {"query": "24006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3750} 
+
+WITH
+   q AS (
+      SELECT p.Id   AS qid,
+             p.Title,
+             p.Tags,
+             p.ViewCount,
+             p.AcceptedAnswerId,
+             p.CreationDate,
+             p.ClosedDate IS NOT NULL AS is_closed,
+             p.OwnerUserId
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+   ),
+   a AS (
+      SELECT Id         AS aid,
+             ParentId,
+             Score,
+             LastActivityDate
+      FROM Posts
+      WHERE PostTypeId = 2
+   ),
+   qstats AS (
+      SELECT q.qid,
+             q.Title,
+             q.is_closed,
+             u.Reputation           AS owner_rep,
+             u.DisplayName          AS owner_name,
+             q.ViewCount,
+             COUNT(a.aid)           AS answer_count,
+             MAX(a.Score)           AS max_answer_score,
+             MAX(a.LastActivityDate) AS latest_answer,
+             (SELECT Score
+                FROM Posts acc
+                WHERE acc.Id = q.AcceptedAnswerId) AS accepted_score,
+             STRING_TO_ARRAY(q.Tags, '><') AS tag_array
+      FROM q
+      LEFT JOIN a ON a.ParentId = q.qid
+      LEFT JOIN Users u ON u.Id = q.OwnerUserId
+      GROUP BY q.qid, q.Title, q.is_closed, u.Reputation,
+               u.DisplayName, q.ViewCount, q.AcceptedAnswerId
+   ),
+   open_stats AS (
+      SELECT *,
+             RANK() OVER (ORDER BY answer_count DESC, ViewCount DESC) AS travel_rank
+      FROM qstats
+      WHERE is_closed = false
+   ),
+   closed_stats AS (
+      SELECT *,
+             RANK() OVER (ORDER BY answer_count DESC, ViewCount DESC) AS travel_rank
+      FROM qstats
+      WHERE is_closed = true
+   ),
+   combined AS (
+      SELECT qid, Title, owner_name, owner_rep, ViewCount, answer_count,
+             max_answer_score, accepted_score, latest_answer, is_closed,
+             tag_array, travel_rank,
+             'Open' AS status
+      FROM open_stats
+      UNION ALL
+      SELECT qid, Title, owner_name, owner_rep, ViewCount, answer_count,
+             max_answer_score, accepted_score, latest_answer, is_closed,
+             tag_array, travel_rank,
+             'Closed' AS status
+      FROM closed_stats
+   )
+SELECT c.*,
+       CASE WHEN c.tag_array @> ARRAY['c#'] THEN 'Programming' ELSE 'Other' END AS label
+FROM combined c
+WHERE c.answer_count >= 7
+  AND c.ViewCount   > 100
+ORDER BY c.travel_rank,
+         c.is_closed DESC;

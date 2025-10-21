@@ -1,0 +1,164 @@
+-- {"query": "18022.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1726} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ViewCount AS PostViewCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.Score > 0
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        COUNT(DISTINCT rp.PostId) AS TotalPosts,
+        SUM(rp.PostScore) AS TotalScore,
+        AVG(rp.PostScore) AS AvgScore,
+        COUNT(CASE WHEN rp.PostTypeId = 1 THEN rp.PostId END) AS QuestionCount,
+        COUNT(CASE WHEN rp.PostTypeId = 2 THEN rp.PostId END) AS AnswerCount,
+        MAX(rp.PostCreationDate) AS LatestPostDate,
+        SUM(rp.PostViewCount) AS TotalViews,
+        MAX(rp.rn) AS MaxRankWithinType
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+HighEngagementUsers AS (
+    SELECT
+        upa.UserId,
+        upa.UserDisplayName,
+        upa.TotalPosts,
+        upa.TotalScore,
+        upa.AvgScore,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.LatestPostDate,
+        upa.TotalViews,
+        upa.MaxRankWithinType,
+        (upa.TotalScore * 1.5) + (upa.TotalPosts * 0.5) - (upa.TotalViews * 0.01) AS EngagementScore
+    FROM UserPostActivity upa
+    WHERE upa.TotalPosts > 10 AND upa.AvgScore > 5
+),
+PostDetailsWithUsers AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        CASE
+            WHEN p.OwnerUserId = -1 THEN 'Community'
+            WHEN p.OwnerUserId IS NULL THEN 'Unknown'
+            ELSE CAST(p.OwnerUserId AS VARCHAR(20))
+        END AS OwnerIdentifier,
+        CONCAT(COALESCE(u.Location, 'No Location'), ' | ', COALESCE(u.WebsiteUrl, 'No Website')) AS UserContactInfo,
+        CASE
+            WHEN u.Reputation > 100000 THEN 'High'
+            WHEN u.Reputation BETWEEN 10000 AND 100000 THEN 'Medium'
+            ELSE 'Low'
+        END AS ReputationLevel,
+        CASE WHEN u.CreationDate < '2010-01-01' THEN 'Early Adopter' ELSE 'Later Adopter' END AS UserVintage
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.Score > 0
+),
+PostLag AS (
+    SELECT
+        pd.PostId,
+        pd.Title,
+        pd.PostTypeName,
+        pd.OwnerDisplayName,
+        pd.CreationDate,
+        pd.Score,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.PostStatus,
+        pd.OwnerIdentifier,
+        pd.UserContactInfo,
+        pd.ReputationLevel,
+        pd.UserVintage,
+        LAG(pd.CreationDate, 1, pd.CreationDate) OVER (ORDER BY pd.CreationDate) AS PreviousPostCreationDate,
+        JULIANDAY(pd.CreationDate) - JULIANDAY(LAG(pd.CreationDate, 1, pd.CreationDate) OVER (ORDER BY pd.CreationDate)) AS DaysSincePreviousPost
+    FROM PostDetailsWithUsers pd
+)
+SELECT
+    pl.PostId,
+    pl.Title,
+    pl.PostTypeName,
+    pl.OwnerDisplayName,
+    pl.CreationDate,
+    pl.Score,
+    pl.ViewCount,
+    pl.AnswerCount,
+    pl.CommentCount,
+    pl.FavoriteCount,
+    pl.PostStatus,
+    pl.OwnerIdentifier,
+    pl.UserContactInfo,
+    pl.ReputationLevel,
+    pl.UserVintage,
+    pl.DaysSincePreviousPost,
+    heu.EngagementScore AS UserEngagementScore,
+    COALESCE(heu.TotalPosts, 0) AS UserTotalPosts,
+    COALESCE(heu.AvgScore, 0) AS UserAvgScore,
+    CASE
+        WHEN pl.DaysSincePreviousPost > 30 THEN 'Significant Lag'
+        WHEN pl.DaysSincePreviousPost BETWEEN 7 AND 30 THEN 'Moderate Lag'
+        ELSE 'Short Lag'
+    END AS PostLagCategory,
+    CASE
+        WHEN pl.Score > 100 AND pl.AnswerCount > 5 AND pl.ViewCount > 1000 THEN 'High Value Post'
+        WHEN pl.Score > 20 AND pl.AnswerCount > 1 THEN 'Medium Value Post'
+        ELSE 'Standard Post'
+    END AS PostValueCategory,
+    (pl.Score * pl.AnswerCount) + pl.FavoriteCount AS WeightedScore
+FROM PostLag pl
+LEFT JOIN HighEngagementUsers heu ON CAST(pl.OwnerIdentifier AS INT) = heu.UserId
+WHERE pl.PostStatus = 'Open' AND pl.PostTypeName IN ('Question', 'Answer')
+UNION ALL
+SELECT
+    NULL AS PostId,
+    'Summary Row' AS Title,
+    'Total' AS PostTypeName,
+    NULL AS OwnerDisplayName,
+    NULL AS CreationDate,
+    SUM(pl.Score) AS Score,
+    SUM(pl.ViewCount) AS ViewCount,
+    SUM(pl.AnswerCount) AS AnswerCount,
+    SUM(pl.CommentCount) AS CommentCount,
+    SUM(pl.FavoriteCount) AS FavoriteCount,
+    NULL AS PostStatus,
+    NULL AS OwnerIdentifier,
+    NULL AS UserContactInfo,
+    NULL AS ReputationLevel,
+    NULL AS UserVintage,
+    AVG(pl.DaysSincePreviousPost) AS DaysSincePreviousPost,
+    AVG(heu.EngagementScore) AS UserEngagementScore,
+    COUNT(DISTINCT heu.UserId) AS UserTotalPosts,
+    AVG(heu.AvgScore) AS UserAvgScore,
+    NULL AS PostLagCategory,
+    NULL AS PostValueCategory,
+    SUM(pl.Score * pl.AnswerCount) + SUM(pl.FavoriteCount) AS WeightedScore
+FROM PostLag pl
+LEFT JOIN HighEngagementUsers heu ON CAST(pl.OwnerIdentifier AS INT) = heu.UserId
+WHERE pl.PostStatus = 'Open' AND pl.PostTypeName IN ('Question', 'Answer');

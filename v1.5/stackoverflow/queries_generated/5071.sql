@@ -1,0 +1,94 @@
+-- {"query": "5071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 984} 
+WITH TopUsers AS (
+    SELECT U.Id AS UserId,
+           U.DisplayName,
+           U.Reputation,
+           COUNT(DISTINCT P.Id) AS NumPosts,
+           SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS NumQuestions,
+           SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS NumAnswers,
+           DENSE_RANK() OVER (ORDER BY U.Reputation DESC) AS RepRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.CreationDate <= (SELECT MAX(CreationDate) FROM Users) - INTERVAL '1 year'
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+    HAVING COUNT(P.Id) > 10
+),
+UserBadges AS (
+    SELECT B.UserId,
+           COUNT(*) FILTER (WHERE B.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE B.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+           COUNT(*) AS TotalBadges,
+           COUNT(*) FILTER (WHERE B.TagBased = true) AS TagBadges,
+           MIN(B.Date) AS FirstBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+ActivePosts AS (
+    SELECT P.*,
+           ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.LastActivityDate DESC NULLS LAST) AS RecentRank
+    FROM Posts P
+    WHERE P.CreationDate > NOW() - INTERVAL '90 days'
+      AND P.Score >= 1
+      AND P.PostTypeId IN (1,2)
+),
+PivotedVotes AS (
+    SELECT PostId,
+           SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes V
+    GROUP BY PostId
+),
+CommentStats AS (
+    SELECT C.PostId,
+           COUNT(*) AS NumComments,
+           AVG(C.Score)::numeric(5,2) AS AvgCommentScore,
+           MAX(C.CreationDate) AS LastCommentDate,
+           COUNT(*) FILTER (WHERE C.Score >= 5) AS HighScoreComments
+    FROM Comments C
+    GROUP BY C.PostId
+)
+SELECT
+    T.UserId,
+    T.DisplayName,
+    T.Reputation,
+    T.NumPosts,
+    T.NumQuestions,
+    T.NumAnswers,
+    T.RepRank,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    UB.TotalBadges,
+    UB.TagBadges,
+    COALESCE(UB.FirstBadgeDate::date::text, 'Never Awarded') AS FirstBadgeDate,
+    AP.Id AS RecentPostId,
+    AP.Title AS RecentPostTitle,
+    AP.PostTypeId,
+    AP.CreationDate AS RecentPostCreated,
+    AP.LastActivityDate,
+    AP.Score AS RecentPostScore,
+    string_to_array(substring(AP.Tags, 2, length(AP.Tags)-2), '><') AS RecentPostTags,
+    PV.UpVotes,
+    PV.DownVotes,
+    PV.Favorites,
+    CS.NumComments,
+    CS.AvgCommentScore,
+    CASE 
+        WHEN CS.HighScoreComments IS NULL OR CS.HighScoreComments = 0 THEN 'No High Score Comments'
+        ELSE CS.HighScoreComments::text || ' high score comment(s)'
+    END AS HighScoreComments,
+    CASE 
+        WHEN AP.ClosedDate IS NOT NULL THEN 'Closed on ' || AP.ClosedDate::date::text
+        ELSE 'Open'
+    END AS PostState,
+    (SELECT COUNT(*) FROM Posts P2 WHERE P2.OwnerUserId = T.UserId AND P2.Score > 5) AS HighlyUpvotedPosts,
+    (SELECT AVG(P3.ViewCount) FROM Posts P3 WHERE P3.OwnerUserId = T.UserId AND P3.ViewCount IS NOT NULL) AS AvgViewCount
+FROM TopUsers T
+LEFT JOIN UserBadges UB ON T.UserId = UB.UserId
+LEFT JOIN ActivePosts AP ON T.UserId = AP.OwnerUserId AND AP.RecentRank = 1
+LEFT JOIN PivotedVotes PV ON AP.Id = PV.PostId
+LEFT JOIN CommentStats CS ON AP.Id = CS.PostId
+WHERE T.RepRank <= 50
+ORDER BY T.RepRank, AP.LastActivityDate DESC NULLS LAST;

@@ -1,0 +1,134 @@
+-- {"query": "9045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3514} 
+WITH tag_expanded AS (
+    SELECT p.Id AS question_id,
+           trim(tag) AS tag
+    FROM Posts p
+    CROSS JOIN LATERAL
+         unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+    WHERE p.PostTypeId = 1
+),
+question_scores AS (
+    SELECT
+        te.question_id,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY te.tag ORDER BY p.Score DESC, p.ViewCount DESC) AS tag_rank,
+        COUNT(*)     OVER (PARTITION BY te.tag)                       AS tag_size
+    FROM tag_expanded te
+    JOIN Posts p ON p.Id = te.question_id
+    WHERE p.Score > (
+        SELECT AVG(p2.Score)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    )
+),
+filtered_questions AS (
+    SELECT question_id, Title
+    FROM question_scores
+    WHERE tag_rank <= GREATEST(1, LEAST(tag_size / 10, 5))
+),
+user_badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS golds,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silvers,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronzes
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_activity AS (
+    SELECT
+        u.Id            AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ub.golds, 0)   * 100
+      + COALESCE(ub.silvers, 0) *  50
+      + COALESCE(ub.bronzes, 0) *  10 AS badge_score,
+        (
+            SELECT COUNT(*)
+            FROM Posts a
+            WHERE a.OwnerUserId = u.Id
+              AND a.PostTypeId   = 2
+              AND a.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+        ) AS recent_answers,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS user_rank
+    FROM Users u
+    LEFT JOIN user_badge_counts ub ON ub.UserId = u.Id
+),
+recent_comments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) FILTER (WHERE c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS recent_comment_count,
+        MAX(c.CreationDate)                                    AS last_comment_date
+    FROM Comments c
+    GROUP BY c.PostId
+),
+reply_counts AS (
+    SELECT
+        ParentId AS question_id,
+        COUNT(*) AS answer_count
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+combined AS (
+    SELECT
+        fq.question_id,
+        fq.Title,
+        rc.answer_count,
+        cm.recent_comment_count,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.badge_score,
+        ua.recent_answers,
+        cm.last_comment_date
+    FROM filtered_questions fq
+    LEFT JOIN reply_counts rc    ON rc.question_id       = fq.question_id
+    LEFT JOIN recent_comments cm ON cm.PostId            = fq.question_id
+    LEFT JOIN Posts q            ON q.Id                 = fq.question_id
+    LEFT JOIN user_activity ua   ON ua.user_id           = q.OwnerUserId
+),
+set_op AS (
+    SELECT question_id, Title
+    FROM combined
+    WHERE recent_comment_count IS NULL
+    INTERSECT
+    SELECT question_id, Title
+    FROM combined
+    WHERE answer_count IS NULL
+)
+SELECT
+    c.*,
+    CASE
+        WHEN c.answer_count IS NULL AND c.recent_comment_count IS NULL THEN 'Dormant'
+        WHEN c.answer_count IS NULL                                    THEN 'Unanswered'
+        WHEN c.recent_comment_count IS NULL                             THEN 'NoComments'
+        ELSE 'Active'
+    END                                             AS status,
+    substr(c.Title, 1, 50)
+      || CASE WHEN length(c.Title) > 50 THEN '…' ELSE '' END         AS snippet,
+    (c.badge_score + COALESCE(c.Reputation, 0))::numeric
+      / NULLIF(c.recent_answers, 0)                                  AS activity_ratio
+FROM combined c
+WHERE (c.user_rank <= 100 OR c.recent_comment_count > 5)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM set_op so
+      WHERE so.question_id = c.question_id
+  )
+UNION ALL
+SELECT
+    so.question_id,
+    so.Title,
+    NULL    AS answer_count,
+    NULL    AS recent_comment_count,
+    NULL    AS DisplayName,
+    NULL    AS Reputation,
+    NULL    AS badge_score,
+    NULL    AS recent_answers,
+    NULL    AS last_comment_date,
+    'Edge'  AS status,
+    substr(so.Title, 1, 50),
+    NULL    AS activity_ratio
+FROM set_op so
+ORDER BY status NULLS LAST,
+         activity_ratio DESC;

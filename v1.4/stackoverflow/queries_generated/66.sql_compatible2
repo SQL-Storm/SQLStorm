@@ -1,0 +1,145 @@
+WITH
+TagsWithCounts AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    p.Id AS PostId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.PostTypeId,
+    p.CommentCount
+  FROM Posts p
+  JOIN Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+  WHERE p.PostTypeId = 1
+),
+RecentActive AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CommentCount,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate AS UserCreated,
+    u.LastAccessDate,
+    u.Location,
+    u.ProfileImageUrl,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+    (SELECT COUNT(*) FROM Posts pr WHERE pr.OwnerUserId = u.Id AND pr.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts pr WHERE pr.OwnerUserId = u.Id AND pr.PostTypeId = 2) AS AnswerCount
+  FROM Users u
+),
+TopVoters AS (
+  SELECT
+    v.UserId,
+    SUM(CASE WHEN vt.Name ILIKE 'UpMod%' THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN vt.Name ILIKE 'DownMod%' THEN 1 ELSE 0 END) AS DownVotesCast
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.UserId
+),
+ComplexPostAggregation AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.PostTypeId,
+    pv.UpVotes AS NetUpVotes,
+    pv.DownVotes AS NetDownVotes
+  FROM (
+    SELECT
+      pr.Id,
+      pr.Title,
+      pr.CreationDate,
+      pr.LastActivityDate,
+      pr.ViewCount,
+      pr.Score,
+      pr.AnswerCount,
+      pr.CommentCount,
+      pr.Tags,
+      pr.OwnerUserId,
+      pr.PostTypeId
+    FROM Posts pr
+    LEFT JOIN (
+      SELECT
+        PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+      FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+      GROUP BY PostId
+    ) pv ON pr.Id = pv.PostId
+  ) p
+),
+Final AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.ProfileImageUrl,
+    COALESCE(t.Title, v.Title) AS HighlightPostTitle,
+    v.PostId,
+    v.ViewCount,
+    v.Score,
+    v.LastActivityDate,
+    v.Tags,
+    v.OwnerUserId,
+    w.UpVotesGiven,
+    w.DownVotesCast,
+    b.BadgeCount
+  FROM UserStats u
+  LEFT JOIN TopVoters w ON w.UserId = u.UserId
+  LEFT JOIN Posts v ON v.OwnerUserId = u.UserId
+  LEFT JOIN ComplexPostAggregation pv ON pv.OwnerUserId = u.UserId
+  LEFT JOIN Tags t ON t.ExcerptPostId = v.PostId OR t.WikiPostId = v.PostId
+  LEFT JOIN Badges b ON b.UserId = u.UserId
+  WHERE u.Reputation > 100
+)
+SELECT
+  F.UserId,
+  F.DisplayName,
+  F.Reputation,
+  F.Location,
+  F.ProfileImageUrl,
+  F.HighlightPostTitle,
+  F.PostId,
+  F.ViewCount,
+  F.Score,
+  F.LastActivityDate,
+  F.Tags,
+  F.OwnerUserId,
+  F.UpVotesGiven,
+  F.DownVotesCast,
+  F.BadgeCount
+FROM Final F
+ORDER BY F.Reputation DESC, F.UpVotesGiven DESC
+LIMIT 200;

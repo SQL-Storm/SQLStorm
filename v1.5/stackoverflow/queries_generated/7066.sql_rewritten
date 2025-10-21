@@ -1,0 +1,212 @@
+-- {"query": "7066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2623} 
+with
+-- recent activity per post including derived score density and tag array
+post_recent as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.tags,
+    coalesce(p.score,0) as score,
+    coalesce(p.viewcount,0) as views,
+    p.creationdate,
+    p.lastactivitydate,
+    -- approximate tag list as array (tags stored like '<tag1><tag2>')
+    case
+      when p.tags is null then array[]::varchar[]
+      else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tag_list,
+    -- score per day since creation (avoid div0)
+    coalesce( (coalesce(p.score,0)::numeric) / nullif(greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate))/86400)::numeric,0), 0) as score_per_day,
+    -- score density combining views and answers
+    coalesce((coalesce(p.score,0) * 1.0) / nullif(greatest(1, p.viewcount),0),0) as score_per_view
+  from posts p
+  where p.posttypeid in (1,2)
+),
+-- windowed aggregates for user contribution patterns
+user_stats as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    count(distinct p.id) filter (where p.posttypeid=1) as q_count,
+    count(distinct p.id) filter (where p.posttypeid=2) as a_count,
+    sum(coalesce(p.score,0)) as total_post_score,
+    avg(coalesce(p.score,0)) filter (where p.posttypeid=2) as avg_answer_score,
+    max(coalesce(p.score,0)) as max_post_score,
+    min(coalesce(p.score,0)) as min_post_score,
+    -- temporal: median days between posts (using percentile_cont)
+    case when count(p.id) > 1 then
+      (percentile_cont(0.5) within group (order by extract(epoch from (p.creationdate - lag(p.creationdate) over (partition by u.id order by p.creationdate)))/86400) )
+    else null end as median_days_between_posts
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+-- expensive correlated: for each question get best answer candidate stats and text heuristics
+question_answer_summary as (
+  select
+    q.id as question_id,
+    q.title,
+    q.tags,
+    q.creationdate as q_created,
+    q.owneruserid as q_owner,
+    -- answers joined and aggregated
+    count(a.id) as answer_count,
+    sum(case when a.score > 0 then 1 else 0 end) as positive_answers,
+    max(a.score) as top_answer_score,
+    -- choose top answer id by score then by creationdate
+    (select a2.id from posts a2 where a2.parentid = q.id order by a2.score desc nulls last, a2.creationdate asc limit 1) as top_answer_id,
+    -- existence of accepted answer and that answer's lead over others
+    case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+    coalesce(
+      (select coalesce(a3.score,0) - coalesce((select max(a4.score) from posts a4 where a4.parentid = q.id and a4.id <> a3.id),0)
+       from posts a3 where a3.id = q.acceptedanswerid), 0) as accepted_lead,
+    -- text complexity proxies (length, tag intersections)
+    length(coalesce(q.body,'') ) as q_body_len,
+    array_length(
+      case when q.tags is null then array[]::varchar[] else string_to_array(substring(q.tags from 2 for char_length(q.tags)-2),'><') end,1) as q_tag_count
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.title, q.tags, q.creationdate, q.owneruserid, q.acceptedanswerid, q.body
+),
+-- tag popularity snapshot with trending delta comparing recent week vs prior month
+tag_trend as (
+  select
+    t.tagname,
+    t.id as tagid,
+    t.count as total_count,
+    coalesce(sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end),0) as last_week_posts,
+    coalesce(sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' and p.creationdate < cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end),0) as prior_30_to_7_days_posts,
+    -- trend score (normalized)
+    (coalesce(sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1.0 else 0 end),0) - coalesce(sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' and p.creationdate < cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1.0 else 0 end),0)) / nullif(greatest(1, t.count),0) as trend_ratio
+  from tags t
+  left join posts p on p.posttypeid = 1 and p.tags is not null and position('<' || t.tagname || '>' in p.tags) > 0
+  group by t.tagname, t.id, t.count
+),
+-- heavy join: for each user compute recent vote behavior and correlate with answer acceptance
+user_vote_behavior as (
+  select
+    u.id as userid,
+    u.displayname,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_cast,
+    -- recency weighted score of votes (exponential decay)
+    sum( case when v.creationdate is null then 0 else exp(-extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - v.creationdate)/86400/30) end ) as vote_recency_weight
+  from users u
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname
+),
+-- badge shock: users with sudden badge acquisition in last week vs prior month
+badge_spike as (
+  select
+    b.userid,
+    u.displayname,
+    sum(case when b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end) as badges_last_week,
+    sum(case when b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' and b.date < cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end) as badges_prior_30_to_7,
+    greatest(0, sum(case when b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end) - sum(case when b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' and b.date < cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end)) as badge_spike
+  from badges b
+  join users u on u.id = b.userid
+  group by b.userid, u.displayname
+),
+-- complex union: top posts by different metrics combined and ranked
+combined_top_posts as (
+  select id, title, 'top_by_score' as reason, score as metric, creationdate from posts where posttypeid in (1,2)
+  union all
+  select id, title, 'top_by_views' as reason, viewcount as metric, creationdate from posts where posttypeid in (1,2)
+  union all
+  select id, title, 'recent_activity' as reason, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(lastactivitydate,creationdate))) * -1 as metric, creationdate from posts where posttypeid in (1,2)
+),
+-- final heavy analytics combining many pieces
+analytics as (
+  select
+    pr.id as postid,
+    pr.posttypeid,
+    pr.title,
+    pr.tag_list,
+    pr.score,
+    pr.views,
+    pr.score_per_day,
+    pr.score_per_view,
+    qs.answer_count,
+    qs.has_accepted,
+    qs.top_answer_id,
+    qs.accepted_lead,
+    us.userid,
+    us.displayname,
+    us.reputation,
+    us.q_count,
+    us.a_count,
+    uv.upvotes_cast,
+    bs.badges_last_week,
+    tt.tagname as sample_tag,
+    tt.trend_ratio,
+    -- window functions: rank posts by mixed metric inside tag
+    rank() over (partition by coalesce((tt.tagname),'__none__') order by (pr.score * 0.6 + coalesce(qs.answer_count,0) * 0.3 + pr.score_per_view * 100.0) desc) as tag_rank,
+    dense_rank() over (order by pr.score desc, pr.views desc) as global_rank
+  from post_recent pr
+  left join question_answer_summary qs on qs.question_id = pr.id
+  left join users us on us.id = pr.owneruserid
+  left join user_vote_behavior uv on uv.userid = us.id
+  left join badge_spike bs on bs.userid = us.id
+  left join lateral (
+    select tt.tagname, tt.trend_ratio
+    from tag_trend tt
+    where tt.tagname = coalesce(pr.tag_list[1], tt.tagname) -- pick first tag or any match
+    order by tt.trend_ratio desc
+    limit 1
+  ) tt on true
+)
+select
+  a.postid,
+  a.title,
+  -- reconstruct tag string with safe null handling and top 3 tags if present
+  case when a.tag_list is null or array_length(a.tag_list,1) is null then '<no-tags>'
+       else
+         (select string_agg(t, ',') from unnest(a.tag_list[1:3]) t)
+  end as top_tags,
+  a.score,
+  a.views,
+  a.score_per_day,
+  a.score_per_view,
+  a.answer_count,
+  a.has_accepted,
+  a.top_answer_id,
+  a.displayname as owner_name,
+  a.reputation,
+  a.upvotes_cast,
+  a.badges_last_week,
+  a.sample_tag,
+  round(a.trend_ratio::numeric,6) as sample_tag_trend,
+  a.tag_rank,
+  a.global_rank,
+  -- derived complex expression mixing null logic and math + string
+  (case
+     when a.score is null and a.views is null then 'unknown'
+     when a.score_per_view > 0 then 'efficient'
+     when a.score_per_view between 0 and 0.01 then 'low-efficiency'
+     else 'neutral'
+   end) || '|' ||
+  coalesce(a.displayname,'[deleted]') ||
+  '|' || coalesce((a.reputation::text),'0') as diagnostic,
+  -- include a correlated subquery to compute distinct commenters count in last month
+  (select count(distinct c.userid) from comments c where c.postid = a.postid and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as distinct_commenters_30d,
+  -- complex predicate: mark suspicious if many downvotes but low views
+  case
+    when exists (select 1 from votes v where v.postid = a.postid and v.votetypeid = 3 and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days') and (a.views < 100 and a.score < 0) then true
+    else false
+  end as suspicious_signal
+from analytics a
+where
+  -- filter to interesting candidates: recent activity OR high global rank OR trending tag
+  (
+    a.lastactivitydate >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days'
+    or a.global_rank <= 200
+    or a.trend_ratio > 0.02
+  )
+  and (a.score_per_view is not null)
+order by a.global_rank asc nulls last, a.trend_ratio desc nulls last
+limit 250;

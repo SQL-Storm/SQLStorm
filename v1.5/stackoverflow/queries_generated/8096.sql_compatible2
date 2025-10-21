@@ -1,0 +1,387 @@
+with params as (
+    select 
+        (timestamp '2024-10-01 12:34:56') - interval '365 days' as since_dt,
+        50 as min_reputation,
+        0.15 as hot_zscore_threshold
+),
+posts_enriched as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        coalesce(u.Reputation, 0) as owner_rep,
+        u.DisplayName as owner_name
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+q_tags as (
+    select 
+        q.Id as QuestionId,
+        unnest(string_to_array(substr(q.Tags, 2, char_length(q.Tags) - 2), '><')) as tagname
+    from posts_enriched q
+    where q.PostTypeId = 1
+      and q.Tags is not null
+),
+tag_stats as (
+    select 
+        t.TagName,
+        t.Count,
+        ntile(100) over (order by t.Count desc nulls last) as pop_ntile,
+        percentile_rank() over (order by t.Count) as pop_prank
+    from Tags t
+),
+vote_agg as (
+    select 
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+        count(*) as total_votes,
+        min(v.CreationDate) as first_vote_at,
+        max(v.CreationDate) as last_vote_at
+    from Votes v
+    group by v.PostId
+),
+recent_activity as (
+    select 
+        p.Id as PostId,
+        coalesce(c.cmt_30d,0) as comments_30d,
+        coalesce(ph.edits_30d,0) as edits_30d,
+        coalesce(pl.links_30d,0) as links_30d,
+        (coalesce(c.cmt_30d,0) * 1.0 + coalesce(ph.edits_30d,0) * 2.0 + coalesce(pl.links_30d,0) * 1.5) as recency_score
+    from Posts p
+    left join (
+        select PostId, count(*) as cmt_30d
+        from Comments
+        where CreationDate >= (timestamp '2024-10-01 12:34:56') - interval '30 days'
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select PostId, count(*) as edits_30d
+        from PostHistory
+        where CreationDate >= (timestamp '2024-10-01 12:34:56') - interval '30 days'
+          and PostHistoryTypeId in (4,5,6,7,8,9,24)
+        group by PostId
+    ) ph on ph.PostId = p.Id
+    left join (
+        select PostId, count(*) as links_30d
+        from PostLinks
+        where CreationDate >= (timestamp '2024-10-01 12:34:56') - interval '30 days'
+        group by PostId
+    ) pl on pl.PostId = p.Id
+),
+question_core as (
+    select 
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate,
+        q.LastActivityDate,
+        q.AcceptedAnswerId,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as has_accepted,
+        extract(epoch from (coalesce(min(a.CreationDate), q.CreationDate) - q.CreationDate))/3600.0 as hours_to_first_answer,
+        extract(epoch from (q.LastActivityDate - q.CreationDate))/3600.0 as hours_active,
+        sum(case when a.Id is not null then 1 else 0 end) as answers_found,
+        max(a.Score) as best_answer_score
+    from posts_enriched q
+    left join posts_enriched a
+      on a.ParentId = q.Id
+     and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.OwnerUserId, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate, q.LastActivityDate, q.AcceptedAnswerId
+),
+user_answering_behavior as (
+    select 
+        a.OwnerUserId as AnswererId,
+        count(*) as answers_total,
+        sum(case when q.AcceptedAnswerId = a.Id then 1 else 0 end) as answers_accepted,
+        avg(a.Score) as avg_answer_score
+    from posts_enriched a
+    join posts_enriched q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+    group by a.OwnerUserId
+),
+question_metrics as (
+    select 
+        qc.QuestionId,
+        qc.OwnerUserId,
+        qc.Title,
+        qc.Score,
+        qc.ViewCount,
+        qc.AnswerCount,
+        qc.CreationDate,
+        qc.LastActivityDate,
+        qc.AcceptedAnswerId,
+        qc.has_accepted,
+        qc.hours_to_first_answer,
+        qc.hours_active,
+        qc.answers_found,
+        qc.best_answer_score,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.total_votes,0) as total_votes,
+        ra.recency_score
+    from question_core qc
+    left join vote_agg va on va.PostId = qc.QuestionId
+    left join recent_activity ra on ra.PostId = qc.QuestionId
+),
+question_dupe as (
+    select 
+        q.Id as QuestionId,
+        max(case when pl.LinkTypeId = 3 then 1 else 0 end) as is_duplicate_link,
+        max(case when ph.PostHistoryTypeId = 10 and ph.Comment in ('1','101') then 1 else 0 end) as is_duplicate_closed
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    where q.PostTypeId = 1
+    group by q.Id
+),
+question_tag_signals as (
+    select 
+        qt.QuestionId,
+        count(*) as tag_count,
+        min(coalesce(ts.pop_ntile,100)) as best_tag_ntile,
+        avg(coalesce(ts.pop_prank,1.0)) as avg_tag_prank,
+        exp(avg(ln(greatest(ts.Count,1)))) as geom_mean_tag_count
+    from q_tags qt
+    left join tag_stats ts on ts.TagName = qt.tagname
+    group by qt.QuestionId
+),
+engagement_timeseries as (
+    select 
+        date_trunc('month', q.CreationDate) as ym,
+        avg(coalesce(va.total_votes,0) + coalesce(q.ViewCount,0)/100.0 + coalesce(ra.recency_score,0)) as eng_mean,
+        stddev_pop(coalesce(va.total_votes,0) + coalesce(q.ViewCount,0)/100.0 + coalesce(ra.recency_score,0)) as eng_std
+    from question_core q
+    left join vote_agg va on va.PostId = q.QuestionId
+    left join recent_activity ra on ra.PostId = q.QuestionId
+    group by date_trunc('month', q.CreationDate)
+),
+question_scored as (
+    select 
+        qm.QuestionId,
+        qm.OwnerUserId,
+        qm.Title,
+        qm.Score,
+        qm.ViewCount,
+        qm.AnswerCount,
+        qm.CreationDate,
+        qm.LastActivityDate,
+        qm.AcceptedAnswerId,
+        qm.has_accepted,
+        qm.hours_to_first_answer,
+        qm.hours_active,
+        qm.answers_found,
+        qm.best_answer_score,
+        coalesce(qts.tag_count,0) as tag_count,
+        coalesce(qts.best_tag_ntile,100) as best_tag_ntile,
+        coalesce(qts.avg_tag_prank,1.0) as avg_tag_prank,
+        coalesce(qts.geom_mean_tag_count,1.0) as geom_mean_tag_count,
+        coalesce(qd.is_duplicate_link,0) as is_duplicate_link,
+        coalesce(qd.is_duplicate_closed,0) as is_duplicate_closed,
+        coalesce(qm.upvotes,0) as upvotes,
+        coalesce(qm.downvotes,0) as downvotes,
+        coalesce(qm.favorites,0) as favorites,
+        coalesce(qm.total_votes,0) as total_votes,
+        coalesce(qm.recency_score,0) as recency_score,
+        (coalesce(qm.total_votes,0)*1.0 + coalesce(qm.upvotes,0)*0.7 - coalesce(qm.downvotes,0)*0.4 + coalesce(qm.favorites,0)*0.9 + coalesce(qm.ViewCount,0)/100.0 + coalesce(qm.recency_score,0)) as engagement_raw,
+        row_number() over (order by coalesce(qm.total_votes,0) desc, coalesce(qm.ViewCount,0) desc, qm.CreationDate desc) as rn_popular,
+        dense_rank() over (order by coalesce(qm.Score,0) desc) as dr_score
+    from question_metrics qm
+    left join question_tag_signals qts on qts.QuestionId = qm.QuestionId
+    left join question_dupe qd on qd.QuestionId = qm.QuestionId
+),
+question_normalized as (
+    select 
+        qs.*,
+        et.eng_mean,
+        et.eng_std,
+        case 
+            when et.eng_std is null or et.eng_std = 0 then null
+            else (qs.engagement_raw - et.eng_mean) / NULLIF(et.eng_std,0)
+        end as engagement_z
+    from question_scored qs
+    left join engagement_timeseries et 
+      on et.ym = date_trunc('month', qs.CreationDate)
+),
+recent_filtered as (
+    select 
+        qn.*
+    from question_normalized qn
+    join Users u on u.Id = qn.OwnerUserId
+    cross join params p
+    where qn.CreationDate >= p.since_dt
+      and coalesce(u.Reputation,0) >= p.min_reputation
+),
+text_summaries as (
+    select 
+        rf.QuestionId,
+        rf.OwnerUserId,
+        coalesce(nullif(btrim(rf.Title), ''), '[untitled]') as safe_title,
+        case 
+            when rf.has_accepted = 1 then 'accepted'
+            when rf.answers_found > 0 then 'answered'
+            when rf.AnswerCount > 0 then 'answers-mismatch'
+            else 'unanswered'
+        end as answer_state,
+        case 
+            when rf.is_duplicate_link = 1 or rf.is_duplicate_closed = 1 then 'duplicate'
+            else 'original'
+        end as originality,
+        to_char(rf.CreationDate, 'YYYY-MM-DD') as created_on,
+        '(' || cast(coalesce(rf.upvotes,0) as text) || '↑, ' || cast(coalesce(rf.downvotes,0) as text) || '↓, ' || cast(coalesce(rf.favorites,0) as text) || '♥)' as vote_tuple,
+        lpad(cast(coalesce(rf.ViewCount,0) as text), 6, '0') as view_padded
+    from recent_filtered rf
+),
+user_time_windows as (
+    select 
+        rf.OwnerUserId,
+        rf.QuestionId,
+        rf.CreationDate,
+        count(*) over (partition by rf.OwnerUserId order by rf.CreationDate rows between 6 preceding and current row) as rolling_q7,
+        avg(rf.Score) over (partition by rf.OwnerUserId order by rf.CreationDate rows between 6 preceding and current row) as rolling_avg_score_q7
+    from recent_filtered rf
+),
+final_scored as (
+    select 
+        rf.*,
+        ts.safe_title,
+        ts.answer_state,
+        ts.originality,
+        ts.created_on,
+        ts.vote_tuple,
+        ts.view_padded,
+        utw.rolling_q7,
+        utw.rolling_avg_score_q7,
+        case 
+            when rf.is_duplicate_link = 1 or rf.is_duplicate_closed = 1 then rf.engagement_raw * 0.6
+            when rf.has_accepted = 1 then rf.engagement_raw * 1.1
+            else rf.engagement_raw
+        end as adjusted_engagement,
+        case 
+            when rf.best_tag_ntile <= 5 then 'very-popular-tag'
+            when rf.best_tag_ntile <= 20 then 'popular-tag'
+            when rf.best_tag_ntile <= 60 then 'mid-tag'
+            else 'niche-tag'
+        end as tag_bucket
+    from recent_filtered rf
+    join text_summaries ts on ts.QuestionId = rf.QuestionId
+    left join user_time_windows utw on utw.QuestionId = rf.QuestionId
+),
+robust_stats as (
+    select
+        percentile_cont(0.5) within group (order by adjusted_engagement) as med,
+        percentile_cont(0.25) within group (order by adjusted_engagement) as q1,
+        percentile_cont(0.75) within group (order by adjusted_engagement) as q3
+    from final_scored
+),
+ranked as (
+    select 
+        fs.*,
+        rs.med,
+        rs.q1,
+        rs.q3,
+        case when rs.q3 - rs.q1 = 0 then null else (fs.adjusted_engagement - rs.med) / nullif(rs.q3 - rs.q1,0) end as robust_z,
+        case 
+            when fs.engagement_z is not null then fs.engagement_z
+            when rs.q3 - rs.q1 > 0 then (fs.adjusted_engagement - rs.med) / (rs.q3 - rs.q1)
+            else null
+        end as final_zscore,
+        case 
+            when fs.adjusted_engagement > rs.q3 + 1.5*(rs.q3 - rs.q1) then 1
+            when fs.adjusted_engagement < rs.q1 - 1.5*(rs.q3 - rs.q1) then -1
+            else 0
+        end as iqr_outlier_flag
+    from final_scored fs
+    cross join robust_stats rs
+),
+latest_comment as (
+    select 
+        c.PostId,
+        max(c.CreationDate) as last_comment_at,
+        substring(max(c.CreationDate::text || '|' || left(c.Text, 100)) from position('|' in max(c.CreationDate::text || '|' || left(c.Text, 100)))+1) as last_comment_snippet
+    from Comments c
+    group by c.PostId
+),
+user_acceptance as (
+    select 
+        u.Id as UserId,
+        coalesce((
+            select avg(case when q.AcceptedAnswerId = a.Id then 1.0 else 0.0 end)
+            from Posts a
+            join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+            where a.PostTypeId = 2 and a.OwnerUserId = u.Id
+        ), 0.0) as acceptance_ratio
+    from Users u
+),
+top_by_z as (
+    select r.QuestionId
+    from ranked r, params p
+    where r.final_zscore is not null and r.final_zscore >= p.hot_zscore_threshold
+    order by r.final_zscore desc
+    limit 500
+),
+top_by_eng as (
+    select QuestionId
+    from ranked
+    order by adjusted_engagement desc
+    limit 500
+),
+consensus as (
+    select QuestionId from top_by_z
+    intersect
+    select QuestionId from top_by_eng
+)
+select 
+    r.QuestionId,
+    r.OwnerUserId,
+    u.DisplayName as owner_name,
+    u.Reputation as owner_rep,
+    ua.acceptance_ratio,
+    r.safe_title as title,
+    r.answer_state,
+    r.originality,
+    r.tag_bucket,
+    r.tag_count,
+    r.avg_tag_prank,
+    r.geom_mean_tag_count,
+    r.view_padded,
+    r.vote_tuple,
+    r.Score as question_score,
+    r.upvotes,
+    r.downvotes,
+    r.favorites,
+    r.total_votes,
+    r.AnswerCount,
+    r.hours_to_first_answer,
+    r.hours_active,
+    r.best_answer_score,
+    r.recency_score,
+    round(r.adjusted_engagement::numeric, 3) as adjusted_engagement,
+    round(coalesce(r.final_zscore, r.robust_z)::numeric, 3) as zscore,
+    r.iqr_outlier_flag,
+    lc.last_comment_at,
+    lc.last_comment_snippet,
+    r.created_on,
+    r.LastActivityDate
+from ranked r
+join Users u on u.Id = r.OwnerUserId
+left join latest_comment lc on lc.PostId = r.QuestionId
+left join user_acceptance ua on ua.UserId = r.OwnerUserId
+where r.QuestionId in (select QuestionId from consensus)
+order by zscore desc nulls last, adjusted_engagement desc
+limit 200;

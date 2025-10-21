@@ -1,0 +1,74 @@
+-- {"query": "2078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 502} 
+WITH TopUsers AS (
+    SELECT
+        U.Id,
+        U.DisplayName,
+        SUM(P.Score) AS TotalScore,
+        DENSE_RANK() OVER (ORDER BY SUM(P.Score) DESC) AS Rank
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.Reputation > 1000
+    GROUP BY
+        U.Id, U.DisplayName
+    HAVING
+        COUNT(P.Id) > 10
+),
+RecentBadges AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC) AS BadgeOrder
+    FROM
+        Badges B
+),
+PostDetails AS (
+    SELECT
+        P.Id,
+        P.Title,
+        P.CreationDate,
+        PH.Comment AS CloseReason
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+    WHERE
+        P.AcceptedAnswerId IS NOT NULL OR P.Score > 0
+),
+VoteSummary AS (
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN VT.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN VT.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes V
+    INNER JOIN
+        VoteTypes VT ON V.VoteTypeId = VT.Id
+    INNER JOIN
+        Posts P ON V.PostId = P.Id
+    WHERE
+        V.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 DAY'
+    GROUP BY
+        P.Id
+)
+SELECT
+    TU.DisplayName,
+    TU.TotalScore,
+    RB.BadgeName,
+    PD.Title,
+    PD.CreationDate,
+    COALESCE(PD.CloseReason, 'No Close Reason') AS CloseReason,
+    VS.UpVotes,
+    VS.DownVotes
+FROM
+    TopUsers TU
+LEFT JOIN
+    RecentBadges RB ON TU.Id = RB.UserId AND RB.BadgeOrder = 1
+LEFT JOIN
+    PostDetails PD ON TU.Id = PD.OwnerUserId
+LEFT JOIN
+    VoteSummary VS ON PD.Id = VS.PostId
+ORDER BY
+    TU.Rank, PD.CreationDate DESC;

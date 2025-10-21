@@ -1,0 +1,84 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+CommentCounts AS (
+  SELECT c.PostId, count(*) AS CommentCount
+  FROM Comments c
+  GROUP BY c.PostId
+),
+VotesAgg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+EngagementPost AS (
+  SELECT rq.Id,
+         rq.Title,
+         rq.OwnerUserId,
+         rq.CreationDate,
+         rq.LastActivityDate,
+         rq.Score,
+         rq.ViewCount,
+         COALESCE(cc.CommentCount, 0) AS CommentCount,
+         COALESCE(va.UpVotes, 0) AS UpVotes,
+         COALESCE(va.DownVotes, 0) AS DownVotes,
+         (rq.Score + COALESCE(cc.CommentCount, 0) * 2 + COALESCE(va.UpVotes, 0) - COALESCE(va.DownVotes, 0)) AS EngagementScore,
+         string_to_array(substr(rq.Tags, 2, length(rq.Tags) - 2), '><') AS TagList,
+         ROW_NUMBER() OVER (PARTITION BY rq.OwnerUserId ORDER BY rq.LastActivityDate DESC) AS rn
+  FROM RecentQuestions rq
+  LEFT JOIN CommentCounts cc ON cc.PostId = rq.Id
+  LEFT JOIN VotesAgg va ON va.PostId = rq.Id
+),
+EngagementAnswer AS (
+  SELECT a.Id,
+         a.Title,
+         a.OwnerUserId,
+         a.CreationDate,
+         a.LastActivityDate,
+         a.Score,
+         a.ViewCount,
+         COALESCE(cc.CommentCount, 0) AS CommentCount,
+         COALESCE(va.UpVotes, 0) AS UpVotes,
+         COALESCE(va.DownVotes, 0) AS DownVotes,
+         (a.Score + COALESCE(cc.CommentCount, 0) * 3 + COALESCE(va.UpVotes, 0)) AS EngagementScore,
+         string_to_array(substr(a.Tags, 2, length(a.Tags) - 2), '><') AS TagList,
+         ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.LastActivityDate DESC) AS rn
+  FROM Posts a
+  LEFT JOIN Comments cc ON cc.PostId = a.Id
+  LEFT JOIN Votes va ON va.PostId = a.Id
+  WHERE a.PostTypeId = 2
+),
+Final AS (
+  SELECT Id, Title, OwnerUserId, CreationDate, LastActivityDate, Score, ViewCount, CommentCount, UpVotes, DownVotes, EngagementScore, TagList, rn
+  FROM EngagementPost
+  UNION ALL
+  SELECT Id, Title, OwnerUserId, CreationDate, LastActivityDate, Score, ViewCount, CommentCount, UpVotes, DownVotes, EngagementScore, TagList, rn
+  FROM EngagementAnswer
+)
+SELECT f.Id,
+       f.Title,
+       f.OwnerUserId,
+       u.DisplayName AS OwnerDisplayName,
+       f.CreationDate,
+       f.LastActivityDate,
+       f.Score,
+       f.ViewCount,
+       f.CommentCount,
+       f.UpVotes,
+       f.DownVotes,
+       f.EngagementScore,
+       f.TagList,
+       f.rn,
+       (SELECT c.Text FROM Comments c WHERE c.PostId = f.Id ORDER BY c.CreationDate DESC LIMIT 1) AS LatestComment,
+       EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = f.OwnerUserId AND b.Date > f.CreationDate) AS HasRecentBadge
+FROM Final f
+LEFT JOIN Users u ON u.Id = f.OwnerUserId
+WHERE f.rn = 1
+ORDER BY f.EngagementScore DESC
+LIMIT 200;

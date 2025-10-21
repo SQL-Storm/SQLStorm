@@ -1,0 +1,109 @@
+-- {"query": "25096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2152} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)               AS NetVotes,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                  AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                  AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(p.CreationDate)                                          AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)            AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)            AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)            AS BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)         AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+TopTags AS (
+    SELECT
+        u.Id                                      AS UserId,
+        UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST) AS rn
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+                 AND p.PostTypeId = 1
+                 AND p.Tags IS NOT NULL
+),
+
+UserTagCounts AS (
+    SELECT
+        UserId,
+        COUNT(DISTINCT Tag)                                            AS DistinctTagCount,
+        STRING_AGG(DISTINCT Tag, ',' ORDER BY Tag) FILTER (WHERE Tag IS NOT NULL) AS TagList
+    FROM TopTags
+    WHERE rn <= 5
+    GROUP BY UserId
+),
+
+LatestVote AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)   -- up‑vote, down‑vote
+),
+
+PostVoteSummary AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(CASE WHEN v.rn = 1 THEN v.VoteTypeId END)      AS LatestVoteType
+    FROM Posts p
+    LEFT JOIN LatestVote v ON v.PostId = p.Id AND v.rn = 1
+    GROUP BY p.Id, p.OwnerUserId
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalQuestionViews,
+    COALESCE(bs.GoldBadges,0)    AS GoldBadges,
+    COALESCE(bs.SilverBadges,0)  AS SilverBadges,
+    COALESCE(bs.BronzeBadges,0)  AS BronzeBadges,
+    COALESCE(bs.TagBasedBadges,0) AS TagBasedBadges,
+    COALESCE(utc.DistinctTagCount,0) AS DistinctTagCount,
+    utc.TagList,
+    CASE
+        WHEN us.AnswerCount = 0 THEN NULL
+        ELSE ROUND(1.0 * us.QuestionCount / us.AnswerCount, 2)
+    END AS QtoA_Ratio,
+    pv.UpVoteCount,
+    pv.DownVoteCount,
+    CASE pv.LatestVoteType
+        WHEN 2 THEN 'Up'
+        WHEN 3 THEN 'Down'
+        ELSE 'None'
+    END AS LatestVote,
+    us.LatestPostDate
+FROM UserStats us
+LEFT JOIN BadgeSummary   bs  ON bs.UserId = us.Id
+LEFT JOIN UserTagCounts  utc ON utc.UserId = us.Id
+LEFT JOIN PostVoteSummary pv  ON pv.OwnerUserId = us.Id
+WHERE (us.Reputation > 1000 OR us.QuestionCount > 50)
+ORDER BY us.Reputation DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 1000);

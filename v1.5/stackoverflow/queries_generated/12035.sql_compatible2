@@ -1,0 +1,78 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        P.Tags
+    FROM
+        Posts P
+    LEFT JOIN
+        Users U ON P.OwnerUserId = U.Id
+    WHERE
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+TagCounts AS (
+    SELECT
+        T.TagName,
+        COUNT(P.Id) AS PostCount
+    FROM
+        Tags T
+    JOIN
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY
+        T.TagName
+),
+UserBadges AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+PostHistorySummary AS (
+    SELECT
+        PH.PostId,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE 0 END) AS RollbackCount
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+)
+SELECT
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerDisplayName,
+    RP.OwnerReputation,
+    RP.PostRank,
+    COALESCE(TC.PostCount, 0) AS TagPostCount,
+    COALESCE(UB.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UB.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UB.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(PHS.EditCount, 0) AS EditCount,
+    COALESCE(PHS.RollbackCount, 0) AS RollbackCount
+FROM
+    RankedPosts RP
+LEFT JOIN
+    TagCounts TC ON RP.Tags LIKE '%' || TC.TagName || '%'
+LEFT JOIN
+    UserBadges UB ON RP.OwnerDisplayName = NULL
+LEFT JOIN
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+WHERE
+    RP.PostRank <= 10
+ORDER BY
+    RP.Score DESC,
+    RP.CreationDate;

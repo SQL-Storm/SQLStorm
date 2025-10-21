@@ -1,0 +1,46 @@
+WITH TagUserStats AS (
+    SELECT 
+        tag,
+        COUNT(DISTINCT p.Id) AS question_count,
+        AVG(u.Reputation) AS avg_reputation,
+        SUM(p.Score) AS total_score,
+        COUNT(v.Id) AS total_upvotes
+    FROM (
+        SELECT 
+            p.Id,
+            UNNEST(SPLIT(p.Tags, '><')) AS tag,
+            p.OwnerUserId,
+            p.Score
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND LENGTH(p.Tags) > 2
+    ) AS unrolled_tags
+    JOIN Posts p ON p.Id = unrolled_tags.Id
+    JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    GROUP BY UNNEST(SPLIT(p.Tags, '><')), tag
+),
+TagBadgeStats AS (
+    SELECT 
+        b.Name AS badge_name,
+        COUNT(*) AS badge_count,
+        AVG(us.Reputation) AS avg_badge_user_rep
+    FROM Badges b
+    JOIN TagUserStats tus ON LOWER(b.Name) LIKE CONCAT('%', LOWER(tus.tag), '%')
+    JOIN Users us ON us.Id = b.UserId
+    GROUP BY b.Name
+)
+SELECT 
+    tus.tag,
+    tus.question_count,
+    tus.avg_reputation,
+    tus.total_score,
+    tus.total_upvotes,
+    COALESCE(tbs.badge_count, 0) AS related_badge_count,
+    COALESCE(tbs.avg_badge_user_rep, 0) AS avg_related_badge_rep,
+    (tus.question_count * 0.1 + tus.avg_reputation * 0.3 + tus.total_score * 0.2 + tus.total_upvotes * 0.4) AS composite_score
+FROM TagUserStats tus
+LEFT JOIN TagBadgeStats tbs ON LOWER(tbs.badge_name) LIKE CONCAT('%', LOWER(tus.tag), '%')
+ORDER BY composite_score DESC
+LIMIT 100;

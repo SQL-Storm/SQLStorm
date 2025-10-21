@@ -1,0 +1,116 @@
+WITH 
+-- Extract each tag from question posts
+question_tags AS (
+    SELECT 
+        p.Id                                   AS QuestionId,
+        p.Title,
+        p.CreationDate                         AS QuestionCreated,
+        p.Score                                AS QuestionScore,
+        p.OwnerUserId,
+        UNNEST(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+-- First answer times per question
+first_answers AS (
+    SELECT 
+        a.ParentId                                 AS QuestionId,
+        MIN(a.CreationDate)                        AS FirstAnswerDate,
+        MIN(a.Score) FILTER (WHERE a.Score > 0)    AS FirstAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+
+-- Answer count and acceptance info per question
+answer_metrics AS (
+    SELECT 
+        q.Id                                      AS QuestionId,
+        COUNT(a.Id)                               AS AnswerCount,
+        MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+
+-- Vote aggregates per question
+question_votes AS (
+    SELECT 
+        v.PostId                                 AS QuestionId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY v.PostId
+),
+
+-- User reputation snapshots at question creation
+user_reps AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        u.Reputation,
+        u.CreationDate
+    FROM Users u
+),
+
+-- Tag metadata
+tag_meta AS (
+    SELECT 
+        t.TagName,
+        t.Count                                 AS TagUseCount,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+),
+
+-- Combine everything per tag
+tag_aggregates AS (
+    SELECT 
+        qt.Tag,
+        COUNT(DISTINCT qt.QuestionId)                                           AS Questions,
+        AVG(qt.QuestionScore)                                                   AS AvgQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qt.QuestionScore)           AS MedianQuestionScore,
+        AVG(COALESCE((fa.FirstAnswerDate - qt.QuestionCreated), NULL))             AS AvgTimeToFirstAnswer,
+        AVG(COALESCE(fa.FirstAnswerScore, 0))                                    AS AvgFirstAnswerScore,
+        AVG(am.AnswerCount)                                                     AS AvgAnswersPerQuestion,
+        SUM(am.HasAccepted)                                                     AS QuestionsWithAccepted,
+        AVG(qv.UpVotes)                                                         AS AvgUpVotes,
+        AVG(qv.DownVotes)                                                       AS AvgDownVotes,
+        AVG(qv.Favorites)                                                       AS AvgFavorites,
+        JSONB_AGG(DISTINCT jsonb_build_object(
+            'UserId', qt.OwnerUserId,
+            'ReputationAtAsk', ur.Reputation,
+            'QuestionsAsked', 1
+        )) FILTER (WHERE ur.UserId = qt.OwnerUserId)                            AS TopAskers
+    FROM question_tags qt
+    LEFT JOIN first_answers fa       ON fa.QuestionId = qt.QuestionId
+    LEFT JOIN answer_metrics am     ON am.QuestionId = qt.QuestionId
+    LEFT JOIN question_votes qv     ON qv.QuestionId = qt.QuestionId
+    LEFT JOIN user_reps ur          ON ur.UserId = qt.OwnerUserId
+    GROUP BY qt.Tag
+)
+
+SELECT 
+    tm.Tag,
+    tm.Questions,
+    tm.AvgQuestionScore,
+    tm.MedianQuestionScore,
+    tm.AvgTimeToFirstAnswer,
+    tm.AvgFirstAnswerScore,
+    tm.AvgAnswersPerQuestion,
+    tm.QuestionsWithAccepted,
+    tm.AvgUpVotes,
+    tm.AvgDownVotes,
+    tm.AvgFavorites,
+    tm.TopAskers,
+    tm_meta.TagUseCount,
+    tm_meta.ExcerptPostId,
+    tm_meta.WikiPostId
+FROM tag_aggregates tm
+JOIN tag_meta tm_meta ON tm_meta.TagName = tm.Tag
+ORDER BY tm.Questions DESC
+LIMIT 100;

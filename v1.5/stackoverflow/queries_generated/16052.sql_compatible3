@@ -1,0 +1,132 @@
+WITH user_activity_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS post_count,
+    COUNT(DISTINCT c.Id) AS comment_count,
+    COUNT(DISTINCT b.Id) AS badge_count,
+    AVG(p.Score) AS avg_post_score,
+    COALESCE(CAST(STRING_AGG(DISTINCT CAST(SUBSTRING(b.Name, 1, 20) AS VARCHAR(20)) , ', ') AS VARCHAR(1000)), 'No Badges') AS badge_summary,
+    ROW_NUMBER() OVER (PARTITION BY CASE WHEN u.Location IS NULL THEN 'Unknown' ELSE SUBSTRING(u.Location, 1, 20) END ORDER BY u.Reputation DESC) AS location_rank,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS post_volume_rank
+  FROM Users u
+  LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+  LEFT OUTER JOIN Comments c ON u.Id = c.UserId
+  LEFT OUTER JOIN Badges b ON u.Id = b.UserId AND b.Class <= 2
+  WHERE u.CreationDate >= DATE '2020-01-01'
+    AND (u.Reputation > 1000 OR u.UpVotes > 50)
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+  HAVING COUNT(DISTINCT p.Id) > 5
+),
+question_answer_stats AS (
+  SELECT
+    q.Id AS question_id,
+    q.Title,
+    q.Score AS question_score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId AS asker_id,
+    a.Id AS answer_id,
+    a.Score AS answer_score,
+    a.OwnerUserId AS answerer_id,
+    CASE 
+      WHEN q.AcceptedAnswerId = a.Id THEN 1
+      ELSE 0
+    END AS is_accepted,
+    LAG(a.Score, 1, 0) OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS prev_answer_score,
+    SUM(v.BountyAmount) OVER (PARTITION BY q.Id) AS total_bounty,
+    COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) OVER (PARTITION BY q.Id) AS favorite_count_calc
+  FROM Posts q
+  LEFT OUTER JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+  LEFT OUTER JOIN Votes v ON q.Id = v.PostId AND v.VoteTypeId IN (5, 8, 9)
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+    AND q.ClosedDate IS NULL
+    AND LENGTH(COALESCE(q.Tags, '')) > 0
+),
+complex_tag_analysis AS (
+  SELECT
+    t.TagName,
+    t.Count AS tag_usage_count,
+    AVG(p.Score) AS avg_tag_score,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS median_views,
+    COUNT(DISTINCT pl.RelatedPostId) AS related_post_count,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.Tags LIKE CONCAT('%<', t.TagName, '>%') 
+       AND p2.AcceptedAnswerId IS NOT NULL
+       AND p2.PostTypeId = 1) AS questions_with_accepted_answers,
+    STRING_AGG(DISTINCT pt.Name, ' | ') AS post_types
+  FROM Tags t
+  INNER JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%' )
+  LEFT OUTER JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+  LEFT OUTER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE t.Count > 100
+    AND t.IsModeratorOnly = 0
+  GROUP BY t.Id, t.TagName, t.Count
+  HAVING AVG(p.Score) > 0
+)
+SELECT DISTINCT
+  uam.DisplayName,
+  COALESCE(uam.Location, 'Unknown Location') AS user_location,
+  uam.Reputation,
+  uam.post_count,
+  uam.comment_count,
+  uam.badge_count,
+  ROUND(CAST(uam.avg_post_score AS NUMERIC), 2) AS avg_score,
+  uam.location_rank,
+  qas.Title AS top_question_title,
+  qas.question_score,
+  qas.ViewCount,
+  qas.answer_score,
+  CASE 
+    WHEN qas.is_accepted = 1 THEN 'Accepted'
+    WHEN qas.answer_score > qas.prev_answer_score THEN 'Top Answer'
+    WHEN qas.answer_score = qas.prev_answer_score THEN 'Tied'
+    ELSE 'Lower Ranked'
+  END AS answer_status,
+  cta.TagName AS primary_tag,
+  ROUND(CAST(cta.avg_tag_score AS NUMERIC), 2) AS tag_avg_score,
+  cta.median_views AS tag_median_views,
+  CAST(cta.questions_with_accepted_answers AS FLOAT) / NULLIF(cta.tag_usage_count, 0) AS acceptance_rate,
+  COALESCE(qas.total_bounty, 0) AS question_bounty_total,
+  (SELECT COUNT(*) 
+   FROM PostHistory ph 
+   WHERE ph.PostId = qas.question_id 
+     AND ph.PostHistoryTypeId IN (4, 5, 6)
+     AND ph.UserId != qas.asker_id) AS external_edit_count,
+  CASE
+    WHEN uam.badge_count > 10 AND uam.Reputation > 5000 THEN 'Elite'
+    WHEN uam.badge_count > 5 OR uam.Reputation > 2000 THEN 'Advanced'
+    WHEN uam.post_count > 20 THEN 'Active'
+    ELSE 'Regular'
+  END AS user_tier
+FROM user_activity_metrics uam
+INNER JOIN question_answer_stats qas ON uam.Id = qas.answerer_id
+LEFT OUTER JOIN complex_tag_analysis cta ON qas.question_id IN (
+  SELECT p.Id 
+  FROM Posts p 
+  WHERE p.Tags LIKE CONCAT('%<', cta.TagName, '>%')
+)
+WHERE qas.answer_score >= (
+  SELECT AVG(a2.Score) 
+  FROM Posts a2 
+  WHERE a2.PostTypeId = 2 
+    AND a2.OwnerUserId = uam.Id
+)
+  AND uam.location_rank <= 3
+  AND (qas.is_accepted = 1 OR qas.answer_score > 5)
+  AND EXISTS (
+    SELECT 1 
+    FROM Comments c 
+    WHERE c.PostId = qas.answer_id 
+      AND c.Score > 0
+  )
+ORDER BY 
+  uam.Reputation DESC,
+  qas.question_score DESC,
+  qas.answer_score DESC,
+  cta.acceptance_rate DESC NULLS LAST
+LIMIT 500;

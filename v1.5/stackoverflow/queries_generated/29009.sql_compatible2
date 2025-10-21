@@ -1,0 +1,205 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        0 AS Level,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        ph.Level + 1 AS Level,
+        ph.Path || ',' || CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Level < 5
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        AVG(CAST(p.Score AS FLOAT)) AS AvgScore,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors,
+        STRING_AGG(DISTINCT COALESCE(u.DisplayName, ''), ', ') AS Authors
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastActivity,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS RankByScore,
+        NTILE(100) OVER (ORDER BY SUM(p.Score) DESC) AS ScorePercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.Title,
+        ph.Score,
+        ph.ViewCount,
+        ph.CreationDate,
+        ph.Level,
+        ph.Path,
+        CASE 
+            WHEN ph.Score > 100 THEN 'Highly_Voted'
+            WHEN ph.Score > 50 THEN 'Moderately_Voted'
+            WHEN ph.Score > 0 THEN 'Low_Voted'
+            ELSE 'No_Votes'
+        END AS VotingCategory,
+        COALESCE(u.DisplayName, 'Anonymous') AS AuthorName,
+        COALESCE(u.Reputation, 0) AS AuthorReputation,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has_Accepted_Answer'
+            WHEN ph.PostTypeId = 2 THEN 'Is_Answer'
+            ELSE 'Pending_Answer'
+        END AS AnswerStatus,
+        EXISTS (
+            SELECT 1 FROM Comments c 
+            WHERE c.PostId = ph.PostId 
+              AND c.CreationDate > ph.CreationDate
+        ) AS HasCommentsAfterCreation,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                STRING_AGG(
+                    TRIM(BOTH '<>' FROM TRIM(tag.value)), 
+                    ', '
+                ) 
+            ELSE 'No_Tags'
+        END AS TagList,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId IN (2,3)) AS TotalVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId = 3) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY ph.OwnerUserId ORDER BY ph.Score DESC) AS PostRankPerUser
+    FROM PostHierarchy ph
+    LEFT JOIN Posts p ON ph.PostId = p.Id
+    LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT value FROM UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) tag ON TRUE
+    GROUP BY ph.PostId, ph.Title, ph.Score, ph.ViewCount, ph.CreationDate, 
+             ph.Level, ph.Path, ph.PostTypeId, ph.OwnerUserId, u.DisplayName, 
+             u.Reputation, p.AcceptedAnswerId, p.Tags
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.VotingCategory,
+    ca.AuthorName,
+    ca.AuthorReputation,
+    ca.AnswerStatus,
+    ca.HasCommentsAfterCreation,
+    ca.TagList,
+    ca.TotalVotes,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.PostRankPerUser,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM ComplexPostAnalysis) THEN 'Above_Average'
+        ELSE 'Below_Average'
+    END AS PerformanceCategory,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 3) AS BronzeBadges,
+    (SELECT MAX(u.Reputation) FROM Users u WHERE u.Id IN (
+        SELECT DISTINCT p.OwnerUserId FROM Posts p 
+        WHERE p.ParentId = ca.PostId AND p.PostTypeId = 2
+    )) AS MaxAnswerReputation,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl 
+            WHERE pl.PostId = ca.PostId AND pl.LinkTypeId = 3
+        ) THEN 'Duplicate_Linked'
+        ELSE 'No_Duplicate_Link'
+    END AS DuplicateStatus,
+    DENSE_RANK() OVER (ORDER BY ca.Score DESC) AS ScoreRank,
+    PERCENT_RANK() OVER (ORDER BY ca.Score DESC) AS ScorePercentileRank,
+    LAG(ca.Score, 1) OVER (ORDER BY ca.Score DESC) - ca.Score AS ScoreDiffFromPrev,
+    LEAD(ca.TagList, 1) OVER (ORDER BY ca.Score DESC) AS NextHigherTagList,
+    CASE 
+        WHEN ca.HasCommentsAfterCreation = 1 AND EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+        ) THEN 'Edited_With_Comments'
+        WHEN ca.HasCommentsAfterCreation = 1 THEN 'Has_Comments'
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+        ) THEN 'Edited_Only'
+        ELSE 'Unchanged'
+    END AS ContentModificationStatus,
+    NULLIF(
+        (SELECT COUNT(*) FROM PostHistory ph 
+         WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (10,11,12,13,14,15)
+        ), 0
+    ) AS PostStatusChangeCount,
+    CASE 
+        WHEN ca.Score > 0 AND ca.ViewCount > 0 THEN 
+            CAST(ca.Score AS FLOAT) / CAST(ca.ViewCount AS FLOAT) * 100
+        ELSE 0
+    END AS ScoreToViewRatio,
+    CASE 
+        WHEN ca.TagList = 'No_Tags' THEN 0
+        ELSE LENGTH(ca.TagList) 
+    END AS TagLength,
+    (SELECT STRING_AGG(CONCAT(b.Name, '(', b.Class, ')'), ', ') 
+     FROM Badges b 
+     WHERE b.UserId = ca.OwnerUserId 
+       AND b.Class = 1 
+       AND b.Date > DATE '2020-01-01'
+    ) AS RecentGoldBadges,
+    ROW_NUMBER() OVER (ORDER BY ca.CreationDate DESC) AS RecentPostRank,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.ParentId = ca.PostId AND p2.PostTypeId = 2
+        ) THEN 'Question_With_Answers'
+        WHEN ca.PostId IN (
+            SELECT ParentId FROM Posts WHERE PostTypeId = 2
+        ) THEN 'Answer_To_Question'
+        ELSE 'Orphaned_Post'
+    END AS PostTypeCategory
+FROM ComplexPostAnalysis ca
+WHERE ca.PostId IS NOT NULL
+  AND ca.Level <= 3
+  AND ca.TotalVotes >= 0
+  AND ca.PostRankPerUser <= 5
+  AND (ca.Score > 0 OR ca.ViewCount > 0)
+ORDER BY ca.Score DESC, ca.CreationDate DESC
+LIMIT 1000;

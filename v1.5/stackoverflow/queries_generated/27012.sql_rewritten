@@ -1,0 +1,116 @@
+-- {"query": "27012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1125} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (8, 9)
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate
+),
+
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS Rank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2)
+),
+
+TagActivity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT u.Id) AS UniqueUsers,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    GROUP BY
+        t.TagName
+),
+AllAutumnBadges AS(
+    SELECT
+        b.UserId
+    FROM
+        Badges b
+    WHERE
+        b.Name LIKE 'Autumn%'
+    )
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.DisplayName,
+    ua.LastAccessDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalScore,
+    ua.LastPostDate,
+    ua.TotalBountyAmount,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.CreationDate AS PostCreationDate,
+    rp.Score AS PostScore,
+    rp.ViewCount AS PostViewCount,
+    rp.Title AS PostTitle,
+    rp.Tags AS PostTags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.LastActivityDate,
+    ta.TagName,
+    ta.PostCount,
+    ta.TotalScore AS TagTotalScore,
+    ta.TotalViews AS TagTotalViews,
+    ta.UniqueUsers,
+    ta.LastPostDate AS TagLastPostDate,
+    pl.RelatedPostId,
+    pl.LinkTypeId
+FROM
+    UserActivity ua
+LEFT JOIN
+    RecentPosts rp ON ua.UserId = rp.OwnerUserId AND rp.Rank = 1
+LEFT JOIN
+    Posts p ON ua.UserId = p.OwnerUserId AND p.LastActivityDate >= DATEADD(MONTH, -3, cast('2024-10-01 12:34:56' as timestamp)) /*3 months*/
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+JOIN
+    AllAutumnBadges ab ON p.OwnerUserId=ab.UserID
+RIGHT JOIN
+    TagActivity ta ON p.Tags LIKE CONCAT('%<', ta.TagName, '>%')
+WHERE ua.LastAccessDate>=DATEADD(WEEK, -52, cast('2024-10-01 12:34:56' as timestamp)) OR ua.Reputation>10000
+ORDER BY
+    ua.TotalScore DESC, rp.PostScore DESC;

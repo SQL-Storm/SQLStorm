@@ -1,0 +1,68 @@
+-- {"query": "22021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 816} 
+WITH user_posts AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        COUNT(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedQuestions,
+        STRING_AGG(DISTINCT REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ', ') AS AllTags
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+),
+user_badges AS (
+    SELECT 
+        u.Id,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+user_votes AS (
+    SELECT 
+        u.Id,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesReceived
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT OUTER JOIN Votes v ON p.Id = v.PostId
+    GROUP BY u.Id
+)
+SELECT 
+    up.Id,
+    up.DisplayName,
+    up.TotalPosts,
+    up.TotalScore,
+    up.AvgScore,
+    up.AcceptedQuestions,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBadges,
+    uv.UpVotesReceived,
+    uv.DownVotesReceived,
+    CASE 
+        WHEN up.TotalScore IS NULL THEN 0 
+        ELSE up.TotalScore 
+    END + COALESCE(ub.GoldBadges * 100, 0) + COALESCE(ub.SilverBadges * 50, 0) + COALESCE(ub.BronzeBadges * 25, 0) + COALESCE(uv.UpVotesReceived, 0) - COALESCE(uv.DownVotesReceived, 0) AS EngagementScore,
+    DENSE_RANK() OVER (ORDER BY 
+        CASE 
+            WHEN up.TotalScore IS NULL THEN 0 
+            ELSE up.TotalScore 
+        END + COALESCE(ub.GoldBadges * 100, 0) + COALESCE(ub.SilverBadges * 50, 0) + COALESCE(ub.BronzeBadges * 25, 0) + COALESCE(uv.UpVotesReceived, 0) - COALESCE(uv.DownVotesReceived, 0) DESC
+    ) AS Rank,
+    REGEXP_REPLACE(COALESCE(up.AllTags, ''), '[^a-zA-Z0-9, ]', '', 'g') AS CleanTags,
+    (SELECT AVG(sub_p.Score) 
+     FROM Posts sub_p 
+     WHERE sub_p.OwnerUserId = up.Id AND sub_p.PostTypeId = 1) AS UserAvgQuestionScore
+FROM user_posts up
+FULL OUTER JOIN user_badges ub ON up.Id = ub.Id
+FULL OUTER JOIN user_votes uv ON up.Id = uv.Id
+WHERE (up.TotalPosts > 0 OR ub.GoldBadges > 0 OR ub.SilverBadges > 0 OR ub.BronzeBadges > 0) AND 
+      (COALESCE(uv.UpVotesReceived, 0) - COALESCE(uv.DownVotesReceived, 0)) > -100
+ORDER BY EngagementScore DESC;

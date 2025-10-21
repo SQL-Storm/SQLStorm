@@ -1,0 +1,58 @@
+-- {"query": "23048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 849} 
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.DisplayName,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+           COUNT(p.Id) AS PostCount,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.LastAccessDate >= '2020-01-01' AND (p.CreationDate >= '2020-01-01' OR p.CreationDate IS NULL)
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(p.Id) > 10 OR u.Reputation > 10000
+),
+BadgeSummary AS (
+    SELECT b.UserId,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           STRING_AGG(CASE WHEN b.TagBased = 1 THEN CONCAT('<', b.Name, '>') ELSE b.Name END, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopPosts AS (
+    SELECT p.Id, p.Title, p.Score, p.OwnerUserId,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+           COALESCE(p.ViewCount * LOG(p.Score + 1), 0) AS WeightedViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+UserActivity AS (
+    SELECT au.Id, au.Reputation, au.DisplayName, au.RepRank, au.PostCount, au.QuestionScore, au.AnswerScore,
+           bs.GoldBadges, bs.SilverBadges, bs.BadgeNames,
+           SUM(tp.PositiveComments) AS TotalPositiveComments,
+           AVG(tp.PrevScore) AS AvgPrevScore,
+           MAX(tp.WeightedViews) AS MaxWeightedViews
+    FROM ActiveUsers au
+    LEFT OUTER JOIN BadgeSummary bs ON au.Id = bs.UserId
+    LEFT OUTER JOIN TopPosts tp ON au.Id = tp.OwnerUserId
+    WHERE au.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 0) * 2
+       OR EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = tp.Id AND v.VoteTypeId = 2 AND v.CreationDate > '2022-01-01')
+    GROUP BY au.Id, au.Reputation, au.DisplayName, au.RepRank, au.PostCount, au.QuestionScore, au.AnswerScore,
+             bs.GoldBadges, bs.SilverBadges, bs.BadgeNames
+)
+SELECT ua.Id, ua.DisplayName, ua.Reputation, ua.RepRank,
+       ua.PostCount + COALESCE(ua.GoldBadges, 0) + COALESCE(ua.SilverBadges, 0) AS TotalActivity,
+       CASE WHEN ua.AvgPrevScore IS NULL THEN 'No Previous Scores' ELSE CAST(ua.AvgPrevScore AS VARCHAR) END AS AvgPrevScoreStr,
+       ua.BadgeNames,
+       RANK() OVER (ORDER BY ua.TotalPositiveComments DESC NULLS LAST) AS CommentRank
+FROM UserActivity ua
+UNION ALL
+SELECT u.Id, u.DisplayName, u.Reputation, 0 AS RepRank,
+       0 AS TotalActivity,
+       'Inactive' AS AvgPrevScoreStr,
+       NULL AS BadgeNames,
+       0 AS CommentRank
+FROM Users u
+WHERE u.Id NOT IN (SELECT Id FROM ActiveUsers) AND u.Reputation < 100
+ORDER BY RepRank ASC, TotalActivity DESC;

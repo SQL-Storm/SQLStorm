@@ -1,0 +1,105 @@
+-- {"query": "40.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 764} 
+WITH
+RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    -- compute a complex derived metric
+    (COALESCE(p.Score,0) * 0.75 + COALESCE(p.ViewCount,0) * 0.25) AS EngagementScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(COALESCE(p.Score,0)) AS TagScore,
+    COUNT(*) AS PostCount
+  FROM RecentActive ra
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(ra.Tags, 2, length(ra.Tags)-2), '><')) AS TagName
+  ) t
+  GROUP BY t.TagName
+),
+TagInsights AS (
+  SELECT
+    t.TagName,
+    t.TagScore,
+    t.PostCount,
+    ROUND(t.TagScore::numeric / NULLIF(t.PostCount,0), 4) AS AvgScorePerPost
+  FROM TopTags t
+  ORDER BY AvgScorePerPost DESC, t.TagScore DESC
+  LIMIT 100
+),
+AdvancedMetrics AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.EngagementScore,
+    COALESCE(vt.Name, 'Unknown') AS LastVoteType,
+    v.UserId AS LastVoterUserId,
+    u.DisplayName AS LastVoterDisplayName,
+    CASE
+      WHEN u.Reputation > 1000 THEN 'high-rep'
+      WHEN u.Reputation > 100 THEN 'mid-rep'
+      ELSE 'low-rep'
+    END AS VoterTier
+  FROM RecentActive rp
+  LEFT JOIN Votes v ON v.PostId = rp.PostId
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId AND v.Id = (
+    SELECT MAX(Id) FROM Votes v2 WHERE v2.PostId = rp.PostId
+  )
+  LEFT JOIN Users u ON u.Id = v.UserId
+  WHERE rp.EngagementScore > (
+    SELECT AVG(EngagementScore) * 0.95 FROM RecentActive
+  )
+),
+CorrelationCTE AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.EngagementScore,
+    CASE
+      WHEN a.LastVoterUserId IS NULL THEN 0
+      ELSE 1
+    END AS HasVoter
+  FROM AdvancedMetrics a
+),
+Final AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.EngagementScore,
+    c.LastVoteType,
+    c.LastVoterDisplayName,
+    ci.AvgScorePerPost,
+    ci.TagName
+  FROM CorrelationCTE c
+  LEFT JOIN (
+    SELECT TagInsights.TagName, TagInsights.AvgScorePerPost
+    FROM TagInsights
+    ORDER BY AvgScorePerPost DESC
+    LIMIT 5
+  ) ci ON TRUE
+  ORDER BY c.EngagementScore DESC
+  LIMIT 250
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.EngagementScore,
+  f.LastVoteType,
+  f.LastVoterDisplayName,
+  f.AvgScorePerPost,
+  f.TagName
+FROM Final f
+ORDER BY f.EngagementScore DESC, f.AvgScorePerPost DESC
+;

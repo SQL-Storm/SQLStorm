@@ -1,0 +1,73 @@
+WITH TopPosts AS (
+  SELECT 
+    P.Id, 
+    P.Score, 
+    P.ViewCount, 
+    P.Title, 
+    P.Tags, 
+    U.DisplayName AS OwnerDisplayName, 
+    U.Reputation AS OwnerReputation, 
+    ROW_NUMBER() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+    ROW_NUMBER() OVER (ORDER BY P.ViewCount DESC) AS ViewCountRank,
+    P.OwnerUserId
+  FROM 
+    Posts P
+  JOIN 
+    Users U ON P.OwnerUserId = U.Id
+  WHERE 
+    P.PostTypeId = 1 AND P.ClosedDate IS NULL
+),
+TopUsers AS (
+  SELECT 
+    U.Id, 
+    U.DisplayName, 
+    U.Reputation, 
+    COUNT(P.Id) AS PostCount,
+    SUM(P.Score) AS TotalScore,
+    ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+  FROM 
+    Users U
+  JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+  WHERE 
+    P.PostTypeId IN (1, 2)
+  GROUP BY 
+    U.Id, U.DisplayName, U.Reputation
+),
+PostHistoryStats AS (
+  SELECT 
+    PH.PostId, 
+    COUNT(PH.Id) AS EditCount,
+    SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+    SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount
+  FROM 
+    PostHistory PH
+  GROUP BY 
+    PH.PostId
+)
+SELECT 
+  TP.Id, 
+  TP.Score, 
+  TP.ViewCount, 
+  TP.Title, 
+  TP.Tags, 
+  TP.OwnerDisplayName, 
+  TP.OwnerReputation, 
+  TP.ScoreRank, 
+  TP.ViewCountRank,
+  TU.PostCount, 
+  TU.TotalScore, 
+  TU.ReputationRank,
+  PHS.EditCount, 
+  PHS.CloseCount, 
+  PHS.ReopenCount
+FROM 
+  TopPosts TP
+JOIN 
+  TopUsers TU ON TP.OwnerUserId = TU.Id
+JOIN 
+  PostHistoryStats PHS ON TP.Id = PHS.PostId
+WHERE 
+  TP.ScoreRank <= 100 AND TP.ViewCountRank <= 100
+ORDER BY 
+  TP.Score DESC, TP.ViewCount DESC;

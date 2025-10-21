@@ -1,0 +1,104 @@
+-- {"query": "46062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 142228, "output_tokens": 114251} 
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.Score) as avg_score,
+        SUM(p.ViewCount) as total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId as question_id,
+        a.OwnerUserId as answerer_id,
+        a.Id as answer_id,
+        a.Score as answer_score,
+        a.CreationDate as answer_date,
+        COUNT(DISTINCT c.Id) as comment_count,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as answer_rank
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY a.ParentId, a.OwnerUserId, a.Id, a.Score, a.CreationDate
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as bronze_badges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) as unique_tag_badges
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2019-01-01'
+    GROUP BY b.UserId
+),
+QuestionEngagement AS (
+    SELECT 
+        p.Id as question_id,
+        p.OwnerUserId,
+        p.Score as question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), ARRAY[]::varchar[]) as tag_array,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 5) as favorites,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) as linked_count,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 5) as edit_count,
+        MAX(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as has_accepted_answer
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags, p.AcceptedAnswerId
+)
+SELECT 
+    u.Id as user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    tqa.question_count,
+    tqa.avg_score as avg_question_score,
+    tqa.total_views,
+    COALESCE(ubs.gold_badges, 0) as gold_badges,
+    COALESCE(ubs.silver_badges, 0) as silver_badges,
+    COALESCE(ubs.bronze_badges, 0) as bronze_badges,
+    COALESCE(ubs.unique_tag_badges, 0) as unique_tag_badges,
+    COUNT(DISTINCT qe.question_id) as detailed_questions,
+    AVG(qe.question_score) as avg_detailed_score,
+    SUM(qe.ViewCount) as sum_views,
+    AVG(qe.AnswerCount) as avg_answers_per_question,
+    SUM(qe.upvotes) as total_upvotes,
+    SUM(qe.downvotes) as total_downvotes,
+    SUM(qe.linked_count) as total_links,
+    SUM(qe.edit_count) as total_edits,
+    SUM(qe.has_accepted_answer) as questions_with_accepted_answers,
+    COUNT(DISTINCT am.answer_id) FILTER (WHERE am.answer_rank = 1) as top_ranked_answers,
+    AVG(am.answer_score) FILTER (WHERE am.answer_rank <= 3) as avg_top3_answer_score,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qe.ViewCount) as median_view_count,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) FILTER (WHERE t.Count > 1000) as popular_tags_used
+FROM TopQuestionAuthors tqa
+JOIN Users u ON u.Id = tqa.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = u.Id
+LEFT JOIN QuestionEngagement qe ON qe.OwnerUserId = u.Id
+LEFT JOIN AnswerMetrics am ON am.answerer_id = u.Id
+LEFT JOIN LATERAL (
+    SELECT DISTINCT unnest(qe.tag_array) as tag_name
+) tag_unnest ON true
+LEFT JOIN Tags t ON t.TagName = tag_unnest.tag_name
+WHERE u.Reputation >= 1000
+    AND tqa.question_count >= 10
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, tqa.question_count, tqa.avg_score, tqa.total_views, ubs.gold_badges, ubs.silver_badges, ubs.bronze_badges, ubs.unique_tag_badges
+HAVING COUNT(DISTINCT qe.question_id) >= 5
+ORDER BY u.Reputation DESC, tqa.total_views DESC
+LIMIT 100;

@@ -1,0 +1,67 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.Title, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Users.DisplayName AS OwnerDisplayName, 
+        COUNT(DISTINCT CASE WHEN Votes.VoteTypeId = 2 THEN Votes.UserId END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN Votes.VoteTypeId = 3 THEN Votes.UserId END) AS DownVotes
+    FROM Posts
+    LEFT JOIN Votes ON Posts.Id = Votes.PostId
+    LEFT JOIN Users ON Posts.OwnerUserId = Users.Id
+    WHERE Posts.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+    GROUP BY Posts.Id, Posts.PostTypeId, Posts.Title, Posts.CreationDate, Posts.Score, Posts.ViewCount, Posts.AnswerCount, Posts.CommentCount, Users.DisplayName
+),
+UserActivity AS (
+    SELECT 
+        CAST(Posts.OwnerUserId AS BIGINT) AS UserId, 
+        COUNT(DISTINCT Posts.Id) AS TotalPosts, 
+        SUM(Posts.Score) AS TotalScore, 
+        SUM(Posts.ViewCount) AS TotalViews, 
+        SUM(Posts.AnswerCount) AS TotalAnswers, 
+        SUM(Posts.CommentCount) AS TotalComments
+    FROM Posts
+    GROUP BY CAST(Posts.OwnerUserId AS BIGINT)
+),
+BadgeSummary AS (
+    SELECT 
+        CAST(UserBadges.OwnerUserId AS BIGINT) AS UserId, 
+        COUNT(Badges.Id) AS TotalBadges, 
+        SUM(CASE WHEN Badges.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN Badges.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN Badges.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    LEFT JOIN UserBadges AS UserBadges ON Badges.Id = UserBadges.BadgeId
+    GROUP BY CAST(UserBadges.OwnerUserId AS BIGINT)
+)
+SELECT 
+    RecentPosts.Id,
+    RecentPosts.PostTypeId,
+    RecentPosts.Title,
+    RecentPosts.CreationDate,
+    RecentPosts.Score,
+    RecentPosts.ViewCount,
+    RecentPosts.AnswerCount,
+    RecentPosts.CommentCount,
+    RecentPosts.OwnerDisplayName,
+    RecentPosts.UpVotes,
+    RecentPosts.DownVotes,
+    COALESCE(UserActivity.TotalPosts, 0) AS TotalPosts,
+    COALESCE(UserActivity.TotalScore, 0) AS TotalScore,
+    COALESCE(UserActivity.TotalViews, 0) AS TotalViews,
+    COALESCE(UserActivity.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(UserActivity.TotalComments, 0) AS TotalComments,
+    COALESCE(BadgeSummary.TotalBadges, 0) AS TotalBadges,
+    COALESCE(BadgeSummary.GoldBadges, 0) AS GoldBadges,
+    COALESCE(BadgeSummary.SilverBadges, 0) AS SilverBadges,
+    COALESCE(BadgeSummary.BronzeBadges, 0) AS BronzeBadges
+FROM RecentPosts
+LEFT JOIN UserActivity ON RecentPosts.OwnerDisplayName = UserActivity.UserId
+LEFT JOIN BadgeSummary ON RecentPosts.OwnerDisplayName = BadgeSummary.UserId
+ORDER BY RecentPosts.CreationDate DESC, RecentPosts.Score DESC
+LIMIT 100;

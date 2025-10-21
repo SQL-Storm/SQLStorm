@@ -1,0 +1,166 @@
+-- {"query": "17060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 142435, "output_tokens": 141685} 
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_given,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as avg_question_score,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.ParentId IN (
+            SELECT Id FROM Posts WHERE PostTypeId = 1 AND AcceptedAnswerId = p.Id
+        ) THEN 1 ELSE 0 END), 0) as accepted_answers,
+        DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate) as account_age_days,
+        STRING_AGG(DISTINCT SUBSTRING(b.Name, 1, 20), ', ' ORDER BY b.Class, b.Date DESC) FILTER (WHERE b.Class <= 2) as elite_badges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+        AND u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        TRIM(BOTH '<>' FROM tag_elem) as tag_name,
+        COUNT(*) as posts_in_tag,
+        SUM(p.Score) as total_score_in_tag,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY p.Score) as q75_score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag_elem
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId, tag_elem
+),
+recent_engagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) FILTER (
+            WHERE ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+                AND ph.PostHistoryTypeId IN (2, 5, 8)
+        ) as recent_edits,
+        COUNT(DISTINCT c.Id) FILTER (
+            WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+        ) as recent_comments,
+        COALESCE(
+            MAX(GREATEST(
+                ph.CreationDate,
+                COALESCE(c.CreationDate, '1900-01-01'::timestamp)
+            )), '1900-01-01'::timestamp
+        ) as last_activity
+    FROM PostHistory ph
+    LEFT JOIN Comments c ON ph.UserId = c.UserId
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+network_analysis AS (
+    SELECT 
+        p1.OwnerUserId as user_id,
+        COUNT(DISTINCT p2.OwnerUserId) FILTER (
+            WHERE p2.OwnerUserId != p1.OwnerUserId 
+                AND p2.OwnerUserId IS NOT NULL
+        ) as unique_interactions,
+        AVG(CASE 
+            WHEN p2.Score > p1.Score THEN 1.0 
+            WHEN p2.Score = p1.Score THEN 0.5 
+            ELSE 0 
+        END) as interaction_quality
+    FROM Posts p1
+    INNER JOIN Posts p2 ON p1.Id = p2.ParentId
+    WHERE p1.PostTypeId = 1 
+        AND p2.PostTypeId = 2
+        AND p1.OwnerUserId IS NOT NULL
+    GROUP BY p1.OwnerUserId
+)
+SELECT 
+    uam.Id,
+    COALESCE(uam.DisplayName, 'Anonymous') as DisplayName,
+    uam.Reputation,
+    CASE 
+        WHEN uam.Reputation >= 100000 THEN 'Legendary'
+        WHEN uam.Reputation >= 25000 THEN 'Elite'
+        WHEN uam.Reputation >= 10000 THEN 'Trusted'
+        WHEN uam.Reputation >= 3000 THEN 'Established'
+        WHEN uam.Reputation >= 1000 THEN 'Experienced'
+        ELSE 'Rising'
+    END as user_tier,
+    uam.total_posts,
+    uam.questions_asked,
+    uam.answers_given,
+    ROUND(uam.avg_question_score::numeric, 2) as avg_question_score,
+    uam.accepted_answers,
+    ROUND(
+        CASE 
+            WHEN uam.answers_given > 0 
+            THEN (uam.accepted_answers::numeric / uam.answers_given * 100) 
+            ELSE 0 
+        END, 2
+    ) as acceptance_rate,
+    uam.account_age_days,
+    ROUND(
+        CASE 
+            WHEN uam.account_age_days > 0 
+            THEN (uam.Reputation::numeric / uam.account_age_days) 
+            ELSE 0 
+        END, 2
+    ) as daily_reputation_gain,
+    LEFT(COALESCE(uam.elite_badges, 'No elite badges'), 100) as elite_badges,
+    COALESCE(te.tag_name, 'No specialty') as primary_tag,
+    COALESCE(te.posts_in_tag, 0) as posts_in_primary_tag,
+    COALESCE(te.total_score_in_tag, 0) as score_in_primary_tag,
+    COALESCE(re.recent_edits, 0) as recent_edit_count,
+    COALESCE(re.recent_comments, 0) as recent_comment_count,
+    CASE 
+        WHEN re.last_activity IS NULL THEN 'Never active'
+        WHEN re.last_activity >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Very active'
+        WHEN re.last_activity >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Active'
+        WHEN re.last_activity >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 'Somewhat active'
+        ELSE 'Inactive'
+    END as activity_status,
+    COALESCE(na.unique_interactions, 0) as network_size,
+    ROUND(COALESCE(na.interaction_quality, 0)::numeric * 100, 2) as network_quality_score,
+    RANK() OVER (
+        ORDER BY 
+            uam.Reputation * 0.3 + 
+            COALESCE(te.total_score_in_tag, 0) * 0.2 + 
+            uam.accepted_answers * 15 + 
+            COALESCE(na.unique_interactions, 0) * 0.5 + 
+            COALESCE(re.recent_edits + re.recent_comments, 0) * 2 DESC
+    ) as composite_rank,
+    CASE 
+        WHEN uam.questions_asked > 0 AND uam.answers_given > 0 
+        THEN ROUND(
+            LOG(1 + uam.answers_given::numeric) / LOG(1 + uam.questions_asked::numeric), 
+            3
+        )
+        WHEN uam.answers_given > 0 THEN 999.999
+        WHEN uam.questions_asked > 0 THEN 0.001
+        ELSE NULL
+    END as contribution_ratio
+FROM user_activity_metrics uam
+LEFT JOIN tag_expertise te ON uam.Id = te.OwnerUserId AND te.tag_rank = 1
+LEFT JOIN recent_engagement re ON uam.Id = re.UserId
+LEFT JOIN network_analysis na ON uam.Id = na.user_id
+WHERE (uam.total_posts > 5 OR uam.Reputation > 5000)
+    AND (
+        uam.DisplayName IS NULL 
+        OR UPPER(uam.DisplayName) NOT LIKE '%BOT%'
+    )
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph_del 
+        WHERE ph_del.UserId = uam.Id 
+            AND ph_del.PostHistoryTypeId = 12
+            AND ph_del.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+        GROUP BY ph_del.UserId
+        HAVING COUNT(*) > 10
+    )
+ORDER BY 
+    composite_rank,
+    uam.Reputation DESC,
+    activity_status,
+    network_quality_score DESC
+LIMIT 100;

@@ -1,0 +1,61 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        AVG(p.AnswerCount) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Location) AS AvgAnswersInLocation
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Location
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        -- Normalize tag array construction for broader SQL compatibility
+        CAST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS text[]) AS TagArray,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        LEAD(p.CreationDate) OVER (ORDER BY p.CreationDate) - p.CreationDate AS TimeToNextPost
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    us.BadgeCount,
+    us.GoldBadges,
+    pa.TagArray[1] AS PrimaryTag,
+    ARRAY_LENGTH(pa.TagArray, 1) AS TagCount,
+    pa.CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.Id AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM PostHistory ph 
+     WHERE ph.PostId = pa.Id AND ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents,
+    us.TotalPostScore / NULLIF(us.Reputation, 0) AS ScoreReputationRatio,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name = 'Legendary') 
+        THEN 'Elite' 
+        ELSE 'Regular' 
+    END AS UserClass,
+    PERCENT_RANK() OVER (ORDER BY us.Reputation DESC) AS ReputationPercentile,
+    AVG(pa.Score) OVER (PARTITION BY COALESCE(u.Location, 'Unknown')) AS AvgLocationScore
+FROM Users u
+JOIN UserStats us ON u.Id = us.Id
+LEFT JOIN PostAnalysis pa ON u.Id = pa.OwnerUserId AND pa.UserPostRank = 1
+FULL OUTER JOIN PostHistory ph ON pa.Id = ph.PostId
+WHERE u.Reputation > 1000
+    AND (u.UpVotes > u.DownVotes * 2 OR u.DownVotes = 0)
+    AND pa.CreationDate BETWEEN '2015-01-01' AND '2023-01-01'
+    AND (ph.Text LIKE '%duplicate%' OR ph.Text IS NULL)
+ORDER BY 
+    us.AvgAnswersInLocation DESC, 
+    ScoreReputationRatio DESC NULLS LAST
+LIMIT 500;

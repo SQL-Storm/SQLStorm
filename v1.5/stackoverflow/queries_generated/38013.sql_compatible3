@@ -1,0 +1,252 @@
+WITH recent_users AS (
+  SELECT u.id AS user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate
+  FROM users u
+  WHERE u.creationdate >= (SELECT MAX(creationdate) - INTERVAL '365 days' FROM users)
+),
+hot_questions AS (
+  SELECT p.id AS question_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.owneruserid AS eruserid,
+         p.tags,
+         COALESCE(p.favoritecount, 0) AS favoritecount,
+         COALESCE(p.answercount, 0) AS answercount
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= (SELECT MAX(creationdate) - INTERVAL '730 days' FROM posts)
+),
+answers AS (
+  SELECT a.id AS answer_id,
+         a.parentid AS question_id,
+         a.owneruserid AS answerer_id,
+         a.score AS answer_score,
+         a.creationdate AS answer_date
+  FROM posts a
+  WHERE a.posttypeid = 2
+),
+votes_agg AS (
+  SELECT v.postid,
+         SUM(CASE WHEN CAST(v.votetypeid AS INTEGER) = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN CAST(v.votetypeid AS INTEGER) = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN CAST(v.votetypeid AS INTEGER) = 5 THEN 1 ELSE 0 END) AS favorites_legacy,
+         COUNT(*) AS total_votes,
+         MIN(v.creationdate) AS first_vote_at,
+         MAX(v.creationdate) AS last_vote_at
+  FROM votes v
+  WHERE v.creationdate >= (SELECT MAX(creationdate) - INTERVAL '730 days' FROM votes)
+  GROUP BY v.postid
+),
+comments_agg AS (
+  SELECT c.postid,
+         COUNT(*) AS comment_count,
+         MAX(c.creationdate) AS last_comment_at,
+         SUM(GREATEST(c.score, 0)) AS comment_karma
+  FROM comments c
+  GROUP BY c.postid
+),
+tagged AS (
+  SELECT hq.question_id,
+         UNNEST(STRING_TO_ARRAY(SUBSTRING(hq.tags, 2, LENGTH(hq.tags) - 2), '><')) AS tag
+  FROM hot_questions hq
+  WHERE hq.tags IS NOT NULL AND LENGTH(hq.tags) > 2
+),
+top_tags AS (
+  SELECT t.tag,
+         COUNT(*) AS tag_q_count
+  FROM tagged t
+  GROUP BY t.tag
+  HAVING COUNT(*) >= 50
+),
+question_engagement AS (
+  SELECT hq.question_id,
+         hq.creationdate AS q_created,
+         hq.score AS q_score,
+         hq.viewcount AS q_views,
+         hq.favoritecount + COALESCE(va.favorites_legacy, 0) AS favorites_total,
+         COALESCE(hq.answercount, 0) AS answers_declared,
+         COALESCE(va.upvotes, 0) AS upvotes,
+         COALESCE(va.downvotes, 0) AS downvotes,
+         COALESCE(va.total_votes, 0) AS total_votes,
+         va.first_vote_at,
+         va.last_vote_at,
+         COALESCE(ca.comment_count, 0) AS comment_count,
+         COALESCE(ca.comment_karma, 0) AS comment_karma
+  FROM hot_questions hq
+  LEFT JOIN votes_agg va ON va.postid = hq.question_id
+  LEFT JOIN comments_agg ca ON ca.postid = hq.question_id
+),
+answers AS (
+  SELECT a.id AS answer_id,
+         a.parentid AS question_id,
+         a.owneruserid AS answerer_id,
+         a.score AS answer_score,
+         a.creationdate AS answer_date
+  FROM posts a
+  WHERE a.posttypeid = 2
+),
+answerers AS (
+  SELECT a.question_id,
+         a.answerer_id,
+         COUNT(*) AS answers_count,
+         MAX(a.answer_score) AS best_answer_score,
+         MIN(a.answer_date) AS first_answer_at
+  FROM answers a
+  GROUP BY a.question_id, a.answerer_id
+),
+best_answerers AS (
+  SELECT a1.question_id,
+         a1.answerer_id,
+         a1.answers_count,
+         a1.best_answer_score,
+         a1.first_answer_at,
+         ROW_NUMBER() OVER (PARTITION BY a1.question_id
+                          ORDER BY a1.answers_count DESC,
+                                   a1.best_answer_score DESC,
+                                   a1.first_answer_at ASC) AS rk
+  FROM answerers a1
+),
+user_reach AS (
+  SELECT u.id AS user_id,
+         SUM(COALESCE(p.viewcount, 0)) AS total_views_contributed,
+         SUM(CASE WHEN p.posttypeid = 2 THEN COALESCE(p.score, 0) ELSE 0 END) AS answer_score_sum,
+         SUM(CASE WHEN p.posttypeid = 1 THEN COALESCE(p.score, 0) ELSE 0 END) AS question_score_sum
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  GROUP BY u.id
+),
+recent_activity_bursts AS (
+  SELECT ph.postid,
+         COUNT(*) AS bursts,
+         MIN(ph.creationdate) AS first_event_at,
+         MAX(ph.creationdate) AS last_event_at
+  FROM posthistory ph
+  WHERE ph.posthistorytypeid IN (10,11,12,13,14,15,24,31,33,34,35,36,50,52,53)
+    AND ph.creationdate >= (SELECT MAX(creationdate) - INTERVAL '365 days' FROM posthistory)
+  GROUP BY ph.postid
+),
+dup_links AS (
+  SELECT pl.postid AS dup_post_id,
+         pl.relatedpostid AS target_post_id,
+         pl.creationdate AS link_date
+  FROM postlinks pl
+  WHERE pl.linktypeid = 3
+),
+question_tags_filtered AS (
+  SELECT t.question_id, t.tag
+  FROM tagged t
+  JOIN top_tags tt ON tt.tag = t.tag
+),
+question_tag_pivot AS (
+  SELECT qt.question_id,
+         ARRAY_AGG(qt.tag ORDER BY qt.tag) AS tags_array
+  FROM question_tags_filtered qt
+  GROUP BY qt.question_id
+),
+ranked_questions AS (
+  SELECT qe.question_id,
+         qe.q_created,
+         qe.q_score,
+         qe.q_views,
+         qe.favorites_total,
+         qe.answers_declared,
+         qe.upvotes,
+         qe.downvotes,
+         qe.total_votes,
+         qe.comment_count,
+         qe.comment_karma,
+         COALESCE(rab.bursts, 0) AS moderation_bursts,
+         COALESCE(EXTRACT(EPOCH FROM (qe.last_vote_at - qe.first_vote_at)) / 3600.0, 0) AS vote_window_hours,
+         COALESCE(qtp.tags_array, ARRAY[]::varchar[]) AS tags_array,
+         0.4 * LN(1 + GREATEST(qe.q_views, 0)) +
+         0.3 * GREATEST(qe.q_score, 0) +
+         0.15 * GREATEST(qe.upvotes - qe.downvotes, 0) +
+         0.1 * GREATEST(qe.comment_count, 0) +
+         0.05 * GREATEST(qe.favorites_total, 0) -
+         0.1 * GREATEST(qe.downvotes, 0) +
+         0.05 * GREATEST(COALESCE(rab.bursts, 0), 0) AS engagement_score
+  FROM question_engagement qe
+  LEFT JOIN recent_activity_bursts rab ON rab.postid = qe.question_id
+  LEFT JOIN question_tag_pivot qtp ON qtp.question_id = qe.question_id
+),
+accepted_map AS (
+  SELECT p.id AS question_id, p.acceptedanswerid
+  FROM posts p
+  WHERE p.posttypeid = 1 AND p.acceptedanswerid IS NOT NULL
+),
+answer_quality AS (
+  SELECT a.question_id,
+         SUM(CASE WHEN a.answer_score >= 5 THEN 1 ELSE 0 END) AS good_answers,
+         SUM(CASE WHEN a.answer_score < 0 THEN 1 ELSE 0 END) AS bad_answers,
+         AVG(a.answer_score) AS avg_answer_score
+  FROM answers a
+  GROUP BY a.question_id
+),
+top_contributors AS (
+  SELECT ba.question_id,
+         ba.answerer_id,
+         ba.answers_count,
+         ba.best_answer_score,
+         ba.first_answer_at
+  FROM best_answerers ba
+  WHERE ba.rk = 1
+),
+question_owner AS (
+  SELECT p.id AS question_id, p.owneruserid AS owner_id
+  FROM posts p
+  WHERE p.posttypeid = 1
+),
+user_summary AS (
+  SELECT u.id AS user_id,
+         u.displayname,
+         u.reputation,
+         COALESCE(ur.total_views_contributed, 0) AS total_views_contributed,
+         COALESCE(ur.answer_score_sum, 0) AS answer_score_sum,
+         COALESCE(ur.question_score_sum, 0) AS question_score_sum
+  FROM users u
+  LEFT JOIN user_reach ur ON ur.user_id = u.id
+),
+final AS (
+  SELECT rq.question_id,
+         rq.q_created,
+         rq.q_score,
+         rq.q_views,
+         rq.favorites_total,
+         rq.upvotes,
+         rq.downvotes,
+         rq.total_votes,
+         rq.comment_count,
+         rq.comment_karma,
+         rq.moderation_bursts,
+         rq.vote_window_hours,
+         rq.tags_array,
+         rq.engagement_score,
+         COALESCE(aq.good_answers, 0) AS good_answers,
+         COALESCE(aq.bad_answers, 0) AS bad_answers,
+         COALESCE(aq.avg_answer_score, 0) AS avg_answer_score,
+         CASE WHEN am.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END AS has_accepted_answer,
+         tc.answerer_id AS top_answerer_id,
+         tc.answers_count AS top_answerer_answers_count,
+         tc.best_answer_score AS top_answerer_best_score,
+         us_top.displayname AS top_answerer_name,
+         us_top.reputation AS top_answerer_rep,
+         qo.owner_id AS owner_user_id,
+         us_owner.displayname AS owner_name,
+         us_owner.reputation AS owner_rep
+  FROM ranked_questions rq
+  LEFT JOIN answer_quality aq ON aq.question_id = rq.question_id
+  LEFT JOIN accepted_map am ON am.question_id = rq.question_id
+  LEFT JOIN top_contributors tc ON tc.question_id = rq.question_id
+  LEFT JOIN user_summary us_top ON us_top.user_id = tc.answerer_id
+  LEFT JOIN question_owner qo ON qo.question_id = rq.question_id
+  LEFT JOIN user_summary us_owner ON us_owner.user_id = qo.owner_id
+)
+SELECT *
+FROM final
+WHERE q_views >= 100
+  AND engagement_score > 1.0
+ORDER BY engagement_score DESC, q_score DESC, q_views DESC
+LIMIT 250;

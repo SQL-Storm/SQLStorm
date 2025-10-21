@@ -1,0 +1,148 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score END) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 20), ', ' ORDER BY t.Count DESC) FILTER (WHERE t.TagName IS NOT NULL) AS TopTags,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) AS MedianScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT DISTINCT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) pt ON p.PostTypeId = 1
+    LEFT JOIN Tags t ON pt.tag = t.TagName
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionEngagement AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        MAX(a.Score) AS BestAnswerScore,
+        MIN(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600) AS FastestAnswerHours,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.ViewCount DESC NULLS LAST) AS UserQuestionRank,
+        DENSE_RANK() OVER (ORDER BY q.Score DESC NULLS LAST) AS GlobalScoreRank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 
+        AND q.ClosedDate IS NULL
+        AND q.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount
+),
+EditPatterns AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS UniqueEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 8 THEN 1 ELSE 0 END) AS HasRollback,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS FirstCloseDate,
+        STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' 
+                THEN COALESCE(crt.Name, 'Unknown')
+                ELSE NULL 
+            END, 
+            ' -> ' ORDER BY ph.CreationDate
+        ) AS CloseReasonSequence
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY ph.PostId
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ARRAY_AGG(b.Name ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) AS RecentGoldBadges,
+        LAG(COUNT(*), 1, 0) OVER (PARTITION BY b.UserId ORDER BY DATE_TRUNC('month', b.Date)) AS PrevMonthBadges
+    FROM Badges b
+    GROUP BY b.UserId, DATE_TRUNC('month', b.Date)
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    COALESCE(uam.QuestionCount, 0) AS Questions,
+    COALESCE(uam.AnswerCount, 0) AS Answers,
+    ROUND(COALESCE(uam.AvgPostScore, 0), 2) AS AvgScore,
+    COALESCE(uam.MedianScore, 0) AS MedianScore,
+    CASE 
+        WHEN uam.Reputation > 10000 THEN 'Expert'
+        WHEN uam.Reputation > 1000 THEN 'Advanced'
+        WHEN uam.Reputation > 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    SUBSTRING(COALESCE(uam.TopTags, 'No tags'), 1, 100) AS TopTags,
+    COALESCE(qe.TotalQuestions, 0) AS HighViewQuestions,
+    COALESCE(qe.AvgFastestAnswer, 0) AS AvgFastestAnswerHours,
+    COALESCE(qe.TopQuestionScore, 0) AS TopQuestionScore,
+    COALESCE(bp.GoldBadges, 0) + COALESCE(bp.SilverBadges, 0) + COALESCE(bp.BronzeBadges, 0) AS TotalBadges,
+    ARRAY_TO_STRING(bp.RecentGoldBadges, ', ') AS RecentGoldBadges,
+    COALESCE(edit_stats.AvgEditsPerPost, 0) AS AvgEditsPerPost,
+    COALESCE(edit_stats.PostsWithRollback, 0) AS PostsWithRollback,
+    CASE 
+        WHEN uam.Reputation / NULLIF(GREATEST(uam.PostCount, 1), 0) > 100 THEN 'High Impact'
+        WHEN uam.Reputation / NULLIF(GREATEST(uam.PostCount, 1), 0) > 50 THEN 'Medium Impact'
+        ELSE 'Standard Impact'
+    END AS ImpactRating,
+    COALESCE(voting.NetVotesGiven, 0) AS NetVotesGiven,
+    COALESCE(voting.VoteRatio, 0) AS UpDownVoteRatio,
+    RANK() OVER (ORDER BY uam.Reputation DESC) AS ReputationRank,
+    PERCENT_RANK() OVER (ORDER BY COALESCE(uam.AvgPostScore, 0)) AS ScorePercentile
+FROM UserActivityMetrics uam
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) AS TotalQuestions,
+        AVG(qe.FastestAnswerHours) AS AvgFastestAnswer,
+        MAX(qe.QuestionScore) AS TopQuestionScore
+    FROM QuestionEngagement qe
+    WHERE qe.OwnerUserId = uam.Id 
+        AND qe.UserQuestionRank <= 5
+        AND qe.ViewCount > 1000
+) qe ON true
+LEFT JOIN BadgeProgression bp ON bp.UserId = uam.Id
+LEFT JOIN LATERAL (
+    SELECT 
+        AVG(ep.EditCount) AS AvgEditsPerPost,
+        COUNT(*) FILTER (WHERE ep.HasRollback = 1) AS PostsWithRollback
+    FROM EditPatterns ep
+    INNER JOIN Posts p ON ep.PostId = p.Id
+    WHERE p.OwnerUserId = uam.Id
+) edit_stats ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) - COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS NetVotesGiven,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE v.VoteTypeId = 3) > 0 
+            THEN COUNT(*) FILTER (WHERE v.VoteTypeId = 2)::numeric / COUNT(*) FILTER (WHERE v.VoteTypeId = 3)
+            ELSE COUNT(*) FILTER (WHERE v.VoteTypeId = 2)
+        END AS VoteRatio
+    FROM Votes v
+    WHERE v.UserId = uam.Id
+) voting ON true
+WHERE uam.PostCount > 0
+    AND uam.Reputation IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = uam.Id 
+            AND p.Score < -5
+            AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '3 months'
+    )
+ORDER BY 
+    CASE 
+        WHEN uam.Reputation > 5000 THEN uam.AvgPostScore 
+        ELSE uam.Reputation 
+    END DESC NULLS LAST,
+    uam.PostCount DESC
+LIMIT 100;

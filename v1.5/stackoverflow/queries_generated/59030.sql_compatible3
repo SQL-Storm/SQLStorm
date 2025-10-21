@@ -1,0 +1,47 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT v.Id) AS Votes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    COUNT(DISTINCT pl.Id) AS PostLinks,
+    COUNT(DISTINCT t.Id) AS TagsUsed,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    DATEDIFF(COALESCE(CAST(MAX(p.CreationDate) AS DATE), DATE '2024-10-01'), COALESCE(CAST(MIN(p.CreationDate) AS DATE), DATE '2024-10-01')) AS DaysActive,
+    COUNT(DISTINCT p.OwnerUserId) AS DistinctPostOwners,
+    COUNT(DISTINCT p.LastEditorUserId) AS DistinctEditors,
+    COUNT(DISTINCT CASE WHEN p.ViewCount > 0 THEN p.Id END) AS ViewedPosts
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId OR u.Id = c.LastEditorUserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.UserId
+LEFT JOIN (
+    SELECT DISTINCT t2.Id
+    FROM Posts p2
+    JOIN PostTags pt ON p2.Id = pt.PostId
+    JOIN Tags t2 ON pt.TagId = t2.Id
+    WHERE p2.OwnerUserId = u.Id
+      AND p2.Tags LIKE '%' || t2.TagName || '%'
+) AS t ON TRUE
+WHERE u.Id BETWEEN 1 AND 10000
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY MAX(p.Reputation) DESC, COUNT(DISTINCT p.Id) DESC
+LIMIT 1000;

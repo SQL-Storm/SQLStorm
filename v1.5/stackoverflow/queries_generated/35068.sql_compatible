@@ -1,0 +1,117 @@
+WITH UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT a.Id) AS TotalAnswers,
+    COUNT(DISTINCT q.Id) AS TotalQuestions,
+    COALESCE(SUM(p.Score),0) AS TotalPostScore,
+    COALESCE(SUM(c.Score),0) AS TotalCommentScore,
+    COALESCE(MAX(u.Reputation),0) AS MaxReputation,
+    MIN(u.CreationDate) AS FirstSeen,
+    MAX(u.LastAccessDate) AS LastSeen,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    SUM(CASE WHEN b.Class=1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class=2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class=3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+MostEditedPosts AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) AS EditCount
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title/Body/Tags
+  GROUP BY ph.PostId
+),
+TopTags AS (
+  SELECT
+    pt.Tag,
+    COUNT(*) AS TagCount
+  FROM (
+    SELECT
+      p.Id,
+      UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ) pt
+  GROUP BY pt.Tag
+  ORDER BY TagCount DESC
+  LIMIT 10
+),
+TagActivity AS (
+  SELECT
+    pt.Tag,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    COALESCE(SUM(p.Score),0) AS TotalScore,
+    AVG(p.Score) AS AvgScore,
+    COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+    AVG(p.ViewCount) AS AvgViews
+  FROM (
+    SELECT
+      p.Id,
+      UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ) pt
+  JOIN Posts p ON pt.Id = p.Id
+  WHERE pt.Tag IN (SELECT Tag FROM TopTags)
+  GROUP BY pt.Tag
+),
+DuplicateClusters AS (
+  SELECT
+    pl.RelatedPostId AS CanonicalId,
+    COUNT(DISTINCT pl.PostId) AS DuplicateCount,
+    MAX(p.Score) AS MaxScore,
+    AVG(p.Score) AS AvgScore
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.PostId
+  WHERE pl.LinkTypeId = 3 -- Duplicate
+  GROUP BY pl.RelatedPostId
+  HAVING COUNT(DISTINCT pl.PostId) >= 5
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.TotalPosts,
+  ua.TotalQuestions,
+  ua.TotalAnswers,
+  ua.TotalPostScore,
+  ua.TotalCommentScore,
+  ua.MaxReputation,
+  ua.BadgeCount,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.FirstSeen,
+  ua.LastSeen,
+  COALESCE(mp.EditCount,0) AS MostEditsOnAnyPost,
+  ARRAY(
+    SELECT ta.Tag || ' (' || ta.QuestionCount || ' q, ' || ROUND(ta.AvgScore,2) || ' avg score, ' || ROUND(ta.AvgViews,2) || ' avg views)'
+    FROM TagActivity ta
+    ORDER BY ta.QuestionCount DESC
+    LIMIT 3
+  ) AS TopTagActivity,
+  (
+    SELECT COALESCE(SUM(dc.DuplicateCount),0)
+    FROM DuplicateClusters dc
+    JOIN Posts q ON q.Id = dc.CanonicalId AND q.OwnerUserId = ua.UserId
+  ) AS DuplicateClustersAsCanonical
+FROM UserActivity ua
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    MAX(COALESCE(mp.EditCount,0)) AS EditCount
+  FROM Posts p
+  LEFT JOIN MostEditedPosts mp ON mp.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+) mp ON mp.OwnerUserId = ua.UserId
+ORDER BY ua.MaxReputation DESC, ua.TotalPosts DESC
+LIMIT 50;

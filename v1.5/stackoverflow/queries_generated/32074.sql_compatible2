@@ -1,0 +1,30 @@
+SELECT 
+    U.Id AS UserId,
+    U.DisplayName,
+    P1.Id AS QuestionId,
+    P1.Title AS QuestionTitle,
+    AVG(DISTINCT V1.Score) OVER (PARTITION BY P1.Id) AS AvgScore,
+    P1.ViewCount,
+    COUNT(DISTINCT A.Id) AS TotalAnswers,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+    ARRAY_AGG(PT.Name) FILTER (WHERE PT.Id = P1.PostTypeId) AS PostTypeNames
+FROM 
+    Users U
+JOIN 
+    Posts P1 ON U.Id = P1.OwnerUserId AND P1.PostTypeId = 1
+LEFT JOIN 
+    Posts A ON A.ParentId = P1.Id AND A.PostTypeId = 2
+LEFT JOIN 
+    Comments C ON C.PostId = P1.Id
+LEFT JOIN 
+    Votes V1 ON V1.PostId = P1.Id
+LEFT JOIN 
+    PostTypes PT ON PT.Id = P1.PostTypeId
+WHERE 
+    U.Reputation > 1000
+    AND P1.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+GROUP BY 
+    U.Id, U.DisplayName, P1.Id, P1.Title, P1.ViewCount
+ORDER BY 
+    AvgScore DESC NULLS LAST, TotalAnswers DESC, TotalComments DESC;

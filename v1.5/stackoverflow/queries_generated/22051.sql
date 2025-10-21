@@ -1,0 +1,87 @@
+-- {"query": "22051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1380} 
+WITH UserPostStats AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+         COUNT(p.Id) AS TotalPosts,
+         AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+         AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+         SUM(p.ViewCount) AS TotalViews,
+         SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+         STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE p.PostTypeId = 1) AS TopTags
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_id ON true
+  LEFT JOIN Tags t ON tag_id = t.TagName
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserVoteStats AS (
+  SELECT p.OwnerUserId,
+         COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+         COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+         COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+         SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId IN (8,9)) AS TotalBountyAmount
+  FROM Posts p
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY p.OwnerUserId
+),
+UserBadgeStats AS (
+  SELECT b.UserId,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         COUNT(b.Id) FILTER (WHERE b.TagBased = 1) AS TagBasedBadges,
+         MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+CombinedStats AS (
+  SELECT ups.Id, ups.DisplayName, ups.Reputation, ups.CreationDate,
+         COALESCE(ups.TotalPosts, 0) AS TotalPosts,
+         COALESCE(ups.AvgQuestionScore, 0) AS AvgQuestionScore,
+         COALESCE(ups.AvgAnswerScore, 0) AS AvgAnswerScore,
+         COALESCE(ups.TotalViews, 0) AS TotalViews,
+         COALESCE(ups.AcceptedAnswersGiven, 0) AS AcceptedAnswersGiven,
+         COALESCE(uvs.UpVotesReceived, 0) AS UpVotesReceived,
+         COALESCE(uvs.DownVotesReceived, 0) AS DownVotesReceived,
+         COALESCE(uvs.BountiesStarted, 0) AS BountiesStarted,
+         COALESCE(uvs.TotalBountyAmount, 0) AS TotalBountyAmount,
+         COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+         COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+         COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+         COALESCE(ubs.TagBasedBadges, 0) AS TagBasedBadges,
+         ubs.LastBadgeDate,
+         (ups.Reputation + 10 * COALESCE(ups.TotalViews, 0) + 5 * COALESCE(uvs.UpVotesReceived, 0) - 2 * COALESCE(uvs.DownVotesReceived, 0) + 100 * COALESCE(ubs.GoldBadges, 0) + 50 * COALESCE(ubs.SilverBadges, 0) + 10 * COALESCE(ubs.BronzeBadges, 0)) AS ComputedEngagementScore,
+         CASE 
+           WHEN ups.TotalPosts > 0 THEN LENGTH(COALESCE(ups.TopTags, ''))
+           ELSE 0
+         END AS TagStringLength,
+         NULLIF(DATE_PART('year', AGE(NOW(), ups.CreationDate)), 0) AS AccountAgeYears,
+         (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ups.Id) AS CommentCount
+  FROM UserPostStats ups
+  FULL OUTER JOIN UserVoteStats uvs ON ups.Id = uvs.OwnerUserId
+  FULL OUTER JOIN UserBadgeStats ubs ON ups.Id = ubs.UserId
+)
+SELECT cs.Id, cs.DisplayName, cs.Reputation, cs.ComputedEngagementScore,
+       ROW_NUMBER() OVER (ORDER BY cs.ComputedEngagementScore DESC NULLS LAST) AS GlobalRank,
+       RANK() OVER (PARTITION BY DATE_PART('year', cs.CreationDate) ORDER BY cs.ComputedEngagementScore DESC) AS YearlyRank,
+       DENSE_RANK() OVER (ORDER BY cs.TotalPosts DESC) AS PostRank,
+       LAG(cs.ComputedEngagementScore) OVER (ORDER BY cs.ComputedEngagementScore DESC) - cs.ComputedEngagementScore AS ScoreDiffFromPrev,
+       SUM(cs.UpVotesReceived) OVER (ORDER BY cs.ComputedEngagementScore DESC ROWS UNBOUNDED PRECEDING) AS CumulativeUpVotes,
+       CASE 
+         WHEN cs.TotalPosts = 0 THEN 'Inactive'
+         WHEN cs.ComputedEngagementScore > 100000 THEN 'Superuser'
+         WHEN cs.ComputedEngagementScore > 50000 THEN 'Poweruser'
+         ELSE 'Active'
+       END AS UserTier,
+       UPPER(LEFT(cs.DisplayName, 5)) || '...' AS AbbreviatedName,
+       GREATEST(cs.TotalViews, cs.TotalPosts * 10) AS MaxViewsOrPosts,
+       LEAST(cs.GoldBadges + cs.SilverBadges + cs.BronzeBadges, 100) AS CappedTotalBadges,
+       cs.AccountAgeYears,
+       cs.CommentCount,
+       (SELECT ph.Text FROM PostHistory ph WHERE ph.UserId = cs.Id AND ph.PostHistoryTypeId = 2 ORDER BY ph.CreationDate DESC LIMIT 1) AS LatestBodyEdit
+FROM CombinedStats cs
+WHERE cs.ComputedEngagementScore > 0
+  AND (cs.TotalPosts > 5 OR cs.Reputation > 5000)
+  AND NOT (cs.LastBadgeDate IS NULL AND cs.TotalPosts = 0)
+ORDER BY cs.ComputedEngagementScore DESC
+LIMIT 100;

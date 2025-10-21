@@ -1,0 +1,83 @@
+WITH
+TagLists AS (
+  SELECT p.Id AS PostId,
+         STRING_AGG(t.tag_name, ', ' ORDER BY t.tag_name) AS TagList,
+         COUNT(*) AS TagCount
+  FROM Posts p
+  LEFT JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS t(tag_name) ON true
+  GROUP BY p.Id
+),
+VoteStats AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+LastClose AS (
+  SELECT ph.PostId,
+         crt.Name AS CloseReasonName
+  FROM (
+     SELECT ph.PostId, MAX(ph.CreationDate) AS MaxDate
+     FROM PostHistory ph
+     WHERE ph.PostHistoryTypeId = 10
+     GROUP BY ph.PostId
+  ) AS last
+  LEFT JOIN PostHistory ph ON ph.PostId = last.PostId AND ph.CreationDate = last.MaxDate
+  LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(REGEXP_REPLACE(COALESCE(ph.Text, ''), '[^0-9]', '', 'g') AS INTEGER)
+)
+SELECT
+  p.Id AS PostId,
+  p.Title AS Title,
+  p.OwnerDisplayName AS OwnerDisplayName,
+  pt.Name AS PostTypeName,
+  p.CreationDate AS CreationDate,
+  p.LastActivityDate AS LastActivityDate,
+  p.ViewCount AS ViewCount,
+  p.Score AS Score,
+  COALESCE(vs.Upvotes, 0) AS Upvotes,
+  COALESCE(vs.Downvotes, 0) AS Downvotes,
+  COALESCE(tt.TagList, '') AS TagList,
+  COALESCE(tt.TagCount, 0) AS TagCount,
+  (p.ClosedDate IS NOT NULL) AS IsClosed,
+  lo.CloseReasonName AS CloseReasonName,
+  (p.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+  p.AnswerCount AS AnswerCount,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId) AS BadgeCountForOwner,
+  ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.LastActivityDate DESC) AS TypeRank
+FROM Posts p
+LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+LEFT JOIN TagLists tt ON tt.PostId = p.Id
+LEFT JOIN VoteStats vs ON vs.PostId = p.Id
+LEFT JOIN LastClose lo ON lo.PostId = p.Id
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+UNION ALL
+SELECT
+  p.Id AS PostId,
+  p.Title AS Title,
+  p.OwnerDisplayName AS OwnerDisplayName,
+  pt.Name AS PostTypeName,
+  p.CreationDate AS CreationDate,
+  p.LastActivityDate AS LastActivityDate,
+  p.ViewCount AS ViewCount,
+  p.Score AS Score,
+  COALESCE(vs.Upvotes, 0) AS Upvotes,
+  COALESCE(vs.Downvotes, 0) AS Downvotes,
+  COALESCE(tt.TagList, '') AS TagList,
+  COALESCE(tt.TagCount, 0) AS TagCount,
+  (p.ClosedDate IS NOT NULL) AS IsClosed,
+  lo.CloseReasonName AS CloseReasonName,
+  (p.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+  p.AnswerCount AS AnswerCount,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId) AS BadgeCountForOwner,
+  ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.LastActivityDate DESC) AS TypeRank
+FROM Posts p
+LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+LEFT JOIN TagLists tt ON tt.PostId = p.Id
+LEFT JOIN VoteStats vs ON vs.PostId = p.Id
+LEFT JOIN LastClose lo ON lo.PostId = p.Id
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '120 days'
+ORDER BY TypeRank, Score DESC, LastActivityDate DESC
+LIMIT 300;

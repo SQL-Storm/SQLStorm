@@ -1,0 +1,60 @@
+-- {"query": "43094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 681} 
+WITH TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScores,
+        RANK() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 MONTHS'
+    GROUP BY U.Id
+    HAVING COUNT(DISTINCT P.Id) > 10
+),
+UserBadges AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserTags AS (
+    SELECT
+        P.OwnerUserId,
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsInTag
+    FROM Posts P
+    CROSS JOIN LATERAL string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'') AS TagsArray
+    JOIN Tags T ON T.TagName = TagsArray
+    WHERE P.PostTypeId = 1
+    GROUP BY P.OwnerUserId, T.TagName
+)
+SELECT 
+    TU.Id,
+    TU.DisplayName,
+    TU.Reputation,
+    TU.TotalPosts,
+    TU.TotalQuestions,
+    TU.TotalAnswers,
+    TU.TotalQuestionViews,
+    TU.TotalAnswerScores,
+    UB.TotalBadges,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    JSON_AGG(DISTINCT jsonb_build_object('TagName', UT.TagName, 'PostsInTag', UT.PostsInTag)) AS TagExpertise
+FROM TopUsers TU
+LEFT JOIN UserBadges UB ON TU.Id = UB.UserId
+LEFT JOIN UserTags UT ON TU.Id = UT.OwnerUserId
+WHERE TU.ReputationRank <= 100
+GROUP BY TU.Id, UB.TotalBadges, UB.GoldBadges, UB.SilverBadges, UB.BronzeBadges
+ORDER BY TU.Reputation DESC, UB.TotalBadges DESC
+LIMIT 10;

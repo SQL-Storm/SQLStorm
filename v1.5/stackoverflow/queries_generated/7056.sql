@@ -1,0 +1,208 @@
+-- {"query": "7056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1969} 
+with
+-- active questions in the last year with parsed tags exploded
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as ViewCount,
+    p.AnswerCount,
+    p.Tags,
+    regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '365 days'
+),
+-- best answer per question (highest score, tie-break by earliest creation)
+BestAnswer as (
+  select distinct on (a.ParentId)
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    a.Body
+  from Posts a
+  where a.PostTypeId = 2
+  order by a.ParentId, a.Score desc nulls last, a.CreationDate asc nulls last
+),
+-- aggregate votes per post with weighted scoring
+VotesAgg as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as Upvotes,
+    count(*) filter (where v.VoteTypeId = 3) as Downvotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(*) filter (where v.VoteTypeId = 1) as AcceptedByOwner,
+    sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 when v.VoteTypeId = 5 then 2 else 0 end) as WeightedScore
+  from Votes v
+  group by v.PostId
+),
+-- compute user reputation and burstiness (edits/comments density)
+UserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    coalesce(b.BadgeCount,0) as BadgeCount,
+    -- edits and comments in last 90 days
+    coalesce(e.Edits90,0) as Edits90,
+    coalesce(c.Comments90,0) as Comments90,
+    -- simple burst metric
+    (coalesce(e.Edits90,0) + coalesce(c.Comments90,0))::float / greatest(date_part('day', now() - u.CreationDate),1) as BurstPerDay
+  from Users u
+  left join (
+    select UserId, count(*) as Edits90
+    from PostHistory ph
+    where ph.UserId is not null
+      and ph.CreationDate >= now() - interval '90 days'
+    group by UserId
+  ) e on e.UserId = u.Id
+  left join (
+    select UserId, count(*) as Comments90
+    from Comments cm
+    where cm.UserId is not null
+      and cm.CreationDate >= now() - interval '90 days'
+    group by UserId
+  ) c on c.UserId = u.Id
+  left join (
+    select UserId, count(*) as BadgeCount
+    from Badges
+    group by UserId
+  ) b on b.UserId = u.Id
+),
+-- links between recent questions and related posts (including duplicates)
+QuestionLinks as (
+  select
+    q.Id as QuestionId,
+    pl.RelatedPostId,
+    pl.LinkTypeId
+  from RecentQuestions q
+  left join PostLinks pl on pl.PostId = q.Id
+),
+-- tag popularity and median score per tag (window function)
+TagStats as (
+  select
+    Tag,
+    count(*) as QuestionCount,
+    sum(Score) as SumScore,
+    avg(Score) as AvgScore,
+    percentile_disc(0.5) within group (order by Score) as MedianScore,
+    rank() over (order by count(*) desc) as PopularityRank
+  from RecentQuestions
+  group by Tag
+),
+-- pivot-like heavy calculation: join questions with best answer, votes and tagstats
+QuestionEnriched as (
+  select
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tag,
+    bs.AnswerId,
+    bs.AnswerOwnerId,
+    bs.AnswerScore,
+    va.Upvotes,
+    va.Downvotes,
+    va.Favorites,
+    va.WeightedScore,
+    ts.QuestionCount,
+    ts.AvgScore as TagAvgScore,
+    ts.MedianScore as TagMedianScore,
+    ua.DisplayName as OwnerName,
+    ua.Reputation as OwnerReputation,
+    ua.BurstPerDay
+  from RecentQuestions q
+  left join BestAnswer bs on bs.QuestionId = q.Id
+  left join VotesAgg va on va.PostId = coalesce(bs.AnswerId, q.Id) -- prefer answer votes else question votes
+  left join TagStats ts on ts.Tag = q.Tag
+  left join UserActivity ua on ua.UserId = q.OwnerUserId
+),
+-- identify suspicious mixed signals: high views low score, or low views high score
+Anomalies as (
+  select
+    q.*,
+    case
+      when q.ViewCount > 10000 and q.QuestionScore <= 0 then 'HighViewsLowScore'
+      when q.ViewCount < 100 and q.QuestionScore >= 10 then 'LowViewsHighScore'
+      when q.AnswerCount = 0 and q.ViewCount > 500 and q.QuestionScore >= 3 then 'PopularNoAnswers'
+      else 'Normal'
+    end as AnomalyType,
+    -- derived quality metric mixing many signals
+    (
+      coalesce(q.QuestionScore,0) * 1.5
+      + coalesce(q.AnswerScore,0) * 2
+      + coalesce(q.WeightedScore,0)
+      + log(1+coalesce(q.ViewCount,0)) * 0.7
+      + (coalesce(q.OwnerReputation,0) / 1000.0)
+      - (coalesce(q.TagMedianScore,0) * 0.5)
+      - (case when q.BurstPerDay > 0.5 then 1 else 0 end)
+    ) as QualityScore
+  from QuestionEnriched q
+)
+select
+  a.Id as QuestionId,
+  left(a.Title,200) as ShortTitle,
+  a.Tag,
+  a.OwnerName,
+  a.OwnerReputation,
+  a.CreationDate,
+  a.QuestionScore,
+  a.ViewCount,
+  a.AnswerCount,
+  a.AnswerId,
+  a.AnswerOwnerId,
+  a.AnswerScore,
+  a.Upvotes,
+  a.Downvotes,
+  a.Favorites,
+  a.WeightedScore,
+  a.QuestionCount as TagQuestionCount,
+  a.TagAvgScore,
+  a.TagMedianScore,
+  a.BurstPerDay,
+  a.AnomalyType,
+  round(a.QualityScore::numeric,4) as QualityScore,
+  -- rank within tag by quality (correlated subquery)
+  (select count(*) + 1
+   from Anomalies a2
+   where a2.Tag = a.Tag
+     and a2.QualityScore > a.QualityScore
+  ) as RankInTag,
+  -- composers of complex string expression with null-safe concat
+  (coalesce(a.OwnerName,'<anonymous>') || ' | ' ||
+   coalesce(left(a.Tag,30),'') || ' | Q:' || coalesce(a.QuestionScore::text,'0') || ' A:' || coalesce(a.AnswerScore::text,'0')
+  ) as Summary,
+  -- include recent comment snippet (correlated subquery)
+  (
+    select left(string_agg(distinct coalesce(cm.UserDisplayName,'') || ':' || left(cm.Text,140), ' || ' order by cm.CreationDate desc),300)
+    from Comments cm
+    where cm.PostId = a.Id
+    limit 1
+  ) as RecentCommentsSnippet
+from Anomalies a
+where
+  -- complex predicate mixing null logic, set operators and regex
+  (a.Tag is not null and a.Tag ~ '^(sql|postgres|database|performance)$')
+  or a.AnomalyType in ('HighViewsLowScore','PopularNoAnswers')
+  or (a.OwnerReputation > 10000 and a.QualityScore > 10)
+  or a.Id in (
+    select RelatedPostId from QuestionLinks where LinkTypeId = 3 -- duplicates linking here
+  )
+order by
+  -- order by a combination of anomaly, quality and popularity, using set operators in sort (coalesce then nulls last)
+  case when a.AnomalyType = 'HighViewsLowScore' then 0 when a.AnomalyType = 'PopularNoAnswers' then 1 when a.AnomalyType = 'LowViewsHighScore' then 2 else 3 end,
+  a.QualityScore desc nulls last,
+  a.ViewCount desc nulls last
+limit 200;

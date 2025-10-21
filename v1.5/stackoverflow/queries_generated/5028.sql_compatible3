@@ -1,0 +1,104 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC, u.Reputation DESC) AS rn_active
+    FROM
+        Users AS u
+        LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges AS b ON b.UserId = u.Id
+    WHERE
+        u.LastAccessDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+TopQuestions AS (
+    SELECT
+        pq.Id AS QuestionId,
+        pq.Title,
+        pq.OwnerUserId AS OwnerId,
+        pq.CreationDate,
+        pq.Score,
+        pq.ViewCount,
+        pq.AnswerCount,
+        pq.Tags,
+        ROW_NUMBER() OVER (ORDER BY pq.Score DESC, pq.ViewCount DESC) AS rn_question
+    FROM
+        Posts AS pq
+    WHERE
+        pq.PostTypeId = 1
+        AND pq.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY
+),
+AnswersWithFirstComment AS (
+    SELECT
+        pa.Id AS AnswerId,
+        pa.ParentId AS QuestionId,
+        pa.OwnerUserId AS AnswerUserId,
+        pa.Score AS AnswerScore,
+        pa.CreationDate AS AnswerDate,
+        c.Id AS FirstCommentId,
+        c.Text AS FirstCommentText,
+        c.CreationDate AS FirstCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY pa.Id ORDER BY c.CreationDate ASC) AS rn_comment
+    FROM
+        Posts AS pa
+        LEFT JOIN Comments AS c ON c.PostId = pa.Id
+    WHERE
+        pa.PostTypeId = 2
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.Location,
+    ru.PostCount,
+    ru.BadgeCount,
+    ru.GoldBadgeCount,
+    tq.QuestionId,
+    tq.Title AS QuestionTitle,
+    tq.Score AS QuestionScore,
+    tq.ViewCount AS QuestionViews,
+    CASE
+        WHEN tq.Tags IS NOT NULL THEN CARDINALITY(string_to_array(SUBSTRING(tq.Tags, 2, LENGTH(tq.Tags) - 2), '><'))
+        ELSE 0
+    END AS TagCount,
+    (
+        SELECT COUNT(*) FROM AnswersWithFirstComment a
+        WHERE a.QuestionId = tq.QuestionId AND a.rn_comment = 1 AND a.FirstCommentId IS NOT NULL
+    ) AS AnswersWithAtLeastOneComment,
+    cr.Name AS LastCloseReason,
+    ph.CloseDate,
+    (COALESCE(tq.Score, 0) * 2 + COALESCE(tq.ViewCount, 0) / 100.0) * 
+    (1 + COALESCE(ru.GoldBadgeCount, 0) / NULLIF(ru.BadgeCount, 0)) AS PopularityScore
+FROM
+    RecentActiveUsers ru
+    INNER JOIN TopQuestions tq ON tq.OwnerId = ru.UserId AND tq.rn_question <= 5
+    LEFT JOIN LATERAL (
+        SELECT
+            ph1.PostHistoryTypeId = 10 AS CloseReasonIdRaw,
+            ph1.PostHistoryTypeId,
+            ph1.CreationDate AS CloseDate
+        FROM
+            PostHistory ph1
+        WHERE
+            ph1.PostId = tq.QuestionId
+            AND ph1.PostHistoryTypeId = 10
+        ORDER BY
+            ph1.CreationDate DESC
+        LIMIT 1
+    ) ph ON TRUE
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = CASE
+        WHEN ph.CloseReasonIdRaw THEN 10 ELSE NULL END
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = tq.QuestionId
+WHERE
+    ru.rn_active <= 20
+ORDER BY
+    ru.rn_active,
+    tq.rn_question;

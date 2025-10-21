@@ -1,0 +1,59 @@
+-- {"query": "1046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 427} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS Rank
+    FROM 
+        Posts p
+    WHERE 
+        p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year' 
+        AND p.Score > 0
+),
+UserReputation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty
+    FROM 
+        Users u
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id, u.Reputation
+),
+ClosedPosts AS (
+    SELECT 
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstClosedDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId = 10 -- Closed posts
+    GROUP BY 
+        ph.PostId
+)
+SELECT 
+    up.Id AS UserId,
+    up.DisplayName,
+    up.Reputation,
+    COALESCE(rp.Title, 'No Posts') AS BestPostTitle,
+    COALESCE(rp.CreationDate, 'N/A') AS BestPostDate,
+    COALESCE(rp.Score, 0) AS BestPostScore,
+    COALESCE(cp.FirstClosedDate, 'Not Closed') AS FirstClosedDate
+FROM 
+    Users up
+LEFT JOIN 
+    RankedPosts rp ON up.Id = rp.OwnerUserId AND rp.Rank = 1
+LEFT JOIN 
+    UserReputation ur ON up.Id = ur.UserId
+LEFT JOIN 
+    ClosedPosts cp ON up.Id = (SELECT OwnerUserId FROM Posts WHERE Id = cp.PostId)
+WHERE 
+    (ur.TotalBounty > 0 OR ur.Reputation > 1000)
+ORDER BY 
+    up.Reputation DESC, 
+    rp.Score DESC NULLS LAST
+LIMIT 50;

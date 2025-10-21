@@ -1,0 +1,85 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, Posts.Title, Posts.CreationDate, Posts.Score, Posts.ViewCount, Posts.AnswerCount, 
+        Users.DisplayName AS OwnerDisplayName, Users.Reputation AS OwnerReputation,
+        COUNT(DISTINCT Comments.Id) AS CommentCount
+    FROM 
+        Posts
+    JOIN 
+        Users ON Posts.OwnerUserId = Users.Id
+    LEFT JOIN 
+        Comments ON Posts.Id = Comments.PostId
+    WHERE 
+        Posts.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month'
+    GROUP BY 
+        Posts.Id, Posts.Title, Posts.CreationDate, Posts.Score, Posts.ViewCount, Posts.AnswerCount, Users.DisplayName, Users.Reputation
+),
+TopUsers AS (
+    SELECT 
+        Users.Id, Users.DisplayName, Users.Reputation, 
+        COALESCE(SUM(Posts.Score), 0) AS TotalScore
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    GROUP BY 
+        Users.Id, Users.DisplayName, Users.Reputation
+    ORDER BY 
+        TotalScore DESC
+    FETCH FIRST 10 ROWS ONLY
+),
+PostTags AS (
+    SELECT 
+        Posts.Id, Tags.TagName
+    FROM 
+        Posts
+    JOIN 
+        Tags ON Posts.Id = Tags.ExcerptPostId
+    WHERE 
+        Posts.PostTypeId = 1
+),
+PostActivity AS (
+    SELECT 
+        Posts.Id, 
+        (SELECT COUNT(*) FROM PostHistory WHERE Posts.Id = PostHistory.PostId) AS EditCount,
+        (SELECT COUNT(*) FROM Votes WHERE Posts.Id = Votes.PostId) AS VoteCount
+    FROM 
+        Posts
+)
+SELECT 
+    RP.Id, RP.Title, RP.CreationDate, RP.Score, RP.ViewCount, RP.AnswerCount, 
+    RP.OwnerDisplayName, RP.OwnerReputation, RP.CommentCount,
+    PT.TagName,
+    PA.EditCount, PA.VoteCount,
+    TU.DisplayName AS TopUserDisplayName, TU.Reputation AS TopUserReputation
+FROM 
+    RecentPosts RP
+LEFT JOIN 
+    PostTags PT ON RP.Id = PT.Id
+LEFT JOIN 
+    PostActivity PA ON RP.Id = PA.Id
+CROSS JOIN 
+    (SELECT * FROM TopUsers WHERE 1 = 1) AS TU
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC, RP.CreationDate DESC
+UNION ALL
+SELECT 
+    P.Id, P.Title, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, 
+    U.DisplayName AS OwnerDisplayName, U.Reputation AS OwnerReputation, 
+    COUNT(DISTINCT C.Id) AS CommentCount,
+    NULL AS TagName, 
+    (SELECT COUNT(*) FROM PostHistory WHERE P.Id = PostHistory.PostId) AS EditCount,
+    (SELECT COUNT(*) FROM Votes WHERE P.Id = Votes.PostId) AS VoteCount,
+    NULL AS TopUserDisplayName, NULL AS TopUserReputation
+FROM 
+    Posts P
+JOIN 
+    Users U ON P.OwnerUserId = U.Id
+LEFT JOIN 
+    Comments C ON P.Id = C.PostId
+WHERE 
+    P.PostTypeId = 2
+GROUP BY 
+    P.Id, P.Title, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, U.DisplayName, U.Reputation
+ORDER BY 
+    P.Score DESC, P.ViewCount DESC, P.CreationDate DESC;

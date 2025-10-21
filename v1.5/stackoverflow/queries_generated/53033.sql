@@ -1,0 +1,99 @@
+-- {"query": "53033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2646, "output_tokens": 845} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1  -- Questions
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) > 10 AND SUM(p.Score) > 100
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+PopularTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        ARRAY_AGG(DISTINCT substring(unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')), 1)) AS QuestionTags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT SUM(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId IN (8,9)) AS TotalBounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 500
+    GROUP BY p.Id
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS ActualAnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+)
+SELECT 
+    au.UserId,
+    au.Reputation,
+    au.PostCount,
+    au.TotalScore,
+    au.LastPostDate,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    uv.UpvotesGiven,
+    uv.DownvotesGiven,
+    qs.QuestionId,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.CommentCount,
+    qs.TotalBounty,
+    qs.QuestionTags,
+    ast.ActualAnswerCount,
+    ast.AvgAnswerScore,
+    ast.MaxAnswerScore,
+    pt.TagName AS TopTag,
+    pt.TagUsage,
+    pt.TagRank,
+    (SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = qs.QuestionId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM ActiveUsers au
+JOIN UserBadges ub ON au.UserId = ub.UserId
+JOIN UserVotes uv ON au.UserId = uv.UserId
+JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId
+JOIN AnswerStats ast ON qs.QuestionId = ast.QuestionId
+JOIN PopularTags pt ON pt.TagName = ANY(qs.QuestionTags) AND pt.TagRank <= 5
+WHERE au.Reputation > 1000
+ORDER BY au.TotalScore DESC, qs.ViewCount DESC
+LIMIT 1000;

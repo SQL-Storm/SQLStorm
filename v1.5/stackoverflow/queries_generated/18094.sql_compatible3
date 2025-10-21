@@ -1,0 +1,242 @@
+WITH
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.PostTypeId = 1 THEN CAST(p.Title AS VARCHAR(300))
+        ELSE NULL
+      END AS QuestionTitle,
+      CASE
+        WHEN p.PostTypeId = 2 THEN CAST(p.ParentId AS VARCHAR(20))
+        ELSE NULL
+      END AS ParentPostId,
+      LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+  ),
+  AnswerStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      COUNT(a.Id) AS AnswerCount,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM
+      Posts AS p
+      LEFT JOIN Posts AS a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id
+  ),
+  CommentSentiment AS (
+    SELECT
+      c.PostId,
+      AVG(CASE
+            WHEN LOWER(c.Text) LIKE '%great%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%excellent%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%helpful%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%good%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%nice%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%thanks%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%thank you%' THEN 1
+            WHEN LOWER(c.Text) LIKE '%bad%' THEN -1
+            WHEN LOWER(c.Text) LIKE '%terrible%' THEN -1
+            WHEN LOWER(c.Text) LIKE '%awful%' THEN -1
+            WHEN LOWER(c.Text) LIKE '%useless%' THEN -1
+            WHEN LOWER(c.Text) LIKE '%poor%' THEN -1
+            ELSE 0
+          END) AS AverageCommentSentimentScore,
+      COUNT(c.Id) AS CommentCount,
+      COUNT(CASE WHEN c.UserId IS NULL THEN 1 END) AS AnonymousCommentCount
+    FROM
+      Comments AS c
+    GROUP BY
+      c.PostId
+  ),
+  UserPostSummary AS (
+    SELECT
+      upa.OwnerUserId,
+      COUNT(DISTINCT CASE WHEN upa.PostTypeId = 1 THEN upa.PostId ELSE NULL END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN upa.PostTypeId = 2 THEN upa.PostId ELSE NULL END) AS AnswerCount,
+      SUM(upa.Score) AS TotalScore,
+      AVG(upa.Score) AS AverageScore,
+      SUM(upa.ViewCount) AS TotalViewCount,
+      MAX(upa.CreationDate) AS LastPostCreationDate,
+      AVG(CASE WHEN upa.ClosedDate IS NOT NULL THEN 1.0 ELSE 0.0 END) AS ClosureRate,
+      SUM(CASE WHEN upa.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPosts,
+      COUNT(DISTINCT CASE WHEN upa.PostTypeName = 'Question' AND upa.AnswerCount > 5 THEN upa.PostId ELSE NULL END) AS HighAnswerQuestions,
+      SUM(CASE WHEN upa.PostTypeName = 'Answer' AND upa.Score > 10 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+      SUM(CASE WHEN upa.PostTypeName = 'Answer' AND upa.ParentPostId IS NOT NULL AND EXISTS (
+            SELECT 1
+            FROM Posts p2
+            WHERE p2.Id = CAST(upa.ParentPostId AS INTEGER)
+              AND p2.AcceptedAnswerId = upa.PostId
+          ) THEN 1 ELSE 0 END) AS AcceptedAnswers,
+      AVG(CASE WHEN upa.PostTypeName = 'Answer' AND upa.ParentPostId IS NOT NULL AND CAST(upa.ParentPostId AS INTEGER) IS NOT NULL THEN
+                 (CAST(strftime('%s', upa.CreationDate) AS NUMERIC) - CAST(strftime('%s', upa.PreviousPostCreationDate) AS NUMERIC)) / 86400.0
+               ELSE NULL END) AS AverageTimeBetweenPosts
+    FROM
+      UserPostActivity AS upa
+    GROUP BY
+      upa.OwnerUserId
+  ),
+  UserBadgeRank AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+      SUM(CASE WHEN b.Name = 'Tagger' THEN 1 ELSE 0 END) AS TaggerBadges,
+      SUM(CASE WHEN b.Name = 'Enlightener' THEN 1 ELSE 0 END) AS EnlightenerBadges,
+      ROW_NUMBER() OVER (ORDER BY
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) DESC,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) DESC,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) DESC
+      ) AS BadgeRank
+    FROM
+      Badges AS b
+    GROUP BY
+      b.UserId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  ups.QuestionCount,
+  ups.AnswerCount,
+  ups.TotalScore,
+  ups.AverageScore,
+  ups.TotalViewCount,
+  ups.LastPostCreationDate,
+  ups.ClosureRate,
+  ups.HighAnswerQuestions,
+  ups.HighScoreAnswers,
+  ups.AcceptedAnswers,
+  COALESCE(ups.AverageTimeBetweenPosts, 0) AS AverageTimeBetweenPosts,
+  ubr.GoldBadges,
+  ubr.SilverBadges,
+  ubr.BronzeBadges,
+  ubr.TaggerBadges,
+  ubr.EnlightenerBadges,
+  ubr.BadgeRank,
+  COALESCE(cs.AverageCommentSentimentScore, 0) AS AvgCommentSentiment,
+  COALESCE(cs.AnonymousCommentCount, 0) AS AnonymousCommentCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.PostId = ups.OwnerUserId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksPosted,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.RelatedPostId = ups.OwnerUserId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksReceived,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+  ) AS ModerationActions,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (5, 8)
+  ) AS BodyEdits,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 7)
+  ) AS TitleEdits,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (6, 9)
+  ) AS TagEdits,
+  (
+    SELECT
+      COUNT(v.Id)
+    FROM
+      Votes AS v
+    WHERE
+      v.UserId = u.Id AND v.VoteTypeId = 2
+  ) AS UpVotesGiven,
+  (
+    SELECT
+      COUNT(v.Id)
+    FROM
+      Votes AS v
+    WHERE
+      v.UserId = u.Id AND v.VoteTypeId = 3
+  ) AS DownVotesGiven,
+  (
+    SELECT
+      COUNT(v.Id)
+    FROM
+      Votes AS v
+    WHERE
+      v.UserId = u.Id AND v.VoteTypeId = 16
+  ) AS EditSuggestionsApproved,
+  CASE
+    WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 1
+    ELSE 0
+  END AS HasWebsite,
+  CASE
+    WHEN u.AboutMe IS NOT NULL AND u.AboutMe <> '' THEN 1
+    ELSE 0
+  END AS HasAboutMe,
+  CASE
+    WHEN u.DisplayName LIKE '%[a-z]%' THEN 1 ELSE 0
+  END AS HasAlphaInDisplayName,
+  STRFTIME('%Y', u.CreationDate) AS CreationYear
+FROM
+  Users AS u
+  LEFT JOIN UserPostSummary AS ups
+  ON u.Id = ups.OwnerUserId
+  LEFT JOIN UserBadgeRank AS ubr
+  ON u.Id = ubr.UserId
+  LEFT JOIN CommentSentiment AS cs
+  ON u.Id = cs.PostId
+WHERE
+  u.Id < 1000000
+ORDER BY
+  u.Reputation DESC,
+  ubr.BadgeRank ASC,
+  u.CreationDate ASC
+LIMIT 1000;

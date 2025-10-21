@@ -1,0 +1,223 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(C.Score) AS AvgCommentScore,
+        (SELECT COUNT(DISTINCT VT.VoteTypeId) FROM Votes VT WHERE VT.UserId = U.Id) AS DistinctVoteTypesReceived
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+QuestionAnalysis AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId,
+        Q.AcceptedAnswerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.CommentCount AS QuestionCommentCount,
+        Q.FavoriteCount,
+        COALESCE(Q.ClosedDate, TIMESTAMP '1900-01-01 00:00:00') AS ClosedDate,
+        COALESCE(Q.CommunityOwnedDate, TIMESTAMP '1900-01-01 00:00:00') AS CommunityOwnedDate,
+        Q.Tags,
+        (CASE 
+            WHEN Q.Tags IS NULL THEN 0
+            ELSE ARRAY_LENGTH(string_to_array(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><'), 1)
+         END) AS NumTags,
+        SUM(CASE WHEN A.Id IS NOT NULL THEN A.Score ELSE 0 END) AS SumAnswerScores,
+        COUNT(A.Id) AS ActualAnswerCount,
+        MAX(A.CreationDate) AS LastAnswerDate,
+        MIN(A.CreationDate) FILTER (WHERE A.Id IS NOT NULL) AS FirstAnswerDate,
+        COUNT(DISTINCT PH_edit.Id) FILTER (WHERE PH_edit.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(DISTINCT PH_close.Id) FILTER (WHERE PH_close.PostHistoryTypeId = 10) AS CloseCount,
+        COUNT(DISTINCT PH_reopen.Id) FILTER (WHERE PH_reopen.PostHistoryTypeId = 11) AS ReopenCount,
+        RANK() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.ViewCount DESC) AS UserQuestionRank,
+        LAG(Q.CreationDate, 1, TIMESTAMP '1900-01-01 00:00:00') OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionDate,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 5) AS TotalFavoritedByUsers,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 2) AS TotalUpVoters,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 3) AS TotalDownVoters
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistory PH_edit ON Q.Id = PH_edit.PostId
+    LEFT JOIN PostHistory PH_close ON Q.Id = PH_close.PostId
+    LEFT JOIN PostHistory PH_reopen ON Q.Id = PH_reopen.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Title, Q.OwnerUserId, Q.AcceptedAnswerId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.ClosedDate, Q.CommunityOwnedDate, Q.Tags
+),
+PostLifeCycle AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS HistoryDate,
+        PH.UserId AS HistoryUserId,
+        PH.Text AS HistoryText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate) AS HistoryEventRank,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryDate,
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) AS TimeSincePreviousEvent_Sec
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 4, 5, 6, 10, 11, 12, 13)
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.GoldBadges,
+    QA.QuestionId,
+    QA.QuestionTitle,
+    QA.QuestionScore,
+    QA.ViewCount,
+    QA.AnswerCount AS DeclaredAnswerCount,
+    QA.ActualAnswerCount,
+    QA.EditCount,
+    QA.CloseCount,
+    QA.ReopenCount,
+    TP.TopTagForUser,
+    EXTRACT(DAY FROM (UE.LastAccessDate - UE.UserCreationDate)) AS DaysSinceUserCreation,
+    EXTRACT(HOUR FROM (QA.FirstAnswerDate - QA.QuestionCreationDate)) AS HoursToFirstAnswer,
+    COALESCE(QA.QuestionScore * 1.0 / NULLIF(QA.ViewCount, 0), 0.0) AS ScorePerViewRatio,
+    COALESCE(UE.UserUpVotes * 1.0 / NULLIF(UE.UserDownVotes, 0), 0.0) AS UserVoteRatio,
+    CASE
+        WHEN QA.CloseCount > 0 AND QA.ReopenCount > 0 THEN 'Closed and Reopened'
+        WHEN QA.ClosedDate != TIMESTAMP '1900-01-01 00:00:00' THEN 'Closed'
+        WHEN QA.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer'
+        WHEN QA.ActualAnswerCount = 0 AND AGE(TIMESTAMP '2024-10-01 12:34:56', QA.QuestionCreationDate) > INTERVAL '30 days' THEN 'Unanswered Old'
+        ELSE 'Active'
+    END AS QuestionStatusCategory,
+    ST_CLOSE_EVENT.HistoryDate AS CloseEventDate,
+    ST_REOPEN_EVENT.HistoryDate AS ReopenEventDate,
+    ST_DELETE_EVENT.HistoryDate AS DeleteEventDate,
+    COALESCE(QA.QuestionTitle, '[No Title]') || ' - ' || COALESCE(UE.DisplayName, '[Anonymous]') AS PostAuthorCombo,
+    (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = QA.QuestionId AND PL.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = QA.QuestionId AND PL.LinkTypeId = 3) AS DuplicatePostsCount,
+    (SELECT EXISTS (SELECT 1 FROM Posts P_inner WHERE P_inner.ParentId = QA.QuestionId AND P_inner.Score > 50)) AS HasHighlyScoredAnswer,
+    (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.PostId = QA.QuestionId AND V.VoteTypeId = 8) AS TotalBountyAmount,
+    (
+        SELECT
+            array_agg(DISTINCT T.TagName ORDER BY T.TagName)
+        FROM UNNEST(string_to_array(SUBSTRING(QA.Tags, 2, LENGTH(QA.Tags) - 2), '><')) AS user_tag_name
+        JOIN Tags T ON LOWER(T.TagName) = LOWER(user_tag_name)
+    ) AS QuestionTagArray,
+    CASE
+        WHEN UE.Reputation > 10000 AND UE.GoldBadges > 0 AND QA.QuestionScore > 100 THEN 'Elite Contributor Question'
+        WHEN UE.Reputation > 5000 AND QA.QuestionScore > 50 THEN 'High Impact Contributor Question'
+        ELSE 'General Contributor Question'
+    END AS ContributorImpactCategory
+FROM UserEngagement UE
+INNER JOIN QuestionAnalysis QA ON UE.UserId = QA.OwnerUserId
+LEFT JOIN (
+    SELECT DISTINCT ON (U_Tags.Id)
+        U_Tags.Id AS UserId,
+        LOWER(TRIM(REPLACE(REPLACE(SUBSTRING(P_Tags.Tags, 2, LENGTH(P_Tags.Tags) - 2), '>', ' '), '<', ''))) AS TopTagForUser
+    FROM Users U_Tags
+    JOIN Posts P_Tags ON U_Tags.Id = P_Tags.OwnerUserId
+    WHERE P_Tags.PostTypeId = 1 AND P_Tags.Tags IS NOT NULL AND LENGTH(P_Tags.Tags) > 2
+    GROUP BY U_Tags.Id, LOWER(TRIM(REPLACE(REPLACE(SUBSTRING(P_Tags.Tags, 2, LENGTH(P_Tags.Tags) - 2), '>', ' '), '<', '')))
+    ORDER BY U_Tags.Id, COUNT(P_Tags.Id) DESC
+) AS TP ON UE.UserId = TP.UserId
+LEFT JOIN PostLifeCycle ST_CLOSE_EVENT ON QA.QuestionId = ST_CLOSE_EVENT.PostId
+    AND ST_CLOSE_EVENT.PostHistoryTypeId = 10
+    AND ST_CLOSE_EVENT.HistoryEventRank = 1
+LEFT JOIN PostLifeCycle ST_REOPEN_EVENT ON QA.QuestionId = ST_REOPEN_EVENT.PostId
+    AND ST_REOPEN_EVENT.PostHistoryTypeId = 11
+    AND ST_REOPEN_EVENT.HistoryEventRank = 1
+LEFT JOIN PostLifeCycle ST_DELETE_EVENT ON QA.QuestionId = ST_DELETE_EVENT.PostId
+    AND ST_DELETE_EVENT.PostHistoryTypeId = 12
+    AND ST_DELETE_EVENT.HistoryEventRank = 1
+WHERE UE.Reputation > 1000
+  AND QA.ViewCount > 500
+  AND QA.QuestionScore > 10
+  AND (UE.TotalQuestions > 5 OR UE.TotalAnswers > 10)
+  AND UE.DisplayName IS NOT NULL
+  AND QA.QuestionTitle IS NOT NULL
+  AND AGE(TIMESTAMP '2024-10-01 12:34:56', UE.UserCreationDate) > INTERVAL '365 days'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM Posts P_no_answer
+      WHERE P_no_answer.Id = QA.QuestionId
+        AND P_no_answer.AnswerCount = 0
+        AND AGE(TIMESTAMP '2024-10-01 12:34:56', P_no_answer.CreationDate) > INTERVAL '90 days'
+  )
+  AND (
+      QA.QuestionTitle ILIKE '%sql%'
+      OR QA.QuestionTitle ILIKE '%database%'
+      OR QA.QuestionTitle ILIKE '%performance%'
+      OR QA.Tags ILIKE '%<sql>%'
+      OR QA.Tags ILIKE '%<database>%'
+      OR QA.Tags ILIKE '%<performance>%'
+  )
+UNION ALL
+SELECT
+    P_Edited.OwnerUserId AS UserId,
+    U_Owner.DisplayName AS DisplayName,
+    U_Owner.Reputation AS Reputation,
+    (SELECT COUNT(P_sub.Id) FROM Posts P_sub WHERE P_sub.OwnerUserId = U_Owner.Id) AS TotalPosts,
+    (SELECT COUNT(B_sub.Id) FROM Badges B_sub WHERE B_sub.UserId = U_Owner.Id AND B_sub.Class = 1) AS GoldBadges,
+    P_Edited.Id AS QuestionId,
+    P_Edited.Title AS QuestionTitle,
+    P_Edited.Score AS QuestionScore,
+    P_Edited.ViewCount,
+    P_Edited.AnswerCount AS DeclaredAnswerCount,
+    COUNT(PA.Id) AS ActualAnswerCount,
+    COUNT(DISTINCT PH_E.Id) AS EditCount,
+    NULL AS CloseCount,
+    NULL AS ReopenCount,
+    NULL AS TopTagForUser,
+    NULL AS DaysSinceUserCreation,
+    NULL AS HoursToFirstAnswer,
+    COALESCE(P_Edited.Score * 1.0 / NULLIF(P_Edited.ViewCount, 0), 0.0) AS ScorePerViewRatio,
+    COALESCE(U_Owner.UpVotes * 1.0 / NULLIF(U_Owner.DownVotes, 0), 0.0) AS UserVoteRatio,
+    'Edited by Other' AS QuestionStatusCategory,
+    NULL AS CloseEventDate,
+    NULL AS ReopenEventDate,
+    NULL AS DeleteEventDate,
+    COALESCE(P_Edited.Title, '[No Title]') || ' - Edited by ' || COALESCE(U_Editor.DisplayName, '[Anonymous Editor]') AS PostAuthorCombo,
+    (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P_Edited.Id AND PL.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P_Edited.Id AND PL.LinkTypeId = 3) AS DuplicatePostsCount,
+    (SELECT EXISTS (SELECT 1 FROM Posts PA_inner WHERE PA_inner.ParentId = P_Edited.Id AND PA_inner.Score > 75)) AS HasHighlyScoredAnswer,
+    (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.PostId = P_Edited.Id AND V.VoteTypeId = 8) AS TotalBountyAmount,
+    (
+        SELECT
+            array_agg(DISTINCT T.TagName ORDER BY T.TagName)
+        FROM UNNEST(string_to_array(SUBSTRING(P_Edited.Tags, 2, LENGTH(P_Edited.Tags) - 2), '><')) AS post_tag_name
+        JOIN Tags T ON LOWER(T.TagName) = LOWER(post_tag_name)
+    ) AS QuestionTagArray,
+    'Community Edited Impact' AS ContributorImpactCategory
+FROM Posts P_Edited
+LEFT JOIN Users U_Owner ON P_Edited.OwnerUserId = U_Owner.Id
+LEFT JOIN Users U_Editor ON P_Edited.LastEditorUserId = U_Editor.Id
+LEFT JOIN PostHistory PH_E ON P_Edited.Id = PH_E.PostId AND PH_E.PostHistoryTypeId IN (4, 5, 6) AND PH_E.UserId IS NOT NULL AND PH_E.UserId != P_Edited.OwnerUserId
+LEFT JOIN Posts PA ON P_Edited.Id = PA.ParentId AND PA.PostTypeId = 2
+WHERE P_Edited.PostTypeId = 1
+  AND P_Edited.LastEditorUserId IS NOT NULL
+  AND P_Edited.OwnerUserId IS NOT NULL
+  AND P_Edited.LastEditorUserId != P_Edited.OwnerUserId
+  AND P_Edited.Score > 20
+  AND P_Edited.ViewCount > 1000
+  AND EXISTS (SELECT 1 FROM PostHistory PH_E_check WHERE PH_E_check.PostId = P_Edited.Id AND PH_E_check.PostHistoryTypeId IN (4, 5, 6) AND PH_E_check.UserId IS NOT NULL AND PH_E_check.UserId != P_Edited.OwnerUserId)
+  AND (P_Edited.Title ILIKE '%best practice%' OR P_Edited.Body ILIKE '%optimization%')
+GROUP BY P_Edited.Id, P_Edited.Title, P_Edited.Score, P_Edited.ViewCount, P_Edited.AnswerCount, U_Owner.DisplayName, U_Editor.DisplayName, P_Edited.Tags, P_Edited.OwnerUserId, U_Owner.Reputation, U_Owner.UpVotes, U_Owner.DownVotes
+ORDER BY QuestionScore DESC, ViewCount DESC
+LIMIT 5000;

@@ -1,0 +1,162 @@
+-- {"query": "49075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2294} 
+WITH UserPostAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViewCount,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount,
+        COUNT(DISTINCT p.ParentId) AS DistinctQuestionsAnswered
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswerAcceptance AS (
+    SELECT
+        a.OwnerUserId AS UserId,
+        COUNT(q.Id) AS AnswersAcceptedByOthers
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+UserCommentAggregates AS (
+    SELECT
+        c.UserId AS UserId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceivedOnPosts,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceivedOnPosts
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL AND v.VoteTypeId IN (2, 3)
+    GROUP BY p.OwnerUserId
+),
+UserBadgeAggregates AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostHistoryAggregates AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPostsCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctHistoryTypes,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS RecentPosts,
+        COUNT(DISTINCT c.Id) AS RecentComments,
+        COUNT(DISTINCT v.Id) AS RecentVotesCast,
+        COUNT(DISTINCT v_received.Id) AS RecentVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '90 days'
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '90 days'
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '90 days'
+    LEFT JOIN Posts p_received ON u.Id = p_received.OwnerUserId
+    LEFT JOIN Votes v_received ON p_received.Id = v_received.PostId AND v_received.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '90 days'
+                               AND v_received.VoteTypeId IN (2, 3) -- UpMod, DownMod
+    GROUP BY u.Id
+),
+UserTagContribution AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT TRIM(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS DistinctTagsContributed
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.OwnerUserId
+),
+RankedTagPopularity AS (
+    SELECT
+        TagName,
+        ROW_NUMBER() OVER (ORDER BY Count DESC, TagName ASC) AS TagRank
+    FROM Tags
+),
+UserTopTagInfluence AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT rp.TagName) AS Top500TagsContributed
+    FROM Posts p
+    JOIN LATERAL unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS user_tag ON TRUE
+    JOIN RankedTagPopularity rp ON user_tag = rp.TagName
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+      AND rp.TagRank <= 500
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    u.Views AS ProfileViews,
+    u.UpVotes AS TotalUpVotesGiven,
+    u.DownVotes AS TotalDownVotesGiven,
+    COALESCE(upa.QuestionCount, 0) AS TotalQuestionsPosted,
+    COALESCE(upa.AnswerCount, 0) AS TotalAnswersPosted,
+    COALESCE(upa.DistinctQuestionsAnswered, 0) AS DistinctQuestionsAnswered,
+    COALESCE(uaa.AnswersAcceptedByOthers, 0) AS AnswersAcceptedByOthers,
+    COALESCE(upa.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(upa.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(uva.UpVotesReceivedOnPosts, 0) AS PostUpVotesReceived,
+    COALESCE(uva.DownVotesReceivedOnPosts, 0) AS PostDownVotesReceived,
+    COALESCE(uca.CommentCount, 0) AS TotalCommentsMade,
+    COALESCE(uca.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(uba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(uba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(uba.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uba.TotalBadges, 0) AS TotalBadges,
+    COALESCE(upha.EditedPostsCount, 0) AS PostsEditedCount,
+    COALESCE(upha.TotalEditsMade, 0) AS TotalEditsMade,
+    COALESCE(upha.DistinctHistoryTypes, 0) AS DistinctPostHistoryTypes,
+    COALESCE(ura.RecentPosts, 0) AS PostsInLast90Days,
+    COALESCE(ura.RecentComments, 0) AS CommentsInLast90Days,
+    COALESCE(ura.RecentVotesCast, 0) AS VotesCastInLast90Days,
+    COALESCE(ura.RecentVotesReceived, 0) AS VotesReceivedInLast90Days,
+    COALESCE(utc.DistinctTagsContributed, 0) AS UniqueTagsOnQuestions,
+    COALESCE(utt.Top500TagsContributed, 0) AS Top500TagsContributed,
+    (
+        0.4 * u.Reputation +
+        0.2 * COALESCE(upa.TotalAnswerScore, 0) +
+        0.15 * COALESCE(upa.TotalQuestionScore, 0) +
+        0.1 * COALESCE(uaa.AnswersAcceptedByOthers, 0) * 10 +
+        0.05 * COALESCE(uba.GoldBadges, 0) * 100 +
+        0.03 * COALESCE(uba.SilverBadges, 0) * 50 +
+        0.01 * COALESCE(uba.BronzeBadges, 0) * 10 +
+        0.0001 * COALESCE(upa.TotalViewCount, 0) +
+        0.005 * COALESCE(upha.TotalEditsMade, 0) +
+        0.002 * COALESCE(utt.Top500TagsContributed, 0) * 5
+    ) AS CalculatedInfluenceScore
+FROM Users u
+LEFT JOIN UserPostAggregates upa ON u.Id = upa.UserId
+LEFT JOIN UserAnswerAcceptance uaa ON u.Id = uaa.UserId
+LEFT JOIN UserCommentAggregates uca ON u.Id = uca.UserId
+LEFT JOIN UserVoteAggregates uva ON u.Id = uva.UserId
+LEFT JOIN UserBadgeAggregates uba ON u.Id = uba.UserId
+LEFT JOIN UserPostHistoryAggregates upha ON u.Id = upha.UserId
+LEFT JOIN UserRecentActivity ura ON u.Id = ura.UserId
+LEFT JOIN UserTagContribution utc ON u.Id = utc.UserId
+LEFT JOIN UserTopTagInfluence utt ON u.Id = utt.UserId
+ORDER BY CalculatedInfluenceScore DESC, u.Reputation DESC, u.CreationDate ASC
+LIMIT 200;

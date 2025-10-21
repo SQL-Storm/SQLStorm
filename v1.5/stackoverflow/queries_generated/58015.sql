@@ -1,0 +1,54 @@
+-- {"query": "58015.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1249} 
+
+WITH HighRepUsers AS (
+    SELECT Id, DisplayName, Reputation, UpVotes, DownVotes
+    FROM Users
+    WHERE Reputation > 10000
+    AND CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+),
+ActivePosts AS (
+    SELECT p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.Tags,
+           COUNT(c.Id) AS CommentCount,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    AND p.CreationDate >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.Tags
+    HAVING AVG(p.Score) > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+),
+GoldBadgeUsers AS (
+    SELECT UserId, COUNT(Id) AS GoldBadges
+    FROM Badges
+    WHERE Class = 1
+    AND Name LIKE '%Legendary%'
+    GROUP BY UserId
+    HAVING COUNT(Id) >= 3
+)
+SELECT hru.DisplayName, hru.Reputation, ap.Title, ap.Score, ap.ViewCount,
+       ap.CommentCount, ap.Upvotes, gbu.GoldBadges,
+       (SELECT COUNT(ph.Id)
+        FROM PostHistory ph
+        WHERE ph.PostId = ap.Id
+        AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+       (SELECT GROUP_CONCAT(TagName SEPARATOR ', ')
+        FROM Tags
+        WHERE FIND_IN_SET(TagName, REPLACE(REPLACE(ap.Tags, '<', ''), '>', ',')) > 0
+        AND IsModeratorOnly = 0) AS CleanedTags
+FROM HighRepUsers hru
+JOIN ActivePosts ap ON hru.Id = ap.OwnerUserId
+JOIN GoldBadgeUsers gbu ON hru.Id = gbu.UserId
+JOIN PostLinks pl ON ap.Id = pl.PostId AND pl.LinkTypeId = 3
+WHERE ap.PostRank <= 5
+AND ap.Tags LIKE '%<sql>%'
+AND EXISTS (
+    SELECT 1
+    FROM PostHistory ph
+    WHERE ph.PostId = ap.Id
+    AND ph.PostHistoryTypeId = 10
+    AND ph.CreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+)
+ORDER BY hru.Reputation DESC, ap.Score DESC
+LIMIT 100;

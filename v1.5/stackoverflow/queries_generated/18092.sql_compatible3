@@ -1,0 +1,171 @@
+WITH PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ViewCount,
+        COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as RowNum
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+AnswerMetrics AS (
+    SELECT
+        ParentId,
+        COUNT(Id) AS NumberOfAnswers,
+        AVG(Score) AS AvgAnswerScore,
+        MAX(Score) AS MaxAnswerScore,
+        SUM(CASE WHEN COALESCE(u.DisplayName, 'Community') = 'Community' THEN 1 ELSE 0 END) AS CommunityAnswerCount,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 1) THEN 1 ELSE 0 END) AS AcceptedAnswerVoteCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY ParentId
+),
+QuestionWithAnswerDetails AS (
+    SELECT
+        pd.PostId,
+        pd.Title,
+        pd.CreationDate,
+        pd.Score AS QuestionScore,
+        pd.AnswerCount AS QuestionAnswerCount,
+        pd.FavoriteCount AS QuestionFavoriteCount,
+        pd.ViewCount AS QuestionViewCount,
+        pd.OwnerDisplayName AS QuestionOwnerDisplayName,
+        pd.OwnerReputation AS QuestionOwnerReputation,
+        pd.IsClosed AS QuestionIsClosed,
+        pd.IsCommunityOwned AS QuestionIsCommunityOwned,
+        COALESCE(am.NumberOfAnswers, 0) AS TotalAnswers,
+        COALESCE(am.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+        COALESCE(am.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(am.CommunityAnswerCount, 0) AS CommunityAnswerCount,
+        COALESCE(am.AcceptedAnswerVoteCount, 0) AS AcceptedAnswerVoteCount,
+        ROW_NUMBER() OVER(ORDER BY pd.Score DESC, pd.FavoriteCount DESC) as RankedQuestion
+    FROM PostDetails pd
+    LEFT JOIN AnswerMetrics am ON pd.PostId = am.ParentId
+    WHERE pd.PostTypeId = 2
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.PostId) AS PostsEdited,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        LENGTH(p.Body) AS BodyLength,
+        (LENGTH(p.Body) - LENGTH(REPLACE(LOWER(p.Body), 'performance', ''))) AS PerformanceKeywordCount,
+        CASE
+            WHEN POSITION('<sql>' IN p.Tags) > 0 THEN 1
+            ELSE 0
+        END AS HasSqlTag,
+        CASE
+            WHEN POSITION('<database>' IN p.Tags) > 0 THEN 1
+            ELSE 0
+        END AS HasDatabaseTag,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS HighScoreCommentCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        AVG(p.Score) AS AvgTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount,
+        SUM(COALESCE(am.NumberOfAnswers, 0)) AS TotalAnswersForTag,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id ELSE NULL END) AS QuestionsWithAcceptedAnswer
+    FROM Tags t
+    JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    LEFT JOIN AnswerMetrics am ON p.Id = am.ParentId
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+UserPostInteractions AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT CASE WHEN c.UserId = p.OwnerUserId THEN c.Id ELSE NULL END) AS OwnerComments,
+        COUNT(DISTINCT CASE WHEN v.UserId = p.OwnerUserId AND v.VoteTypeId = 2 THEN v.Id ELSE NULL END) AS OwnerUpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.UserId = p.OwnerUserId AND v.VoteTypeId = 3 THEN v.Id ELSE NULL END) AS OwnerDownvotesReceived
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+)
+SELECT
+    qawd.RankedQuestion,
+    qawd.PostId,
+    qawd.Title,
+    qawd.CreationDate,
+    qawd.QuestionScore,
+    qawd.QuestionAnswerCount,
+    qawd.QuestionFavoriteCount,
+    qawd.QuestionViewCount,
+    qawd.QuestionOwnerDisplayName,
+    qawd.QuestionOwnerReputation,
+    qawd.QuestionIsClosed,
+    qawd.QuestionIsCommunityOwned,
+    qawd.TotalAnswers,
+    qawd.AvgAnswerScore,
+    qawd.MaxAnswerScore,
+    qawd.CommunityAnswerCount,
+    qawd.AcceptedAnswerVoteCount,
+    COALESCE(pca.BodyLength, 0) AS PostBodyLength,
+    COALESCE(pca.PerformanceKeywordCount, 0) AS PerformanceKeywordOccurrences,
+    pca.HasSqlTag,
+    pca.HasDatabaseTag,
+    pca.HighScoreCommentCount,
+    COALESCE(upi.OwnerComments, 0) AS OwnerMadeCommentsOnOwnPost,
+    COALESCE(upi.OwnerUpvotesReceived, 0) AS OwnerUpvotesReceivedOnPost,
+    COALESCE(upi.OwnerDownvotesReceived, 0) AS OwnerDownvotesReceivedOnPost,
+    ua.PostsEdited AS UserTotalPostsEdited,
+    ua.CommentsMade AS UserTotalCommentsMade,
+    ua.UpvotesGiven AS UserTotalUpvotesGiven,
+    ua.DownvotesGiven AS UserTotalDownvotesGiven,
+    ua.LastBadgeDate AS UserLastBadgeAwarded,
+    tp.TagName AS TopTag,
+    tp.QuestionsWithTag AS TopTagQuestionsCount,
+    tp.AvgTagScore AS TopTagAvgScore,
+    tp.AvgTagViewCount AS TopTagAvgViewCount,
+    tp.TotalAnswersForTag AS TopTagTotalAnswers,
+    tp.QuestionsWithAcceptedAnswer AS TopTagQuestionsWithAcceptedAnswer
+FROM QuestionWithAnswerDetails qawd
+LEFT JOIN PostContentAnalysis pca ON qawd.PostId = pca.PostId
+LEFT JOIN UserPostInteractions upi ON qawd.PostId = upi.PostId
+LEFT JOIN UserActivity ua ON qawd.QuestionOwnerDisplayName = ua.DisplayName
+LEFT JOIN (
+    SELECT
+        tp.*,
+        ROW_NUMBER() OVER(PARTITION BY qawd.PostId ORDER BY tp.AvgTagScore DESC) as TagRank
+    FROM TagPerformance tp
+    JOIN QuestionWithAnswerDetails qawd ON POSITION('<' || tp.TagName || '>' IN qawd.Title || ' ' || qawd.Tags) > 0
+) tp ON qawd.PostId = tp.PostId AND tp.TagRank = 1
+WHERE qawd.RankedQuestion <= 500
+ORDER BY qawd.RankedQuestion;

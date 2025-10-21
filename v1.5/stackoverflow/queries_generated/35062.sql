@@ -1,0 +1,81 @@
+-- {"query": "35062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 879} 
+WITH RecentActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+           COUNT(DISTINCT p.Id) AS NumPosts,
+           COUNT(DISTINCT c.Id) AS NumComments,
+           COUNT(DISTINCT b.Id) AS NumBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > NOW() - INTERVAL '90 days'
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate > NOW() - INTERVAL '90 days'
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date > NOW() - INTERVAL '90 days'
+    WHERE u.LastAccessDate > NOW() - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags AS (
+    SELECT t.TagName, SUM(t.Count) AS TotalTagCount
+    FROM Tags t
+    GROUP BY t.TagName
+    ORDER BY SUM(t.Count) DESC
+    LIMIT 20
+),
+PopularQuestions AS (
+    SELECT p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > NOW() - INTERVAL '1 year'
+      AND p.ViewCount > 1000
+      AND p.Score > 10
+),
+HotNetworkMoves AS (
+    SELECT ph.PostId, ph.CreationDate, p.Title, ph.UserId
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (52, 53) -- Hot/Removed Hot Network Question
+      AND ph.CreationDate > NOW() - INTERVAL '1 year'
+),
+UserParticipation AS (
+    SELECT rau.Id AS UserId, COUNT(DISTINCT pq.Id) AS PopularQuestionsPosted,
+           COUNT(DISTINCT c.Id) AS PopularQuestionsCommented,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGivenToPopularQuestions,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGivenToPopularQuestions
+    FROM RecentActiveUsers rau
+    LEFT JOIN PopularQuestions pq ON rau.Id = pq.OwnerUserId
+    LEFT JOIN Comments c ON rau.Id = c.UserId AND c.PostId = pq.Id
+    LEFT JOIN Votes v ON rau.Id = v.UserId AND v.PostId = pq.Id
+    GROUP BY rau.Id
+)
+SELECT
+    rau.Id AS UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.CreationDate,
+    rau.LastAccessDate,
+    rau.NumPosts,
+    rau.NumComments,
+    rau.NumBadges,
+    up.PopularQuestionsPosted,
+    up.PopularQuestionsCommented,
+    up.UpvotesGivenToPopularQuestions,
+    up.DownvotesGivenToPopularQuestions,
+    ARRAY(
+        SELECT t.TagName
+        FROM TopTags t
+        WHERE EXISTS (
+            SELECT 1 FROM Posts p
+            WHERE p.OwnerUserId = rau.Id
+              AND p.PostTypeId = 1
+              AND POSITION(CONCAT('<', t.TagName, '>') IN p.Tags) > 0
+        )
+        LIMIT 5
+    ) AS TopUserTags,
+    COUNT(DISTINCT hn.PostId) AS HotNetworkPostsPastYear
+FROM RecentActiveUsers rau
+LEFT JOIN UserParticipation up ON up.UserId = rau.Id
+LEFT JOIN HotNetworkMoves hn ON hn.UserId = rau.Id
+GROUP BY 
+    rau.Id, rau.DisplayName, rau.Reputation, rau.CreationDate, rau.LastAccessDate,
+    rau.NumPosts, rau.NumComments, rau.NumBadges,
+    up.PopularQuestionsPosted, up.PopularQuestionsCommented, up.UpvotesGivenToPopularQuestions, up.DownvotesGivenToPopularQuestions
+ORDER BY
+    rau.Reputation DESC, HotNetworkPostsPastYear DESC, rau.NumPosts DESC
+LIMIT 50;

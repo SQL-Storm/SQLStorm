@@ -1,0 +1,56 @@
+-- {"query": "36039.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 410} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  p.Tags,
+  pc.TotalComments,
+  COALESCE(vt.TotalVotes, 0) AS TotalVotes,
+  COALESCE(vt.UpVotes, 0) AS UpVotes,
+  COALESCE(vt.DownVotes, 0) AS DownVotes,
+  p.AnswerCount,
+  p.FavoriteCount,
+  p.LastActivityDate,
+  p.LastEditDate,
+  b.TotalBadges
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS TotalComments
+    FROM Comments
+    GROUP BY PostId
+  ) pc ON pc.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS TotalVotes,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY PostId
+  ) vt ON vt.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY PostId
+  ) b ON b.PostId = p.Id
+WHERE
+  p.CreationDate >= NOW() - INTERVAL '30 days'
+  AND p.PostTypeId IN (1, 2) -- Questions and Answers
+ORDER BY
+  p.Score DESC,
+  TotalVotes DESC,
+  p.ViewCount DESC
+LIMIT 100;

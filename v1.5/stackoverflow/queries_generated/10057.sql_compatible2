@@ -1,0 +1,63 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS Owner,
+        U.Reputation,
+        U.Location,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        CAST(U.Id AS bigint) AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Owner AS OwnerDisplayName,
+    RP.Reputation,
+    RP.Location,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus,
+    (
+        SELECT 
+            STRING_AGG(T.TagName, ', ' ORDER BY T.Id)
+        FROM (
+            SELECT
+                CAST((STRING_TO_ARRAY(P.Tags, '><'))[i] AS int) AS TagIndex
+            FROM generate_subscripts(STRING_TO_ARRAY(P.Tags, '><'), 1) AS i
+        ) AS TagArrayIndices
+        JOIN Tags T ON TagArrayIndices.TagIndex = T.Id
+        WHERE P.Id = RP.Id
+    ) AS Tags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.Owner = BC.UserId
+ORDER BY 
+    RP.Rank;

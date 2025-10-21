@@ -1,0 +1,134 @@
+-- {"query": "25016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1406} 
+
+/* Benchmark query: complex analytics across Users, Posts, Badges, Votes, Tags and PostHistory */
+WITH
+-- 1️⃣ Users with at least one gold badge and recent activity
+ActiveGoldUsers AS (
+    SELECT
+        u.Id                           AS UserId,
+        u.DisplayName                  AS DisplayName,
+        u.Reputation                   AS Reputation,
+        MAX(p.CreationDate)            AS LastPostDate,
+        COUNT(DISTINCT b.Id)           AS GoldBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b
+           ON b.UserId = u.Id
+          AND b.Class = 1                       -- Gold only
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    WHERE u.CreationDate < CURRENT_TIMESTAMP   -- exclude future dates (if any)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT b.Id) > 0
+),
+
+-- 2️⃣ Most recent answer per question with its vote breakdown
+RecentAnswers AS (
+    SELECT
+        q.Id                                     AS QuestionId,
+        a.Id                                     AS AnswerId,
+        a.OwnerUserId                            AS AnswerOwnerId,
+        a.CreationDate                           AS AnswerDate,
+        a.Score                                  AS AnswerScore,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.CreationDate DESC) AS rn
+    FROM Posts q
+    JOIN Posts a
+          ON a.ParentId = q.Id
+         AND a.PostTypeId = 2                     -- Answer
+    LEFT JOIN Votes v
+           ON v.PostId = a.Id
+    WHERE q.PostTypeId = 1                         -- Question
+      AND q.ClosedDate IS NULL
+    GROUP BY q.Id, a.Id, a.OwnerUserId, a.CreationDate, a.Score
+),
+
+-- 3️⃣ Tag statistics for tags appearing in the top‑100 scored questions
+TopTags AS (
+    SELECT
+        UNNEST(string_to_array(trim(both '<>' FROM q.Tags), '><')) AS TagName,
+        COUNT(*)                                                      AS QuestionCount,
+        AVG(q.Score)                                                  AS AvgQuestionScore
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.Score >= (
+            SELECT DISTINCT Score
+            FROM Posts
+            WHERE PostTypeId = 1
+            ORDER BY Score DESC
+            OFFSET 99 LIMIT 1
+        )
+    GROUP BY TagName
+),
+
+-- 4️⃣ Latest close reason (if any) per closed question
+LatestCloseReason AS (
+    SELECT
+        ph.PostId                                           AS QuestionId,
+        ph.Comment::int                                     AS CloseReasonId,
+        ph.CreationDate                                     AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10                         -- Post Closed
+      AND ph.Comment ~ '^\d+$'                               -- only numeric close reasons
+)
+
+-- 5️⃣ Combine everything; use UNION ALL to also list users without any answers
+SELECT
+    agu.UserId,
+    agu.DisplayName,
+    agu.Reputation,
+    agu.GoldBadgeCount,
+    COALESCE(ra.AnswerScore, 0)                               AS LatestAnswerScore,
+    COALESCE(ra.UpVotes, 0) - COALESCE(ra.DownVotes, 0)       AS NetAnswerVotes,
+    COALESCE(lcr.CloseReasonId, NULL)                        AS LastCloseReasonId,
+    STRING_AGG(DISTINCT tt.TagName, ', ')                     AS TagsInTop100,
+    ROW_NUMBER() OVER (ORDER BY agu.Reputation DESC)         AS ReputationRank,
+    CASE
+        WHEN agu.Reputation >= 20000 THEN 'Elite'
+        WHEN agu.Reputation >= 10000 THEN 'Veteran'
+        ELSE 'Member'
+    END                                                       AS ReputationTier,
+    CURRENT_TIMESTAMP                                        AS BenchmarkRunAt
+FROM ActiveGoldUsers agu
+LEFT JOIN RecentAnswers ra
+       ON ra.AnswerOwnerId = agu.UserId
+      AND ra.rn = 1
+LEFT JOIN LatestCloseReason lcr
+       ON lcr.QuestionId = ra.QuestionId
+      AND lcr.rn = 1
+LEFT JOIN TopTags tt
+       ON tt.TagName = ANY (SELECT UNNEST(string_to_array(trim(both '<>' FROM (SELECT Tags FROM Posts WHERE Id = ra.QuestionId LIMIT 1)), '><')))
+WHERE (ra.rn = 1 OR ra.rn IS NULL)
+GROUP BY
+    agu.UserId,
+    agu.DisplayName,
+    agu.Reputation,
+    agu.GoldBadgeCount,
+    ra.AnswerScore,
+    ra.UpVotes,
+    ra.DownVotes,
+    lcr.CloseReasonId,
+    lcr.QuestionId
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0                                 AS GoldBadgeCount,
+    NULL                              AS LatestAnswerScore,
+    NULL                              AS NetAnswerVotes,
+    NULL                              AS LastCloseReasonId,
+    NULL                              AS TagsInTop100,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    CASE
+        WHEN u.Reputation >= 20000 THEN 'Elite'
+        WHEN u.Reputation >= 10000 THEN 'Veteran'
+        ELSE 'Member'
+    END                               AS ReputationTier,
+    CURRENT_TIMESTAMP                AS BenchmarkRunAt
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)
+  AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)

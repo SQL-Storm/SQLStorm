@@ -1,0 +1,53 @@
+WITH TopUserTags AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        tag_item.Tag AS Tag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgPostScore,
+        RANK() OVER (
+            PARTITION BY tag_item.Tag
+            ORDER BY COUNT(*) DESC
+        ) AS TagRank
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    CROSS APPLY (
+        SELECT value AS Tag
+        FROM STRING_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+    ) AS tag_item
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        u.Id, u.DisplayName, tag_item.Tag
+    HAVING 
+        COUNT(*) > 10
+)
+SELECT 
+    t.Tag,
+    t.DisplayName,
+    t.TagCount,
+    t.AvgPostScore,
+    v.UpVotes,
+    v.DownVotes,
+    b.BadgeCount
+FROM 
+    TopUserTags t
+JOIN 
+    Users v ON t.UserId = v.Id
+LEFT JOIN (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount 
+    FROM 
+        Badges 
+    GROUP BY 
+        UserId
+) b ON t.UserId = b.UserId
+WHERE 
+    t.TagRank <= 5
+ORDER BY 
+    t.TagCount DESC, 
+    t.AvgPostScore DESC
+LIMIT 100;

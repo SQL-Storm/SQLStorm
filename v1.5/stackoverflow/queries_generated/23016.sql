@@ -1,0 +1,56 @@
+-- {"query": "23016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 842} 
+
+WITH GoldBadgeUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(b.Id) AS GoldBadgeCount,
+           MAX(b.Date) AS LatestGoldBadgeDate
+    FROM Users u
+    INNER JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Class = 1 AND b.TagBased = 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 3
+),
+QuestionPosts AS (
+    SELECT p.Id, p.OwnerUserId, p.Title, p.ViewCount, p.Score, p.Tags,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS ViewRank,
+           COALESCE(p.AnswerCount, 0) AS AnswerCountNullSafe,
+           CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+),
+UserQuestionMetrics AS (
+    SELECT gbu.Id AS UserId, qp.Id AS PostId, qp.Title, qp.ViewCount, qp.Score,
+           (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = qp.Id AND v.VoteTypeId = 9) AS AvgBounty,
+           STRING_AGG(SPLIT_PART(tag, '><', 1), ', ') AS TagList
+    FROM GoldBadgeUsers gbu
+    LEFT OUTER JOIN QuestionPosts qp ON gbu.Id = qp.OwnerUserId AND qp.ViewRank = 1
+    LEFT OUTER JOIN LATERAL (SELECT substring(qp.Tags, 2, length(qp.Tags)-2) AS tags) AS t ON TRUE
+    LEFT OUTER JOIN LATERAL string_to_array(t.tags, '><') AS tag ON TRUE
+    WHERE qp.Tags IS NOT NULL AND qp.Tags LIKE '<%'
+    GROUP BY gbu.Id, qp.Id, qp.Title, qp.ViewCount, qp.Score
+),
+EditHistory AS (
+    SELECT ph.PostId, COUNT(ph.Id) AS EditCount,
+           MIN(ph.CreationDate) AS FirstEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.PostId
+),
+CombinedMetrics AS (
+    SELECT uqm.UserId, uqm.PostId, uqm.Title, uqm.ViewCount, uqm.Score, uqm.AvgBounty, uqm.TagList,
+           COALESCE(eh.EditCount, 0) AS EditCount,
+           (uqm.Score * 1.0 / NULLIF(uqm.ViewCount, 0)) AS ScorePerView,
+           RANK() OVER (ORDER BY uqm.ViewCount DESC NULLS LAST) AS OverallRank
+    FROM UserQuestionMetrics uqm
+    LEFT OUTER JOIN EditHistory eh ON uqm.PostId = eh.PostId
+    WHERE uqm.AvgBounty IS NULL OR uqm.AvgBounty > 50
+)
+SELECT cm.UserId, cm.PostId, cm.Title, cm.ViewCount, cm.Score, cm.AvgBounty, cm.TagList, cm.EditCount, cm.ScorePerView, cm.OverallRank,
+       (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = cm.PostId AND c.Score > 1) AS HighScoreComments
+FROM CombinedMetrics cm
+WHERE cm.OverallRank <= 10
+UNION ALL
+SELECT gbu.Id AS UserId, NULL AS PostId, 'No Top Question' AS Title, 0 AS ViewCount, 0 AS Score, NULL AS AvgBounty, NULL AS TagList, 0 AS EditCount, 0.0 AS ScorePerView, NULL AS OverallRank, 0 AS HighScoreComments
+FROM GoldBadgeUsers gbu
+WHERE NOT EXISTS (SELECT 1 FROM QuestionPosts qp WHERE qp.OwnerUserId = gbu.Id AND qp.ViewRank = 1)
+ORDER BY OverallRank ASC NULLS LAST, ViewCount DESC;

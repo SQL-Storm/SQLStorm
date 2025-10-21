@@ -1,0 +1,117 @@
+-- {"query": "53014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2646, "output_tokens": 998} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE 0 END) AS TotalBounty
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    GROUP BY v.PostId, p.OwnerUserId
+),
+AggregatedVotes AS (
+    SELECT 
+        UserId,
+        SUM(Upvotes) AS TotalUpvotes,
+        SUM(Downvotes) AS TotalDownvotes,
+        SUM(TotalBounty) AS TotalBountyEarned
+    FROM VoteAnalysis
+    GROUP BY UserId
+),
+TagPopularity AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        t.TagName,
+        COUNT(*) AS TagUsageCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    CROSS APPLY string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag_array
+    JOIN Tags t ON t.TagName = tag_array
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, t.TagName
+),
+TopTagsPerUser AS (
+    SELECT 
+        UserId,
+        TagName AS TopTag,
+        TagUsageCount
+    FROM TagPopularity
+    WHERE TagRank = 1
+),
+CommentActivity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.UserId
+),
+PostHistoryEdits AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.UserId
+)
+SELECT 
+    ua.UserId,
+    u.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalScore,
+    ua.TotalViews,
+    ua.AvgScore,
+    ua.LastPostDate,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.TagBasedBadges,
+    av.TotalUpvotes,
+    av.TotalDownvotes,
+    av.TotalBountyEarned,
+    tt.TopTag,
+    tt.TagUsageCount,
+    ca.CommentCount,
+    ca.AvgCommentScore,
+    phe.EditCount,
+    RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ua.TotalScore) OVER (PARTITION BY tt.TopTag) AS MedianScoreByTopTag
+FROM UserActivity ua
+JOIN Users u ON ua.UserId = u.Id
+LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN AggregatedVotes av ON ua.UserId = av.UserId
+LEFT JOIN TopTagsPerUser tt ON ua.UserId = tt.UserId
+LEFT JOIN CommentActivity ca ON ua.UserId = ca.UserId
+LEFT JOIN PostHistoryEdits phe ON ua.UserId = phe.UserId
+WHERE ua.QuestionCount > 10 OR ua.AnswerCount > 20
+ORDER BY ua.Reputation DESC
+LIMIT 1000;

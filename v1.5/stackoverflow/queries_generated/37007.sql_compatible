@@ -1,0 +1,149 @@
+WITH
+-- recent activity window
+recent_posts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+-- compute tag list exploded
+question_tags AS (
+  SELECT p.Id AS QuestionId,
+         regexp_split_to_table(substring(p.Tags, 2, char_length(p.Tags)-2), '><') AS Tag
+  FROM recent_posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+-- per-question aggregates: answers, avg answer score, top answer age, comments, favorites
+answer_aggs AS (
+  SELECT q.Id AS QuestionId,
+         count(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCountCalc,
+         avg(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         max(a.CreationDate) FILTER (WHERE a.PostTypeId = 2) AS LatestAnswerDate,
+         min(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) FILTER (WHERE a.PostTypeId = 2) AS FastestAnswerSeconds
+  FROM recent_posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+comment_aggs AS (
+  SELECT p.Id AS PostId,
+         count(c.Id) AS CommentCount,
+         avg(c.Score) AS AvgCommentScore,
+         max(c.CreationDate) AS LastCommentDate
+  FROM recent_posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+vote_aggs AS (
+  SELECT p.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) AS UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) AS DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) AS Favorites,
+         sum(case when v.VoteTypeId = 1 then 1 else 0 end) AS AcceptedCount
+  FROM Votes v
+  JOIN recent_posts p ON p.Id = v.PostId
+  GROUP BY p.PostId
+),
+user_activity AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         count(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS QuestionsLastYear,
+         count(p.Id) FILTER (WHERE p.PostTypeId = 2 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS AnswersLastYear,
+         max(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  GROUP BY u.Id, u.Reputation
+),
+-- compute tag popularity and quality metrics
+tag_metrics AS (
+  SELECT qt.Tag,
+         count(distinct qt.QuestionId) AS QuestionsWithTag,
+         count(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersTotal,
+         avg(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScoreForTag,
+         avg(q.Score) FILTER (WHERE q.PostTypeId = 1) AS AvgQuestionScoreForTag,
+         sum(case when q.AcceptedAnswerId IS NOT NULL then 1 else 0 end) AS QuestionsWithAccepted
+  FROM question_tags qt
+  LEFT JOIN Posts q ON q.Id = qt.QuestionId
+  LEFT JOIN Posts a ON a.ParentId = qt.QuestionId
+  GROUP BY qt.Tag
+),
+-- identify question networks via links (duplicates/linked)
+post_link_components AS (
+  SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkType
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+-- heavy join bringing everything together for per-question benchmarking row
+bench_rows AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.OwnerUserId,
+         u.Reputation AS OwnerReputation,
+         ua.QuestionsLastYear,
+         ua.AnswersLastYear,
+         COALESCE(ag.AnswerCountCalc,0) AS CalculatedAnswerCount,
+         COALESCE(ag.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE(ag.FastestAnswerSeconds,0) AS FastestAnswerSeconds,
+         COALESCE(ca.CommentCount,0) AS CommentCount,
+         COALESCE(vg.UpVotes,0) AS UpVotes,
+         COALESCE(vg.DownVotes,0) AS DownVotes,
+         COALESCE(vg.Favorites,0) AS Favorites,
+         COALESCE(vg.AcceptedCount,0) AS AcceptedVotes,
+         COALESCE(tm.QuestionsWithTag,0) AS DistinctTagsCountHint,
+         string_agg(distinct qt.Tag, ',' ORDER BY qt.Tag) AS Tags,
+         count(pl.PostId) FILTER (WHERE pl.RelatedPostId IS NOT NULL) AS OutgoingLinks,
+         count(pl.RelatedPostId) FILTER (WHERE pl.PostId IS NOT NULL) AS IncomingLinks
+  FROM recent_posts q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_activity ua ON ua.UserId = u.Id
+  LEFT JOIN answer_aggs ag ON ag.QuestionId = q.Id
+  LEFT JOIN comment_aggs ca ON ca.PostId = q.Id
+  LEFT JOIN vote_aggs vg ON vg.PostId = q.Id
+  LEFT JOIN (
+    SELECT QuestionId, count(*) AS QuestionsWithTag
+    FROM question_tags GROUP BY QuestionId
+  ) tm ON tm.QuestionId = q.Id
+  LEFT JOIN question_tags qt ON qt.QuestionId = q.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id OR pl.RelatedPostId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId, u.Reputation, ua.QuestionsLastYear, ua.AnswersLastYear,
+           ag.AnswerCountCalc, ag.AvgAnswerScore, ag.FastestAnswerSeconds, ca.CommentCount,
+           vg.UpVotes, vg.DownVotes, vg.Favorites, vg.AcceptedCount, tm.QuestionsWithTag
+)
+SELECT
+  br.QuestionId,
+  br.Title,
+  br.CreationDate,
+  br.OwnerUserId,
+  br.OwnerReputation,
+  br.QuestionsLastYear,
+  br.AnswersLastYear,
+  br.CalculatedAnswerCount,
+  br.AvgAnswerScore,
+  br.FastestAnswerSeconds,
+  br.CommentCount,
+  br.UpVotes,
+  br.DownVotes,
+  br.Favorites,
+  br.AcceptedVotes,
+  br.DistinctTagsCountHint,
+  br.Tags,
+  br.OutgoingLinks,
+  br.IncomingLinks,
+  tm2.Tag,
+  tm2.QuestionsWithTag,
+  tm2.AnswersTotal,
+  tm2.AvgAnswerScoreForTag,
+  tm2.AvgQuestionScoreForTag,
+  tm2.QuestionsWithAccepted,
+  -- derived scoring heuristics
+  (br.CalculatedAnswerCount * 1.5 + coalesce(br.UpVotes,0) * 0.1 + coalesce(br.Favorites,0) * 0.2
+    - coalesce(br.DownVotes,0) * 0.3 + greatest(0, 100 - br.OwnerReputation/100) * 0.01) AS EngagementScore,
+  rank() OVER (PARTITION BY tm2.Tag ORDER BY (br.CalculatedAnswerCount * 1.5 + coalesce(br.UpVotes,0) * 0.1 + coalesce(br.Favorites,0) * 0.2 - coalesce(br.DownVotes,0) * 0.3) DESC) AS TagLocalRank,
+  dense_rank() OVER (ORDER BY (br.CalculatedAnswerCount * 1.5 + coalesce(br.UpVotes,0) * 0.1 + coalesce(br.Favorites,0) * 0.2 - coalesce(br.DownVotes,0) * 0.3) DESC) AS GlobalDenseRank
+FROM bench_rows br
+LEFT JOIN question_tags qt2 ON qt2.QuestionId = br.QuestionId
+LEFT JOIN tag_metrics tm2 ON tm2.Tag = qt2.Tag
+ORDER BY EngagementScore DESC NULLS LAST
+LIMIT 100;

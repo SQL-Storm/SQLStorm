@@ -1,0 +1,122 @@
+-- {"query": "47005.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 11470, "output_tokens": 9770} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        1 as level
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers_in_tag,
+        SUM(p.Score) as total_score_in_tag,
+        AVG(p.Score) as avg_score_in_tag,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND u.Reputation > 10000
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as month,
+        COUNT(DISTINCT p.Id) as questions_asked,
+        COUNT(DISTINCT a.Id) as answers_provided,
+        AVG(COALESCE(p.AnswerCount, 0)) as avg_answers_per_question,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_question_score,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.ViewCount) as p90_views,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) as closed_questions,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as accepted_questions
+    FROM Posts p
+    LEFT JOIN Posts a ON a.PostTypeId = 2 AND DATE_TRUNC('month', a.CreationDate) = DATE_TRUNC('month', p.CreationDate)
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+badge_correlations AS (
+    SELECT 
+        b1.Name as badge1,
+        b2.Name as badge2,
+        COUNT(DISTINCT b1.UserId) as users_with_both,
+        COUNT(DISTINCT b1.UserId)::FLOAT / NULLIF(COUNT(DISTINCT u.Id), 0) as correlation_strength
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b1.UserId = b2.UserId AND b1.Name < b2.Name
+    INNER JOIN Users u ON u.Id = b1.UserId
+    WHERE b1.Class IN (1, 2)
+        AND b2.Class IN (1, 2)
+        AND u.Reputation > 5000
+    GROUP BY b1.Name, b2.Name
+    HAVING COUNT(DISTINCT b1.UserId) >= 100
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) as posts_edited,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as edit_actions,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) as rollback_actions,
+        AVG(LENGTH(ph.Text)) as avg_edit_size,
+        STDDEV(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))/3600) as edit_timing_stddev_hours
+    FROM PostHistory ph
+    INNER JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+        AND ph.UserId IS NOT NULL
+        AND ph.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY ph.UserId
+    HAVING COUNT(DISTINCT ph.PostId) >= 10
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.Reputation,
+    ue.answers_in_tag,
+    ue.total_score_in_tag,
+    ue.avg_score_in_tag,
+    ue.accepted_answers,
+    ue.tag_rank,
+    COALESCE(ep.posts_edited, 0) as posts_edited,
+    COALESCE(ep.edit_actions, 0) as edit_actions,
+    ROUND(COALESCE(ep.avg_edit_size, 0)::NUMERIC, 2) as avg_edit_size,
+    tp.month as peak_activity_month,
+    tp.questions_asked as monthly_questions,
+    tp.median_question_score,
+    tp.p90_views,
+    COUNT(DISTINCT bc.badge2) as correlated_badges,
+    STRING_AGG(DISTINCT bc.badge2, ', ' ORDER BY bc.badge2) as related_badges,
+    LAG(ue.total_score_in_tag, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.tag_rank) as previous_ranker_score,
+    LEAD(ue.total_score_in_tag, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.tag_rank) as next_ranker_score,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation DESC) as global_reputation_rank,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ue.total_score_in_tag) OVER (PARTITION BY ue.TagName) as p95_score_in_tag
+FROM user_expertise ue
+LEFT JOIN edit_patterns ep ON ep.UserId = ue.UserId
+CROSS JOIN LATERAL (
+    SELECT * FROM temporal_patterns tp
+    ORDER BY tp.questions_asked DESC
+    LIMIT 1
+) tp
+LEFT JOIN Badges b ON b.UserId = ue.UserId
+LEFT JOIN badge_correlations bc ON bc.badge1 = b.Name
+WHERE ue.tag_rank <= 10
+GROUP BY 
+    ue.DisplayName, ue.TagName, ue.Reputation, ue.answers_in_tag,
+    ue.total_score_in_tag, ue.avg_score_in_tag, ue.accepted_answers,
+    ue.tag_rank, ep.posts_edited, ep.edit_actions, ep.avg_edit_size,
+    tp.month, tp.questions_asked, tp.median_question_score, tp.p90_views, ue.UserId
+ORDER BY ue.TagName, ue.tag_rank
+LIMIT 500;

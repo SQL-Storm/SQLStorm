@@ -1,0 +1,23 @@
+-- {"query": "32057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 293} 
+
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName, 
+    COALESCE(SUM(v.VoteTypeId = 2) - SUM(v.VoteTypeId = 3), 0) AS NetVotes,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id), 0) AS CommentCount
+FROM 
+    Users u
+LEFT JOIN 
+    Votes v ON v.UserId = u.Id
+GROUP BY 
+    u.Id
+HAVING 
+    NetVotes > 0
+ORDER BY 
+    NetVotes DESC, GoldBadges DESC, SilverBadges DESC, BronzeBadges DESC, AnswerCount DESC, QuestionCount DESC
+LIMIT 100;

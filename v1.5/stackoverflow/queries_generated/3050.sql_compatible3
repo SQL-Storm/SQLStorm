@@ -1,0 +1,100 @@
+WITH PostTypeQuestionCounts AS (
+    SELECT pt.Id AS PostTypeId, pt.Name AS PostTypeName, COUNT(p.Id) AS PostCount
+    FROM PostTypes pt
+    LEFT JOIN Posts p ON p.PostTypeId = pt.Id
+    GROUP BY pt.Id, pt.Name
+),
+RecentPostComments AS (
+    SELECT c.PostId, COUNT(c.Id) AS CommentCount, MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+AnswerDetails AS (
+    SELECT a.Id AS AnswerId, a.Score AS AnswerScore, a.ParentId, a.OwnerUserId, u.DisplayName AS OwnerName,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS Rank
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+MostVotedAnswers AS (
+    SELECT ParentId, AnswerId, AnswerScore, OwnerName
+    FROM AnswerDetails
+    WHERE Rank = 1
+),
+UserBadgeCounts AS (
+    SELECT ub.UserId, COUNT(ub.Id) AS BadgeCount, MAX(ub.Date) AS MostRecentBadgeDate
+    FROM Badges ub
+    GROUP BY ub.UserId
+),
+PostHistorySummary AS (
+    SELECT ph.PostId,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditCount,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,12,13) THEN 1 END) AS ClosureReopenCount,
+           COUNT(*) AS TotalHistoryEntries
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+LinkedPosts AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+QuestionTags AS (
+    SELECT p.Id AS PostId, unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagUsage AS (
+    SELECT Tag, COUNT(*) AS UsageCount
+    FROM QuestionTags
+    GROUP BY Tag
+),
+OpenQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.AnswerCount, p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+AggregatedData AS (
+    SELECT 
+        ptPostType.PostTypeName,
+        ptPostType.PostCount,
+        rpc.CommentCount AS CommentCount,
+        rpa.AnswerScore,
+        rpa.OwnerName AS TopAnswerOwner,
+        ubc.BadgeCount,
+        ubc.MostRecentBadgeDate,
+        ph.EditCount,
+        ph.ClosureReopenCount,
+        ph.TotalHistoryEntries,
+        COUNT(lp.PostId) AS LinkCount,
+        COUNT(DISTINCT ptags.Tag) AS DistinctTags,
+        COUNT(DISTINCT ow.Id) AS ActiveQuestions
+    FROM PostTypeQuestionCounts ptPostType
+    LEFT JOIN RecentPostComments rpc ON rpc.PostId IN (
+        SELECT Id FROM Posts WHERE PostTypeId = 1
+    )
+    LEFT JOIN MostVotedAnswers rpa ON rpa.ParentId = rpc.PostId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = rpa.OwnerUserId
+    LEFT JOIN PostHistorySummary ph ON ph.PostId IN (
+        SELECT Id FROM Posts WHERE PostTypeId = 1
+    )
+    LEFT JOIN LinkedPosts lp ON lp.PostId IN (
+        SELECT Id FROM Posts WHERE PostTypeId = 1
+    )
+    LEFT JOIN QuestionTags ptags ON ptags.PostId = lp.PostId
+    LEFT JOIN Posts ow ON ow.Id = lp.PostId AND ow.PostTypeId = 1
+    WHERE ow.ClosedDate IS NULL
+    GROUP BY 
+        ptPostType.PostTypeName,
+        ptPostType.PostCount,
+        rpc.CommentCount,
+        rpa.AnswerScore,
+        rpa.OwnerName,
+        ubc.BadgeCount,
+        ubc.MostRecentBadgeDate,
+        ph.EditCount,
+        ph.ClosureReopenCount,
+        ph.TotalHistoryEntries
+)
+SELECT * FROM AggregatedData
+ORDER BY PostTypeName ASC;

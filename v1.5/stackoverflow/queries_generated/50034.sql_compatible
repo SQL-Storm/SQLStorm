@@ -1,0 +1,94 @@
+WITH UserAnswerStats AS (
+  SELECT
+    a.OwnerUserId,
+    COUNT(DISTINCT a.Id) AS AnswerCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnAnswers,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnAnswers,
+    AVG(q.Score) AS AvgQuestionScore,
+    AVG(q.AnswerCount) AS AvgQuestionAnswerCount
+  FROM Posts AS q
+  INNER JOIN Posts AS a
+    ON q.Id = a.ParentId
+  LEFT JOIN Votes AS v
+    ON a.Id = v.PostId
+  WHERE
+    q.PostTypeId = 1 -- Question
+    AND a.PostTypeId = 2 -- Answer
+    AND q.Tags LIKE '%<sql>%'
+    AND a.OwnerUserId IS NOT NULL
+    AND q.ClosedDate IS NULL
+  GROUP BY
+    a.OwnerUserId
+  HAVING
+    COUNT(DISTINCT a.Id) > 25
+), UserBadgeRanks AS (
+  SELECT
+    UserId,
+    Name,
+    Date,
+    ROW_NUMBER() OVER (PARTITION BY UserId, Class ORDER BY Date DESC) AS RankNum
+  FROM Badges
+), RecentBadges AS (
+  SELECT
+    UserId,
+    MAX(CASE WHEN Class = 1 AND RankNum = 1 THEN Name END) AS LastGoldBadge,
+    MAX(CASE WHEN Class = 1 AND RankNum = 1 THEN Date END) AS LastGoldBadgeDate,
+    MAX(CASE WHEN Class = 2 AND RankNum = 1 THEN Name END) AS LastSilverBadge,
+    MAX(CASE WHEN Class = 2 AND RankNum = 1 THEN Date END) AS LastSilverBadgeDate
+  FROM UserBadgeRanks
+  WHERE
+    RankNum = 1
+    AND Class IN (1, 2)
+  GROUP BY
+    UserId
+), PostEditHistory AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(ph.Id) AS TotalEdits,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 ELSE 0 END) AS BodyEdits,
+    COUNT(DISTINCT ph.UserId) AS DistinctEditors
+  FROM Posts AS p
+  INNER JOIN PostHistory AS ph
+    ON p.Id = ph.PostId
+  WHERE
+    p.OwnerUserId IS NOT NULL
+    AND ph.UserId != p.OwnerUserId
+  GROUP BY
+    p.OwnerUserId
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  uas.AnswerCount,
+  uas.UpVotesOnAnswers,
+  uas.DownVotesOnAnswers,
+  (
+    CAST(uas.UpVotesOnAnswers AS REAL) / (
+      uas.UpVotesOnAnswers + uas.DownVotesOnAnswers + 1
+    )
+  ) AS AnswerVoteRatio,
+  uas.AvgQuestionScore,
+  uas.AvgQuestionAnswerCount,
+  COALESCE(peh.TotalEdits, 0) AS EditsByOthers,
+  COALESCE(peh.DistinctEditors, 0) AS DistinctEditorsCount,
+  rb.LastGoldBadge,
+  rb.LastGoldBadgeDate
+FROM Users AS u
+INNER JOIN UserAnswerStats AS uas
+  ON u.Id = uas.OwnerUserId
+LEFT JOIN RecentBadges AS rb
+  ON u.Id = rb.UserId
+LEFT JOIN PostEditHistory AS peh
+  ON u.Id = peh.OwnerUserId
+WHERE
+  u.Reputation > (
+    SELECT
+      AVG(Reputation)
+    FROM Users
+  )
+  AND u.UpVotes > u.DownVotes
+ORDER BY
+  AnswerVoteRatio DESC,
+  u.Reputation DESC
+LIMIT 200;

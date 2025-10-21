@@ -1,0 +1,50 @@
+SELECT
+  p.Id AS PostId,
+  p.PostTypeId,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  CAST(
+    JSON_AGG(
+      JSON_BUILD_OBJECT(
+        'CommentId', c.Id,
+        'CommentUser', c.UserDisplayName,
+        'Comment', c.Text,
+        'CommentDate', c.CreationDate,
+        'CommentLicense', c.ContentLicense
+      )
+      ORDER BY c.CreationDate
+    ) AS JSON
+  ) AS Comments,
+  COUNT(DISTINCT cl.RelatedPostId) FILTER (WHERE cl.LinkTypeId = 3) AS DuplicateCount,
+  AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBountyForVotes,
+  MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS LastUpVoteDate,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN PostLinks cl ON cl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+WHERE
+  p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '12' MONTH)
+  AND p.PostTypeId IN (1, 2)
+GROUP BY
+  p.Id,
+  p.PostTypeId,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName,
+  u.Reputation
+ORDER BY
+  p.ViewCount DESC NULLS LAST,
+  p.CreationDate ASC
+LIMIT 100;

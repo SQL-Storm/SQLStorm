@@ -1,0 +1,63 @@
+-- {"query": "22076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 784} 
+WITH user_influence AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS question_score_sum,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS avg_answer_score,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END) AS gold_badges,
+        COUNT(DISTINCT v.Id) AS total_votes_given,
+        SUM(v.BountyAmount) AS total_bounty_spent,
+        COUNT(DISTINCT unnest(string_to_array(substring(COALESCE(p.Tags, ''), 2, length(COALESCE(p.Tags, ''))-2), '><'))) FILTER (WHERE p.Tags IS NOT NULL) AS unique_tags_used,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 0) AS helpful_comments,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Proficient'
+            ELSE 'Beginner'
+        END AS skill_level,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('year', u.CreationDate) ORDER BY u.Reputation DESC) AS year_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > u.CreationDate
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date > u.CreationDate - INTERVAL '1 year'
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2,3,8) AND v.CreationDate BETWEEN u.CreationDate AND NOW()
+    WHERE u.Id IN (
+        SELECT DISTINCT OwnerUserId 
+        FROM Posts 
+        WHERE AcceptedAnswerId IS NOT NULL 
+        AND OwnerUserId IS NOT NULL
+    )
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+high_influencers AS (
+    SELECT * FROM user_influence WHERE total_posts > 10 AND gold_badges > 0
+),
+casual_users AS (
+    SELECT * FROM user_influence WHERE total_posts BETWEEN 1 AND 10 AND gold_badges = 0
+),
+merged_users AS (
+    SELECT * FROM high_influencers
+    UNION ALL
+    SELECT * FROM casual_users
+)
+SELECT 
+    m.Id,
+    CONCAT(COALESCE(m.DisplayName, 'Unknown User'), ' (', m.skill_level, ')') AS full_display_name,
+    m.total_posts,
+    m.question_score_sum,
+    m.avg_answer_score,
+    m.gold_badges,
+    m.total_votes_given,
+    m.total_bounty_spent,
+    m.unique_tags_used,
+    m.helpful_comments,
+    m.year_rank,
+    PERCENT_RANK() OVER (ORDER BY m.question_score_sum + m.avg_answer_score * m.total_posts) AS influence_percentile,
+    CASE WHEN m.unique_tags_used > 20 THEN 'Versatile' ELSE 'Specialist' END AS tag_type,
+    (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = m.Id AND p.Score = (SELECT MAX(Score) FROM Posts WHERE OwnerUserId = m.Id) LIMIT 1) AS top_post_title
+FROM merged_users m
+LEFT JOIN PostLinks pl ON m.Id = (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = pl.PostId LIMIT 1)
+WHERE m.Reputation > 100 AND (m.avg_answer_score > 10 OR m.helpful_comments > 5)
+ORDER BY influence_percentile DESC, m.gold_badges DESC
+LIMIT 100;

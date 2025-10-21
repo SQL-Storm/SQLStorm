@@ -1,0 +1,101 @@
+WITH
+LatestPost AS (
+  SELECT DISTINCT ON (p.OwnerUserId) p.OwnerUserId AS UserId,
+         p.Id AS LatestPostId,
+         COALESCE(p.LastActivityDate, p.CreationDate) AS LastActivityDate
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  ORDER BY p.OwnerUserId, COALESCE(p.LastActivityDate, p.CreationDate) DESC
+),
+UserPosts AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    p.Id AS PostId,
+    p.LastActivityDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViews
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+UserStats AS (
+  SELECT
+    up.UserId,
+    up.DisplayName,
+    MAX(up.LastActivityDate) AS LastActivityDate,
+    COUNT(up.PostId) AS NumPosts,
+    COALESCE(SUM(up.PostScore), 0) AS TotalPostScore,
+    COALESCE(AVG(up.PostScore), 0) AS AvgPostScore,
+    COALESCE(SUM(up.PostViews), 0) AS TotalViews
+  FROM UserPosts up
+  GROUP BY up.UserId, up.DisplayName
+),
+RankedUsers AS (
+  SELECT
+    s.UserId,
+    s.DisplayName,
+    s.LastActivityDate,
+    s.NumPosts,
+    s.TotalPostScore,
+    s.AvgPostScore,
+    s.TotalViews,
+    ROW_NUMBER() OVER (ORDER BY s.LastActivityDate DESC NULLS LAST) AS RecencyRank
+  FROM UserStats s
+),
+TopTag AS (
+  SELECT u.Id AS UserId,
+         (
+           SELECT t.tagname
+           FROM Posts p2
+           CROSS JOIN LATERAL unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags) - 2), '><')) AS t(tagname)
+           WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+           GROUP BY t.tagname
+           ORDER BY count(*) DESC
+           LIMIT 1
+         ) AS TopTag
+  FROM Users u
+),
+BadgeCounts AS (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+CommentCounts AS (
+  SELECT OwnerUserId AS UserId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY OwnerUserId
+)
+SELECT
+  ru.UserId,
+  ru.DisplayName,
+  ru.NumPosts,
+  ru.TotalViews,
+  ru.TotalPostScore,
+  ru.AvgPostScore,
+  ru.LastActivityDate,
+  lp.LatestPostId,
+  COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+  COALESCE(cc.CommentCount, 0) AS CommentCount,
+  tt.TopTag,
+  ru.RecencyRank
+FROM RankedUsers ru
+LEFT JOIN LatestPost lp ON lp.UserId = ru.UserId
+LEFT JOIN TopTag tt ON tt.UserId = ru.UserId
+LEFT JOIN BadgeCounts bc ON bc.UserId = ru.UserId
+LEFT JOIN CommentCounts cc ON cc.UserId = ru.UserId
+ORDER BY ru.RecencyRank
+LIMIT 100
+UNION ALL
+SELECT
+  -1 AS UserId,
+  'Summary: All Users' AS DisplayName,
+  0 AS NumPosts,
+  0 AS TotalViews,
+  0 AS TotalPostScore,
+  0 AS AvgPostScore,
+  NULL AS LastActivityDate,
+  NULL AS LatestPostId,
+  0 AS BadgeCount,
+  0 AS CommentCount,
+  NULL AS TopTag,
+  0 AS RecencyRank;

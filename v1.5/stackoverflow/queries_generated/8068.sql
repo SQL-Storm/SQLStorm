@@ -1,0 +1,371 @@
+-- {"query": "8068.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3758} 
+with recent_active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.websiteurl,
+        u.creationdate as user_created_at,
+        u.lastaccessdate,
+        u.upvotes,
+        u.downvotes,
+        dense_rank() over (order by u.reputation desc, u.id) as rep_rank
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+user_badge_summary as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        min(b.date) as first_badge_at,
+        max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+post_core as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid,
+        p.lastactivitydate,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.communityowneddate
+    from posts p
+    where p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from posts)
+),
+post_agg_votes as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 12) as spam_flags,
+        count(*) filter (where v.votetypeid = 10) as deletion_votes,
+        count(*) filter (where v.votetypeid = 11) as undeletion_votes,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount
+    from votes v
+    group by v.postid
+),
+post_comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_at,
+        avg(c.score) as avg_comment_score,
+        string_agg(distinct coalesce(nullif(trim(c.userdisplayname), ''), 'Anonymous'), ', ' order by max(c.creationdate) desc) as distinct_commenters
+    from comments c
+    group by c.postid
+),
+question_answer_pairs as (
+    select
+        q.id as question_id,
+        a.id as answer_id,
+        a.owneruserid as answerer_id,
+        a.score as answer_score,
+        a.creationdate as answer_created_at,
+        row_number() over (partition by q.id order by a.score desc nulls last, a.creationdate asc, a.id asc) as answer_rank_by_score,
+        row_number() over (partition by q.id order by a.creationdate asc, a.id asc) as answer_rank_by_time
+    from posts q
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+),
+question_first_and_best_answer as (
+    select
+        qap.question_id,
+        max(case when qap.answer_rank_by_time = 1 then qap.answer_id end) as first_answer_id,
+        max(case when qap.answer_rank_by_score = 1 then qap.answer_id end) as top_scored_answer_id,
+        max(case when qap.answer_rank_by_time = 1 then qap.answerer_id end) as first_answerer_id,
+        max(case when qap.answer_rank_by_score = 1 then qap.answerer_id end) as top_answerer_id
+    from question_answer_pairs qap
+    group by qap.question_id
+),
+title_tag_text as (
+    select
+        pc.id as post_id,
+        lower(coalesce(pc.title, '')) as title_lc,
+        coalesce(pc.tags, '') as raw_tags,
+        string_to_array(substring(coalesce(pc.tags,'[]'), 2, greatest(length(coalesce(pc.tags,'[]'))-2, 0)), '><') as tag_array
+    from post_core pc
+),
+tag_exploded as (
+    select
+        ttt.post_id,
+        unnest(ttt.tag_array) as tag_name
+    from title_tag_text ttt
+),
+tag_rank as (
+    select
+        te.post_id,
+        te.tag_name,
+        row_number() over (partition by te.post_id order by coalesce(t.count, 0) desc, te.tag_name) as tag_pop_rank,
+        sum(coalesce(t.count,0)) over (partition by te.post_id) as post_tag_total_popularity
+    from tag_exploded te
+    left join tags t on t.tagname = te.tag_name
+),
+link_graph as (
+    select
+        pl.postid as src_post_id,
+        pl.relatedpostid as dst_post_id,
+        pl.linktypeid,
+        pl.creationdate
+    from postlinks pl
+),
+duplicate_clusters as (
+    select
+        lg.dst_post_id as canonical_id,
+        count(*) filter (where lg.linktypeid = 3) as dup_incoming,
+        count(*) filter (where lg.linktypeid = 1) as linked_incoming
+    from link_graph lg
+    group by lg.dst_post_id
+),
+closed_reasons as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid = 10 then cast(nullif(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g'), '') as int) end) as last_close_reason_id,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_at,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events
+    from posthistory ph
+    group by ph.postid
+),
+accepted_answer_lag as (
+    select
+        q.id as question_id,
+        q.creationdate as question_created_at,
+        ans.creationdate as accepted_created_at,
+        extract(epoch from (ans.creationdate - q.creationdate)) as accept_seconds
+    from posts q
+    join posts ans on ans.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+user_activity as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions_authored,
+        count(*) filter (where p.posttypeid = 2) as answers_authored,
+        sum(coalesce(pa.upvotes,0)) as total_post_upvotes,
+        sum(coalesce(pa.downvotes,0)) as total_post_downvotes,
+        max(p.creationdate) as last_post_at
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join post_agg_votes pa on pa.postid = p.id
+    group by u.id
+),
+heavy_set_ops as (
+    select pc.id as post_id, 'Q_ONLY' as src
+    from post_core pc
+    where pc.posttypeid = 1
+    union
+    select pc.id, 'A_ONLY'
+    from post_core pc
+    where pc.posttypeid = 2
+    except
+    select pc.id, 'EXCLUDED_IF_LOW_SCORE'
+    from post_core pc
+    where coalesce(pc.score,0) < 0
+),
+scored_posts as (
+    select
+        pc.id as post_id,
+        pc.posttypeid,
+        pc.owneruserid,
+        pc.creationdate,
+        pc.score,
+        pc.viewcount,
+        coalesce(pav.upvotes,0) as upvotes,
+        coalesce(pav.downvotes,0) as downvotes,
+        coalesce(pav.bounty_amount,0) as bounty_amount,
+        coalesce(pcs.comment_count,0) as comment_count,
+        pcs.last_comment_at,
+        coalesce(pc.favoritecount,0) as favorite_count
+    from post_core pc
+    left join post_agg_votes pav on pav.postid = pc.id
+    left join post_comment_stats pcs on pcs.postid = pc.id
+),
+normalized_scores as (
+    select
+        sp.*,
+        avg(score) over () as global_avg_score,
+        stddev_pop(score) over () as global_std_score,
+        avg(viewcount) over () as global_avg_views,
+        stddev_pop(viewcount) over () as global_std_views
+    from scored_posts sp
+),
+post_quality as (
+    select
+        ns.post_id,
+        case when ns.global_std_score > 0 then (ns.score - ns.global_avg_score) / ns.global_std_score else 0 end as z_score,
+        case when ns.global_std_views > 0 then (ns.viewcount - ns.global_avg_views) / ns.global_std_views else 0 end as z_views,
+        (coalesce(ns.upvotes,0) - coalesce(ns.downvotes,0))::numeric / nullif((coalesce(ns.upvotes,0) + coalesce(ns.downvotes,0)),0) as vote_ratio,
+        ln(1 + greatest(ns.viewcount,0)) + 0.5 * coalesce(ns.favorite_count,0) + 0.25 * greatest(ns.comment_count,0) as engagement_score
+    from normalized_scores ns
+),
+user_post_rollup as (
+    select
+        pc.owneruserid as user_id,
+        count(*) as total_posts,
+        count(*) filter (where pc.posttypeid = 1) as total_questions,
+        count(*) filter (where pc.posttypeid = 2) as total_answers,
+        avg(pc.score) as avg_post_score,
+        max(pc.score) as max_post_score,
+        min(pc.creationdate) as first_post_at,
+        max(pc.creationdate) as last_post_at
+    from post_core pc
+    where pc.owneruserid is not null
+    group by pc.owneruserid
+),
+final_scored_posts as (
+    select
+        pc.id as post_id,
+        pc.posttypeid,
+        pc.owneruserid,
+        pq.z_score,
+        pq.z_views,
+        pq.vote_ratio,
+        pq.engagement_score,
+        coalesce(cr.last_close_reason_id, 0) as last_close_reason_id,
+        cr.last_closed_at,
+        coalesce(dc.dup_incoming, 0) as dup_incoming,
+        coalesce(dc.linked_incoming, 0) as linked_incoming
+    from post_core pc
+    left join post_quality pq on pq.post_id = pc.id
+    left join closed_reasons cr on cr.postid = pc.id
+    left join duplicate_clusters dc on dc.canonical_id = pc.id
+),
+ranked_posts as (
+    select
+        fsp.*,
+        dense_rank() over (order by coalesce(fsp.engagement_score,0) desc, coalesce(fsp.z_score, -999) desc, fsp.post_id) as engagement_rank,
+        dense_rank() over (order by coalesce(fsp.z_score, -999) desc, coalesce(fsp.engagement_score,0) desc, fsp.post_id) as quality_rank
+    from final_scored_posts fsp
+),
+post_user_enriched as (
+    select
+        rp.post_id,
+        rp.posttypeid,
+        rp.owneruserid,
+        rp.z_score,
+        rp.z_views,
+        rp.vote_ratio,
+        rp.engagement_score,
+        rp.last_close_reason_id,
+        rp.last_closed_at,
+        rp.dup_incoming,
+        rp.linked_incoming,
+        rp.engagement_rank,
+        rp.quality_rank,
+        rau.displayname as owner_displayname,
+        rau.reputation as owner_reputation,
+        ubs.total_badges,
+        ubs.gold_badges,
+        ubs.silver_badges,
+        ubs.bronze_badges,
+        upu.total_posts as owner_total_posts,
+        upu.avg_post_score as owner_avg_post_score
+    from ranked_posts rp
+    left join recent_active_users rau on rau.user_id = rp.owneruserid
+    left join user_badge_summary ubs on ubs.userid = rp.owneruserid
+    left join user_post_rollup upu on upu.user_id = rp.owneruserid
+),
+question_metrics as (
+    select
+        pc.id as question_id,
+        coalesce(qfab.first_answer_id, 0) as first_answer_id,
+        coalesce(qfab.top_scored_answer_id, 0) as top_scored_answer_id,
+        case when pc.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+        aal.accept_seconds,
+        count(*) filter (where qap.answer_rank_by_time is not null) as answer_count_by_scan
+    from post_core pc
+    left join question_first_and_best_answer qfab on qfab.question_id = pc.id
+    left join accepted_answer_lag aal on aal.question_id = pc.id
+    left join question_answer_pairs qap on qap.question_id = pc.id
+    where pc.posttypeid = 1
+    group by pc.id, qfab.first_answer_id, qfab.top_scored_answer_id, pc.acceptedanswerid, aal.accept_seconds
+),
+stringy as (
+    select
+        pue.post_id,
+        coalesce(pue.owner_displayname, 'unknown') as owner_name,
+        'rank:' || pue.engagement_rank::text || '|score:' || coalesce(round(pue.z_score::numeric,2)::text,'NaN') || '|viewsZ:' || coalesce(round(pue.z_views::numeric,2)::text,'NaN') as metrics_compact
+    from post_user_enriched pue
+),
+suspicious_null_logic as (
+    select
+        pc.id as post_id,
+        case
+            when pc.closeddate is not null and cr.last_closed_at is null then 1
+            when pc.closeddate is null and cr.last_closed_at is not null then 1
+            else 0
+        end as close_mismatch_flag,
+        case when pc.acceptedanswerid is null and pc.posttypeid = 1 and pa.upvotes > 5 and pc.score > 10 then 1 else 0 end as high_score_no_accept_flag
+    from post_core pc
+    left join closed_reasons cr on cr.postid = pc.id
+    left join post_agg_votes pa on pa.postid = pc.id
+),
+tag_top as (
+    select
+        tr.post_id,
+        min(case when tr.tag_pop_rank = 1 then tr.tag_name end) as top_tag
+    from tag_rank tr
+    group by tr.post_id
+)
+select
+    pue.post_id,
+    pue.posttypeid,
+    case pue.posttypeid when 1 then 'Question' when 2 then 'Answer' else 'Other' end as post_type_name,
+    pue.owneruserid as owner_user_id,
+    coalesce(pue.owner_displayname, '(deleted)') as owner_displayname,
+    coalesce(pue.owner_reputation, 0) as owner_reputation,
+    coalesce(pue.total_badges,0) as total_badges,
+    pue.gold_badges, pue.silver_badges, pue.bronze_badges,
+    coalesce(pue.owner_total_posts,0) as owner_total_posts,
+    round(coalesce(pue.owner_avg_post_score,0)::numeric, 2) as owner_avg_post_score,
+    pue.z_score,
+    pue.z_views,
+    round(coalesce(pue.vote_ratio,0)::numeric, 4) as vote_ratio,
+    round(coalesce(pue.engagement_score,0)::numeric, 3) as engagement_score,
+    pue.engagement_rank,
+    pue.quality_rank,
+    coalesce(tm.has_accepted,0) as has_accepted_answer,
+    tm.accept_seconds,
+    tm.first_answer_id,
+    tm.top_scored_answer_id,
+    coalesce(snl.close_mismatch_flag,0) as close_mismatch_flag,
+    coalesce(snl.high_score_no_accept_flag,0) as high_score_no_accept_flag,
+    coalesce(tt.top_tag, '') as top_tag,
+    coalesce(spcs.distinct_commenters, '') as distinct_commenters,
+    st.metrics_compact,
+    coalesce(cr.last_close_reason_id,0) as last_close_reason_id,
+    coalesce(dc.dup_incoming,0) as dup_incoming,
+    coalesce(dc.linked_incoming,0) as linked_incoming
+from post_user_enriched pue
+left join question_metrics tm on tm.question_id = pue.post_id
+left join suspicious_null_logic snl on snl.post_id = pue.post_id
+left join tag_top tt on tt.post_id = pue.post_id
+left join post_comment_stats spcs on spcs.postid = pue.post_id
+left join closed_reasons cr on cr.postid = pue.post_id
+left join duplicate_clusters dc on dc.canonical_id = pue.post_id
+where exists (
+    select 1
+    from heavy_set_ops hso
+    where hso.post_id = pue.post_id
+)
+and (
+    pue.engagement_rank <= 100
+    or pue.quality_rank <= 100
+    or coalesce(dc.dup_incoming,0) > 0
+)
+order by pue.engagement_rank nulls last, pue.quality_rank nulls last, pue.post_id
+limit 500;

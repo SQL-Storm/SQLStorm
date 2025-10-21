@@ -1,0 +1,243 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.ParentId IS NOT NULL THEN p.ParentId END) as AnsweredQuestions,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        STRING_AGG(DISTINCT t.TagName, ', ') as TagsUsed,
+        RANK() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        ROW_NUMBER() OVER (ORDER BY u.CreationDate ASC) as JoinOrder
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Tags t ON t.Id IN (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+        FROM Posts p 
+        WHERE p.OwnerUserId = u.Id AND p.Tags IS NOT NULL AND p.Tags != ''
+    )
+    WHERE u.Reputation > 1000 OR u.Views > 100
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        LastPostDate,
+        AnsweredQuestions,
+        AvgAnswerScore,
+        TagsUsed,
+        RepRank,
+        JoinOrder,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Grandmaster'
+            WHEN Reputation > 50000 THEN 'Master'
+            WHEN Reputation > 10000 THEN 'Expert'
+            WHEN Reputation > 1000 THEN 'Novice'
+            ELSE 'Beginner'
+        END as UserTier,
+        CASE 
+            WHEN AvgAnswerScore > 10 THEN 'HighlyRated'
+            WHEN AvgAnswerScore > 5 THEN 'Good'
+            WHEN AvgAnswerScore > 0 THEN 'Average'
+            ELSE 'BelowAverage'
+        END as AnswerQuality,
+        DENSE_RANK() OVER (PARTITION BY CASE 
+            WHEN Reputation > 100000 THEN 'Grandmaster'
+            WHEN Reputation > 50000 THEN 'Master'
+            WHEN Reputation > 10000 THEN 'Expert'
+            WHEN Reputation > 1000 THEN 'Novice'
+            ELSE 'Beginner'
+        END ORDER BY TotalScore DESC) as ScoreRankInTier
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN p.PostTypeId = 2 THEN 1
+            ELSE 0
+        END as IsAnswered,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN 'Moderate'
+            WHEN p.PostTypeId = 1 THEN 'Low'
+            ELSE 'N/A'
+        END as PopularityLevel,
+        LENGTH(p.Body) as BodyLength,
+        COALESCE(COUNT(v.Id), 0) as VoteCount,
+        COALESCE(COUNT(c.Id), 0) as CommentCountPost,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as FreshnessRank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) as ViewPercentile
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate > TIMESTAMP '2020-01-01' AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    GROUP BY p.Id, p.Title, p.Body, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.ParentId, p.AnswerCount, p.CommentCount, p.Tags, p.AcceptedAnswerId, u.DisplayName
+),
+ComplexAnalytics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.ParentId,
+        pa.AnswerCount,
+        pa.CommentCountPost,
+        pa.Tags,
+        pa.OwnerName,
+        pa.IsAnswered,
+        pa.PopularityLevel,
+        pa.BodyLength,
+        pa.VoteCount,
+        pa.UpVotes,
+        pa.DownVotes,
+        pa.ScoreRankByType,
+        pa.FreshnessRank,
+        pa.ViewPercentile,
+        CASE 
+            WHEN pa.Score > 100 THEN 'Viral'
+            WHEN pa.Score > 50 THEN 'Trending'
+            WHEN pa.Score > 10 THEN 'Noticeable'
+            ELSE 'Normal'
+        END as ImpactLevel,
+        CASE 
+            WHEN pa.ViewCount > 1000 AND pa.UpVotes > pa.DownVotes THEN 'HighlyEngaged'
+            WHEN pa.ViewCount > 100 AND pa.UpVotes > pa.DownVotes THEN 'Engaged'
+            WHEN pa.ViewCount > 10 AND pa.UpVotes > pa.DownVotes THEN 'Standard'
+            ELSE 'LowEngagement'
+        END as EngagementStatus,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as UserAvgScore,
+        MAX(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as UserMaxScore,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as UserScoreRank,
+        PERCENT_RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score) as ScorePercentile,
+        COALESCE(pah.Text, 'No History') as LastHistory,
+        COALESCE(pah.UserId, -1) as HistoryUserId,
+        CASE 
+            WHEN pa.ParentId IS NOT NULL THEN (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = pa.ParentId AND p2.Score > 0)
+            ELSE 0
+        END as PeerAnswerCount,
+        LENGTH(pa.Tags) - LENGTH(REPLACE(pa.Tags, '><', '')) + 1 as TagCount,
+        CASE 
+            WHEN pa.CommentCountPost > 0 THEN (pa.VoteCount * 1.0 / pa.CommentCountPost)
+            ELSE 0
+        END as EngagementRatio
+    FROM PostAnalysis pa
+    LEFT JOIN PostHistory pah ON pa.PostId = pah.PostId
+        AND pah.CreationDate = (
+            SELECT MAX(ph.CreationDate)
+            FROM PostHistory ph
+            WHERE ph.PostId = pa.PostId
+        )
+    WHERE pa.Score > 5 OR pa.ViewCount > 50
+)
+SELECT 
+    tua.UserId,
+    tua.DisplayName,
+    tua.Reputation,
+    tua.PostCount,
+    tua.CommentCount,
+    tua.QuestionCount,
+    tua.AnswerCount,
+    tua.TotalScore,
+    tua.BadgeCount,
+    tua.UserTier,
+    tua.AnswerQuality,
+    tua.ScoreRankInTier,
+    ca.PostId,
+    ca.Title,
+    ca.BodyLength,
+    ca.Score,
+    ca.ViewCount,
+    ca.VoteCount,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.PopularityLevel,
+    ca.ImpactLevel,
+    ca.EngagementStatus,
+    ca.UserAvgScore,
+    ca.UserMaxScore,
+    ca.UserScoreRank,
+    ca.ScorePercentile,
+    ca.LastHistory,
+    ca.HistoryUserId,
+    ca.PeerAnswerCount,
+    ca.TagCount,
+    ca.EngagementRatio,
+    CASE 
+        WHEN (tua.Reputation > 10000 AND ca.Score > 50) OR (tua.Reputation > 50000 AND ca.Score > 25) THEN 'HighValuePost'
+        WHEN (tua.Reputation BETWEEN 1000 AND 10000 AND ca.Score > 25) OR (tua.Reputation > 10000 AND ca.Score > 10) THEN 'MediumValuePost'
+        WHEN (tua.Reputation BETWEEN 100 AND 1000 AND ca.Score > 10) THEN 'LowValuePost'
+        ELSE 'NonValuePost'
+    END as ValueCategory,
+    ROW_NUMBER() OVER (ORDER BY CASE 
+        WHEN (tua.Reputation > 10000 AND ca.Score > 50) OR (tua.Reputation > 50000 AND ca.Score > 25) THEN 1
+        WHEN (tua.Reputation BETWEEN 1000 AND 10000 AND ca.Score > 25) OR (tua.Reputation > 10000 AND ca.Score > 10) THEN 2
+        WHEN (tua.Reputation BETWEEN 100 AND 1000 AND ca.Score > 10) THEN 3
+        ELSE 4
+    END,
+    ca.Score DESC) as PriorityRank,
+    NTILE(4) OVER (ORDER BY ca.Score DESC) as ScoreQuartile,
+    CASE 
+        WHEN LAG(ca.Score, 1) OVER (ORDER BY ca.Score DESC) IS NOT NULL THEN 
+            ((ca.Score - LAG(ca.Score, 1) OVER (ORDER BY ca.Score DESC)) * 100.0 / LAG(ca.Score, 1) OVER (ORDER BY ca.Score DESC))
+        ELSE NULL
+    END as ScoreChangePercentage,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Users u2 
+            INNER JOIN Posts p ON u2.Id = p.OwnerUserId 
+            WHERE u2.Id = tua.UserId 
+            AND p.Id IN (SELECT ParentId FROM Posts WHERE Id = ca.PostId)
+            AND (p.Score > ca.Score OR (p.Score = ca.Score AND p.CreationDate < ca.CreationDate))
+        ) THEN 'IsNotTopAnswer'
+        ELSE 'IsTopAnswer'
+    END as AnswerStatus
+FROM TopUsers tua
+INNER JOIN ComplexAnalytics ca ON tua.UserId = ca.OwnerUserId
+WHERE tua.PostCount > 0
+    AND (ca.PopularityLevel IN ('Popular', 'Trending') OR ca.EngagementStatus IN ('Viral', 'Trending'))
+    AND ca.EngagementRatio > 1.0
+ORDER BY PriorityRank, ca.Score DESC, tua.Reputation DESC, tua.PostCount DESC
+LIMIT 1000 OFFSET 500;

@@ -1,0 +1,127 @@
+WITH RecentUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        DENSE_RANK() OVER (ORDER BY u.CreationDate DESC) AS RecencyRank
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '180' DAY
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+QuestionStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS QuestionsAsked,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalQuestionViews,
+        MAX(p.CreationDate) AS LastQuestionDate
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+AnswerStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS AnswersGiven,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS TotalPositiveAnswerScore,
+        MAX(p.CreationDate) AS LastAnswerDate
+    FROM Posts AS p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+RecentCommenters AS (
+    SELECT 
+        c.UserId,
+        COUNT(DISTINCT c.PostId) AS CommentedPosts,
+        COUNT(*) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    WHERE c.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY
+    GROUP BY c.UserId
+),
+FavoriteTags AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        LOWER(SUBSTRING(t, 2, LENGTH(t) - 2)) AS Tag,
+        COUNT(*) AS TagUse
+    FROM (
+        SELECT OwnerUserId, UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS t
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    ) AS sub
+    GROUP BY p.OwnerUserId, LOWER(SUBSTRING(t, 2, LENGTH(t) - 2))
+),
+TopFavoriteTag AS (
+    SELECT DISTINCT ON (UserId)
+        UserId,
+        Tag AS FavoriteTag,
+        TagUse
+    FROM FavoriteTags
+    ORDER BY UserId, TagUse DESC NULLS LAST, Tag
+),
+UserVotesInLastYear AS (
+    SELECT
+        v.UserId,
+        COUNT(*) AS VotesCast,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesCast
+    FROM Votes AS v
+    JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY
+    GROUP BY v.UserId
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.BadgeCount,
+    'Gold: ' || COALESCE(ru.GoldBadges,0) || ', Silver: ' || COALESCE(ru.SilverBadges,0) || ', Bronze: ' || COALESCE(ru.BronzeBadges,0) AS BadgeBreakdown,
+    ru.UpVotes, ru.DownVotes,
+    COALESCE(qs.QuestionsAsked, 0) AS QuestionsAsked,
+    ROUND(COALESCE(qs.AvgQuestionScore, 0), 2) AS AvgQuestionScore,
+    COALESCE(qs.TotalQuestionViews, 0) AS TotalQuestionViews,
+    TO_CHAR(qs.LastQuestionDate, 'YYYY-MM-DD') AS LastQuestionDate,
+    COALESCE(ans.AnswersGiven, 0) AS AnswersGiven,
+    ROUND(COALESCE(ans.AvgAnswerScore, 0), 2) AS AvgAnswerScore,
+    COALESCE(ans.TotalPositiveAnswerScore, 0) AS TotalPositiveAnswerScore,
+    TO_CHAR(ans.LastAnswerDate, 'YYYY-MM-DD') AS LastAnswerDate,
+    COALESCE(rc.CommentedPosts, 0) AS CommentedPosts,
+    COALESCE(rc.TotalComments, 0) AS TotalComments,
+    COALESCE(rc.TotalCommentScore, 0) AS TotalCommentScore,
+    TO_CHAR(rc.LastCommentDate, 'YYYY-MM-DD') AS LastCommentDate,
+    COALESCE(tt.FavoriteTag, '') AS FavoriteTag,
+    COALESCE(tt.TagUse, 0) AS FavoriteTagUsageCount,
+    COALESCE(vu.VotesCast, 0) AS VotesCast,
+    COALESCE(vu.UpVotesCast, 0) AS UpVotesCast,
+    COALESCE(vu.DownVotesCast, 0) AS DownVotesCast,
+    CASE 
+        WHEN (ru.RecencyRank % 2) = 0 THEN 'EVEN'
+        ELSE 'ODD'
+    END AS RecencyEvenOdd,
+    CASE
+        WHEN (COALESCE(qs.QuestionsAsked,0) + COALESCE(ans.AnswersGiven,0)) > 100 THEN 'PROLIFIC'
+        WHEN (COALESCE(qs.QuestionsAsked,0) + COALESCE(ans.AnswersGiven,0)) = 0 THEN 'INACTIVE'
+        ELSE 'NORMAL'
+    END AS ActivityLevel,
+    (COALESCE(qs.TotalQuestionViews,0) + COALESCE(rc.TotalCommentScore,0) + COALESCE(ans.TotalPositiveAnswerScore,0))
+        / NULLIF(COALESCE(qs.QuestionsAsked,0) + COALESCE(ans.AnswersGiven,0),0) AS EngagementFactor
+FROM RecentUsers ru
+LEFT JOIN QuestionStats qs ON ru.UserId = qs.UserId
+LEFT JOIN AnswerStats ans ON ru.UserId = ans.UserId
+LEFT JOIN RecentCommenters rc ON ru.UserId = rc.UserId
+LEFT JOIN TopFavoriteTag tt ON ru.UserId = tt.UserId
+LEFT JOIN UserVotesInLastYear vu ON ru.UserId = vu.UserId
+WHERE (ru.Reputation > 100 OR ru.BadgeCount > 0)
+  AND (COALESCE(ans.AvgAnswerScore,0) > 0 OR COALESCE(qs.AvgQuestionScore,0) > 0 OR COALESCE(qs.TotalQuestionViews,0) > 0)
+ORDER BY EngagementFactor DESC NULLS LAST, ru.Reputation DESC
+LIMIT 100;

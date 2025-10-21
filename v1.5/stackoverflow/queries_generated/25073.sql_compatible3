@@ -1,0 +1,167 @@
+WITH
+/* 1️⃣ Aggregate posts per user */
+user_posts AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS PostCount,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT p.Tags) AS DistinctTagSets,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(CASE WHEN p.Title IS NOT NULL THEN p.Title ELSE NULL END) AS LatestPostTitle
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 2️⃣ Aggregate badges per user */
+user_badges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3️⃣ Extract individual tags used by each user */
+user_tags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT UNNEST(string_to_array(
+            TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')),
+            '><'
+        ))) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 4️⃣ Vote summary per user (votes on their posts) */
+user_votes AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END) AS NetVoteScore
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 5️⃣ Latest comment text per user (correlated sub‑query in SELECT later) */
+latest_comment AS (
+    SELECT
+        c.UserId,
+        c.Text AS CommentText,
+        c.CreationDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+      AND c.CreationDate = (
+          SELECT MAX(c2.CreationDate)
+          FROM Comments c2
+          WHERE c2.UserId = c.UserId
+      )
+),
+
+/* 6️⃣ Combine everything – left outer joins retain users with no activity */
+combined AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(up.PostCount, 0) AS PostCount,
+        COALESCE(up.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(up.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(ub.BadgeCount, 0) AS BadgeCount,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ut.TagCount, 0) AS TagCount,
+        COALESCE(uv.UpVoteCount, 0) AS UpVoteCount,
+        COALESCE(uv.DownVoteCount, 0) AS DownVoteCount,
+        COALESCE(uv.NetVoteScore, 0) AS NetVoteScore,
+        up.LatestPostTitle,
+        lc.CommentText,
+        /* Composite performance score */
+        (COALESCE(up.PostCount,0) * 2)
+        + COALESCE(uv.UpVoteCount,0)
+        - COALESCE(uv.DownVoteCount,0)
+        + COALESCE(ub.BadgeCount,0) * 5
+        + COALESCE(ut.TagCount,0) * 1
+        AS CompositeScore
+    FROM Users u
+    LEFT JOIN user_posts up      ON up.UserId      = u.Id
+    LEFT JOIN user_badges ub     ON ub.UserId      = u.Id
+    LEFT JOIN user_tags ut       ON ut.UserId      = u.Id
+    LEFT JOIN user_votes uv      ON uv.UserId      = u.Id
+    LEFT JOIN latest_comment lc  ON lc.UserId      = u.Id
+),
+
+/* 7️⃣ Ranking users by the composite score – using window functions */
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY CompositeScore DESC, Reputation DESC) AS RankByScore,
+        RANK() OVER (ORDER BY CompositeScore DESC) AS DenseRankByScore,
+        SUM(CompositeScore) OVER (PARTITION BY GoldBadges) AS SumScoreByGoldBadgeLevel
+    FROM combined
+)
+
+/* 8️⃣ Final result: merge active users with completely inactive accounts using UNION ALL */
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.PostCount,
+    r.TotalPostScore,
+    r.AvgPostScore,
+    r.BadgeCount,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.TagCount,
+    r.UpVoteCount,
+    r.DownVoteCount,
+    r.NetVoteScore,
+    r.CompositeScore,
+    r.RankByScore,
+    r.DenseRankByScore,
+    r.SumScoreByGoldBadgeLevel,
+    r.LatestPostTitle,
+    r.CommentText
+FROM ranked r
+WHERE r.CompositeScore > 0
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 AS PostCount,
+    0 AS TotalPostScore,
+    0 AS AvgPostScore,
+    0 AS BadgeCount,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TagCount,
+    0 AS UpVoteCount,
+    0 AS DownVoteCount,
+    0 AS NetVoteScore,
+    0 AS CompositeScore,
+    NULL AS RankByScore,
+    NULL AS DenseRankByScore,
+    NULL AS SumScoreByGoldBadgeLevel,
+    NULL AS LatestPostTitle,
+    NULL AS CommentText
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY CompositeScore DESC NULLS LAST, Reputation DESC;

@@ -1,0 +1,116 @@
+-- {"query": "34024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1068} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(v.VoteTypeId IN (2, 5)::int), 0) AS TotalUpvotesAndFavorites,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,5)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 AND u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS PostsPerTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+RankedTags AS (
+    SELECT
+        UserId,
+        Tag,
+        PostsPerTag,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY PostsPerTag DESC) AS TagRank
+    FROM TopTags
+),
+FilteredTags AS (
+    SELECT UserId, Tag, PostsPerTag
+    FROM RankedTags
+    WHERE TagRank <= 3
+),
+UserPerformance AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalUpvotesAndFavorites,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.BadgeCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        STRING_AGG(ft.Tag || ' (' || ft.PostsPerTag || ')', ', ') AS TopTags
+    FROM UserActivity ua
+    LEFT JOIN FilteredTags ft ON ft.UserId = ua.UserId
+    GROUP BY 
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalUpvotesAndFavorites,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.BadgeCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges
+),
+QuestionAnswerGap AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate))/3600) AS AvgAnswerDelayHours,
+        COUNT(a.Id) AS AnswerCount
+    FROM Posts p
+    JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.QuestionsAsked,
+    up.AnswersGiven,
+    up.CommentsMade,
+    up.TotalUpvotesAndFavorites,
+    up.BadgeCount,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.TopTags,
+    qa.AvgAnswerDelayHours,
+    qa.AnswerCount,
+    CASE 
+        WHEN up.AnswersGiven = 0 THEN NULL
+        ELSE ROUND(1.0 * up.QuestionsAsked / up.AnswersGiven, 2)
+    END AS QuestionToAnswerRatio,
+    CASE 
+        WHEN up.BadgeCount = 0 THEN 'New User'
+        WHEN up.GoldBadges > 0 THEN 'Veteran Gold'
+        WHEN up.SilverBadges > 5 THEN 'High Silver'
+        WHEN up.SilverBadges BETWEEN 1 AND 5 THEN 'Silver Member'
+        ELSE 'Bronze Member'
+    END AS UserStatus
+FROM UserPerformance up
+LEFT JOIN QuestionAnswerGap qa ON qa.UserId = up.UserId
+WHERE up.QuestionsAsked > 10
+ORDER BY up.TotalUpvotesAndFavorites DESC, up.BadgeCount DESC, qa.AvgAnswerDelayHours ASC
+LIMIT 100;

@@ -1,0 +1,76 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.CommunityOwnedDate,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+tag_stats AS (
+  SELECT
+    unnest(string_to_array(p.Tags, '><')) AS tag,
+    COUNT(*) AS post_count,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views
+  FROM Posts p
+  JOIN recent_questions rq ON rq.PostId = p.Id
+  WHERE p.Tags IS NOT NULL
+  GROUP BY unnest(string_to_array(p.Tags, '><'))
+),
+top_tags AS (
+  SELECT
+    tag,
+    post_count,
+    avg_score,
+    total_views
+  FROM tag_stats
+  ORDER BY post_count DESC, avg_score DESC
+  LIMIT 20
+),
+author_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+    MAX(p.CreationDate) FILTER (WHERE p.OwnerUserId = u.Id) AS LastOwnPostDate,
+    AVG(p.ViewCount) AS AvgPostViews
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+activity_with_ranks AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (ORDER BY a.UpVotesGiven - a.DownVotesGiven DESC, a.AvgPostViews DESC) AS rank
+  FROM author_activity a
+)
+SELECT
+  rq.PostId,
+  rq.Title AS QuestionTitle,
+  rq.Tags,
+  rq.CreationDate AS QuestionCreated,
+  rq.Score AS QuestionScore,
+  rq.ViewCount AS QuestionViews,
+  u.Id AS AuthorId,
+  u.DisplayName AS AuthorName,
+  COALESCE(awr.rank, 9999) AS AuthorRank,
+  awr.tag AS TagName,
+  ts.post_count AS TagPostCount,
+  ts.avg_score AS TagAvgScore,
+  ts.total_views AS TagTotalViews
+FROM recent_questions rq
+JOIN Users u ON u.Id = rq.OwnerUserId
+LEFT JOIN activity_with_ranks awr ON awr.UserId = u.Id
+LEFT JOIN top_tags ts ON 1=1
+WHERE awr.rank = 1 OR ts.tag IS NOT NULL
+ORDER BY rq.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,67 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2 AND p2.DeletionDate IS NULL) AS AnswerCount,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Date >= p.CreationDate) AS RecentBadges,
+    (SELECT STRING_AGG(ph.Comment, ' | ') FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13) AND ph.CreationDate >= p.CreationDate ORDER BY ph.CreationDate DESC, ph.Id DESC LIMIT 5) AS RecentPostHistory,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (17,35,36)) AS MigrationCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 24) AS EditCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (33,34)) AS NoticeCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (19,20)) AS ProtectionCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS BountyStartCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 9) AS BountyCloseCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = p.OwnerUserId AND p3.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = p.OwnerUserId AND p4.PostTypeId = 2) AS AnswerCount,
+    (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = p.OwnerUserId AND p5.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p6.Score) FROM Posts p6 WHERE p6.OwnerUserId = p.OwnerUserId AND p6.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT MAX(p7.Score) FROM Posts p7 WHERE p7.OwnerUserId = p.OwnerUserId AND p7.PostTypeId = 1) AS MaxQuestionScore,
+    (SELECT MAX(p8.Score) FROM Posts p8 WHERE p8.OwnerUserId = p.OwnerUserId AND p8.PostTypeId = 2) AS MaxAnswerScore,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = p.OwnerUserId) AS CommentCountByOwner,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = p.OwnerUserId AND v2.VoteTypeId IN (1,2,3)) AS VoteActivityByOwner,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = p.OwnerUserId AND b2.Date >= DATE '2023-01-01') AS RecentBadgeCount,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (
+        SELECT t.TagName 
+        FROM Tags t 
+        WHERE POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+        ORDER BY t.Count DESC
+        LIMIT 5
+    ) t) AS TopTags
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1
+AND p.CreationDate >= DATE '2023-01-01'
+AND p.CreationDate <= DATE '2023-12-31'
+AND p.Score >= 10
+AND p.ViewCount >= 100
+AND EXISTS (
+    SELECT 1 FROM Votes v 
+    WHERE v.PostId = p.Id 
+    AND v.VoteTypeId IN (1,2,3) 
+    AND v.CreationDate >= DATE '2023-01-01'
+)
+AND EXISTS (
+    SELECT 1 FROM Comments c 
+    WHERE c.PostId = p.Id 
+    AND c.CreationDate >= DATE '2023-01-01'
+)
+AND p.AnswerCount > 0
+AND p.CommentCount > 0
+AND p.FavoriteCount > 0
+ORDER BY p.Score DESC, p.ViewCount DESC
+LIMIT 10000;

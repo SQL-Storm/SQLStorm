@@ -1,0 +1,126 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        TagName,
+        Id AS TagId,
+        1 AS Level,
+        CAST(NULL AS VARCHAR) AS ParentTag
+    FROM Tags
+    WHERE TagName NOT LIKE '%.%'
+), TagAncestors AS (
+    SELECT
+        th.TagName,
+        th.TagId,
+        th.Level,
+        CAST(NULL AS VARCHAR) AS ParentTag
+    UNION ALL
+    SELECT
+        t.TagName,
+        t.Id AS TagId,
+        th.Level + 1 AS Level,
+        t.TagName AS ParentTag
+    FROM Tags t
+    INNER JOIN TagHierarchy th ON t.TagName = ANY (string_to_array(substring(t.Tags, 2, length(t.Tags)-2), '><')) AND t.TagName <> th.TagName
+), PostQuestionAnswers AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.LastActivityDate AS AnswerLastActivity,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY a.Score DESC, a.CreationDate DESC) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+), UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+), RecentPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RecentOrder
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+), PostNgramStrings AS (
+    SELECT
+        p.Id AS PostId,
+        string_agg(t.TagName, ', ') AS TagNames,
+        COUNT(*) OVER () AS TotalPosts
+    FROM Posts p
+    LEFT JOIN Tags t ON t.Id = ANY (string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    GROUP BY p.Id
+), PostMetrics AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+), FilteredPosts AS (
+    SELECT
+        pm.*
+    FROM PostMetrics pm
+    WHERE
+        pm.PostTypeId = 1
+        AND pm.PostRank <= 5
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT q.Id) FILTER (WHERE q.PostTypeId = 1) AS TotalQuestions,
+    COUNT(DISTINCT a.AnswerId) AS TotalAnswers,
+    AVG(a.AnswerScore) AS AvgAnswerScore,
+    COALESCE(SUM(CASE WHEN lh.PostHistoryTypeId = 4 THEN 1 END), 0) AS TitleChanges,
+    CASE WHEN ubc.GoldBadges IS NULL THEN 0 ELSE ubc.GoldBadges END AS GoldBadges,
+    CASE WHEN ubc.SilverBadges IS NULL THEN 0 ELSE ubc.SilverBadges END AS SilverBadges,
+    CASE WHEN ubc.BronzeBadges IS NULL THEN 0 ELSE ubc.BronzeBadges END AS BronzeBadges,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS AllTags,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score >= 10
+    ) THEN TRUE ELSE FALSE END AS HasPopularComments
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+LEFT JOIN PostQuestionAnswers q ON q.QuestionId = p.Id
+LEFT JOIN PostQuestionAnswers a ON a.QuestionId = p.Id AND a.AnswerRank = 1
+LEFT JOIN RecentPostHistory lh ON lh.PostId = p.Id AND lh.PostHistoryTypeId IN (4, 5)
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+LEFT JOIN Tags t ON t.Id = ANY (string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+LEFT JOIN Comments c ON c.PostId = p.Id
+WHERE
+    u.Reputation > 1000
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    p.Title,
+    p.Tags,
+    p.ContentLicense,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    HasPopularComments
+ORDER BY u.Reputation DESC, TotalQuestions DESC;

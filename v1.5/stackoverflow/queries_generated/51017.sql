@@ -1,0 +1,197 @@
+-- {"query": "51017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1882} 
+
+WITH active_users AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) as user_rank
+    FROM Users u
+    WHERE u.Reputation > 1000
+        AND u.CreationDate > NOW() - INTERVAL '5 years'
+        AND u.UpVotes > 50
+        AND u.DownVotes < u.UpVotes / 2
+),
+high_quality_posts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        au.user_rank
+    FROM Posts p
+    INNER JOIN active_users au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId IN (1, 2)  -- Questions and Answers only
+        AND p.Score >= 5
+        AND p.ViewCount > 1000
+        AND p.CreationDate > NOW() - INTERVAL '2 years'
+        AND (p.PostTypeId = 1 OR (p.PostTypeId = 2 AND p.ParentId IS NOT NULL))
+        AND p.DeletedDate IS NULL
+        AND COALESCE(p.CommunityOwnedDate, '1900-01-01'::timestamp) < p.CreationDate
+),
+tag_usage AS (
+    SELECT 
+        hqp.Id as post_id,
+        STRING_AGG(
+            TRIM(BOTH '"' FROM UNNEST(STRING_TO_ARRAY(
+                SUBSTRING(hqp.Tags, 2, LENGTH(hqp.Tags) - 2), 
+                '"><"'
+            ))), 
+            ', '
+        ) as tag_list,
+        COUNT(DISTINCT TRIM(BOTH '"' FROM UNNEST(STRING_TO_ARRAY(
+            SUBSTRING(hqp.Tags, 2, LENGTH(hqp.Tags) - 2), 
+            '"><"'
+        )))) as tag_count
+    FROM high_quality_posts hqp
+    WHERE hqp.PostTypeId = 1  -- Only questions have tags
+        AND hqp.Tags IS NOT NULL 
+        AND LENGTH(hqp.Tags) > 4
+    GROUP BY hqp.Id, hqp.Tags
+),
+user_engagement AS (
+    SELECT 
+        hqp.OwnerUserId,
+        COUNT(DISTINCT hqp.Id) as total_posts,
+        SUM(hqp.ViewCount) as total_views,
+        SUM(hqp.Score) as total_score,
+        SUM(hqp.AnswerCount) as total_answers_for_questions,
+        AVG(hqp.user_rank) as avg_user_rank,
+        COUNT(DISTINCT CASE WHEN hqp.PostTypeId = 2 THEN hqp.Id END) as answer_count,
+        COUNT(DISTINCT CASE WHEN hqp.PostTypeId = 1 THEN hqp.Id END) as question_count,
+        SUM(CASE WHEN hqp.Score > 10 THEN 1 ELSE 0 END) as high_score_posts,
+        MAX(hqp.LastActivityDate) as latest_activity
+    FROM high_quality_posts hqp
+    GROUP BY hqp.OwnerUserId
+        HAVING COUNT(DISTINCT hqp.Id) >= 3
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) as accepts,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) as favorites,
+        AVG(EXTRACT(EPOCH FROM v.CreationDate)) as avg_vote_timestamp,
+        STRING_AGG(DISTINCT vt.Name, ', ') as vote_types
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.PostId IN (SELECT Id FROM high_quality_posts)
+        AND v.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY v.PostId
+),
+comment_activity AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score,
+        MAX(c.CreationDate) as latest_comment,
+        STRING_AGG(
+            SUBSTRING(c.Text, 1, 50) || 
+            CASE WHEN LENGTH(c.Text) > 50 THEN '...' ELSE '' END, 
+            ' | '
+        ) as sample_comments
+    FROM Comments c
+    WHERE c.PostId IN (SELECT Id FROM high_quality_posts)
+        AND c.Score >= -2
+        AND c.CreationDate > NOW() - INTERVAL '6 months'
+    GROUP BY c.PostId
+),
+post_history_summary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) as revision_count,
+        MAX(ph.CreationDate) as last_revision,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) as edit_count,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN 1 END) as close_reopen_count,
+        STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 THEN 'Closed: ' || COALESCE(ph.Comment::smallint::text, 'Unknown')
+                WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 'Edit'
+                ELSE pht.Name
+            END, 
+            '; '
+        ) as history_events
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostId IN (SELECT Id FROM high_quality_posts)
+    GROUP BY ph.PostId
+)
+SELECT 
+    hqp.Id as post_id,
+    hqp.PostTypeId,
+    hqp.Title,
+    hqp.Body,
+    hqp.Score,
+    hqp.ViewCount,
+    hqp.AnswerCount,
+    hqp.CommentCount,
+    hqp.FavoriteCount,
+    hqp.CreationDate,
+    hqp.LastActivityDate,
+    tu.tag_list,
+    tu.tag_count,
+    ue.total_posts,
+    ue.total_views,
+    ue.total_score,
+    ue.answer_count,
+    ue.question_count,
+    ue.high_score_posts,
+    vp.upvotes,
+    vp.downvotes,
+    vp.accepts,
+    vp.favorites,
+    vp.vote_types,
+    ca.comment_count,
+    ca.avg_comment_score,
+    phs.revision_count,
+    phs.edit_count,
+    phs.close_reopen_count,
+    phs.history_events,
+    au.Reputation as owner_reputation,
+    au.DisplayName as owner_name,
+    au.user_rank,
+    RANK() OVER (
+        PARTITION BY hqp.PostTypeId 
+        ORDER BY 
+            hqp.Score DESC, 
+            hqp.ViewCount DESC, 
+            COALESCE(vp.upvotes, 0) DESC,
+            ue.total_score DESC
+    ) as performance_rank,
+    CASE 
+        WHEN hqp.PostTypeId = 1 AND hqp.AnswerCount > 5 AND hqp.Score > 15 THEN 'Highly Successful Question'
+        WHEN hqp.PostTypeId = 2 AND hqp.Score > 25 AND vp.accepts > 0 THEN 'Accepted Stellar Answer'
+        WHEN hqp.ViewCount > 10000 AND hqp.Score > 10 THEN 'Viral Content'
+        ELSE 'Standard Quality Post'
+    END as content_category,
+    ROUND(
+        (COALESCE(vp.upvotes, 0) * 1.0 / NULLIF(COALESCE(vp.downvotes, 0), 0)) * 100, 2
+    ) as vote_ratio_percentage,
+    EXTRACT(EPOCH FROM (hqp.LastActivityDate - hqp.CreationDate)) / 86400 as days_active,
+    CASE 
+        WHEN tu.tag_count >= 5 AND hqp.ViewCount > 5000 THEN 'Multi-tag High Impact'
+        WHEN phs.edit_count > 3 AND hqp.Score > 20 THEN 'Heavily Curated'
+        WHEN ca.comment_count > 10 AND ca.avg_comment_score > 1 THEN 'Highly Discussed'
+        ELSE 'Typical Engagement'
+    END as engagement_profile
+FROM high_quality_posts hqp
+LEFT JOIN tag_usage tu ON hqp.Id = tu.post_id
+LEFT JOIN user_engagement ue ON hqp.OwnerUserId = ue.OwnerUserId
+LEFT JOIN vote_patterns vp ON hqp.Id = vp.PostId
+LEFT JOIN comment_activity ca ON hqp.Id = ca.PostId
+LEFT JOIN post_history_summary phs ON hqp.Id = phs.PostId
+INNER JOIN active_users au ON hqp.OwnerUserId = au.Id
+WHERE hqp.user_rank <= 1000  -- Top 1000 active users only
+ORDER BY 
+    performance_rank ASC,
+    hqp.LastActivityDate DESC,
+    hqp.ViewCount DESC
+LIMIT 500;

@@ -1,0 +1,190 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.id AS UserId,
+        COUNT(DISTINCT p.id) AS TotalPosts,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.posttypeid IN (1, 2) THEN p.score ELSE 0 END) AS TotalPostScore,
+        COUNT(DISTINCT c.id) AS TotalCommentsMade,
+        SUM(CASE WHEN p.acceptedanswerid IS NOT NULL AND p_accepted.owneruserid = u.id THEN 1 ELSE 0 END) AS TotalAcceptedAnswersReceived,
+        COUNT(DISTINCT b.id) AS TotalBadges,
+        MAX(p.creationdate) AS LatestPostDate,
+        MIN(p.creationdate) AS EarliestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.id = p.owneruserid
+    LEFT JOIN Posts p_accepted ON p.acceptedanswerid = p_accepted.id
+    LEFT JOIN Comments c ON u.id = c.userid
+    LEFT JOIN Badges b ON u.id = b.userid
+    GROUP BY u.id
+),
+PostEngagementEvents AS (
+    SELECT
+        ph.postid,
+        ph.creationdate AS EventDate,
+        ph.userid AS EventInitiatorUserId,
+        ph.userdisplayname AS EventInitiatorDisplayName,
+        'PostHistory' AS EventType,
+        ph.posthistorytypeid AS SpecificEventTypeId,
+        ph.comment AS EventSummary,
+        LENGTH(ph.text) AS EventTextLength
+    FROM PostHistory ph
+    WHERE ph.posthistorytypeid IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20)
+    UNION ALL
+    SELECT
+        c.postid,
+        c.creationdate AS EventDate,
+        c.userid AS EventInitiatorUserId,
+        c.userdisplayname AS EventInitiatorDisplayName,
+        'Comment' AS EventType,
+        NULL AS SpecificEventTypeId,
+        SUBSTRING(c.text, 1, 100) || CASE WHEN LENGTH(c.text) > 100 THEN '...' ELSE '' END AS EventSummary,
+        LENGTH(c.text) AS EventTextLength
+    FROM Comments c
+    WHERE c.score > 0
+),
+PostEvolutionDetails AS (
+    SELECT
+        p.id AS PostId,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate AS PostCreationDate,
+        p.lasteditdate,
+        p.closeddate,
+        p.viewcount,
+        p.favoritecount,
+        COALESCE(p.score, 0) AS InitialScore,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.tags, 2, LENGTH(p.tags) - 2), '><'), 1) AS TagCount,
+        LENGTH(p.body) AS InitialBodyLength,
+        (SELECT ph_init.text FROM PostHistory ph_init WHERE ph_init.postid = p.id AND ph_init.posthistorytypeid = 2 ORDER BY ph_init.creationdate ASC LIMIT 1) AS InitialRawBody,
+        (SELECT ph_latest.text FROM PostHistory ph_latest WHERE ph_latest.postid = p.id AND ph_latest.posthistorytypeid = 5 ORDER BY ph_latest.creationdate DESC LIMIT 1) AS LatestRawBodyEdit,
+        SUM(CASE WHEN ph.posthistorytypeid IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        MAX(CASE WHEN ph.posthistorytypeid IN (4, 5, 6) THEN ph.creationdate END) AS LastMajorEditDate,
+        COUNT(DISTINCT (pee.eventdate || '_' || pee.eventtype)) AS TotalPostInteractionEvents,
+        MAX(pee.eventdate) AS LastInteractionEventDate,
+        (
+            SELECT AVG(p_related.score)
+            FROM PostLinks pl
+            JOIN Posts p_related ON pl.relatedpostid = p_related.id
+            WHERE pl.postid = p.id AND pl.linktypeid = 3
+        ) AS AvgDuplicatePostScore
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.id = ph.postid
+    LEFT JOIN PostEngagementEvents pee ON p.id = pee.postid
+    GROUP BY p.id, p.posttypeid, p.owneruserid, p.creationdate, p.lasteditdate, p.closeddate, p.viewcount, p.favoritecount, p.score, p.tags
+),
+TagPerformanceMetrics AS (
+    SELECT
+        unnest(string_to_array(SUBSTRING(p.tags, 2, LENGTH(p.tags) - 2), '><')) AS TagName,
+        p.id AS PostId,
+        p.score,
+        p.posttypeid
+    FROM Posts p
+    WHERE p.tags IS NOT NULL AND p.posttypeid = 1
+),
+AggregatedTagStats AS (
+    SELECT
+        tpm.TagName,
+        COUNT(tpm.PostId) AS QuestionsUsingTag,
+        AVG(tpm.score) AS AvgQuestionScore,
+        MAX(p.viewcount) AS MaxQuestionViewCountForTag,
+        MIN(p.creationdate) AS EarliestTagUsage,
+        MAX(p.creationdate) AS LatestTagUsage
+    FROM TagPerformanceMetrics tpm
+    JOIN Posts p ON tpm.PostId = p.id
+    GROUP BY tpm.TagName
+    HAVING COUNT(tpm.PostId) > 10
+)
+SELECT
+    u.id AS UserId,
+    u.displayname AS UserName,
+    u.reputation,
+    u.creationdate AS UserRegistrationDate,
+    u.lastaccessdate,
+    u.views AS UserProfileViews,
+    u.upvotes AS UserUpVotesGiven,
+    u.downvotes AS UserDownVotesGiven,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalCommentsMade,
+    uas.TotalAcceptedAnswersReceived,
+    uas.TotalBadges,
+    uas.TotalPostScore AS SumOfAllPostScores,
+    uas.LatestPostDate,
+    uas.EarliestPostDate,
+    DENSE_RANK() OVER (ORDER BY u.reputation DESC) AS ReputationRank,
+    NTILE(10) OVER (ORDER BY u.creationdate) AS UserCreationDecile,
+    ROUND(CAST(uas.TotalPostScore AS NUMERIC) / NULLIF(uas.TotalPosts, 0), 2) AS AvgScorePerPost,
+    COALESCE(u.location, 'Unspecified Location') AS UserLocation,
+    UPPER(REGEXP_REPLACE(SUBSTRING(u.websiteurl FROM '^(?:https?://)?(?:www\\.)?([^/]+)'), '\\s+$', '', 'g')) AS WebsiteDomain,
+    LENGTH(u.aboutme) AS AboutMeLength,
+    CASE
+        WHEN u.websiteurl IS NOT NULL AND u.aboutme IS NOT NULL AND u.reputation > 500 AND uas.TotalPosts > 100
+            THEN 'Established & Highly Engaged'
+        WHEN u.reputation > 200 AND uas.TotalPosts > 50
+            THEN 'Active Contributor'
+        WHEN u.creationdate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months' AND uas.TotalPosts > 5
+            THEN 'Promising New User'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    p.id AS QuestionId,
+    p.title AS QuestionTitle,
+    p.creationdate AS QuestionCreationDate,
+    p.viewcount AS QuestionViewCount,
+    p.score AS QuestionScore,
+    p.favoritecount AS QuestionFavoriteCount,
+    ped.InitialBodyLength AS QuestionInitialBodyLength,
+    ped.LatestRawBodyEdit AS QuestionLatestBodyEdit,
+    ped.MajorEditCount ASQuestionMajorEditCount,
+    ped.LastMajorEditDate AS QuestionLastMajorEditDate,
+    ped.AvgDuplicatePostScore,
+    ped.TotalPostInteractionEvents AS QuestionTotalInteractionEvents,
+    ped.LastInteractionEventDate AS QuestionLastInteractionDate,
+    ROW_NUMBER() OVER (PARTITION BY u.id ORDER BY p.score DESC, p.creationdate DESC) AS UserQuestionScoreRank,
+    (
+        SELECT MAX(a.score)
+        FROM Posts a
+        WHERE a.parentid = p.id AND a.posttypeid = 2 AND a.owneruserid = u.id
+    ) AS UsersHighestAnswerScoreForQuestion,
+    (
+        SELECT AVG(c_q.score)
+        FROM Comments c_q
+        WHERE c_q.postid = p.id
+    ) AS AvgCommentScoreOnQuestion,
+    EXISTS (SELECT 1 FROM PostLinks pl_dup WHERE pl_dup.postid = p.id AND pl_dup.linktypeid = 3) AS HasDuplicateLink,
+    ROUND(
+        CAST(COALESCE(p.viewcount, 0) * 0.5 + COALESCE(p.score, 0) * 10 + COALESCE(p.commentcount, 0) * 5 + COALESCE(p.favoritecount, 0) * 20 AS NUMERIC) /
+        NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.creationdate)) / (3600.0 * 24.0), 0), 2
+    ) AS QuestionActivityFactorPerDay,
+    (
+        LENGTH(p.body) - LENGTH(REPLACE(LOWER(p.body), '```', ''))) / 3 AS CodeBlockCount,
+    LOWER(p.title) LIKE '%performance%' OR LOWER(p.body) LIKE '%benchmark%' OR LOWER(p.body) LIKE '%optimize%' AS ContainsPerformanceKeywords,
+    ats.avgquestionscore AS TagAvgScore,
+    ats.QuestionsUsingTag AS TagQuestionCount,
+    ats.LatestTagUsage,
+    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.tags, '<sql>', '[SQL]'), '<javascript>', '[JS]'), '<python>', '[PY]'), '<c#>', '[CS]'), '<java>', '[JV]') AS TransformedTags
+FROM Users u
+JOIN UserActivitySummary uas ON u.id = uas.userid
+LEFT JOIN Posts p ON u.id = p.owneruserid AND p.posttypeid = 1
+LEFT JOIN PostEvolutionDetails ped ON p.id = ped.postid
+LEFT JOIN LATERAL unnest(string_to_array(SUBSTRING(p.tags, 2, LENGTH(p.tags) - 2), '><')) AS q_tag ON TRUE
+LEFT JOIN AggregatedTagStats ats ON q_tag = ats.TagName
+WHERE
+    u.reputation > 1000
+    AND u.lastaccessdate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    AND u.aboutme IS NOT NULL
+    AND u.id IN (
+        SELECT DISTINCT ph_inner.userid
+        FROM PostHistory ph_inner
+        WHERE ph_inner.posthistorytypeid = 5
+        AND ph_inner.creationdate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+    )
+    AND p.score > (SELECT AVG(score) FROM Posts WHERE posttypeid = 1 AND creationdate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    AND p.viewcount > 500
+    AND p.commentcount > 5
+    AND p.closeddate IS NULL
+ORDER BY
+    u.reputation DESC,
+    QuestionActivityFactorPerDay DESC NULLS LAST,
+    ped.lastmajoreditdate DESC NULLS LAST
+LIMIT 500;

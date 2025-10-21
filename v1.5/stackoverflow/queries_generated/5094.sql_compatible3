@@ -1,0 +1,130 @@
+with recent_badges as (
+  select
+    b.UserId,
+    b.Name as BadgeName,
+    b.Date,
+    b.Class,
+    row_number() over (partition by b.UserId order by b.Date desc) as rn
+  from Badges b
+  where b.Date > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+),
+top_questions as (
+  select
+    p.Id as PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.CreationDate,
+    p.ViewCount,
+    p.Tags,
+    count(a.Id) as AnswerCount,
+    max(a.Score) as TopAnswerScore
+  from Posts p
+  left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+  where p.PostTypeId = 1
+    and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+    and p.Score >= 5
+    and p.ViewCount > 0
+  group by p.Id, p.OwnerUserId, p.Title, p.Score, p.CreationDate, p.ViewCount, p.Tags
+  having count(a.Id) >= 2
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct p.Id) as QuestionsAsked,
+    count(distinct a.Id) as AnswersGiven,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesCast,
+    coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesCast,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+  left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+  left join Votes v on v.UserId = u.Id
+  where u.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+favorite_info as (
+  select
+    v.UserId,
+    v.PostId,
+    count(*) as FavoriteCount
+  from Votes v
+  where v.VoteTypeId = 5
+  group by v.UserId, v.PostId
+),
+user_top_tags as (
+  select
+    up.OwnerUserId,
+    tag,
+    count(*) as QuestionCount,
+    dense_rank() over (partition by up.OwnerUserId order by count(*) desc) as rank_in_user
+  from (
+    select
+      p.Id,
+      p.OwnerUserId,
+      unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tag
+    from Posts p
+    where p.PostTypeId = 1
+      and p.OwnerUserId is not null
+      and p.Tags is not null and p.Tags <> ''
+  ) up
+  group by up.OwnerUserId, tag
+)
+select
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  (ua.UpVotesCast - ua.DownVotesCast) as NetVotesCast,
+  to_char(ua.CreationDate, 'YYYY-MM-DD') as UserSince,
+  coalesce(rb.BadgeName, 'None') as RecentBadge,
+  tq.PostId as TopQuestionId,
+  tq.Title as TopQuestionTitle,
+  tq.Score as TopQuestionScore,
+  tq.ViewCount as TopQuestionViews,
+  tq.TopAnswerScore,
+  ft.FavoriteCount as FavoritesOnTop,
+  ut.tag as TopTag,
+  ut.QuestionCount as TopTagQuestionCount,
+  case
+    when tq.Tags ilike '%<sql>%' then 'SQL'
+    when tq.Tags ilike '%<performance>%' then 'Performance'
+    else 'Other'
+  end as SpecialTagCategory,
+  case
+    when (rb.Class = 1 or rb.Class is null) then 'GoldOrNone'
+    when rb.Class = 2 then 'Silver'
+    else 'Bronze'
+  end as BadgeClassRating,
+  (
+    select count(*)
+    from Comments c
+    where c.UserId = ua.UserId
+      and c.PostId in (select Id from Posts where OwnerUserId = ua.UserId and PostTypeId = 1)
+  ) as SelfQuestionComments
+from user_activity ua
+left join recent_badges rb
+  on rb.UserId = ua.UserId and rb.rn = 1
+left join top_questions tq
+  on tq.OwnerUserId = ua.UserId
+left join favorite_info ft
+  on ft.PostId = tq.PostId and ft.UserId = ua.UserId
+left join user_top_tags ut
+  on ut.OwnerUserId = ua.UserId and ut.rank_in_user = 1
+where
+  (tq.PostId is not null)
+  and ua.QuestionsAsked >= 3
+  and ua.AnswersGiven >= 5
+  and (
+    (tq.TopAnswerScore is null or tq.TopAnswerScore >= 5)
+    or (ft.FavoriteCount is null or ft.FavoriteCount >= 2)
+  )
+order by
+  ua.Reputation desc,
+  tq.Score desc,
+  ft.FavoriteCount desc nulls last
+limit 50;

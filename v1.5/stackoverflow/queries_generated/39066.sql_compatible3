@@ -1,0 +1,110 @@
+WITH QuestionTags AS (
+    SELECT
+        p.Id                   AS PostId,
+        unnest(
+            string_to_array(
+                substring(p.Tags, 2, length(p.Tags) - 2),
+                '><'
+            )
+        )                      AS Tag,
+        p.OwnerUserId,
+        CAST(p.CreationDate AS date)   AS CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+VotesAgg AS (
+    SELECT
+        PostId,
+        sum(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        sum(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        sum(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes
+    GROUP BY PostId
+),
+CommentsAgg AS (
+    SELECT
+        PostId,
+        count(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+),
+EditsAgg AS (
+    SELECT
+        PostId,
+        count(*) AS EditCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY PostId
+),
+PostMetrics AS (
+    SELECT
+        qt.PostId,
+        qt.Tag,
+        qt.OwnerUserId,
+        qt.CreationDate,
+        COALESCE(v.UpVotes,    0) AS UpVotes,
+        COALESCE(v.DownVotes,  0) AS DownVotes,
+        COALESCE(v.Favorites,  0) AS Favorites,
+        COALESCE(c.CommentCount, 0) AS Comments,
+        COALESCE(e.EditCount,    0) AS Edits
+    FROM QuestionTags qt
+    LEFT JOIN VotesAgg    v ON qt.PostId = v.PostId
+    LEFT JOIN CommentsAgg c ON qt.PostId = c.PostId
+    LEFT JOIN EditsAgg    e ON qt.PostId = e.PostId
+),
+RankedPosts AS (
+    SELECT
+        pm.*,
+        (pm.UpVotes - pm.DownVotes) AS Score,
+        rank() OVER (
+            PARTITION BY pm.Tag
+            ORDER BY (pm.UpVotes - pm.DownVotes) DESC, pm.Favorites DESC
+        ) AS TagRank
+    FROM PostMetrics pm
+),
+TagSummary AS (
+    SELECT
+        Tag,
+        count(*)       AS TotalQuestions,
+        avg(Score)     AS AvgScore,
+        avg(Favorites) AS AvgFavorites,
+        avg(Comments)  AS AvgComments,
+        avg(Edits)     AS AvgEdits
+    FROM RankedPosts
+    GROUP BY Tag
+),
+TopPosts AS (
+    SELECT *
+    FROM RankedPosts
+    WHERE TagRank <= 5
+)
+SELECT
+    ts.Tag,
+    ts.TotalQuestions,
+    ts.AvgScore,
+    ts.AvgFavorites,
+    ts.AvgComments,
+    ts.AvgEdits,
+    json_agg(
+      json_build_object(
+        'PostId',       tp.PostId,
+        'Score',        tp.Score,
+        'Favorites',    tp.Favorites,
+        'Comments',     tp.Comments,
+        'Edits',        tp.Edits,
+        'OwnerUserId',  tp.OwnerUserId
+      )
+      ORDER BY tp.TagRank
+    ) AS TopPosts
+FROM TagSummary ts
+JOIN TopPosts tp
+  ON ts.Tag = tp.Tag
+GROUP BY
+    ts.Tag,
+    ts.TotalQuestions,
+    ts.AvgScore,
+    ts.AvgFavorites,
+    ts.AvgComments,
+    ts.AvgEdits
+ORDER BY ts.TotalQuestions DESC
+LIMIT 10;

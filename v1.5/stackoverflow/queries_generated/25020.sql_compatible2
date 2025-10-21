@@ -1,0 +1,113 @@
+WITH
+/* 1️⃣  Aggregate per‑user statistics */
+user_stats AS (
+    SELECT
+        u.id                                   AS user_id,
+        u.displayname,
+        u.reputation,
+        COALESCE(u.upvotes,0) - COALESCE(u.downvotes,0) AS net_votes,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges,
+        (SELECT MAX(p.creationdate) FROM posts p WHERE p.owneruserid = u.id) AS last_post_date
+    FROM users u
+),
+
+/* 2️⃣  Tag‑level metrics (excerpt / wiki length, usage count) */
+tag_metrics AS (
+    SELECT
+        t.tagname,
+        t.count                                   AS tag_use_count,
+        COALESCE(LENGTH(p_ex.body),0)              AS excerpt_length,
+        COALESCE(LENGTH(p_wk.body),0)              AS wiki_length
+    FROM tags t
+    LEFT JOIN posts p_ex ON p_ex.id = t.excerptpostid
+    LEFT JOIN posts p_wk ON p_wk.id = t.wikipostid
+),
+
+/* 3️⃣  Top‑scoring question per user (only questions created in 2023+) */
+top_questions AS (
+    SELECT
+        p.id,
+        p.title,
+        p.score,
+        p.viewcount,
+        p.creationdate,
+        p.owneruserid,
+        ROW_NUMBER() OVER (PARTITION BY p.owneruserid
+                           ORDER BY p.score DESC, p.viewcount DESC) AS rn
+    FROM posts p
+    WHERE p.posttypeid = 1                         -- Question
+      AND p.creationdate >= DATE '2023-01-01'
+),
+
+/* 4️⃣  The most popular tag overall (used in the final SELECT) */
+most_popular_tag AS (
+    SELECT tagname, tag_use_count
+    FROM tag_metrics
+    ORDER BY tag_use_count DESC
+    LIMIT 1
+)
+
+SELECT
+    us.user_id,
+    us.displayname,
+    us.reputation,
+    us.net_votes,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.last_post_date,
+    tq.id                         AS top_question_id,
+    tq.title                      AS top_question_title,
+    tq.score                      AS top_question_score,
+    tq.viewcount                  AS top_question_views,
+    COALESCE(tq.creationdate,
+             TIMESTAMP '1970-01-01 00:00:00') AS top_question_created,
+    mt.tagname                    AS most_popular_tag,
+    mt.tag_use_count,
+    tm.excerpt_length,
+    tm.wiki_length,
+    CASE
+        WHEN us.reputation > 20000                THEN 'Veteran'
+        WHEN us.reputation BETWEEN 5000 AND 20000 THEN 'Experienced'
+        ELSE                                        'Newbie'
+    END                                            AS reputation_tier,
+    CASE WHEN tq.id IS NULL THEN 0 ELSE 1 END    AS has_top_question
+FROM user_stats us
+LEFT JOIN top_questions tq
+       ON tq.owneruserid = us.user_id AND tq.rn = 1
+LEFT JOIN most_popular_tag mt ON TRUE
+LEFT JOIN tag_metrics tm
+       ON tm.tagname = mt.tagname
+WHERE (us.reputation IS NOT NULL AND us.reputation > 1000)
+      OR us.gold_badges > 0
+      OR (tq.score IS NOT NULL AND tq.score > 100)
+      OR tm.tag_use_count > 0
+ORDER BY us.reputation DESC, us.gold_badges DESC
+LIMIT 100
+
+UNION ALL
+
+/* 5️⃣  Dummy rows to stress set‑operator handling */
+SELECT
+    NULL AS user_id,
+    NULL AS displayname,
+    NULL AS reputation,
+    NULL AS net_votes,
+    NULL AS gold_badges,
+    NULL AS silver_badges,
+    NULL AS bronze_badges,
+    NULL AS last_post_date,
+    NULL AS top_question_id,
+    NULL AS top_question_title,
+    NULL AS top_question_score,
+    NULL AS top_question_views,
+    NULL AS top_question_created,
+    NULL AS most_popular_tag,
+    NULL AS tag_use_count,
+    NULL AS excerpt_length,
+    NULL AS wiki_length,
+    NULL AS reputation_tier,
+    0              AS has_top_question
+FROM generate_series(1,5) gs(i);

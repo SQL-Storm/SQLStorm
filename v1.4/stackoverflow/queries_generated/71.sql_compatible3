@@ -1,0 +1,134 @@
+WITH RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    NULL AS LastEditorName,
+    NULL AS LastEditorReputation
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+),
+TagMetrics AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  ) AS t
+  GROUP BY t.TagName
+),
+ActivitySummary AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    CASE
+      WHEN p.LastActivityDate > p.CreationDate THEN 1 ELSE 0
+    END AS IsActiveRecently,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+      ) THEN TRUE
+      ELSE FALSE
+    END AS HasUpvote,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+      ) THEN TRUE
+      ELSE FALSE
+    END AS HasDownvote
+  FROM Posts p
+),
+CorrelatedStats AS (
+  SELECT
+    a.PostId,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.AnswerCount,
+    a.CommentCount,
+    a.IsActiveRecently,
+    a.HasUpvote,
+    a.HasDownvote,
+    u.Reputation,
+    u.Location
+  FROM ActivitySummary a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+),
+RankedPosts AS (
+  SELECT
+    cs.PostId,
+    cs.LastActivityDate,
+    cs.Score,
+    cs.ViewCount,
+    cs.AnswerCount,
+    cs.CommentCount,
+    cs.Reputation,
+    cs.Location,
+    ROW_NUMBER() OVER (
+      PARTITION BY cs.Location
+      ORDER BY cs.LastActivityDate DESC,
+               cs.Score DESC,
+               cs.ViewCount DESC
+    ) AS rn_by_location,
+    RANK() OVER (
+      ORDER BY cs.Reputation DESC, cs.ViewCount DESC, cs.Score DESC
+    ) AS overall_rank
+  FROM CorrelatedStats cs
+)
+SELECT
+  rp.PostId,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.Reputation,
+  rp.Location,
+  rp.rn_by_location,
+  rp.overall_rank,
+  p.Title,
+  p.Tags,
+  p.ContentLicense,
+  u.DisplayName AS OwnerDisplayName,
+  b.Name AS BadgeName,
+  bh.Name AS HistoryType
+FROM RankedPosts rp
+JOIN Posts p ON rp.PostId = p.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN PostHistoryTypes bh ON ph.PostHistoryTypeId = bh.Id
+WHERE rp.rn_by_location <= 5
+  AND rp.HasUpvote = TRUE
+  AND rp.HasDownvote = FALSE
+ORDER BY rp.overall_rank ASC, rp.LastActivityDate DESC
+LIMIT 100;

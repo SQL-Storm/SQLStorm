@@ -1,0 +1,80 @@
+WITH TagPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.CreationDate,
+    t.tag,
+    p.OwnerUserId,
+    u.Reputation AS OwnerReputation,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT ph.CreationDate
+     FROM PostHistory ph
+     WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+     ORDER BY ph.CreationDate DESC
+     LIMIT 1) AS LastEditDate
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, greatest(length(coalesce(p.Tags, '')) - 2, 0)), '><')) AS t(tag)
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+    AND p.Tags IS NOT NULL
+),
+RankData AS (
+  SELECT
+    tag,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    CommentCount,
+    LastEditDate,
+    OwnerReputation,
+    ROW_NUMBER() OVER (PARTITION BY tag ORDER BY Score DESC NULLS LAST, LastEditDate DESC NULLS LAST) AS rank_by_score,
+    ROW_NUMBER() OVER (PARTITION BY tag ORDER BY ViewCount DESC NULLS LAST, Score DESC NULLS LAST) AS rank_by_views
+  FROM TagPosts
+),
+TopScore AS (
+  SELECT tag, PostId, Title, Score, ViewCount, CommentCount, LastEditDate, OwnerReputation,
+         rank_by_score AS rank, 'score' AS sort_key
+  FROM RankData
+  WHERE rank_by_score <= 3
+),
+TopViews AS (
+  SELECT tag, PostId, Title, Score, ViewCount, CommentCount, LastEditDate, OwnerReputation,
+         rank_by_views AS rank, 'views' AS sort_key
+  FROM RankData
+  WHERE rank_by_views <= 3
+)
+SELECT
+  tag,
+  PostId,
+  Title,
+  Score,
+  ViewCount,
+  CommentCount,
+  CASE WHEN LastEditDate IS NULL THEN 'never edited'
+       ELSE TO_CHAR(LastEditDate, 'YYYY-MM-DD HH24:MI:SS')
+  END AS LastEditStatus,
+  OwnerReputation,
+  rank,
+  sort_key
+FROM TopScore
+UNION ALL
+SELECT
+  tag,
+  PostId,
+  Title,
+  Score,
+  ViewCount,
+  CommentCount,
+  CASE WHEN LastEditDate IS NULL THEN 'never edited'
+       ELSE TO_CHAR(LastEditDate, 'YYYY-MM-DD HH24:MI:SS')
+  END AS LastEditStatus,
+  OwnerReputation,
+  rank,
+  sort_key
+FROM TopViews
+ORDER BY tag, sort_key, rank;

@@ -1,0 +1,240 @@
+-- {"query": "7011.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2893} 
+WITH
+-- recent active questions with parsed tag array and basic metrics
+RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    -- produce an array of tags by trimming < > and splitting on '><'
+    regexp_split_to_array(substring(p.Tags from 2 for greatest(length(p.Tags)-2,0)), '><') AS TagArray
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE pt.Name = 'Question'
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- answer aggregates per question including avg score and top answer detail
+AnswerStats AS (
+  SELECT
+    q.QuestionId,
+    COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS TotalAnswers,
+    AVG(a.Score) FILTER (WHERE a.Id IS NOT NULL) AS AvgAnswerScore,
+    MAX(a.Score) FILTER (WHERE a.Id IS NOT NULL) AS MaxAnswerScore,
+    -- pick the top scoring answer id (ties broken by earliest CreationDate)
+    (SELECT a2.Id
+     FROM Posts a2
+     WHERE a2.ParentId = q.QuestionId
+     ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate ASC
+     LIMIT 1) AS TopAnswerId
+  FROM RecentQuestions q
+  LEFT JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name='Answer')
+  GROUP BY q.QuestionId
+),
+-- user reputation deciles and recency stats using window functions
+UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    -- reputation percentile among active owners of RecentQuestions
+    PERCENT_RANK() OVER (ORDER BY u.Reputation) AS RepPercentRank,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS RepRank
+  FROM Users u
+  WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM RecentQuestions WHERE OwnerUserId > 0)
+),
+-- badge counts per user with some categorization
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgesTotal,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(*) FILTER (WHERE b.TagBased = B'1') AS TagBasedBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- compute close and reopen events per question from PostHistory with json parsing fallback
+CloseReopen AS (
+  SELECT
+    ph.PostId AS QuestionId,
+    SUM((ph.PostHistoryTypeId = 10)::int) AS CloseEvents,
+    SUM((ph.PostHistoryTypeId = 11)::int) AS ReopenEvents,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseDate,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenDate,
+    -- extract CloseReasonId from Comment when numeric, else null
+    MAX( (CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$' THEN (ph.Comment)::int ELSE NULL END) ) AS DominantCloseReasonId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11)
+  GROUP BY ph.PostId
+),
+-- compute link relationships: inbound/outbound unique counts and duplicates
+LinkMetrics AS (
+  SELECT
+    q.QuestionId,
+    COUNT(pl.Id) FILTER (WHERE pl.PostId = q.QuestionId) AS OutboundLinks,
+    COUNT(pl.Id) FILTER (WHERE pl.RelatedPostId = q.QuestionId) AS InboundLinks,
+    SUM((pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate'))::int) FILTER (WHERE pl.PostId = q.QuestionId) AS OutboundDuplicates,
+    SUM((pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate'))::int) FILTER (WHERE pl.RelatedPostId = q.QuestionId) AS InboundDuplicates
+  FROM RecentQuestions q
+  LEFT JOIN PostLinks pl ON pl.PostId = q.QuestionId OR pl.RelatedPostId = q.QuestionId
+  GROUP BY q.QuestionId
+),
+-- heavy-weight computed score combining many signals, used for ranking and stress-testing expressions
+ComputedSignals AS (
+  SELECT
+    q.*,
+    COALESCE(a.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(l.OutboundLinks,0) AS OutboundLinks,
+    COALESCE(l.InboundLinks,0) AS InboundLinks,
+    COALESCE(cr.CloseEvents,0) AS CloseEvents,
+    COALESCE(cr.ReopenEvents,0) AS ReopenEvents,
+    COALESCE(cr.DominantCloseReasonId, -1) AS DominantCloseReasonId,
+    -- heuristic popularity: weighted combination, with null-safe math and exponential smoothing
+    (
+      (COALESCE(q.Score,0) * 2.5)
+      + (LOG(GREATEST(COALESCE(q.ViewCount,0),1)) * 1.2)
+      + (GREATEST(COALESCE(a.AvgAnswerScore,0),0) * 3)
+      + (LEAST(COALESCE(q.FavoriteCount,0),50) * 1.5)
+      + (LEAST(COALESCE(l.InboundLinks,0),20) * 2)
+      - (COALESCE(cr.CloseEvents,0) * 5)
+      + (CASE WHEN q.AnswerCount > 0 THEN 10 ELSE 0 END)
+    ) * (1 + COALESCE(NULLIF(array_length(q.TagArray,1),0),0)::numeric / 10.0) AS HeuristicPopularity,
+    -- textual complexity metric (length + wordiness + punctuation density), heavy string ops
+    (
+      greatest(char_length(coalesce(q.Title,'')),1)
+      + (regexp_matches(coalesce(q.Title,''), '\w+', 'g'))[1]::text IS NOT NULL::int -- trick to force regex engine path
+    ) AS TextComplexityHack
+  FROM RecentQuestions q
+  LEFT JOIN AnswerStats a ON a.QuestionId = q.QuestionId
+  LEFT JOIN LinkMetrics l ON l.QuestionId = q.QuestionId
+  LEFT JOIN CloseReopen cr ON cr.QuestionId = q.QuestionId
+),
+-- tag-level rollups for tag affinity and top questions per tag
+TagAffinity AS (
+  SELECT
+    tag,
+    COUNT(*) AS QuestionsWithTag,
+    AVG(HeuristicPopularity) AS AvgPopularity,
+    MAX(HeuristicPopularity) AS MaxPopularity
+  FROM ComputedSignals cs,
+       unnest(cs.TagArray) AS tag
+  GROUP BY tag
+),
+-- top N per tag using windowing to stress partitioning and ordering
+TopPerTag AS (
+  SELECT
+    tag,
+    QuestionId,
+    Title,
+    HeuristicPopularity,
+    ROW_NUMBER() OVER (PARTITION BY tag ORDER BY HeuristicPopularity DESC NULLS LAST, CreationDate ASC) AS RankInTag
+  FROM ComputedSignals cs,
+       unnest(cs.TagArray) AS tag
+),
+-- compute cross-user interactions: votes and comments correlated to users (correlated subqueries)
+UserInteractionSummaries AS (
+  SELECT
+    um.UserId,
+    um.DisplayName,
+    COALESCE(bs.BadgesTotal,0) AS BadgesTotal,
+    COALESCE(bs.GoldBadges,0) AS GoldBadges,
+    COALESCE(bs.SilverBadges,0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges,0) AS BronzeBadges,
+    -- correlated subquery: count of answers by this user to recent questions and their avg score
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name='Answer') AND p.OwnerUserId = um.UserId AND p.ParentId IN (SELECT QuestionId FROM RecentQuestions)) AS AnswersToRecentQuestions,
+    (SELECT COALESCE(AVG(p.Score),0) FROM Posts p WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name='Answer') AND p.OwnerUserId = um.UserId AND p.ParentId IN (SELECT QuestionId FROM RecentQuestions)) AS AvgScoreOnThoseAnswers,
+    -- correlated subquery: last 3 comments by the user joined to post titles
+    (SELECT string_agg(distinct left(c.Text,80) || ' @' || coalesce(p.Title,'[no title]'), ' ||| ' ORDER BY c.CreationDate DESC)
+     FROM Comments c
+     LEFT JOIN Posts p ON p.Id = c.PostId
+     WHERE c.UserId = um.UserId
+     LIMIT 3) AS RecentCommentSnippets
+  FROM UserMetrics um
+  LEFT JOIN BadgeSummary bs ON bs.UserId = um.UserId
+)
+-- final select: combine many of the above into a heavy projection for benchmarking
+SELECT
+  cs.QuestionId,
+  cs.Title,
+  cs.CreationDate,
+  cs.Score AS QuestionScore,
+  cs.ViewCount,
+  cs.AnswerCount,
+  cs.TotalAnswers,
+  cs.AvgAnswerScore,
+  cs.MaxAnswerScore,
+  cs.HeuristicPopularity,
+  cs.TagArray,
+  ta.tag AS ExampleTag,
+  COALESCE(tagaff.AvgPopularity,0) AS TagAvgPopularity,
+  COALESCE(tagaff.MaxPopularity,0) AS TagMaxPopularity,
+  l.OutboundLinks,
+  l.InboundLinks,
+  cr.CloseEvents,
+  cr.ReopenEvents,
+  cr.DominantCloseReasonId,
+  um.UserId AS OwnerUserId,
+  um.DisplayName AS OwnerDisplayName,
+  um.Reputation AS OwnerReputation,
+  um.RepPercentRank,
+  um.RepRank,
+  bs.BadgesTotal,
+  bs.GoldBadges,
+  bs.SilverBadges,
+  bs.BronzeBadges,
+  uts.AnswersToRecentQuestions,
+  uts.AvgScoreOnThoseAnswers,
+  uts.RecentCommentSnippets,
+  -- string concatenation and null logic stress
+  (coalesce(cs.Title,'[untitled]') || ' :: ' || COALESCE(LEFT(cs.Tags,120),'[no-tags]')) AS TitleAndTagsSnippet,
+  -- set operator example: existence check of duplicate relations via UNION ALL and aggregation
+  (SELECT COUNT(*) FROM (
+      SELECT RelatedPostId FROM PostLinks pl WHERE pl.PostId = cs.QuestionId AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name='Duplicate')
+      UNION ALL
+      SELECT PostId FROM PostLinks pl WHERE pl.RelatedPostId = cs.QuestionId AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name='Duplicate')
+  ) dups) AS TotalDuplicateLinks,
+  -- window function over full computed set to give relative rank
+  RANK() OVER (ORDER BY cs.HeuristicPopularity DESC NULLS LAST) AS GlobalPopRank,
+  -- correlated subquery: compute time since last activity across posts related to question (answers + comments)
+  (SELECT EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - GREATEST(
+       COALESCE(MAX(a.LastActivityDate), '1970-01-01'::timestamp),
+       COALESCE(MAX(c.CreationDate), '1970-01-01'::timestamp)
+     )) ) FROM Posts a LEFT JOIN Comments c ON c.PostId = a.Id
+     WHERE a.ParentId = cs.QuestionId OR a.Id = cs.QuestionId
+  ) AS SecondsSinceLastRelatedActivity,
+  -- complex predicate example combining boolean algebra and null-safe comparisons
+  (CASE
+     WHEN (cs.HeuristicPopularity > 100 OR (cs.Score >= 5 AND cs.ViewCount > 1000)) AND COALESCE(cr.CloseEvents,0) = 0 THEN 'HotOpen'
+     WHEN COALESCE(cr.CloseEvents,0) > COALESCE(cr.ReopenEvents,0) THEN 'ClosedMoreThanReopened'
+     WHEN cs.AnswerCount = 0 THEN 'Unanswered'
+     ELSE 'Normal'
+   END) AS StatusLabel
+FROM ComputedSignals cs
+LEFT JOIN LATERAL (
+  SELECT tag FROM unnest(cs.TagArray) AS tag ORDER BY tag LIMIT 1
+) ta ON true
+LEFT JOIN TagAffinity tagaff ON tagaff.tag = ta.tag
+LEFT JOIN LinkMetrics l ON l.QuestionId = cs.QuestionId
+LEFT JOIN CloseReopen cr ON cr.QuestionId = cs.QuestionId
+LEFT JOIN Users um ON um.Id = cs.OwnerUserId
+LEFT JOIN BadgeSummary bs ON bs.UserId = um.Id
+LEFT JOIN UserInteractionSummaries uts ON uts.UserId = um.Id
+LEFT JOIN TopPerTag tpt ON tpt.QuestionId = cs.QuestionId AND tpt.RankInTag = 1
+WHERE cs.HeuristicPopularity IS NOT NULL
+ORDER BY cs.HeuristicPopularity DESC NULLS LAST, cs.CreationDate ASC
+LIMIT 200;

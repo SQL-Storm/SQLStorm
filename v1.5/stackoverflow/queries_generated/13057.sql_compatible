@@ -1,0 +1,71 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC NULLS LAST) AS Rank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2) AND
+        u.Reputation > 1000 AND
+        p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 10
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+),
+PostsWithComments AS (
+    SELECT 
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.PostTypeId IN (1, 2)
+    GROUP BY 
+        p.Id
+)
+SELECT 
+    tu.DisplayName,
+    tu.TotalPosts,
+    tu.TotalScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(AVG(pwc.CommentCount), 0) AS AvgCommentsPerPost,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN LENGTH(ph.Text) ELSE 0 END) AS TotalEditLength,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate
+FROM 
+    TopUsers tu
+LEFT JOIN 
+    UserBadges ub ON tu.Id = ub.UserId
+LEFT JOIN 
+    Posts p ON tu.Id = p.OwnerUserId
+LEFT JOIN 
+    PostsWithComments pwc ON p.Id = pwc.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    tu.Rank <= 100
+GROUP BY 
+    tu.Id, tu.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+ORDER BY 
+    tu.TotalScore DESC NULLS LAST, 
+    tu.DisplayName ASC;

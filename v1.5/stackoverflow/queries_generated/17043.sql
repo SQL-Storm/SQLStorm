@@ -1,0 +1,176 @@
+-- {"query": "17043.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 102740, "output_tokens": 100826} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2), ', ') 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) AS TopTags,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400 AS AccountAgeDays,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) 
+            OVER (PARTITION BY u.Id) AS MedianScore
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '2 years'
+        AND (u.Reputation > 100 OR u.Reputation IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+QuestionAnswerPairs AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.CreationDate AS QuestionDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 AS HoursToAnswer,
+        a.OwnerUserId AS AnswererId,
+        q.OwnerUserId AS QuestionerId,
+        CASE 
+            WHEN q.AcceptedAnswerId = a.Id THEN 1 
+            ELSE 0 
+        END AS IsAccepted,
+        DENSE_RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.ClosedDate IS NULL
+        AND q.Score >= 0
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS PrevBadgeDate,
+        LEAD(b.Name) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS NextBadgeName,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date 
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeBadges
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+CommentAnalysis AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.Score) AS MaxCommentScore,
+        ARRAY_AGG(c.Text ORDER BY c.Score DESC LIMIT 3) AS TopComments
+    FROM Comments c
+    WHERE c.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '6 months'
+        AND c.Score > 0
+    GROUP BY c.PostId
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Location, 'Not Specified') AS UserLocation,
+    uam.Reputation,
+    ROUND(uam.AccountAgeDays::numeric, 1) AS DaysActive,
+    uam.Questions + uam.Answers AS TotalContributions,
+    ROUND(uam.AvgPostScore::numeric, 2) AS AvgScore,
+    COALESCE(uam.TopTags, 'No tags') AS PrimaryTags,
+    uam.LocationRank,
+    COUNT(DISTINCT qap.QuestionId) FILTER (WHERE qap.AnswererId = uam.Id) AS AnswersProvided,
+    AVG(qap.HoursToAnswer) FILTER (WHERE qap.AnswererId = uam.Id AND qap.HoursToAnswer < 168) AS AvgResponseTimeHours,
+    SUM(qap.IsAccepted) FILTER (WHERE qap.AnswererId = uam.Id) AS AcceptedAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = uam.Id 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+    ) AS RecentEdits,
+    COALESCE(
+        (
+            SELECT STRING_AGG(DISTINCT bp.BadgeName || ' (' || 
+                            CASE bp.Class 
+                                WHEN 1 THEN 'Gold' 
+                                WHEN 2 THEN 'Silver' 
+                                ELSE 'Bronze' 
+                            END || ')', ', ' ORDER BY bp.Class, bp.BadgeName)
+            FROM BadgeProgression bp
+            WHERE bp.UserId = uam.Id
+                AND bp.Date >= CURRENT_TIMESTAMP - INTERVAL '90 days'
+        ), 
+        'No recent badges'
+    ) AS RecentBadges,
+    CASE 
+        WHEN uam.Reputation >= 10000 THEN 'Expert'
+        WHEN uam.Reputation >= 1000 THEN 'Advanced'
+        WHEN uam.Reputation >= 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    COALESCE(MAX(ca.AvgCommentLength), 0)::INT AS AvgCommentLength,
+    EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.UserId = uam.Id 
+            AND v.VoteTypeId = 8 
+            AND v.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '180 days'
+    ) AS HasRecentBounty,
+    NULLIF(
+        TRIM(BOTH ' ' FROM 
+            REGEXP_REPLACE(
+                SUBSTRING(uam.TopTags FROM 1 FOR 
+                    CASE 
+                        WHEN POSITION(',' IN uam.TopTags) > 0 
+                        THEN POSITION(',' IN uam.TopTags) - 1 
+                        ELSE LENGTH(uam.TopTags) 
+                    END
+                ), 
+                '[^a-zA-Z0-9\-\.]', '', 'g'
+            )
+        ), 
+        ''
+    ) AS PrimaryTag
+FROM UserActivityMetrics uam
+LEFT OUTER JOIN QuestionAnswerPairs qap ON uam.Id = qap.AnswererId
+LEFT OUTER JOIN CommentAnalysis ca ON qap.AnswerId = ca.PostId
+WHERE uam.TotalPosts > 0
+    OR uam.Reputation > 500
+GROUP BY 
+    uam.Id, uam.DisplayName, uam.Location, uam.Reputation, 
+    uam.AccountAgeDays, uam.Questions, uam.Answers, 
+    uam.AvgPostScore, uam.TopTags, uam.LocationRank
+HAVING COUNT(DISTINCT qap.QuestionId) > 0 
+    OR uam.Questions > 0
+    OR uam.Reputation > 1000
+
+UNION ALL
+
+SELECT 
+    'SUMMARY ROW' AS DisplayName,
+    'All Locations' AS UserLocation,
+    NULL AS Reputation,
+    NULL AS DaysActive,
+    COUNT(*) AS TotalContributions,
+    NULL AS AvgScore,
+    'Various' AS PrimaryTags,
+    NULL AS LocationRank,
+    NULL AS AnswersProvided,
+    NULL AS AvgResponseTimeHours,
+    NULL AS AcceptedAnswers,
+    NULL AS RecentEdits,
+    'Statistical Summary' AS RecentBadges,
+    'Summary' AS UserTier,
+    NULL AS AvgCommentLength,
+    NULL AS HasRecentBounty,
+    'all-tags' AS PrimaryTag
+FROM UserActivityMetrics
+
+ORDER BY 
+    CASE WHEN DisplayName = 'SUMMARY ROW' THEN 1 ELSE 0 END,
+    Reputation DESC NULLS LAST,
+    TotalContributions DESC NULLS LAST
+LIMIT 100;

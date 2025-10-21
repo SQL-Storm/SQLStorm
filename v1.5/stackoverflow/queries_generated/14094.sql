@@ -1,0 +1,109 @@
+-- {"query": "14094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 221825, "output_tokens": 96735} 
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.CreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE p.PostTypeId::VARCHAR
+    END AS PostType,
+    COALESCE(pt.Name, 'Unknown') AS PostTypeName,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN COALESCE(cr.Name, 'Unknown')
+      ELSE NULL
+    END AS CloseReason,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN COALESCE(CAST(ph.Comment AS INT), -1)
+      ELSE NULL
+    END AS CloseReasonId,
+    STRING_AGG(DISTINCT REPLACE(REPLACE(t.TagName, '<', ''), '>', ''), '|') AS Tags,
+    CASE
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      WHEN p.OwnerUserId = -1 THEN 'Community'
+      ELSE u.DisplayName
+    END AS OwnerDisplayName,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open'
+    END AS PostStatus,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS OwnerPostRank,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS FavoriteCount,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CloseVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 7 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS ReopenVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DeletionVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UndeletionVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 12 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS SpamVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 14 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS ModeratorNominationVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 15 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS ModeratorReviewVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 16 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS ApproveEditSuggestionVoteCount,
+    COALESCE(CAST(ph.Text AS JSON)->'OriginalQuestionIds', '[]'::JSON) AS DuplicateOfIds
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INT) = cr.Id
+  LEFT JOIN Tags t ON STRPOS(p.Tags, '<' || t.TagName || '>') > 0
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY
+    p.Id, p.Title, p.Body, p.OwnerUserId, u.DisplayName, p.CreationDate, p.LastEditDate,
+    p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+    p.ClosedDate, p.CommunityOwnedDate, pt.Name, cr.Name, ph.Comment
+)
+SELECT
+  PostId,
+  Title,
+  Body,
+  OwnerDisplayName,
+  CreationDate,
+  LastEditDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  ClosedDate,
+  CommunityOwnedDate,
+  PostType,
+  PostTypeName,
+  CloseReason,
+  CloseReasonId,
+  Tags,
+  PostStatus,
+  OwnerPostRank,
+  ScoreRank,
+  UpVoteCount,
+  DownVoteCount,
+  FavoriteCount AS PostFavoriteCount,
+  CloseVoteCount,
+  ReopenVoteCount,
+  DeletionVoteCount,
+  UndeletionVoteCount,
+  SpamVoteCount,
+  ModeratorNominationVoteCount,
+  ModeratorReviewVoteCount,
+  ApproveEditSuggestionVoteCount,
+  COALESCE(CAST(DuplicateOfIds->'0' AS INT), -1) AS DuplicateOfId1,
+  COALESCE(CAST(DuplicateOfIds->'1' AS INT), -1) AS DuplicateOfId2,
+  COALESCE(CAST(DuplicateOfIds->'2' AS INT), -1) AS DuplicateOfId3
+FROM cte
+ORDER BY ScoreRank ASC
+LIMIT 100;

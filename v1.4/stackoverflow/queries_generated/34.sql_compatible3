@@ -1,0 +1,125 @@
+WITH
+    q AS (
+        SELECT
+            p.Id AS PostId,
+            p.Title,
+            p.PostTypeId,
+            p.CreationDate,
+            p.LastActivityDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.Tags,
+            p.Body,
+            p.AcceptedAnswerId,
+            p.CommentCount,
+            p.FavoriteCount,
+            p.ClosedDate,
+            p.CommunityOwnedDate,
+            p.ContentLicense
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.ViewCount > 100
+          AND p.Score > 0
+    ),
+    recent_comments AS (
+        SELECT
+            c.PostId,
+            COUNT(*) AS CommentCountRecent
+        FROM Comments c
+        WHERE c.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+        GROUP BY c.PostId
+    ),
+    recent_votes AS (
+        SELECT
+            V.PostId,
+            SUM(CASE WHEN VT.Id IN (2, 3) THEN 1 ELSE 0 END) AS NetVotes30
+        FROM Votes V
+        JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+        WHERE V.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+        GROUP BY V.PostId
+    ),
+    top_tags AS (
+        SELECT
+            TagName,
+            COUNT(*) AS TagCount
+        FROM (
+            SELECT
+                UNNEST(string_to_array(SUBSTR(p.Tags, 2, CHAR_LENGTH(p.Tags) - 2), '><')) AS TagName
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+        ) t
+        GROUP BY TagName
+    ),
+    badge_influence AS (
+        SELECT
+            u.Id AS UserId,
+            COUNT(b.Id) AS BadgesEarned
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+    last_editor AS (
+        SELECT
+            p.OwnerUserId,
+            p.LastEditorUserId,
+            p.LastEditDate
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    filtered AS (
+        SELECT
+            q.*,
+            rc.CommentCountRecent,
+            rv.NetVotes30,
+            tt.TagName,
+            tt.TagCount,
+            bi.BadgesEarned
+        FROM q
+        LEFT JOIN recent_comments rc ON rc.PostId = q.PostId
+        LEFT JOIN recent_votes rv ON rv.PostId = q.PostId
+        LEFT JOIN top_tags tt ON tt.TagName IS NOT NULL
+        LEFT JOIN badge_influence bi ON bi.UserId = q.OwnerUserId
+        LEFT JOIN last_editor le ON le.OwnerUserId = q.OwnerUserId
+    ),
+    judging AS (
+        SELECT
+            f.*,
+            CASE
+                WHEN f.CommentCount IS NULL THEN 0
+                ELSE f.CommentCount
+            END AS CommentCountFinal,
+            CASE
+                WHEN f.NetVotes30 IS NULL THEN 0
+                ELSE f.NetVotes30
+            END AS NetVotes30Final
+        FROM filtered f
+    )
+SELECT
+    j.PostId,
+    j.Title,
+    j.PostTypeId,
+    j.CreationDate,
+    j.LastActivityDate,
+    j.Score,
+    j.ViewCount,
+    j.OwnerUserId,
+    j.Tags,
+    j.Body,
+    j.AcceptedAnswerId,
+    j.CommentCountFinal,
+    j.FavoriteCount,
+    j.ClosedDate,
+    j.CommunityOwnedDate,
+    j.ContentLicense,
+    j.TagName,
+    j.TagCount,
+    j.BadgesEarned,
+    j.LastEditorUserId,
+    j.LastEditDate
+FROM judging j
+ORDER BY
+    j.LastActivityDate DESC,
+    j.Score DESC,
+    j.ViewCount DESC
+LIMIT 100;

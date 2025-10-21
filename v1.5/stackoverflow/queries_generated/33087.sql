@@ -1,0 +1,45 @@
+-- {"query": "33087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 415} 
+SELECT 
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Title,
+    p.Tags,
+    u.Reputation AS OwnerReputation,
+    u.Location AS OwnerLocation,
+    u.CreationDate AS UserJoinDate,
+    COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountTotal,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) OVER (PARTITION BY p.Id) AS UpVotesCount,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) OVER (PARTITION BY p.Id) AS DownVotesCount,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DuplicateLinks,
+    COUNT(CASE WHEN bh.PostHistoryTypeId = 10 THEN 1 END) OVER (PARTITION BY p.Id) AS CloseVotesCount,
+    ARRAY_AGG(DISTINCT tl.Name) OVER (PARTITION BY p.Id) AS LinkTypesUsed,
+    p.LastActivityDate,
+    p.ContentLicense
+FROM 
+    Posts p
+JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Comments c ON c.PostId = p.Id
+LEFT JOIN 
+    Votes v ON v.PostId = p.Id
+LEFT JOIN 
+    PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN 
+    LinkTypes tl ON pl.LinkTypeId = tl.Id
+LEFT JOIN 
+    PostHistory bh ON bh.PostId = p.Id
+WHERE 
+    p.CreationDate >= NOW() - INTERVAL '1 year'
+    AND p.PostTypeId IN (1, 2)
+ORDER BY 
+    p.CreationDate DESC
+LIMIT 100;

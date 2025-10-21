@@ -1,0 +1,90 @@
+-- {"query": "22054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1087} 
+WITH UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountiesOffered
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        STRING_AGG(b.Name, '; ') AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate, u.Location,
+           COALESCE(ups.QuestionCount, 0) AS Questions,
+           COALESCE(ups.AnswerCount, 0) AS Answers,
+           COALESCE(ups.TotalScore, 0) AS PostScore,
+           COALESCE(uvs.UpvotesGiven, 0) AS Upvotes,
+           COALESCE(ubs.TotalBadges, 0) AS Badges,
+           COALESCE(ubs.BadgeList, 'No Badges') AS BadgesList
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+    LEFT JOIN UserVoteStats uvs ON u.Id = uvs.UserId
+    LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+    WHERE u.Reputation > 1000
+),
+PostInteractions AS (
+    SELECT p.Id AS PostId, p.Title, p.Tags,
+           COUNT(c.Id) AS CommentCount,
+           COUNT(DISTINCT pl.RelatedPostId) AS LinkCount,
+           SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END ELSE 0 END) AS NetVotes
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+    GROUP BY p.Id, p.Title, p.Tags
+),
+RankedUsers AS (
+    SELECT *,
+           ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS GlobalRank,
+           PERCENT_RANK() OVER (ORDER BY Reputation) AS RepPercentile,
+           FIRST_VALUE(Reputation) OVER (ORDER BY Reputation DESC) AS TopRep
+    FROM TopUsers
+),
+FinalStats AS (
+    SELECT ru.Id, ru.Reputation, ru.Questions, ru.Answers, ru.PostScore, ru.Upvotes, ru.Badges,
+           ru.BadgesList, ru.GlobalRank, ru.RepPercentile, ru.TopRep,
+           CASE 
+               WHEN ru.Reputation >= ru.TopRep * 0.9 THEN 'Elite'
+               WHEN ru.Reputation >= ru.TopRep * 0.5 THEN 'Advanced'
+               ELSE 'Beginner'
+           END AS UserTier,
+           (ru.Questions + ru.Answers) * 1.0 / NULLIF(DATEDIFF('day', ru.CreationDate, CURRENT_DATE), 0) AS PostsPerDay,
+           LENGTH(ru.BadgesList) - LENGTH(REPLACE(ru.BadgesList, ';', '')) + 1 AS BadgeTypes
+    FROM RankedUsers ru
+    WHERE ru.Questions > 0
+)
+SELECT fs.*, pi.Title, pi.NetVotes, pi.CommentCount, pi.LinkCount,
+       (SELECT COUNT(*) FROM PostInteractions WHERE NetVotes > fs.PostScore) AS PostsWithHigherNetVotes
+FROM FinalStats fs
+LEFT JOIN PostInteractions pi ON fs.Id = (SELECT OwnerUserId FROM Posts WHERE Id = pi.PostId LIMIT 1)
+ORDER BY fs.GlobalRank, fs.PostsPerDay DESC
+UNION ALL
+SELECT fs.Id, fs.Reputation, fs.Questions, fs.Answers, fs.PostScore, fs.Upvotes, fs.Badges,
+       fs.BadgesList, fs.GlobalRank, fs.RepPercentile, fs.TopRep,
+       fs.UserTier, fs.PostsPerDay, fs.BadgeTypes, NULL, NULL, NULL, NULL, NULL
+FROM FinalStats fs
+WHERE fs.BadgeTypes IS NULL;

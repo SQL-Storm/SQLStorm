@@ -1,0 +1,110 @@
+-- {"query": "12025.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 868} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.ViewCount DESC) AS ViewQuartile
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND
+        P.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+), 
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS Questions,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS Answers,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(P.CreationDate) AS LastActivityDate
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        U.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+), 
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore,
+        MAX(P.CreationDate) AS LatestPostDate
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.Id = ANY(string_to_array(P.Tags, '><'))
+    WHERE 
+        P.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        T.TagName
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserPostRank,
+    RP.ScoreRank,
+    RP.ViewQuartile,
+    UA.Reputation,
+    UA.Questions,
+    UA.Answers,
+    UA.UpVotes,
+    UA.DownVotes,
+    UA.LastActivityDate,
+    TS.TagName,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    TS.LatestPostDate
+FROM 
+    RankedPosts RP
+JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+JOIN 
+    LATERAL (
+        SELECT 
+            T.TagName,
+            TS.PostCount,
+            TS.TotalScore,
+            TS.AvgScore,
+            TS.LatestPostDate
+        FROM 
+            unnest(string_to_array(RP.Tags, '><')) WITH ORDINALITY AS TagArray(TagName, ord)
+        JOIN 
+            Tags T ON TagArray.TagName = T.TagName
+        JOIN 
+            TagStats TS ON T.TagName = TS.TagName
+        ORDER BY 
+            TS.TotalScore DESC
+        LIMIT 1
+    ) TS ON true
+WHERE 
+    RP.UserPostRank <= 3 AND
+    RP.ScoreRank <= 10 AND
+    RP.ViewQuartile = 1
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

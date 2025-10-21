@@ -1,0 +1,87 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalPosts,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.UserId = u.Id) AS TotalComments
+    FROM
+        Users u
+    WHERE
+        u.Reputation > 15000
+        AND u.CreationDate < (DATE '2024-10-01' - INTERVAL '5' YEAR)
+        AND u.AboutMe IS NOT NULL
+),
+RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.ViewCount AS QuestionViewCount,
+        a.CreationDate AS AnswerCreationDate,
+        (a.CreationDate - q.CreationDate) AS ResponseTime,
+        ROW_NUMBER() OVER(PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        AVG(a.Score) OVER(PARTITION BY a.OwnerUserId) AS AvgUserAnswerScore,
+        MAX(a.Score) OVER(PARTITION BY a.OwnerUserId) AS MaxUserAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY a.Id) AS UpvotesOnAnswer
+    FROM
+        Posts a
+    JOIN
+        Posts q ON a.ParentId = q.Id
+    LEFT JOIN
+        Votes v ON a.Id = v.PostId
+    WHERE
+        a.PostTypeId = 2
+        AND a.OwnerUserId IS NOT NULL
+),
+RecentActions AS (
+    SELECT UserId, CreationDate, CAST('Post' AS VARCHAR(10)) AS ActionType FROM Posts WHERE CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+    UNION ALL
+    SELECT UserId, CreationDate, CAST('Comment' AS VARCHAR(10)) AS ActionType FROM Comments WHERE CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+    UNION ALL
+    SELECT UserId, CreationDate, CAST('Vote' AS VARCHAR(10)) AS ActionType FROM Votes WHERE VoteTypeId IN (2, 3, 5) AND CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+)
+SELECT
+    uas.DisplayName,
+    uas.Reputation,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.TotalPosts,
+    ra.AnswerScore AS TopAnswerScore,
+    ra.AvgUserAnswerScore,
+    CASE
+        WHEN uas.Reputation > 200000 AND uas.GoldBadges > 15 AND ra.AvgUserAnswerScore > 20 THEN 'Community Pillar'
+        WHEN uas.Reputation > 100000 OR uas.GoldBadges > 10 THEN 'Esteemed Contributor'
+        WHEN uas.TotalPosts > 1000 AND ra.AvgUserAnswerScore > 5 THEN 'Power User'
+        ELSE 'Regular High-Rep User'
+    END AS UserTier,
+    (LOG(1 + uas.Reputation) * 10) + (uas.GoldBadges * 25) + (uas.SilverBadges * 10) + COALESCE(ra.AvgUserAnswerScore, 0) * 1.5 - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.CreationDate)) / 31536000) AS EngagementScore,
+    COALESCE(NULLIF(REGEXP_REPLACE(uas.Location, '^.*([A-Za-z\\s]+)$', '\\1'), ''), 'Location Undefined') AS ParsedLocation,
+    ra.QuestionTags AS TopAnswerQuestionTags,
+    DENSE_RANK() OVER (ORDER BY (LOG(1 + uas.Reputation) * 10) + (uas.GoldBadges * 25) + (uas.SilverBadges * 10) + COALESCE(ra.AvgUserAnswerScore, 0) * 1.5 - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.CreationDate)) / 31536000) DESC) AS UserRank,
+    LAG(uas.DisplayName, 1, 'N/A') OVER (ORDER BY (LOG(1 + uas.Reputation) * 10) + (uas.GoldBadges * 25) + (uas.SilverBadges * 10) + COALESCE(ra.AvgUserAnswerScore, 0) * 1.5 - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.CreationDate)) / 31536000) DESC) AS PreviousRankedUser
+FROM
+    UserActivitySummary uas
+LEFT JOIN
+    RankedAnswers ra ON uas.Id = ra.OwnerUserId AND ra.AnswerRank = 1
+WHERE
+    uas.TotalComments > uas.TotalPosts
+    AND LENGTH(uas.AboutMe) > 150
+    AND (ra.QuestionTags LIKE '%<sql>%' OR ra.QuestionTags LIKE '%<performance>%')
+    AND EXISTS (
+        SELECT 1
+        FROM RecentActions r_act
+        WHERE r_act.UserId = uas.Id
+          AND r_act.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH)
+    )
+ORDER BY
+    UserRank ASC,
+    uas.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,123 @@
+-- {"query": "21056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1356} 
+
+WITH ActiveUsers AS (
+  SELECT 
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Users u
+  INNER JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Reputation > 100
+    AND u.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    AND p.CreationDate > u.CreationDate
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+  HAVING COUNT(DISTINCT p.Id) >= 3
+),
+UserActivityMetrics AS (
+  SELECT 
+    au.UserId,
+    au.Reputation,
+    au.PostCount,
+    au.AvgPostScore,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id END) AS EditsMade,
+    SUM(CASE WHEN b.Date > au.CreationDate THEN 1 ELSE 0 END) AS TotalBadges,
+    ROW_NUMBER() OVER (PARTITION BY CASE WHEN au.Reputation > 1000 THEN 'High' ELSE 'Medium' END ORDER BY au.PostCount DESC, au.AvgPostScore DESC) AS ActivityRank,
+    LAG(au.PostCount) OVER (PARTITION BY au.UserId ORDER BY au.CreationDate) AS PreviousPostCount
+  FROM ActiveUsers au
+  LEFT JOIN Votes v ON au.UserId = v.PostId AND v.VoteTypeId IN (2, 3)
+  LEFT JOIN PostHistory ph ON au.UserId = ph.UserId AND ph.PostHistoryTypeId = 5
+  LEFT JOIN Badges b ON au.UserId = b.UserId
+  GROUP BY au.UserId, au.Reputation, au.PostCount, au.AvgPostScore, au.CreationDate
+),
+QuestionStats AS (
+  SELECT 
+    p.Id AS QuestionId,
+    p.OwnerUserId,
+    p.Score AS QuestionScore,
+    p.ViewCount,
+    p.AnswerCount,
+    COALESCE(p.ClosedDate, p.CreationDate) AS LastStatusDate,
+    STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ') AS TopQuestionTags,
+    RANK() OVER (ORDER BY p.ViewCount DESC, p.AnswerCount DESC) AS QuestionPopularityRank
+  FROM Posts p
+  INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0
+  WHERE pt.Name = 'Question'
+    AND p.Score IS NOT NULL
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > CURRENT_DATE - INTERVAL '30 days')
+  GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.ClosedDate, p.CreationDate
+)
+SELECT 
+  uam.UserId,
+  u.DisplayName,
+  uam.Reputation,
+  uam.PostCount,
+  uam.AvgPostScore,
+  uam.UpvotesReceived,
+  uam.DownvotesReceived,
+  uam.EditsMade,
+  uam.TotalBadges,
+  uam.ActivityRank,
+  COALESCE(qs.QuestionCount, 0) AS QuestionsPosted,
+  COALESCE(qs.TotalQuestionScore, 0) AS TotalQuestionScore,
+  COALESCE(qs.AvgViewsPerQuestion, 0) AS AvgViewsPerQuestion,
+  CASE 
+    WHEN uam.DownvotesReceived > uam.UpvotesReceived * 0.5 THEN 'NeedsImprovement'
+    WHEN uam.UpvotesReceived > uam.PostCount * 2 THEN 'Popular'
+    ELSE 'Average'
+  END AS UserPerformanceCategory,
+  CONCAT(
+    'User with ',
+    uam.PostCount,
+    ' posts, ',
+    COALESCE(qs.QuestionCount, 0),
+    ' questions, avg score ',
+    ROUND(uam.AvgPostScore, 2),
+    CASE WHEN uam.ClosedQuestions > 0 THEN CONCAT(', ', uam.ClosedQuestions, ' closed') ELSE '' END,
+    CASE WHEN uam.ActivityRank = 1 THEN ' (Top Active)' ELSE '' END
+  ) AS UserSummary,
+  GREATEST(
+    COALESCE(uam.UpvotesReceived, 0),
+    COALESCE(uam.TotalBadges, 0),
+    COALESCE(qs.TotalQuestionScore, 0)
+  ) AS MaxAchievement
+FROM UserActivityMetrics uam
+INNER JOIN Users u ON uam.UserId = u.Id
+LEFT JOIN (
+  SELECT 
+    qs.OwnerUserId,
+    COUNT(*) AS QuestionCount,
+    SUM(qs.QuestionScore) AS TotalQuestionScore,
+    AVG(qs.ViewCount * 1.0) AS AvgViewsPerQuestion,
+    COUNT(CASE WHEN qs.ClosedDate IS NOT NULL THEN 1 END) AS ClosedQuestions,
+    STRING_AGG(DISTINCT qs.TopQuestionTags, '; ') AS AllQuestionTags
+  FROM QuestionStats qs
+  GROUP BY qs.OwnerUserId
+) qs ON uam.UserId = qs.OwnerUserId
+LEFT JOIN (
+  SELECT 
+    pl.PostId,
+    COUNT(DISTINCT pl.RelatedPostId) AS LinkCount,
+    AVG(pl.CreationDate) AS AvgLinkDate
+  FROM PostLinks pl
+  INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked', 'Duplicate')
+    AND pl.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+  GROUP BY pl.PostId
+  HAVING COUNT(DISTINCT pl.RelatedPostId) > 1
+) links ON uam.UserId = links.PostId
+WHERE uam.ActivityRank <= 50
+  AND (uam.PostCount > 5 OR qs.QuestionCount > 3)
+  AND COALESCE(uam.DownvotesReceived, 0) < uam.UpvotesReceived * 0.3
+ORDER BY 
+  CASE uam.ActivityRank 
+    WHEN 1 THEN 0 
+    ELSE 1 
+  END,
+  GREATEST(COALESCE(uam.UpvotesReceived, 0), COALESCE(qs.TotalQuestionScore, 0)) DESC,
+  uam.Reputation DESC
+LIMIT 25;

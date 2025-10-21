@@ -1,0 +1,91 @@
+-- {"query": "14039.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 93400, "output_tokens": 39239} 
+WITH user_posts AS (
+  SELECT 
+    u.Id AS user_id, 
+    COUNT(p.Id) AS total_posts, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS total_questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS total_answers,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS total_closed_posts,
+    SUM(p.Score) AS total_post_score,
+    SUM(p.ViewCount) AS total_post_views,
+    SUM(p.FavoriteCount) AS total_post_favorites
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id
+),
+user_badges AS (
+  SELECT 
+    b.UserId AS user_id,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    COUNT(b.Id) AS total_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_votes AS (
+  SELECT 
+    v.UserId AS user_id,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS total_downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS total_accepted_answers
+  FROM Votes v
+  GROUP BY v.UserId
+),
+user_stats AS (
+  SELECT 
+    up.user_id,
+    up.total_posts,
+    up.total_questions,
+    up.total_answers,
+    up.total_closed_posts,
+    up.total_post_score,
+    up.total_post_views,
+    up.total_post_favorites,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.total_badges,
+    uv.total_upvotes,
+    uv.total_downvotes,
+    uv.total_accepted_answers
+  FROM user_posts up
+  JOIN user_badges ub ON up.user_id = ub.user_id
+  JOIN user_votes uv ON up.user_id = uv.user_id
+)
+SELECT 
+  u.DisplayName, 
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.AboutMe,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.EmailHash,
+  u.AccountId,
+  us.total_posts,
+  us.total_questions,
+  us.total_answers,
+  us.total_closed_posts,
+  us.total_post_score,
+  us.total_post_views,
+  us.total_post_favorites,
+  us.gold_badges,
+  us.silver_badges,
+  us.bronze_badges,
+  us.total_badges,
+  us.total_upvotes,
+  us.total_downvotes,
+  us.total_accepted_answers,
+  ROUND(us.total_post_score * 1.0 / NULLIF(us.total_posts, 0), 2) AS avg_post_score,
+  ROUND(us.total_post_views * 1.0 / NULLIF(us.total_posts, 0), 2) AS avg_post_views,
+  ROUND(us.total_post_favorites * 1.0 / NULLIF(us.total_posts, 0), 2) AS avg_post_favorites,
+  ROUND(us.total_upvotes * 1.0 / NULLIF(us.total_posts, 0), 2) AS avg_upvotes_per_post,
+  ROUND(us.total_downvotes * 1.0 / NULLIF(us.total_posts, 0), 2) AS avg_downvotes_per_post,
+  ROUND(us.total_accepted_answers * 1.0 / NULLIF(us.total_answers, 0), 2) AS acceptance_rate
+FROM Users u
+LEFT JOIN user_stats us ON u.Id = us.user_id
+ORDER BY u.Reputation DESC
+LIMIT 100;

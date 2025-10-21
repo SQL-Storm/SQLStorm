@@ -1,0 +1,172 @@
+WITH
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreation,
+    u.LastAccessDate,
+    COALESCE(u.Views,0) AS Views,
+    COALESCE(u.UpVotes,0) AS UpVotes,
+    COALESCE(u.DownVotes,0) AS DownVotes,
+    COUNT(p.Id) AS TotalPosts,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Views,0),
+    COALESCE(u.UpVotes,0),
+    COALESCE(u.DownVotes,0)
+),
+TagEngagement AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS ttag
+  JOIN Tags t ON t.TagName = ttag.TagName
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+PostHistorySignals AS (
+  SELECT
+    ph.PostId,
+    MAX(CASE WHEN pht.Name IS NULL THEN ph.CreationDate ELSE NULL END) AS dummy
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  GROUP BY ph.PostId
+),
+PostsDerived AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.ClosedDate,
+    CASE
+      WHEN p.ClosedDate IS NULL THEN true
+      ELSE false
+    END AS IsOpen,
+    CASE
+      WHEN p.ViewCount > 1000 THEN 'Popular'
+      WHEN p.ViewCount BETWEEN 100 AND 999 THEN 'Medium'
+      ELSE 'Low'
+    END AS VisibilityBand,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount
+  FROM Posts p
+  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+    AND (p.Score IS NULL OR p.Score >= 0)
+),
+PostLinksAgg AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS LinkCount,
+    SUM(CASE WHEN lt.Name ILIKE '%duplicate%' THEN 1 ELSE 0 END) AS DuplicateLinkCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+),
+BadgesByUser AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+ReputationBands AS (
+  SELECT
+    u.Id AS UserId,
+    CASE
+      WHEN u.Reputation >= 20000 THEN 'Legend'
+      WHEN u.Reputation >= 1000  THEN 'High'
+      WHEN u.Reputation >= 100   THEN 'Medium'
+      ELSE 'Low'
+    END AS RepBand
+  FROM Users u
+),
+BenchmarkA AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.LastPostDate,
+    rb.BadgeCount,
+    rb.LastBadgeDate,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    pa.IsOpen,
+    pa.VisibilityBand,
+    pa.CommentCount,
+    pb.LinkCount
+  FROM RecentActivity ua
+  LEFT JOIN BadgesByUser rb ON rb.UserId = ua.UserId
+  LEFT JOIN ReputationBands rep ON rep.UserId = ua.UserId
+  LEFT JOIN PostsDerived pa ON pa.OwnerUserId = ua.UserId
+  LEFT JOIN PostLinksAgg pb ON pb.PostId = pa.Id
+  WHERE ua.TotalPosts > 0
+),
+BenchmarkB AS (
+  SELECT
+    t.TagName,
+    t.TagPostCount,
+    t.AvgPostScore,
+    SUM(p.Score) AS TotalScoresForTag
+  FROM TagEngagement t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' OR p.Tags LIKE '%' || replace(t.TagName,'_','') || '%'
+  GROUP BY t.TagName, t.TagPostCount, t.AvgPostScore
+)
+SELECT
+  'A' AS Run,
+  bA.UserId,
+  bA.DisplayName,
+  bA.Reputation,
+  bA.TotalPosts,
+  bA.LastPostDate,
+  bA.BadgeCount,
+  bA.LastBadgeDate,
+  bA.Views,
+  bA.UpVotes,
+  bA.DownVotes,
+  bA.IsOpen AS OpenFlag,
+  bA.VisibilityBand,
+  bA.CommentCount,
+  bA.LinkCount
+FROM BenchmarkA bA
+
+UNION ALL
+
+SELECT
+  'B' AS Run,
+  NULL AS UserId,
+  NULL AS DisplayName,
+  NULL AS Reputation,
+  NULL AS TotalPosts,
+  NULL AS LastPostDate,
+  NULL AS BadgeCount,
+  NULL AS LastBadgeDate,
+  NULL AS Views,
+  NULL AS UpVotes,
+  NULL AS DownVotes,
+  NULL AS OpenFlag,
+  NULL AS VisibilityBand,
+  NULL AS CommentCount,
+  bB.TotalScoresForTag AS LinkCount
+FROM BenchmarkB bB
+ORDER BY Run, UserId NULLS LAST
+LIMIT 100;

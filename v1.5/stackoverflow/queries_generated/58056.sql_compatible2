@@ -1,0 +1,71 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserJoinDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownvotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.Score) AS HighestPostScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+ActiveEditors AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.UserId
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.UserJoinDate,
+    us.TotalPosts,
+    us.TotalComments,
+    us.TotalUpvotes,
+    us.TotalDownvotes,
+    us.TotalBadges,
+    ae.EditedPosts,
+    ae.LastEditDate,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 2
+    ) AS AnswersGiven,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId IN (
+            SELECT Id 
+            FROM Posts 
+            WHERE OwnerUserId = u.Id
+        ) 
+          AND pl.LinkTypeId = 3
+    ) AS DuplicateMarkings,
+    (
+        SELECT STRING_AGG(TagName, ', ')
+        FROM Tags
+        WHERE Id IN (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2), '><'))
+        )
+    ) AS TopTags
+FROM Users u
+JOIN UserStats us ON u.Id = us.UserId
+LEFT JOIN ActiveEditors ae ON u.Id = ae.UserId
+WHERE us.TotalPosts > 100
+  AND us.TotalComments > 50
+  AND u.Reputation >= 10000
+  AND us.PostRank = 1
+ORDER BY u.Reputation DESC, us.HighestPostScore DESC
+LIMIT 100;

@@ -1,0 +1,64 @@
+WITH top_users AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS total_downvotes,
+    ROW_NUMBER() OVER (ORDER BY SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC) AS row_num
+  FROM 
+    Users u
+  JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  JOIN 
+    Votes v ON p.Id = v.PostId
+  GROUP BY 
+    u.Id, u.DisplayName
+),
+top_posts AS (
+  SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS row_num
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1
+),
+top_tags AS (
+  SELECT 
+    t.TagName, 
+    COUNT(DISTINCT p.Id) AS num_posts,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS row_num
+  FROM 
+    Posts p
+  CROSS JOIN LATERAL (
+    SELECT TRIM(x) AS TagName
+    FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ',')) AS x
+  ) AS t
+  GROUP BY 
+    t.TagName
+)
+SELECT 
+  tu.Id AS user_id, 
+  tu.DisplayName AS user_name, 
+  tu.total_upvotes, 
+  tu.total_downvotes, 
+  tp.Id AS post_id, 
+  tp.Title AS post_title, 
+  tp.Score AS post_score, 
+  tp.ViewCount AS post_view_count, 
+  tt.TagName AS top_tag
+FROM 
+  top_users tu
+JOIN 
+  top_posts tp ON tu.row_num = tp.row_num
+JOIN 
+  top_tags tt ON tu.row_num = tt.row_num
+WHERE 
+  tu.row_num <= 10
+  AND tp.row_num <= 10
+  AND tt.row_num <= 10
+ORDER BY 
+  tu.total_upvotes DESC;

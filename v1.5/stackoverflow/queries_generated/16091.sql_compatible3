@@ -1,0 +1,176 @@
+WITH user_engagement_metrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= DATE '2020-01-01'
+        AND u.Reputation > 100
+        AND (u.Location IS NOT NULL OR u.WebsiteUrl IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+badge_statistics AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ') AS GoldBadgeNames,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = 0
+    GROUP BY b.UserId
+),
+question_answer_dynamics AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        (CAST((CAST(a.CreationDate AS TIMESTAMP) - CAST(q.CreationDate AS TIMESTAMP) AS INTERVAL) AS DOUBLE) / 3600.0) AS HoursToAnswer,
+        CASE 
+            WHEN q.AcceptedAnswerId = a.Id THEN 'Accepted'
+            WHEN a.Score = (SELECT MAX(a2.Score) FROM Posts a2 WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2) THEN 'HighestScored'
+            ELSE 'Other'
+        END AS AnswerStatus,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS AnswerSequence,
+        LAG(a.Score, 1, 0) OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS PreviousAnswerScore
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate BETWEEN TIMESTAMP '2021-01-01' AND TIMESTAMP '2023-12-31'
+        AND q.ClosedDate IS NULL
+        AND q.Score >= 5
+        AND q.AnswerCount > 0
+),
+tag_performance AS (
+    SELECT 
+        TRIM(tag_element) AS TagName,
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        COUNT(*) OVER (PARTITION BY TRIM(tag_element)) AS TagFrequency,
+        AVG(p.Score) OVER (PARTITION BY TRIM(tag_element)) AS AvgTagScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) OVER (PARTITION BY TRIM(tag_element)) AS MedianTagViews
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag_element
+    WHERE p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND LENGTH(p.Tags) > 2
+),
+voting_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS Favorites,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountyCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount END), 0) AS TotalBountyAmount,
+        MIN(v.CreationDate) AS FirstVoteDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5, 8)
+    GROUP BY v.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.ReputationRank,
+    uem.YearlyRepRank,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(CAST(uem.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    uem.TotalViews,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(bs.GoldBadgeNames, 'None') AS GoldBadgeNames,
+    COALESCE(answered_stats.TotalAnswersGiven, 0) AS TotalAnswersGiven,
+    COALESCE(answered_stats.AcceptedAnswers, 0) AS AcceptedAnswers,
+    COALESCE(answered_stats.AvgAnswerTime, 0) AS AvgHoursToAnswer,
+    COALESCE(tag_stats.TopTag, 'N/A') AS MostUsedTag,
+    COALESCE(tag_stats.TopTagCount, 0) AS TopTagUsageCount,
+    COALESCE(vote_stats.TotalUpVotesReceived, 0) AS TotalUpVotesReceived,
+    COALESCE(vote_stats.TotalDownVotesReceived, 0) AS TotalDownVotesReceived,
+    COALESCE(vote_stats.TotalFavoritesReceived, 0) AS TotalFavoritesReceived,
+    CASE 
+        WHEN uem.AvgPostScore > 10 AND COALESCE(bs.GoldBadges, 0) > 0 THEN 'Elite Contributor'
+        WHEN uem.AvgPostScore > 5 AND COALESCE(bs.TotalBadges, 0) > 10 THEN 'Advanced Contributor'
+        WHEN uem.TotalPosts > 50 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END AS ContributorTier,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     INNER JOIN Posts p2 ON c.PostId = p2.Id 
+     WHERE c.UserId = uem.UserId 
+        AND p2.OwnerUserId != uem.UserId
+        AND c.Score > 0) AS HighQualityCommentsOnOthersPosts,
+    EXISTS(
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = uem.UserId 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId != uem.UserId)
+    ) AS HasEditedOthersPosts
+FROM user_engagement_metrics uem
+LEFT JOIN badge_statistics bs ON uem.UserId = bs.UserId
+LEFT JOIN (
+    SELECT 
+        qad.AnswerOwnerId,
+        COUNT(*) AS TotalAnswersGiven,
+        COUNT(CASE WHEN qad.AnswerStatus = 'Accepted' THEN 1 END) AS AcceptedAnswers,
+        AVG(CASE WHEN qad.HoursToAnswer < 168 THEN qad.HoursToAnswer END) AS AvgAnswerTime
+    FROM question_answer_dynamics qad
+    GROUP BY qad.AnswerOwnerId
+) answered_stats ON uem.UserId = answered_stats.AnswerOwnerId
+LEFT JOIN (
+    SELECT 
+        tp.OwnerUserId,
+        tp.TagName AS TopTag,
+        COUNT(*) AS TopTagCount,
+        ROW_NUMBER() OVER (PARTITION BY tp.OwnerUserId ORDER BY COUNT(*) DESC) AS rn
+    FROM tag_performance tp
+    WHERE tp.TagFrequency > 100
+    GROUP BY tp.OwnerUserId, tp.TagName
+) tag_stats ON uem.UserId = tag_stats.OwnerUserId AND tag_stats.rn = 1
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        SUM(vp.UpVotes) AS TotalUpVotesReceived,
+        SUM(vp.DownVotes) AS TotalDownVotesReceived,
+        SUM(vp.Favorites) AS TotalFavoritesReceived
+    FROM Posts p
+    INNER JOIN voting_patterns vp ON p.Id = vp.PostId
+    GROUP BY p.OwnerUserId
+) vote_stats ON uem.UserId = vote_stats.OwnerUserId
+WHERE uem.ReputationRank <= 1000
+    AND (COALESCE(answered_stats.TotalAnswersGiven, 0) > 0 OR uem.QuestionCount > 0)
+    AND COALESCE(vote_stats.TotalUpVotesReceived, 0) > COALESCE(vote_stats.TotalDownVotesReceived, 0) * 2
+ORDER BY 
+    CASE 
+        WHEN uem.AvgPostScore > 0 THEN (uem.Reputation::numeric / NULLIF(uem.TotalPosts, 0))
+        ELSE 0 
+    END DESC,
+    uem.Reputation DESC,
+    COALESCE(bs.TotalBadges, 0) DESC
+LIMIT 500;

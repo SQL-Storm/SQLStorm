@@ -1,0 +1,140 @@
+-- {"query": "18003.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1467} 
+
+WITH UserPostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.OwnerUserId IS NOT NULL
+),
+HighReputationUsers AS (
+    SELECT
+        UserId
+    FROM Users
+    WHERE Reputation > 10000
+),
+RecentQuestions AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        Title,
+        Tags,
+        Score,
+        AnswerCount,
+        FavoriteCount,
+        CreationDate
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate >= DATE('now', '-30 day')
+),
+QuestionMetrics AS (
+    SELECT
+        rq.Id AS QuestionId,
+        rq.Title,
+        rq.Tags,
+        rq.Score AS QuestionScore,
+        rq.AnswerCount AS QuestionAnswerCount,
+        rq.FavoriteCount AS QuestionFavoriteCount,
+        rq.CreationDate AS QuestionCreationDate,
+        u.DisplayName AS QuestionOwnerDisplayName,
+        u.Reputation AS QuestionOwnerReputation,
+        COUNT(c.Id) AS CommentCountOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        AVG(COALESCE(a.Score, 0)) AS AverageAnswerScore,
+        COUNT(a.Id) AS NumberOfAnswers
+    FROM RecentQuestions rq
+    LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON rq.Id = c.PostId
+    LEFT JOIN Votes v ON rq.Id = v.PostId
+    LEFT JOIN Posts a ON rq.Id = a.ParentId AND a.PostTypeId = 2
+    GROUP BY rq.Id, rq.Title, rq.Tags, rq.Score, rq.AnswerCount, rq.FavoriteCount, rq.CreationDate, u.DisplayName, u.Reputation
+),
+HotQuestions AS (
+    SELECT
+        Id
+    FROM QuestionMetrics
+    WHERE QuestionScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+      AND QuestionAnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1)
+      AND QuestionCreationDate >= DATE('now', '-7 day')
+),
+UserEngagement AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        AVG(p.Score) AS AveragePostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Posts p
+    LEFT JOIN Comments c ON p.OwnerUserId = c.UserId
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    qm.QuestionId,
+    qm.Title,
+    qm.Tags,
+    qm.QuestionScore,
+    qm.QuestionAnswerCount,
+    qm.QuestionFavoriteCount,
+    qm.QuestionCreationDate,
+    qm.QuestionOwnerDisplayName,
+    qm.QuestionOwnerReputation,
+    qm.CommentCountOnQuestion,
+    qm.UpVoteCount,
+    qm.DownVoteCount,
+    qm.AverageAnswerScore,
+    qm.NumberOfAnswers,
+    ue.TotalPosts,
+    ue.QuestionsAsked,
+    ue.AnswersGiven,
+    ue.AveragePostScore,
+    ue.TotalCommentsMade,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    CASE
+        WHEN qm.QuestionId IN (SELECT Id FROM HotQuestions) THEN 'Hot'
+        WHEN qm.QuestionOwnerReputation > 50000 THEN 'High Reputation User'
+        WHEN qm.NumberOfAnswers > 10 THEN 'Popular Question'
+        ELSE 'Standard'
+    END AS QuestionCategory,
+    CASE
+        WHEN qm.QuestionOwnerReputation IS NULL THEN 'Unknown Owner'
+        WHEN qm.QuestionOwnerReputation BETWEEN 0 AND 1000 THEN 'New User'
+        WHEN qm.QuestionOwnerReputation BETWEEN 1001 AND 10000 THEN 'Intermediate User'
+        ELSE 'Experienced User'
+    END AS OwnerExperienceLevel,
+    COALESCE(u.DisplayName, 'Deleted User') AS LatestEditorDisplayName,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.CommunityOwnedDate,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+    CASE WHEN LENGTH(p.Body) > 500 THEN 'Long' WHEN LENGTH(p.Body) > 100 THEN 'Medium' ELSE 'Short' END AS BodyLengthCategory
+FROM QuestionMetrics qm
+LEFT JOIN UserEngagement ue ON qm.OwnerUserId = ue.OwnerUserId
+LEFT JOIN Posts p ON qm.QuestionId = p.Id
+LEFT JOIN Users u ON p.LastEditorUserId = u.Id
+WHERE qm.QuestionOwnerReputation > 100
+ORDER BY qm.QuestionScore DESC, qm.QuestionFavoriteCount DESC, qm.QuestionCreationDate DESC
+LIMIT 100;

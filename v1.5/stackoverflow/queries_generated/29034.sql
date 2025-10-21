@@ -1,0 +1,143 @@
+-- {"query": "29034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3163} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 10 THEN p.Id END) as HighScoreQuestions,
+    COUNT(DISTINCT b.Id) as BadgesEarned,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) as TotalQuestionViews,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as MaxQuestionScore,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT v.Id) as VotesGiven,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2,3) THEN v.Id END) as UpDownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as Favorites,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (1,6,7,10,11) THEN v.Id END) as SpecialVotes,
+    COUNT(DISTINCT ph.Id) as PostHistoryEvents,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) as PostsClosed,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) as PostsReopened,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) as PostsDeleted,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.Id END) as PostsUndeleted,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 14 THEN ph.Id END) as PostsLocked,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 15 THEN ph.Id END) as PostsUnlocked,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (19,20) THEN ph.Id END) as PostsProtected,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (31,33,34) THEN ph.Id END) as SpecialHistoryEvents,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > 0) as PositiveScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > 0) as PositiveScoreAnswers,
+    (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1) as AvgQuestionScoreByUser,
+    (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 2) as AvgAnswerScoreByUser,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 1 AND p6.AcceptedAnswerId IS NOT NULL) as QuestionsWithAcceptedAnswers,
+    (SELECT COUNT(*) FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 2 AND p7.ParentId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1)) as AnswersToOwnQuestions,
+    (SELECT COUNT(*) FROM Posts p8 WHERE p8.OwnerUserId = u.Id AND p8.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts p9 WHERE p9.ParentId = p8.Id AND p9.OwnerUserId = u.Id)) as QuestionsWithOwnAnswers,
+    (SELECT COUNT(*) FROM Posts p10 WHERE p10.OwnerUserId = u.Id AND p10.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts p11 WHERE p11.ParentId = p10.Id AND p11.OwnerUserId IS NOT NULL AND p11.OwnerUserId != u.Id)) as QuestionsWithOtherAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) * 1.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 2)
+        ELSE 0 
+    END as AvgViewsPerQuestion,
+    CASE 
+        WHEN COUNT(DISTINCT b.Id) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) * 100.0 / COUNT(DISTINCT b.Id), 2)
+        ELSE 0 
+    END as GoldBadgePercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 AND COUNT(DISTINCT v.Id) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) * 100.0 / COUNT(DISTINCT v.Id), 2)
+        ELSE 0 
+    END as UpVotePercentage,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) * 100.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 2)
+        ELSE 0 
+    END as HighViewQuestionPercentage,
+    NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) - COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END), 0) as RegularViewQuestions,
+    COALESCE(
+        (SELECT TOP 1 t.TagName 
+         FROM Posts p12 
+         INNER JOIN LATERAL (
+             SELECT TRIM(SUBSTRING(p12.Tags, n.number + 1, 
+                 CASE 
+                     WHEN CHARINDEX('>', p12.Tags, n.number + 1) > 0 THEN CHARINDEX('>', p12.Tags, n.number + 1) - n.number - 1
+                     ELSE LEN(p12.Tags) - n.number
+                 END
+             )) as TagName
+             FROM (
+                 SELECT 0 as number UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
+                 SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+             ) as n
+             WHERE n.number < LEN(p12.Tags) AND SUBSTRING(p12.Tags, n.number + 1, 1) = '<'
+         ) as t ON t.TagName IS NOT NULL 
+         WHERE p12.OwnerUserId = u.Id AND p12.PostTypeId = 1
+         ORDER BY COUNT(*) DESC), 
+        'No Tags'
+    ) as TopTag,
+    (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / 
+     NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0)) as QuestionPercentageOfTotal,
+    (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / 
+     NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2), 0)) as AnswerPercentageOfTotal,
+    (COUNT(DISTINCT b.Id) * 100.0 / 
+     NULLIF((SELECT COUNT(*) FROM Badges), 0)) as BadgePercentageOfTotal,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 1.0 / 
+              (CASE WHEN DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) > 0 THEN DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) ELSE 1 END), 2)
+        ELSE 0 
+    END as QuestionsPerDay,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 1.0 / 
+              (CASE WHEN DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) > 0 THEN DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) ELSE 1 END), 2)
+        ELSE 0 
+    END as AnswersPerDay,
+    (SELECT MIN(p13.CreationDate) FROM Posts p13 WHERE p13.OwnerUserId = u.Id AND p13.PostTypeId = 1) as FirstQuestionDate,
+    (SELECT MAX(p14.CreationDate) FROM Posts p14 WHERE p14.OwnerUserId = u.Id AND p14.PostTypeId = 1) as LastQuestionDate,
+    (SELECT MIN(p15.CreationDate) FROM Posts p15 WHERE p15.OwnerUserId = u.Id AND p15.PostTypeId = 2) as FirstAnswerDate,
+    (SELECT MAX(p16.CreationDate) FROM Posts p16 WHERE p16.OwnerUserId = u.Id AND p16.PostTypeId = 2) as LastAnswerDate,
+    (SELECT COUNT(*) FROM Posts p17 WHERE p17.OwnerUserId = u.Id AND p17.PostTypeId = 1 AND p17.ViewCount = 0) as ZeroViewQuestions,
+    (SELECT COUNT(*) FROM Posts p18 WHERE p18.OwnerUserId = u.Id AND p18.PostTypeId = 2 AND p18.ViewCount = 0) as ZeroViewAnswers,
+    (SELECT COUNT(*) FROM Posts p19 WHERE p19.OwnerUserId = u.Id AND p19.PostTypeId = 1 AND p19.CommentCount > 0) as QuestionsWithComments,
+    (SELECT COUNT(*) FROM Posts p20 WHERE p20.OwnerUserId = u.Id AND p20.PostTypeId = 2 AND p20.CommentCount > 0) as AnswerWithComments,
+    (SELECT AVG(p21.CommentCount) FROM Posts p21 WHERE p21.OwnerUserId = u.Id AND p21.PostTypeId = 1) as AvgCommentsPerQuestion,
+    (SELECT AVG(p22.CommentCount) FROM Posts p22 WHERE p22.OwnerUserId = u.Id AND p22.PostTypeId = 2) as AvgCommentsPerAnswer,
+    (SELECT COUNT(*) FROM Posts p23 WHERE p23.OwnerUserId = u.Id AND p23.PostTypeId = 1 AND p23.AnswerCount > 0) as QuestionsWithAnswers,
+    (SELECT COUNT(*) FROM Posts p24 WHERE p24.OwnerUserId = u.Id AND p24.PostTypeId = 1 AND p24.FavoriteCount > 0) as QuestionsWithFavorites,
+    (SELECT COUNT(*) FROM Posts p25 WHERE p25.OwnerUserId = u.Id AND p25.PostTypeId = 2 AND p25.FavoriteCount > 0) as AnswersWithFavorites,
+    (SELECT COUNT(*) FROM Posts p26 WHERE p26.OwnerUserId = u.Id AND p26.PostTypeId = 1 AND p26.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) as AboveAverageQuestions,
+    (SELECT COUNT(*) FROM Posts p27 WHERE p27.OwnerUserId = u.Id AND p27.PostTypeId = 2 AND p27.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAverageAnswers,
+    (SELECT COUNT(*) FROM Posts p28 WHERE p28.OwnerUserId = u.Id AND p28.PostTypeId = 1 AND p28.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) as BelowAverageQuestions,
+    (SELECT COUNT(*) FROM Posts p29 WHERE p29.OwnerUserId = u.Id AND p29.PostTypeId = 2 AND p29.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as BelowAverageAnswers,
+    (SELECT COUNT(*) FROM Posts p30 WHERE p30.OwnerUserId = u.Id AND p30.PostTypeId = 1 AND p30.Score = (SELECT MAX(Score) FROM Posts WHERE PostTypeId = 1)) as MaxScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p31 WHERE p31.OwnerUserId = u.Id AND p31.PostTypeId = 2 AND p31.Score = (SELECT MAX(Score) FROM Posts WHERE PostTypeId = 2)) as MaxScoreAnswers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE u.Id IN (
+    SELECT DISTINCT UserId FROM Badges WHERE Date >= DATEADD(year, -2, GETDATE())
+    INTERSECT
+    SELECT DISTINCT OwnerUserId FROM Posts WHERE CreationDate >= DATEADD(year, -1, GETDATE())
+    EXCEPT
+    SELECT DISTINCT UserId FROM Votes WHERE VoteTypeId = 10
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0 
+   AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+   AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 0
+ORDER BY 
+    TotalPosts DESC,
+    Reputation DESC,
+    GoldBadges DESC,
+    Questions DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

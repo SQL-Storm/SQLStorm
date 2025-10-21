@@ -1,0 +1,110 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, 1 as Level, t.WikiPostId
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select t.Id, t.TagName, r.Level + 1, t.WikiPostId
+    from Tags t
+    inner join RecursiveTagHierarchy r on t.WikiPostId = r.WikiPostId
+    where r.Level < 5
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreView,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount,
+        coalesce(p.FavoriteCount,0) + coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 5),0) as TotalFavoriteAndSaves
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2) -- Questions and Answers
+      and p.Score > 0
+),
+RecentActivity as (
+    select ph.PostId, max(ph.CreationDate) LatestEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- edits of title, body, tags
+    group by ph.PostId
+),
+PostWithActivity as (
+    select rp.*, ra.LatestEditDate
+    from RankedPosts rp
+    left join RecentActivity ra on rp.Id = ra.PostId
+),
+PostLinkAgg as (
+    select pl.PostId, count(distinct pl.RelatedPostId) as LinkCount, 
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicateLinkCount
+    from PostLinks pl
+    group by pl.PostId
+),
+UserBadgeSummary as (
+    select b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Name end) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+ComplexFilteredPosts as (
+    select pwa.Id, pwa.PostTypeId, pwa.OwnerUserId, pwa.DisplayName, pwa.CreationDate, pwa.Score, pwa.ViewCount, 
+        pwa.Title, pwa.Tags, pwa.RankByScoreView, pwa.UserPostCount, pwa.TotalFavoriteAndSaves,
+        pla.LinkCount, pla.DuplicateLinkCount,
+        coalesce(ubs.BadgeCount,0) as BadgeCount,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.TagBasedBadges,0) as TagBasedBadges,
+        pwa.LatestEditDate,
+        (select count(*) from Comments c where c.PostId = pwa.Id and c.Score >= 5) as HighScoringComments,
+        (select cast(null as varchar) 
+             ) as LastPostHistoryTypeName
+    from PostWithActivity pwa
+    left join PostLinkAgg pla on pwa.Id = pla.PostId
+    left join UserBadgeSummary ubs on pwa.OwnerUserId = ubs.UserId
+    where pwa.ViewCount > 1000
+      and (pwa.Tags is not null and pwa.Tags like '%<sql>%') 
+      and (pwa.BadgeCount is null or pwa.BadgeCount < 100)
+      and pwa.RankByScoreView <= 25
+),
+CombinedPostUserStats as (
+    select cfp.Id, cfp.Title, cfp.Score, cfp.ViewCount, cfp.BadgeCount, cfp.GoldBadges, cfp.SilverBadges, cfp.BronzeBadges, cfp.TagBasedBadges,
+        u.Reputation, u.CreationDate as UserCreationDate, u.Location,
+        case when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 day' then 1 else 0 end as ActiveLast30Days,
+        cfp.LinkCount, cfp.DuplicateLinkCount, cfp.HighScoringComments, cfp.LastPostHistoryTypeName,
+        case 
+            when cfp.Score > 100 then 'HighScoring'
+            when cfp.Score between 50 and 100 then 'MediumScoring'
+            else 'LowScoring' end as ScoreCategory,
+        dense_rank() over (partition by cfp.PostTypeId order by cfp.Score desc, cfp.ViewCount desc) as DetailRank,
+        (select max(Score) from Posts p2 where p2.OwnerUserId = cfp.OwnerUserId and p2.PostTypeId = cfp.PostTypeId) as MaxUserScoreForPostType,
+        cfp.TotalFavoriteAndSaves,
+        cfp.LatestEditDate
+    from ComplexFilteredPosts cfp
+    left join Users u on cfp.OwnerUserId = u.Id
+)
+select cps.Id, cps.Title, cps.Score, cps.ViewCount, cps.BadgeCount, cps.GoldBadges, cps.SilverBadges, cps.BronzeBadges, cps.TagBasedBadges,
+    cps.Reputation, cps.UserCreationDate, cps.Location, cps.ActiveLast30Days,
+    cps.LinkCount, cps.DuplicateLinkCount, cps.HighScoringComments, cps.LastPostHistoryTypeName,
+    cps.ScoreCategory, cps.DetailRank, cps.MaxUserScoreForPostType, cps.TotalFavoriteAndSaves,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - cps.LatestEditDate))/86400.0 as DaysSinceLastEdit,
+    string_agg(distinct rth.TagName, ', ') as RelatedRequiredTags
+from CombinedPostUserStats cps
+left join RecursiveTagHierarchy rth on cps.Tags like '%' || rth.TagName || '%'
+group by cps.Id, cps.Title, cps.Score, cps.ViewCount, cps.BadgeCount, cps.GoldBadges, cps.SilverBadges, cps.BronzeBadges, cps.TagBasedBadges,
+    cps.Reputation, cps.UserCreationDate, cps.Location, cps.ActiveLast30Days,
+    cps.LinkCount, cps.DuplicateLinkCount, cps.HighScoringComments, cps.LastPostHistoryTypeName,
+    cps.ScoreCategory, cps.DetailRank, cps.MaxUserScoreForPostType, cps.TotalFavoriteAndSaves, cps.LatestEditDate
+having count(distinct rth.TagName) >= 2
+order by cps.Score desc, cps.ViewCount desc, cps.BadgeCount desc
+limit 50;

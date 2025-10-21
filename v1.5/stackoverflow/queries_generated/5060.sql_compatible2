@@ -1,0 +1,133 @@
+WITH TopContributors AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.CreationDate <= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentEdits AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS EditCount,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - u.CreationDate)) / 86400) AS AvgDaysSinceJoiningWhenEditMade
+    FROM PostHistory ph
+    INNER JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+PopularTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+UserTopTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        trim(both '<>' from unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS TagName,
+        COUNT(*) AS TagPostCount,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY COUNT(*) DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, trim(both '<>' from unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')))
+)
+SELECT
+    tc.UserId,
+    tc.DisplayName,
+    tc.QuestionsAsked,
+    tc.AnswersGiven,
+    tc.TotalPosts,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalBadges,
+    COALESCE(re.EditCount, 0) AS EditCountLast90Days,
+    COALESCE(re.AvgDaysSinceJoiningWhenEditMade, 0) AS AvgDaysSinceJoiningWhenEdit,
+    ut.TagName AS MostUsedTag,
+    pt.Count AS MostUsedTagOverallUsage,
+    (
+        SELECT
+            STRING_AGG(DISTINCT pht.Name || ': ' || ph.Comment,
+                       '; ' ORDER BY ph.CreationDate DESC)
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+        WHERE ph.UserId = tc.UserId
+          AND ph.PostHistoryTypeId IN (10, 14)
+          AND ph.Comment IS NOT NULL
+    ) AS RecentModerationActions,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.UserId = tc.UserId AND c.Score >= 5
+    ) AS UpvotedComments,
+    CASE
+        WHEN u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Active'
+        WHEN u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Dormant'
+        ELSE 'Inactive'
+    END AS CurrentActivityStatus,
+    CASE 
+        WHEN ub.LatestBadgeDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' THEN 'Recently Awarded'
+        ELSE 'No Badges This Year'
+    END AS BadgeRecency,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.UserId = tc.UserId 
+          AND v.VoteTypeId IN (2,3)
+          AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    ) AS RecentVotesCast,
+    (
+        SELECT COUNT(*)
+        FROM Posts p2
+        WHERE p2.OwnerUserId = tc.UserId AND p2.Score < 0
+    ) AS NegativelyScoredPosts
+FROM TopContributors tc
+JOIN Users u ON u.Id = tc.UserId
+LEFT JOIN UserBadges ub ON ub.UserId = tc.UserId
+LEFT JOIN RecentEdits re ON re.UserId = tc.UserId
+LEFT JOIN UserTopTags ut ON ut.UserId = tc.UserId AND ut.rn = 1
+LEFT JOIN PopularTags pt ON pt.TagName = ut.TagName
+WHERE tc.rn <= 50
+GROUP BY
+    tc.UserId,
+    tc.DisplayName,
+    tc.QuestionsAsked,
+    tc.AnswersGiven,
+    tc.TotalPosts,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalBadges,
+    re.EditCount,
+    re.AvgDaysSinceJoiningWhenEditMade,
+    ut.TagName,
+    pt.Count
+ORDER BY tc.TotalPosts DESC, u.Reputation DESC, tc.UserId ASC;

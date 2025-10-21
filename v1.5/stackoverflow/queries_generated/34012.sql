@@ -1,0 +1,144 @@
+-- {"query": "34012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1620} 
+
+WITH RecursiveAncestorTags AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.Tags,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+
+    UNION ALL
+
+    SELECT 
+        child.PostId,
+        parent.Tags,
+        ra.Level + 1
+    FROM Posts child
+    JOIN RecursiveAncestorTags ra ON child.ParentId = ra.PostId
+    JOIN Posts parent ON parent.Id = ra.PostId
+    WHERE ra.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(votes.UpVotes),0) AS TotalUpVotesReceived,
+        COALESCE(SUM(votes.DownVotes),0) AS TotalDownVotesReceived,
+        AVG(NULLIF(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS TimesPostsClosed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) votes ON votes.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId = 10
+    WHERE u.CreationDate < CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagUsage
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY Tag
+    ORDER BY TagUsage DESC
+    LIMIT 10
+),
+TopQuestions AS (
+    SELECT 
+        p.Id, p.Title, p.CreationDate, p.Score,
+        u.Id AS UserId, u.DisplayName,
+        array_agg(DISTINCT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS Tags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = p.OwnerUserId) AS UserBadgeCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= CURRENT_DATE - INTERVAL '6 months' 
+      AND EXISTS (
+        SELECT 1 FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) t(tag) 
+        WHERE tag IN (SELECT Tag FROM TopTags)
+      )
+    GROUP BY p.Id, u.Id, u.DisplayName
+    ORDER BY p.Score DESC
+    LIMIT 100
+),
+TopUsersEngagedInTopTags AS (
+    SELECT DISTINCT ua.UserId, ua.DisplayName
+    FROM UserActivity ua
+    JOIN Posts p ON p.OwnerUserId = ua.UserId
+    WHERE p.PostTypeId = 1 AND EXISTS (
+        SELECT 1 FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) t(tag)
+        WHERE tag IN (SELECT Tag FROM TopTags)
+    )
+),
+PostsWithComplexVoteStats AS (
+    SELECT 
+        p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END),0) AS TotalBountyStarted,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 9 THEN v.BountyAmount ELSE 0 END),0) AS TotalBountyClosed,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS CloseOrDeletionEvents
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2) AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate
+    HAVING (COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) > 0 OR COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 12) > 0)
+    ORDER BY UpVotes DESC, CommentCount DESC
+    LIMIT 50
+)
+SELECT 
+    tq.Id AS QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.CreationDate,
+    tq.UserId,
+    tq.DisplayName AS OwnerUserName,
+    tq.Tags,
+    tq.CommentCount,
+    tq.UpVotes,
+    tq.DownVotes,
+    tq.UserBadgeCount,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.BadgeCount,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    ua.AvgPostScore,
+    ua.MaxPostScore,
+    ua.MinPostScore,
+    ua.TimesPostsClosed,
+    ptv.UpVotes AS PostUpVotes,
+    ptv.DownVotes AS PostDownVotes,
+    ptv.TotalBountyStarted,
+    ptv.TotalBountyClosed,
+    ptv.CommentCount AS PostCommentCount,
+    ptv.CloseOrDeletionEvents
+FROM TopQuestions tq
+JOIN UserActivity ua ON ua.UserId = tq.UserId
+LEFT JOIN PostsWithComplexVoteStats ptv ON ptv.Id = tq.Id
+WHERE tq.UserId IN (SELECT UserId FROM TopUsersEngagedInTopTags)
+ORDER BY tq.Score DESC, ua.TotalPosts DESC, ptv.CommentCount DESC
+LIMIT 100;

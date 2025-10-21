@@ -1,0 +1,151 @@
+-- {"query": "3086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1319} 
+WITH PostVoteSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AverageViews,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors
+    FROM Posts p
+    INNER JOIN Tags t ON
+        POSITION(t.TagName IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+RecentQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.AnswerCount,
+        q.ViewCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        NULL AS LastAnswerDate
+    FROM Users u
+    WHERE u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+UserAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AverageAnswerScore
+    FROM Users u
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    GROUP BY u.Id
+),
+PostHistoryAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(ph.Id) AS EditCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS UniqueEditTypes
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY p.Id
+),
+ColorfulPostContent AS (
+    SELECT
+        p.Id AS PostId,
+        REGEXP_REPLACE(p.Body, '(<[^>]+>)|(\s+)', '', 'g') AS TextOnly,
+        LENGTH(p.Body) - LENGTH(REGEXP_REPLACE(p.Body, '<[^>]+>', '', 'g')) AS TagCount
+    FROM Posts p
+),
+ComplexPostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        v.UpVotes,
+        v.DownVotes,
+        v.AcceptedVotes,
+        pc.TextOnly,
+        pc.TagCount
+    FROM Posts p
+    LEFT JOIN PostVoteSummary v ON p.Id = v.PostId
+    LEFT JOIN ColorfulPostContent pc ON p.Id = pc.PostId
+),
+AnswerQuestionLink AS (
+    SELECT
+        a.Id AS AnswerId,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        a.CreationDate AS AnswerDate,
+        q.CreationDate AS QuestionDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAnswer
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 AND q.PostTypeId = 1
+),
+LatestCommentPerPost AS (
+    SELECT DISTINCT ON (p.Id) p.Id AS PostId, c.Text AS LatestComment, c.CreationDate AS CommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    ORDER BY p.Id, c.CreationDate DESC
+),
+FinalBenchmarkQuery AS (
+    SELECT
+        cmap.QuestionId,
+        cmap.QuestionTitle,
+        cmap.AnswerDate,
+        cmap.HoursToAnswer,
+        u.DisplayName AS TopAnswerer,
+        u.Reputation AS TopAnswererReputation,
+        hs.AnswerCount AS UserAnswerCount,
+        hs.AverageAnswerScore,
+        ph.EditCount,
+        ph.UniqueEditTypes,
+        cpc.TextOnly,
+        cpc.TagCount,
+        ts.TagName,
+        ts.TotalScore,
+        ts.AverageViews,
+        ts.UniqueAuthors,
+        lp.RelatedPostId,
+        lp.LinkTypeId,
+        pbody.Body AS PostBody,
+        cc.LatestComment
+    FROM AnswerQuestionLink aql
+    LEFT JOIN Posts q ON aql.QuestionId = q.Id
+    LEFT JOIN Posts a ON aql.AnswerId = a.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN UserAnswerStats hs ON u.Id = hs.UserId
+    LEFT JOIN PostHistoryAnalysis ph ON a.Id = ph.PostId
+    LEFT JOIN ColorfulPostContent cpc ON a.Id = cpc.PostId
+    LEFT JOIN Tags t ON POSITION(t.TagName IN q.Tags) > 0
+    LEFT JOIN TagPopularity ts ON t.TagName = ts.TagName
+    LEFT JOIN PostLinks lp ON a.Id = lp.PostId AND lp.LinkTypeId = 3
+    LEFT JOIN Posts pbody ON a.Id = pbody.Id
+    LEFT JOIN LatestCommentPerPost cc ON a.Id = cc.PostId
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2
+    ORDER BY a.CreationDate DESC
+)
+SELECT *
+FROM FinalBenchmarkQuery
+WHERE "HoursToAnswer" BETWEEN 0 AND 720
+  AND ("DisplayName" IS NOT NULL AND "Reputation" >= 1000)
+  AND ("TagName" IS NOT NULL AND LENGTH("TagName") > 2)
+  AND ("TopAnswererReputation" IS NULL OR "TopAnswererReputation" < 500)
+  AND ("AnswerCount" > 10 OR "AnswerCount" IS NULL)
+  AND ("LatestComment" IS NOT NULL OR "PostBody" LIKE '%<img%')
+ORDER BY "HoursToAnswer" DESC, "AnswerDate" DESC;

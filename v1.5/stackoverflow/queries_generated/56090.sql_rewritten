@@ -1,0 +1,43 @@
+-- {"query": "56090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 367} 
+WITH TopPosts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount, p.Tags, u.DisplayName AS OwnerDisplayName
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+),
+TopTags AS (
+  SELECT t.TagName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Posts p
+  JOIN string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'') AS t(TagName)
+  GROUP BY t.TagName
+  HAVING COUNT(DISTINCT p.Id) > 100
+),
+UserBadges AS (
+  SELECT u.Id, COUNT(b.Id) AS BadgeCount
+  FROM Users u
+  JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id
+  HAVING COUNT(b.Id) > 10
+),
+QuestionAnswers AS (
+  SELECT p.Id, COUNT(a.Id) AS AnswerCount
+  FROM Posts p
+  JOIN Posts a ON p.Id = a.ParentId
+  WHERE p.PostTypeId = 1 AND a.PostTypeId = 2
+  GROUP BY p.Id
+)
+SELECT 
+  tp.Id, 
+  tp.Title, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.Tags, 
+  tp.OwnerDisplayName, 
+  tt.PostCount, 
+  ub.BadgeCount, 
+  qa.AnswerCount
+FROM TopPosts tp
+JOIN TopTags tt ON tp.Tags LIKE '%' || tt.TagName || '%'
+JOIN UserBadges ub ON tp.OwnerUserId = ub.Id
+JOIN QuestionAnswers qa ON tp.Id = qa.Id
+ORDER BY tp.Score DESC, tp.ViewCount DESC, tt.PostCount DESC;

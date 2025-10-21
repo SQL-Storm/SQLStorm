@@ -1,0 +1,104 @@
+WITH MostActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC, u.Reputation DESC) AS ActivityRank
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 10
+),
+RecentBadgeWinners AS (
+    SELECT
+        b.UserId,
+        MAX(b.Date) AS LatestBadgeDate,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) AS RecentBadges
+    FROM Badges AS b
+    WHERE b.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days')
+    GROUP BY b.UserId
+),
+PopularTags AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS TagRank
+    FROM Tags AS t
+    WHERE t.Count > 100
+),
+ClosedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM Posts AS p
+    INNER JOIN PostHistory AS ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes AS crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.TotalPosts,
+    u.QuestionsPosted,
+    u.AnswersPosted,
+    u.ActivityRank,
+    COALESCE(bw.RecentBadges, 'No recent badges') AS RecentBadges,
+    COALESCE(CAST(bw.LatestBadgeDate AS VARCHAR), 'N/A') AS LatestBadgeDate,
+    AVG(q.Score) FILTER (WHERE q.PostTypeId = 1) AS AvgQuestionScore,
+    AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    MAX(pq.CreationDate) AS LatestQuestionDate,
+    ARRAY(
+        SELECT pt.TagName
+        FROM PopularTags pt
+        JOIN LATERAL (
+            SELECT unnest(string_to_array(substring(pq.Tags, 2, length(pq.Tags) - 2), '><')) AS TagName
+        ) AS tag ON tag.TagName = pt.TagName
+        WHERE pq.OwnerUserId = u.UserId AND pq.PostTypeId = 1
+        GROUP BY pt.TagName
+        ORDER BY COUNT(*) DESC, pt.TagName
+        LIMIT 3
+    ) AS Top3Tags,
+    COUNT(DISTINCT cq.QuestionId) AS QuestionsClosed,
+    MIN(cq.CloseDate) AS FirstCloseDate,
+    COALESCE((
+        SELECT
+            ROUND(COUNT(*) * 1.0 / NULLIF(COUNT(DISTINCT pq.Id), 0), 2)
+        FROM Posts AS pq
+        WHERE pq.OwnerUserId = u.UserId AND pq.PostTypeId = 1
+    ), 0) AS AvgAnswersPerQuestion,
+    (
+        SELECT
+            STRING_AGG(DISTINCT crt.Name, '; ' ORDER BY crt.Name)
+        FROM ClosedQuestions AS cq2
+        JOIN CloseReasonTypes AS crt ON crt.Id = CAST(cq2.CloseReasonId AS INTEGER)
+        WHERE cq2.OwnerUserId = u.UserId
+    ) AS ClosedReasonSummary
+FROM MostActiveUsers AS u
+LEFT JOIN RecentBadgeWinners AS bw ON bw.UserId = u.UserId
+LEFT JOIN Posts AS q ON q.OwnerUserId = u.UserId AND q.PostTypeId = 1
+LEFT JOIN Posts AS a ON a.OwnerUserId = u.UserId AND a.PostTypeId = 2
+LEFT JOIN Comments AS c ON c.UserId = u.UserId
+LEFT JOIN Posts AS pq ON pq.OwnerUserId = u.UserId AND pq.PostTypeId = 1
+LEFT JOIN ClosedQuestions AS cq ON cq.OwnerUserId = u.UserId
+WHERE u.ActivityRank <= 100
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.TotalPosts,
+    u.QuestionsPosted,
+    u.AnswersPosted,
+    u.ActivityRank,
+    bw.RecentBadges,
+    bw.LatestBadgeDate
+ORDER BY
+    u.ActivityRank,
+    u.TotalPosts DESC,
+    u.UserId
+LIMIT 25;

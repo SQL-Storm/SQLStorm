@@ -1,0 +1,78 @@
+-- {"query": "48093.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 886} 
+
+WITH QuestionAnswers AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.Score AS QuestionScore,
+        p.CreationDate AS QuestionCreationDate,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnsweredByRegisteredUsers,
+        AVG(CASE WHEN a.OwnerUserId IS NOT NULL THEN a.Score ELSE NULL END) AS AvgAnswerScoreRegistered,
+        MAX(CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        AVG(DATEDIFF(day, p.CreationDate, a.CreationDate)) AS AvgDaysToFirstAnswer
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.CreationDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPostCount,
+        COUNT(DISTINCT p.Id) AS QuestionWithTagCount,
+        AVG(p.Score) AS AvgQuestionScoreForTag
+    FROM Tags t
+    LEFT JOIN Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+)
+SELECT
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionScore,
+    qa.QuestionCreationDate,
+    qa.AnswerCount,
+    qa.AnsweredByRegisteredUsers,
+    qa.AvgAnswerScoreRegistered,
+    qa.HasAcceptedAnswer,
+    qa.AvgDaysToFirstAnswer,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ua.UserCreationDate AS OwnerCreationDate,
+    ua.BadgeCount AS OwnerBadgeCount,
+    ua.EditCount AS OwnerEditCount,
+    ua.CommentCount AS OwnerCommentCount,
+    ua.VoteCount AS OwnerVoteCount,
+    tp.TagName,
+    tp.TagPostCount,
+    tp.QuestionWithTagCount,
+    tp.AvgQuestionScoreForTag
+FROM QuestionAnswers qa
+JOIN Posts p ON qa.QuestionId = p.Id
+JOIN UserActivity ua ON p.OwnerUserId = ua.UserId
+LEFT JOIN TagLinks tl ON p.Id = tl.PostId -- Assuming TagLinks table exists linking Posts and Tags, or derive from Posts.Tags
+LEFT JOIN Tags tp ON tl.TagId = tp.Id -- Assuming TagLinks table exists linking Posts and Tags, or derive from Posts.Tags
+WHERE qa.QuestionScore > 10
+AND qa.AnswerCount > 0
+AND ua.Reputation > 1000
+ORDER BY qa.QuestionCreationDate DESC, qa.QuestionScore DESC
+LIMIT 100;

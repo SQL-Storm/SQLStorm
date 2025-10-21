@@ -1,0 +1,68 @@
+-- {"query": "28087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1258} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 8)
+    GROUP BY u.Id
+),
+GoldBadgeUsers AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS GoldBadges,
+        MAX(Date) AS LastGoldBadgeDate
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+    HAVING COUNT(*) > 3
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(g.GoldBadges, 0) AS GoldBadges,
+    ua.ActivityRank,
+    (SELECT AVG(Score) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT MAX(Score) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) AS MaxAnswerScore,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS TopTags
+FROM Users u
+JOIN UserActivity ua ON u.Id = ua.UserId
+LEFT JOIN GoldBadgeUsers g ON u.Id = g.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT TagName 
+    FROM Tags 
+    WHERE Id IN (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    )
+    ORDER BY Count DESC
+    LIMIT 3
+) t ON true
+WHERE u.Reputation > 10000
+    AND EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10, 11)
+        HAVING COUNT(DISTINCT ph.PostHistoryTypeId) = 2
+    )
+    AND p.CreationDate BETWEEN '2015-01-01' AND '2023-12-31'
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '30 days')
+GROUP BY u.Id, u.DisplayName, u.Reputation, g.GoldBadges, ua.ActivityRank
+HAVING MAX(p.Score) > 50 OR COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    CASE 
+        WHEN u.Reputation > 100000 THEN 1 
+        WHEN u.Reputation > 50000 THEN 2 
+        ELSE 3 
+    END,
+    ua.ActivityRank
+LIMIT 1000;

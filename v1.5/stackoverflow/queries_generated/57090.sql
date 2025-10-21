@@ -1,0 +1,103 @@
+-- {"query": "57090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 927} 
+
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+          SUM(v.VoteTypeId = 2) AS TotalUpVotes,
+        COUNT(b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        Reputation DESC
+    LIMIT 100
+),
+
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalPostScore,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(v.Id) AS TotalVotes,
+        COUNT(ph.Id) AS TotalPostHistory,
+        MAX(p.LastActivityDate) AS LastActivityDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id, u.DisplayName
+),
+
+TagStatistics AS(
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostsUsingTag,
+        SUM(p.ViewCount) AS TotalViewCount,
+        AVG(p.Score) AS AverageScore,
+        COUNT(v.Id) AS TotalVotes
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = array_to_string(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), ''><''), ',')::int
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        TotalViewCount
+    )
+
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.TotalScore,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    ua.LastActivityDate,
+    ua.TotalPosts,
+    ua.TotalPostScore,
+   ua.TotalComments,
+   ua.totalVotes,
+    ua.TotalPostHistory,
+    ts.TagName,
+    ts.TotalVotes,
+    ts.TotalViewCount,
+    ts.Count,
+    ts.PostsUsingTag
+FROM
+    TopUsers tu
+JOIN
+    UserActivity ua ON tu.UserId = ua.UserId
+LEFT JOIN
+     TagStatistics ts ON
+     array_to_string(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), ''><''), ',')::int = ts.Id
+WHERE
+    tu.Reputation > 1000
+ORDER BY
+    tu.Reputation DESC,
+    ts.TotalViewCount DESC;

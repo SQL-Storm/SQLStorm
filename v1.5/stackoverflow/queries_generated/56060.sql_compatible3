@@ -1,0 +1,71 @@
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(p.Score) AS total_score
+    FROM 
+        Users AS u
+    JOIN 
+        Posts AS p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        u.Id, 
+        u.DisplayName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 10
+),
+top_posts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId
+    FROM 
+        Posts AS p
+    WHERE 
+        p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.ViewCount > 1000
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS post_count
+    FROM 
+        Posts AS p
+    CROSS JOIN 
+        Tags AS t
+    WHERE 
+        p.PostTypeId = 1
+        AND INSTR(LOWER(p.Tags), LOWER(t.TagName)) > 0
+    GROUP BY 
+        t.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 50
+)
+SELECT 
+    tu.DisplayName,
+    tu.post_count,
+    tu.total_score,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.AnswerCount,
+    tp.CommentCount,
+    tt.TagName,
+    tt.post_count
+FROM 
+    top_users AS tu
+JOIN 
+    top_posts AS tp ON tu.Id = tp.OwnerUserId
+JOIN 
+    top_tags AS tt ON INSTR(LOWER(tp.Title || ' ' || COALESCE(tp.Tags, '')), LOWER(tt.TagName)) > 0
+ORDER BY 
+    tu.post_count DESC,
+    tp.Score DESC,
+    tt.post_count DESC;

@@ -1,0 +1,175 @@
+with
+RecentQuestions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    coalesce(p.tags, '') as raw_tags,
+    case
+      when p.tags is null or p.tags = '' then array[]::text[]
+      else string_to_array(substr(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '730 days')
+    and p.score is not null
+),
+QuestionTags as (
+  select
+    rq.id as question_id,
+    unnest(rq.tag_array) as tag
+  from RecentQuestions rq
+),
+TagPopularity as (
+  select
+    qt.tag,
+    count(distinct qt.question_id) as question_count,
+    rank() over (order by count(distinct qt.question_id) desc) as popularity_rank
+  from QuestionTags qt
+  group by qt.tag
+),
+UserActivity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_creation,
+    count(distinct q.id) filter (where q.posttypeid = 1) as recent_questions_count,
+    count(distinct a.id) filter (where a.posttypeid = 2) as recent_answers_count,
+    coalesce(avg(a.score) filter (where a.posttypeid = 2),0) as avg_answer_score,
+    max(a.creationdate) filter (where a.posttypeid = 2) as last_answer_date,
+    count(distinct b.id) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges
+  from users u
+  left join posts q on q.owneruserid = u.id and q.posttypeid = 1 and q.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '730 days')
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2 and a.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '730 days')
+  left join badges b on b.userid = u.id and b.date >= (cast('2024-10-01 12:34:56' as timestamp) - interval '730 days')
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+QuestionEnrichment as (
+  select
+    rq.*,
+    ta.accepted_answer_id,
+    aa.owneruserid as accepted_answer_owner,
+    aa.score as accepted_answer_score,
+    (select a.id from posts a where a.parentid = rq.id order by a.score desc nulls last, a.creationdate asc limit 1) as top_answer_id,
+    (select a.owneruserid from posts a where a.parentid = rq.id order by a.score desc nulls last, a.creationdate asc limit 1) as top_answer_owner,
+    (select a.score from posts a where a.parentid = rq.id order by a.score desc nulls last, a.creationdate asc limit 1) as top_answer_score,
+    (select count(*) from posts a where a.parentid = rq.id) as total_answers,
+    (select count(*) from comments c where c.postid = rq.id) as question_comment_count,
+    (select ph.creationdate from posthistory ph where ph.postid = rq.id and ph.posthistorytypeid in (4,5,6,24) order by ph.creationdate desc limit 1) as last_edit_date,
+    char_length(coalesce(rq.title, '')) as title_length,
+    coalesce((select avg(char_length(body)) from posts p2 where p2.parentid = rq.id), 0) as avg_answer_body_length
+  from RecentQuestions rq
+  left join posts ta on ta.id = coalesce(rq.accepted_answer_id, 0)
+),
+QuestionScoring as (
+  select
+    qe.*,
+    coalesce(nullif(qe.score,0),0) as q_score,
+    coalesce(nullif(qe.viewcount,0),0) as q_views,
+    coalesce(nullif(qe.answercount,0),0) as q_answers,
+    (select tp.popularity_rank from tagpopularity tp where tp.tag = (select unnest(qe.tag_array) limit 1) limit 1) as primary_tag_rank,
+    (
+      0.40 * (1.0 / (1.0 + exp(-1.0 * greatest(qe.q_score, -50) / 10.0))) +
+      0.30 * (log(greatest(qe.q_views,1)) / log(100000.0)) +
+      0.20 * (least(qe.q_answers,20) / 20.0) +
+      0.10 * (case when qe.accepted_answer_id is not null then least(coalesce(qe.accepted_answer_score,0),50)::double precision/50.0 else 0 end)
+    ) as composite_raw_score,
+    rank() over (order by
+      (
+        2.0 * (case when qe.accepted_answer_id is not null then 1 else 0 end) +
+        log(greatest(nullif(qe.viewcount,0),1)) +
+        coalesce(qe.score,0) * 1.5 +
+        coalesce(qe.answercount,0) * 2.0
+      ) desc
+    ) as activity_rank
+  from QuestionEnrichment qe
+),
+InterestingQuestions as (
+  select qs.*,
+    coalesce(1.0 / NULLIF(qs.primary_tag_rank,0), 0) as primary_tag_rarity,
+    greatest(0.0, 1.0 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.creationdate))/ (60.0*60*24*365.0) ) as recency_factor
+  from QuestionScoring qs
+  where qs.composite_raw_score > 0.02
+),
+FinalSet as (
+  select
+    iq.id as question_id,
+    iq.title,
+    coalesce(u.displayname, cast(iq.owneruserid as text), 'unknown') as author,
+    u.reputation as author_reputation,
+    iq.creationdate as asked_on,
+    iq.score as question_score,
+    iq.viewcount as views,
+    iq.answercount as answers,
+    iq.accepted_answer_id,
+    iq.top_answer_id,
+    iq.top_answer_owner,
+    iq.top_answer_score,
+    iq.question_comment_count,
+    iq.last_edit_date,
+    iq.title_length,
+    iq.avg_answer_body_length,
+    iq.composite_raw_score,
+    iq.activity_rank,
+    iq.primary_tag_rarity,
+    iq.recency_factor,
+    lower(regexp_replace(iq.title, '[^a-zA-Z0-9]+', '-', 'g')) as title_slug,
+    case
+      when iq.accepted_answer_id is not null and iq.top_answer_score >= 10 then 'Solved-HighQuality'
+      when iq.accepted_answer_id is not null and iq.top_answer_score between 1 and 9 then 'Solved-Medium'
+      when iq.accepted_answer_id is null and iq.answercount = 0 then 'Unanswered'
+      when iq.accepted_answer_id is null and iq.answercount > 0 and iq.top_answer_score < 5 then 'Answered-LowQuality'
+      else 'Active'
+    end as question_status,
+    (
+      select case when count(*) = 0 then 0.0 else sum(case when a.score >= sub.median_score then 1 else 0 end)::double precision / count(*) end
+      from posts a
+      cross join lateral (
+        select coalesce((percentile_cont(0.5) within group (order by a2.score)), 0) as median_score
+        from posts a2
+        where a2.parentid = iq.id
+      ) sub
+      where a.parentid = iq.id
+    ) as fraction_answers_above_median,
+    coalesce(ua.badge_count,0) +
+      coalesce(
+        (
+          select sum(case when b.class=1 then 3 when b.class=2 then 2 when b.class=3 then 1 else 0 end)
+          from badges b where b.userid = iq.top_answer_owner and b.date >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+        ),
+      0) as combined_recent_badge_score
+  from InterestingQuestions iq
+  left join users u on u.id = iq.owneruserid
+  left join UserActivity ua on ua.user_id = u.id
+)
+select
+  fs.*,
+  (
+    select string_agg(t.tag, ', ' order by coalesce(tpq.question_count,0) asc nulls last, t.tag)
+    from QuestionTags t
+    left join TagPopularity tpq on tpq.tag = t.tag
+    where t.question_id = fs.question_id
+  ) as tags_ordered,
+  (
+    select json_agg(json_build_object('comment_id', c.id, 'snippet', left(replace(coalesce(c.text,''), E'\n',' '), 140), 'score', coalesce(c.score,0)))
+    from comments c
+    where c.postid = fs.question_id
+    order by coalesce(c.score,0) desc nulls last, c.creationdate asc
+    limit 3
+  ) as top_comments_sample,
+  (
+    select count(distinct pl.relatedpostid) from postlinks pl where pl.postid = fs.question_id and pl.linktypeid in (1,3)
+  ) as related_link_count,
+  exists (select 1 from posts a where a.parentid = fs.question_id and a.owneruserid is null) as has_anonymous_answers
+from FinalSet fs
+order by fs.composite_raw_score desc nulls last, fs.activity_rank asc
+limit 250;

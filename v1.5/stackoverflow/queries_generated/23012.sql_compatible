@@ -1,0 +1,87 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY COUNT(b.Id) DESC) AS BadgeRankInLocation
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND (u.Location IS NOT NULL OR u.AboutMe LIKE '%SQL%')
+    GROUP BY u.Id, u.DisplayName, u.Location
+    HAVING COUNT(b.Id) > 5
+),
+TopPostsPerUser AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS TagArray,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS AvgBounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+    AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 2)
+),
+CorrelatedSubqueryExample AS (
+    SELECT 
+        tp.OwnerUserId,
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.PreviousScore,
+        tp.TagArray,
+        tp.AvgBounty,
+        (SELECT COUNT(*) FROM PostHistory ph 
+         WHERE ph.PostId = tp.PostId 
+         AND ph.PostHistoryTypeId IN (4,5,6) 
+         AND ph.CreationDate > (tp.PostId::bigint)::timestamp - INTERVAL '1 year') AS EditCountLastYear
+    FROM TopPostsPerUser tp
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.BadgeCount,
+    ubs.GoldBadges,
+    ubs.BadgeRankInLocation,
+    cse.PostId,
+    cse.Title,
+    cse.Score,
+    cse.ViewCount,
+    COALESCE(cse.PreviousScore, 0) AS PreviousScore,
+    array_to_string(cse.TagArray, ', ') AS TagsString,
+    COALESCE(cse.AvgBounty, 0) AS AvgBounty,
+    cse.EditCountLastYear,
+    CASE 
+        WHEN cse.Score > 100 THEN 'High Score'
+        WHEN cse.Score BETWEEN 50 AND 100 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    (cse.Score * 1.0 / NULLIF(cse.ViewCount, 0)) AS ScoreViewRatio
+FROM UserBadgeStats ubs
+LEFT OUTER JOIN CorrelatedSubqueryExample cse ON ubs.UserId = cse.OwnerUserId
+WHERE ubs.BadgeRankInLocation <= 3
+UNION ALL
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    0 AS BadgeCount,
+    0 AS GoldBadges,
+    0 AS BadgeRankInLocation,
+    NULL AS PostId,
+    NULL AS Title,
+    0 AS Score,
+    0 AS ViewCount,
+    0 AS PreviousScore,
+    '' AS TagsString,
+    0 AS AvgBounty,
+    0 AS EditCountLastYear,
+    'No Badges' AS ScoreCategory,
+    0 AS ScoreViewRatio
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+AND u.Reputation > 500
+ORDER BY UserId, Score DESC;

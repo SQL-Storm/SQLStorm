@@ -1,0 +1,194 @@
+WITH PopularTags AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName
+    FROM
+        Tags T
+    WHERE
+        T.IsModeratorOnly = FALSE AND T.IsRequired = FALSE
+    ORDER BY
+        T.Count DESC
+    LIMIT 50
+),
+CoreQuestions AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS QuestionTagsArray
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 1
+        AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+        AND P.ViewCount > 5000
+        AND P.Score > 10
+        AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+        AND EXISTS (
+            SELECT 1
+            FROM PopularTags PT
+            WHERE PT.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))
+        )
+),
+QuestionTagMapping AS (
+    SELECT
+        CQ.QuestionId,
+        CQ.OwnerUserId,
+        T.Id AS TagId,
+        T.TagName
+    FROM
+        CoreQuestions CQ
+        CROSS JOIN LATERAL UNNEST(CQ.QuestionTagsArray) AS QuestionTag
+    INNER JOIN Tags T ON T.TagName = QuestionTag
+    WHERE T.Id IN (SELECT TagId FROM PopularTags)
+),
+RelevantAnswers AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        COUNT(C.Id) AS CommentCountOnAnswer,
+        CASE WHEN CQ.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM
+        Posts A
+    INNER JOIN CoreQuestions CQ ON A.ParentId = CQ.QuestionId
+    LEFT JOIN Comments C ON A.Id = C.PostId
+    WHERE
+        A.PostTypeId = 2
+        AND A.OwnerUserId IS NOT NULL
+    GROUP BY
+        A.Id, A.ParentId, A.OwnerUserId, A.Score, A.CreationDate, CQ.AcceptedAnswerId
+),
+UserPostAggregates AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.UpVotes AS UserReceivedUpVotes,
+        U.DownVotes AS UserReceivedDownVotes,
+        COUNT(DISTINCT CQ.QuestionId) AS TotalQuestionsAsked,
+        SUM(CQ.QuestionScore) AS TotalQuestionScore,
+        SUM(CQ.ViewCount) AS TotalQuestionViews,
+        SUM(CQ.FavoriteCount) AS TotalQuestionFavorites,
+        COUNT(DISTINCT RA.AnswerId) AS TotalAnswersProvided,
+        SUM(RA.AnswerScore) AS TotalAnswerScore,
+        SUM(RA.IsAcceptedAnswer) AS TotalAcceptedAnswers,
+        SUM(RA.CommentCountOnAnswer) AS TotalCommentsOnAnswers,
+        AVG(CQ.QuestionScore) FILTER (WHERE CQ.QuestionId IS NOT NULL) AS AvgQuestionScore,
+        AVG(RA.AnswerScore) FILTER (WHERE RA.AnswerId IS NOT NULL) AS AvgAnswerScore
+    FROM
+        Users U
+    LEFT JOIN CoreQuestions CQ ON U.Id = CQ.OwnerUserId
+    LEFT JOIN RelevantAnswers RA ON U.Id = RA.AnswerOwnerUserId
+    WHERE U.Id IS NOT NULL
+    GROUP BY
+        U.Id, U.Reputation, U.UpVotes, U.DownVotes
+    HAVING
+        COUNT(DISTINCT CQ.QuestionId) > 0 OR COUNT(DISTINCT RA.AnswerId) > 0
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE
+            WHEN B.Class = 1 AND B.TagBased = TRUE AND EXISTS (
+                SELECT 1
+                FROM PopularTags PT JOIN Tags T ON PT.TagId = T.Id
+                WHERE T.TagName = B.Name
+            ) THEN 1 ELSE 0
+        END) AS GoldTagBadgesForPopularTags,
+        SUM(CASE
+            WHEN B.Class = 2 AND B.TagBased = TRUE AND EXISTS (
+                SELECT 1
+                FROM PopularTags PT JOIN Tags T ON PT.TagId = T.Id
+                WHERE T.TagName = B.Name
+            ) THEN 1 ELSE 0
+        END) AS SilverTagBadgesForPopularTags
+    FROM
+        Badges B
+    WHERE
+        B.UserId IN (SELECT UserId FROM UserPostAggregates)
+    GROUP BY
+        B.UserId
+),
+UserPostHistoryEvents AS (
+    SELECT
+        PH.UserId,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS PostsClosedByOthersCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS PostsReopenedCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS PostsDeletedCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS PostsUndeletedCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS UserEditCount
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostId IN (SELECT QuestionId FROM CoreQuestions UNION ALL SELECT AnswerId FROM RelevantAnswers)
+        AND PH.UserId IS NOT NULL
+        AND PH.UserId IN (SELECT UserId FROM UserPostAggregates)
+    GROUP BY
+        PH.UserId
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS UserGivenUpVotes,
+    U.DownVotes AS UserGivenDownVotes,
+    UPA.TotalQuestionsAsked,
+    UPA.TotalAnswersProvided,
+    UPA.TotalQuestionScore,
+    UPA.TotalAnswerScore,
+    UPA.TotalAcceptedAnswers,
+    UPA.TotalQuestionViews,
+    UPA.TotalQuestionFavorites,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesReceived,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadgesReceived,
+    COALESCE(UBS.GoldTagBadgesForPopularTags, 0) AS GoldTagBadgesOnPopularTags,
+    COALESCE(UBS.SilverTagBadgesForPopularTags, 0) AS SilverTagBadgesOnPopularTags,
+    COALESCE(UPHE.PostsClosedByOthersCount, 0) AS UserRelatedPostsClosed,
+    COALESCE(UPHE.PostsReopenedCount, 0) AS UserRelatedPostsReopened,
+    COALESCE(UPHE.PostsDeletedCount, 0) AS UserRelatedPostsDeleted,
+    COALESCE(UPHE.PostsUndeletedCount, 0) AS UserRelatedPostsUndeleted,
+    COALESCE(UPHE.UserEditCount, 0) AS UserInitiatedEdits,
+    UPA.AvgQuestionScore,
+    UPA.AvgAnswerScore,
+    ( 
+        U.Reputation * 0.4 +
+        UPA.TotalQuestionScore * 0.2 +
+        UPA.TotalAnswerScore * 0.3 +
+        UPA.TotalAcceptedAnswers * 7 +
+        UPA.TotalQuestionFavorites * 0.1 +
+        COALESCE(UBS.GoldBadges, 0) * 12 +
+        COALESCE(UBS.SilverBadges, 0) * 4 +
+        COALESCE(UBS.GoldTagBadgesForPopularTags, 0) * 18 +
+        COALESCE(UBS.SilverTagBadgesForPopularTags, 0) * 6 +
+        COALESCE(UPHE.PostsReopenedCount, 0) * 8 +
+        COALESCE(UPHE.PostsClosedByOthersCount, 0) * 4 +
+        COALESCE(UPHE.PostsUndeletedCount, 0) * 5 +
+        COALESCE(UPHE.UserInitiatedEdits, 0) * 0.7
+    ) AS UserImpactScore,
+    RANK() OVER (ORDER BY U.Reputation DESC, UPA.TotalAcceptedAnswers DESC, (UPA.TotalQuestionScore + UPA.TotalAnswerScore) DESC) AS OverallUserRank,
+    DENSE_RANK() OVER (ORDER BY (
+        COALESCE(UBS.GoldTagBadgesForPopularTags, 0) * 2.0 + COALESCE(UBS.SilverTagBadgesForPopularTags, 0) * 1.0
+    ) DESC, UPA.TotalAcceptedAnswers DESC, UPA.TotalAnswerScore DESC) AS TagEngagementRank
+FROM
+    Users U
+JOIN UserPostAggregates UPA ON U.Id = UPA.UserId
+LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+LEFT JOIN UserPostHistoryEvents UPHE ON U.Id = UPHE.UserId
+WHERE
+    U.Reputation > 10000
+    AND (COALESCE(UPA.TotalQuestionsAsked, 0) + COALESCE(UPA.TotalAnswersProvided, 0)) > 20
+ORDER BY
+    UserImpactScore DESC, U.Reputation DESC
+FETCH FIRST 500 ROWS ONLY;

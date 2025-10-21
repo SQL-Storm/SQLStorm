@@ -1,0 +1,102 @@
+WITH UserQuestionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount AS QuestionCommentCount,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS QuestionRank,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgUserScore,
+        p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS TimeSinceLastQuestion
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1
+        AND u.Reputation > 1500
+        AND p.ClosedDate IS NULL
+        AND (p.DeletionDate IS NULL OR p.DeletionDate IS NULL)
+),
+AnswerAggregates AS (
+    SELECT
+        a.ParentId,
+        COUNT(a.Id) AS NumAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(a.CommentCount) AS TotalAnswerCommentCount,
+        MAX(c.Score) AS MaxCommentScoreOnAnswers,
+        (SELECT Reputation FROM Users WHERE Id = (
+            SELECT OwnerUserId FROM Posts
+            WHERE ParentId = a.ParentId AND PostTypeId = 2
+            ORDER BY Score DESC
+            LIMIT 1
+        )) AS TopAnswererReputation
+    FROM
+        Posts a
+    LEFT JOIN
+        Comments c ON a.Id = c.PostId
+    WHERE
+        a.PostTypeId = 2
+        AND a.ParentId IN (SELECT PostId FROM UserQuestionStats WHERE QuestionRank <= 10)
+    GROUP BY
+        a.ParentId
+)
+SELECT
+    uqs.DisplayName,
+    uqs.Reputation,
+    uqs.Title AS QuestionTitle,
+    uqs.Score AS QuestionScore,
+    uqs.QuestionRank,
+    uqs.ViewCount,
+    CASE
+        WHEN uqs.Score > uqs.AvgUserScore * 2 AND uqs.AnswerCount > 2 THEN 'High-Performing'
+        WHEN uqs.Score > uqs.AvgUserScore THEN 'Above Average'
+        WHEN uqs.Score < 0 THEN 'Poorly Received'
+        ELSE 'Standard'
+    END AS PerformanceCategory,
+    (uqs.Score + (uqs.FavoriteCount * 5) + (SELECT COUNT(*) FROM Votes v WHERE v.PostId = uqs.PostId AND v.VoteTypeId = 2)) / NULLIF(uqs.ViewCount, 0) AS EngagementRatio,
+    CAST(array_length(string_to_array(substring(uqs.Tags, 2, length(uqs.Tags) - 2), '><'), 1) AS integer) AS TagCount,
+    COALESCE(aa.NumAnswers, 0) AS AnswerCount,
+    COALESCE(aa.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(aa.TopAnswererReputation, 0) AS TopAnswererReputation,
+    EXTRACT(EPOCH FROM uqs.TimeSinceLastQuestion) / 3600 AS HoursSinceLastPost,
+    (SELECT COUNT(*)
+     FROM PostHistory ph
+     WHERE ph.PostId = uqs.PostId
+       AND ph.PostHistoryTypeId IN (4, 5, 6)
+       AND ph.UserId <> uqs.UserId) AS EditsByOthers
+FROM
+    UserQuestionStats uqs
+LEFT JOIN
+    AnswerAggregates aa ON uqs.PostId = aa.ParentId
+WHERE
+    uqs.QuestionRank <= 5
+    AND uqs.Score > 10
+    AND uqs.AnswerCount > 0
+    AND (
+        uqs.Score > uqs.AvgUserScore
+        OR EXISTS (
+            SELECT 1
+            FROM Badges b
+            WHERE b.UserId = uqs.UserId AND b.Name IN ('Strunk & White', 'Copy Editor', 'Explainer')
+        )
+    )
+    AND uqs.PostId NOT IN (
+        SELECT PostId FROM PostLinks WHERE LinkTypeId = 3
+        UNION
+        SELECT RelatedPostId FROM PostLinks WHERE LinkTypeId = 3
+    )
+ORDER BY
+    uqs.Reputation DESC,
+    EngagementRatio DESC,
+    QuestionScore DESC
+LIMIT 500;

@@ -1,0 +1,145 @@
+WITH
+recent_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Body,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+tag_popularity AS (
+  SELECT
+    UNNEST(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) AS tag,
+    p.Id AS PostId,
+    p.CreationDate
+  FROM recent_posts p
+),
+tag_scores AS (
+  SELECT
+    tag,
+    COUNT(*) AS tag_count,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY score) AS p90,
+    AVG(score) AS avg_score
+  FROM (
+    SELECT
+      tp.tag,
+      p.Score AS score
+    FROM tag_popularity tp
+    JOIN Posts p ON p.Id = tp.PostId
+    WHERE p.PostTypeId = 1
+  ) s
+  GROUP BY tag
+),
+top_tags AS (
+  SELECT tag
+  FROM tag_scores
+  WHERE tag_count > 5
+  ORDER BY p90 DESC
+  LIMIT 5
+),
+correlated_posts AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    p2.Id AS RelatedPostId,
+    p2.Title AS RelatedTitle,
+    p2.Score AS RelatedScore,
+    p2.ViewCount AS RelatedViewCount
+  FROM recent_posts rp
+  JOIN PostLinks pl ON pl.PostId = rp.Id
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE rp.PostTypeId = 1
+  AND pl.LinkTypeId = 1
+  AND rp.Score > 0
+  AND p2.Score > 0
+),
+windowed AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.LastActivityDate DESC) AS rn_by_user
+  FROM Posts rp
+  WHERE rp.PostTypeId = 1
+),
+user_engagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COALESCE(u.Reputation,0) * 0.6
+    + COALESCE((SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.UserId = u.Id),0) * 0.2
+    + COALESCE((SELECT AVG(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = u.Id),0) * 0.2 AS engagement_score
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+nil AS (
+  SELECT NULL AS dummy
+)
+SELECT
+  u.UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.engagement_score,
+  p.Id AS PostId,
+  p.Title AS PostTitle,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate AS PostLastActivityDate,
+  p.Score AS PostScore,
+  p.ViewCount AS PostViews,
+  CASE
+    WHEN v.VoteTypeId = 2 THEN 'Upvote'
+    WHEN v.VoteTypeId = 3 THEN 'Downvote'
+    ELSE 'Other'
+  END AS VoteKind,
+  v.CreationDate AS VoteDate,
+  vt.Name AS VoteTypeName,
+  pl.LinkTypeId,
+  pl.RelatedPostId,
+  p2.Title AS RelatedTitle,
+  p2.Score AS RelatedScore,
+  p2.ViewCount AS RelatedViews,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'Unknown'
+    WHEN p.OwnerUserId = u.UserId THEN 'Self'
+    ELSE 'Other'
+  END AS Ownership
+FROM Posts p
+JOIN Votes v ON v.PostId = p.Id
+JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+JOIN Users u ON u.Id = p.OwnerUserId
+WHERE
+  p.PostTypeId = 1
+  AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60 days'
+  AND (p.ViewCount > 0 OR p.Score > 0)
+  AND (v.VoteTypeId IN (2,3) OR v.VoteTypeId IS NULL)
+  AND (pl.LinkTypeId IS NULL OR pl.LinkTypeId IN (1,3))
+ORDER BY u.Reputation DESC, p.CreationDate DESC
+LIMIT 100;

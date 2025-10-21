@@ -1,0 +1,360 @@
+with params as (
+  select
+    cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' as since_dt,
+    50 as min_rep,
+    5 as min_answers,
+    10 as min_views,
+    3 as min_comments,
+    2 as top_n_per_tag
+),
+users_active as (
+  select u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm
+  from users u
+  where u.reputation >= (select min_rep from params)
+    and u.lastaccessdate >= (select since_dt from params)
+),
+questions as (
+  select p.*
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select since_dt from params)
+    and coalesce(p.viewcount, 0) >= (select min_views from params)
+),
+answers as (
+  select a.*
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= (select since_dt from params)
+),
+q_tags as (
+  select q.id as question_id,
+         q.owneruserid as owner_user_id,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.title,
+         regexp_split_to_table(coalesce(nullif(q.tags, ''), '<unknown>'), '><') as raw_tag
+  from questions q
+),
+q_tags_norm as (
+  select
+    question_id,
+    owner_user_id,
+    creationdate,
+    score,
+    viewcount,
+    title,
+    trim(both '<>' from lower(raw_tag)) as tag
+  from q_tags
+),
+tag_stats as (
+  select
+    t.tag,
+    count(*) as q_count,
+    sum(case when score >= 5 then 1 else 0 end) as hot_qs,
+    avg(score::numeric) as avg_q_score,
+    percentile_disc(0.9) within group (order by score) as p90_q_score
+  from q_tags_norm t
+  group by t.tag
+  having count(*) >= 5
+),
+user_answer_activity as (
+  select
+    a.parentid as question_id,
+    a.owneruserid as answer_user_id,
+    count(*) as answers_by_user_on_q,
+    max(a.creationdate) as last_answer_dt,
+    sum(case when a.score >= 1 then 1 else 0 end) as upvoted_answers
+  from answers a
+  where a.parentid is not null
+  group by a.parentid, a.owneruserid
+),
+question_answer_summary as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    coalesce(q.answercount, 0) as answercount,
+    count(a.id) filter (where a.id is not null) as actual_answers,
+    sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+    max(a.score) as max_answer_score,
+    min(a.score) as min_answer_score,
+    sum(coalesce(a.commentcount,0)) as total_answer_comments
+  from questions q
+  left join answers a on a.parentid = q.id
+  group by q.id, q.owneruserid, q.answercount
+),
+dup_links as (
+  select pl.postid as dup_post_id, pl.relatedpostid as canonical_post_id
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+close_events as (
+  select ph.postid,
+         min(ph.creationdate) as first_close_dt,
+         max(ph.creationdate) as last_close_dt,
+         count(*) as close_events_cnt,
+         string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+  from posthistory ph
+  join posthistorytypes pht on pht.id = ph.posthistorytypeid
+  left join closereasontypes crt
+    on pht.id = 10
+   and ph.comment ~ '^[0-9]+$'
+   and crt.id::text = ph.comment
+  where ph.posthistorytypeid in (10, 11)
+  group by ph.postid
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comment_cnt,
+         max(c.creationdate) as last_comment_dt,
+         sum(case when c.score > 0 then 1 else 0 end) as pos_comment_cnt,
+         sum(case when c.userdisplayname ilike '%mod%' then 1 else 0 end) as mod_like_comments
+  from comments c
+  where c.creationdate >= (select since_dt from params)
+  group by c.postid
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  where v.creationdate >= (select since_dt from params)
+  group by v.postid
+),
+user_badge_agg as (
+  select b.userid,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         count(*) filter (where b.tagbased = 1) as tag_badges,
+         max(b.date) as last_badge_dt
+  from badges b
+  group by b.userid
+),
+question_features as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate,
+    coalesce(q.viewcount,0) as viewcount,
+    coalesce(q.score,0) as q_score,
+    qa.actual_answers,
+    qa.pos_answers,
+    qa.max_answer_score,
+    qa.min_answer_score,
+    qa.total_answer_comments,
+    ca.comment_cnt,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.favorites,0) as favorites,
+    coalesce(v.bounty_total,0) as bounty_total,
+    cl.first_close_dt,
+    cl.last_close_dt,
+    cl.close_events_cnt,
+    cl.close_reasons,
+    dl.canonical_post_id,
+    case when dl.canonical_post_id is null then 0 else 1 end as is_duplicate,
+    greatest(coalesce(qa.actual_answers,0), coalesce(q.answercount,0)) as answers_max,
+    least(coalesce(qa.actual_answers,0), coalesce(q.answercount,0)) as answers_min,
+    nullif(length(coalesce(q.title,'')),0) as title_len,
+    nullif(length(regexp_replace(coalesce(q.body,''), '<[^>]+>', '', 'g')),0) as body_plain_len
+  from questions q
+  left join question_answer_summary qa on qa.question_id = q.id
+  left join comment_activity ca on ca.postid = q.id
+  left join vote_agg v on v.postid = q.id
+  left join close_events cl on cl.postid = q.id
+  left join dup_links dl on dl.dup_post_id = q.id
+),
+tagged_questions as (
+  select
+    t.question_id,
+    t.tag,
+    ts.q_count,
+    ts.avg_q_score,
+    ts.p90_q_score
+  from q_tags_norm t
+  join tag_stats ts on ts.tag = t.tag
+),
+ranked_questions_per_tag as (
+  select
+    tq.tag,
+    qf.question_id,
+    qf.q_score,
+    qf.viewcount,
+    qf.actual_answers,
+    row_number() over (
+      partition by tq.tag
+      order by
+        qf.q_score desc,
+        qf.viewcount desc,
+        qf.actual_answers desc,
+        qf.creationdate desc
+    ) as rn
+  from tagged_questions tq
+  join question_features qf on qf.question_id = tq.question_id
+),
+top_questions_per_tag as (
+  select r.tag, r.question_id
+  from ranked_questions_per_tag r
+  where r.rn <= (select top_n_per_tag from params)
+),
+user_engagement as (
+  select
+    qf.asker_id as user_id,
+    count(*) as asked_cnt,
+    sum(case when qf.is_duplicate = 1 then 1 else 0 end) as dup_cnt,
+    avg(qf.q_score::numeric) as avg_q_score,
+    sum(coalesce(qf.favorites,0)) as total_favs,
+    sum(coalesce(qf.upvotes,0) - coalesce(qf.downvotes,0)) as net_votes,
+    max(qf.viewcount) as max_views
+  from question_features qf
+  group by qf.asker_id
+),
+eligible_users as (
+  select ua.id as user_id
+  from users_active ua
+  join user_engagement ue on ue.user_id = ua.id
+  where ue.asked_cnt >= (select min_answers from params)
+),
+final_candidates as (
+  select
+    tq.tag,
+    qf.question_id,
+    qf.asker_id,
+    ue.asked_cnt,
+    ue.dup_cnt,
+    ue.avg_q_score,
+    ue.total_favs,
+    ue.net_votes,
+    ue.max_views,
+    qb.gold_badges, qb.silver_badges, qb.bronze_badges, qb.tag_badges,
+    qf.q_score, qf.viewcount, qf.actual_answers, qf.pos_answers, qf.favorites,
+    qf.is_duplicate, qf.close_events_cnt, qf.bounty_total,
+    (coalesce(qf.comment_cnt,0) + coalesce(qf.total_answer_comments,0)) as comments_total,
+    round(
+      (
+        coalesce(qf.q_score,0)*2
+        + greatest(coalesce(qf.actual_answers,0),0)
+        + ln(greatest(coalesce(qf.viewcount,0)+1,1))
+        + coalesce(qf.favorites,0)
+        - coalesce(qf.downvotes,0)
+        + case when qf.is_duplicate = 1 then -2 else 0 end
+        + case when qf.bounty_total > 0 then 3 else 0 end
+      )::numeric, 3
+    ) as perf_score
+  from top_questions_per_tag tqt
+  join question_features qf on qf.question_id = tqt.question_id
+  join tagged_questions tq on tq.question_id = qf.question_id and tq.tag = tqt.tag
+  join user_engagement ue on ue.user_id = qf.asker_id
+  join eligible_users eu on eu.user_id = qf.asker_id
+  left join user_badge_agg qb on qb.userid = qf.asker_id
+),
+dedup_canonical as (
+  select
+    fc.*,
+    coalesce(dl.canonical_post_id, fc.question_id) as canonical_id
+  from final_candidates fc
+  left join dup_links dl on dl.dup_post_id = fc.question_id
+),
+normalized as (
+  select
+    fc.tag,
+    fc.question_id,
+    fc.asker_id,
+    fc.q_score,
+    fc.viewcount,
+    fc.actual_answers,
+    fc.pos_answers,
+    fc.favorites,
+    fc.perf_score,
+    fc.comments_total,
+    fc.close_events_cnt,
+    fc.is_duplicate,
+    coalesce(fc.gold_badges,0) as gold_badges,
+    coalesce(fc.silver_badges,0) as silver_badges,
+    coalesce(fc.bronze_badges,0) as bronze_badges,
+    coalesce(fc.tag_badges,0) as tag_badges,
+    fc.net_votes,
+    fc.max_views,
+    fc.avg_q_score,
+    fc.dup_cnt,
+    dc.canonical_id
+  from final_candidates fc
+  join dedup_canonical dc on dc.question_id = fc.question_id
+),
+ranked as (
+  select
+    n.*,
+    dense_rank() over (partition by n.tag order by n.perf_score desc, n.q_score desc, n.viewcount desc) as d_rank,
+    rank() over (order by n.perf_score desc, n.viewcount desc, n.q_score desc) as global_rank
+  from normalized n
+),
+unioned as (
+  select 'TOP_PER_TAG' as bucket, r.*
+  from ranked r
+  where r.d_rank <= (select top_n_per_tag from params)
+  union all
+  select 'GLOBAL_TOP' as bucket, r.*
+  from ranked r
+  where r.global_rank <= 50
+),
+with_comments as (
+  select
+    u.bucket,
+    u.tag,
+    u.question_id,
+    p.title,
+    substring(coalesce(p.title,''), 1, 80) as title_prefix,
+    regexp_replace(coalesce(p.title,''), '\\s+', ' ', 'g') as title_squash,
+    u.asker_id,
+    coalesce(ua.displayname, 'anonymous') as asker_name,
+    ua.location_norm,
+    u.q_score,
+    u.viewcount,
+    u.actual_answers,
+    u.pos_answers,
+    u.favorites,
+    u.comments_total,
+    u.close_events_cnt,
+    u.is_duplicate,
+    u.perf_score,
+    u.global_rank,
+    u.d_rank,
+    u.canonical_id,
+    u.gold_badges, u.silver_badges, u.bronze_badges, u.tag_badges
+  from unioned u
+  join posts p on p.id = u.question_id
+  left join users_active ua on ua.id = u.asker_id
+)
+select
+  wc.bucket,
+  wc.tag,
+  wc.global_rank,
+  wc.d_rank,
+  wc.question_id,
+  wc.canonical_id,
+  wc.title,
+  wc.title_prefix,
+  wc.title_squash,
+  wc.asker_id,
+  wc.asker_name,
+  wc.location_norm,
+  wc.q_score,
+  wc.viewcount,
+  wc.actual_answers,
+  wc.pos_answers,
+  wc.favorites,
+  wc.comments_total,
+  wc.close_events_cnt,
+  wc.is_duplicate,
+  wc.perf_score,
+  wc.gold_badges,
+  wc.silver_badges,
+  wc.bronze_badges,
+  wc.tag_badges
+from with_comments wc
+where coalesce(wc.comments_total,0) >= (select min_comments from params)
+order by wc.bucket, wc.tag, wc.d_rank, wc.global_rank, wc.perf_score desc;

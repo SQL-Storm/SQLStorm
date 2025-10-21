@@ -1,0 +1,173 @@
+WITH UserStats AS (
+  SELECT 
+    u.Id AS UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    JULIANDAY(MAX(p.CreationDate)) - JULIANDAY(MIN(p.CreationDate)) AS ActiveDays,
+    COUNT(DISTINCT b.Id) AS BadgeCount
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+  SELECT 
+    UserId,
+    Reputation,
+    DisplayName,
+    Views,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    AvgScore,
+    ActiveDays,
+    RANK() OVER (ORDER BY TotalScore DESC) AS ScoreRank,
+    RANK() OVER (ORDER BY PostCount DESC) AS PostRank,
+    RANK() OVER (ORDER BY BadgeCount DESC) AS BadgeRank
+  FROM UserStats
+),
+QuestionStats AS (
+  SELECT 
+    p.Id AS QuestionId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open'
+    END AS PostStatus,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRankPerUser,
+    NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+    CASE 
+      WHEN p.Score > 100 THEN 'High'
+      WHEN p.Score > 50 THEN 'Medium'
+      WHEN p.Score > 0 THEN 'Low'
+      ELSE 'Very Low'
+    END AS ScoreCategory,
+    (strftime('%s','now') - strftime('%s', p.CreationDate)) / 86400 AS AgeInDays
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+TagUsage AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END AS TagType,
+    CASE 
+      WHEN t.Count > 1000 THEN 'Popular'
+      WHEN t.Count > 500 THEN 'Moderately Popular'
+      WHEN t.Count > 100 THEN 'Common'
+      ELSE 'Rare'
+    END AS PopularityLevel,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank
+  FROM Tags t
+  WHERE t.Count > 50
+),
+ActivityStats AS (
+  SELECT 
+    p.Id AS PostId,
+    p.ParentId,
+    p.PostTypeId,
+    p.Score,
+    p.CreationDate,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.UserId AS HistoryUserId,
+    ph.CreationDate AS HistoryDate,
+    ph.Comment,
+    ph.Text,
+    CASE 
+      WHEN ph.PostHistoryTypeId IN (1, 4, 6, 7, 8, 9) THEN 'Title/Tag Edit'
+      WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edit'
+      WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+      ELSE 'Other'
+    END AS EditCategory,
+    (strftime('%s','now') - strftime('%s', ph.CreationDate)) / 60 AS TimeBetweenEdits,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditSequence
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+  WHERE p.PostTypeId IN (1, 2)
+  AND p.CreationDate > TIMESTAMP '2020-01-01'
+)
+SELECT 
+  'Performance Benchmark Report' AS ReportTitle,
+  COUNT(*) AS TotalUsers,
+  COUNT(DISTINCT CASE WHEN u.Reputation > 10000 THEN u.Id END) AS HighReputationUsers,
+  COUNT(DISTINCT CASE WHEN u.Reputation BETWEEN 1000 AND 10000 THEN u.Id END) AS MediumReputationUsers,
+  COUNT(DISTINCT CASE WHEN u.Reputation < 1000 THEN u.Id END) AS LowReputationUsers,
+  COUNT(DISTINCT ts.QuestionId) AS TotalQuestions,
+  COUNT(DISTINCT CASE WHEN qs.Score > 50 THEN qs.QuestionId END) AS HighScoreQuestions,
+  AVG(qs.Score) AS AvgQuestionScore,
+  AVG(qs.ViewCount) AS AvgViewCount,
+  COUNT(DISTINCT CASE WHEN qs.PostStatus = 'Closed' THEN qs.QuestionId END) AS ClosedQuestions,
+  COUNT(DISTINCT CASE WHEN qs.PostStatus = 'Open' THEN qs.QuestionId END) AS OpenQuestions,
+  COUNT(DISTINCT CASE WHEN qs.AgeInDays < 30 THEN qs.QuestionId END) AS RecentQuestions,
+  COUNT(DISTINCT ts.QuestionId) - COUNT(DISTINCT CASE WHEN qs.AgeInDays < 30 THEN qs.QuestionId END) AS OlderQuestions,
+  COUNT(DISTINCT tu.TagName) AS TotalTags,
+  COUNT(DISTINCT CASE WHEN tu.PopularityLevel = 'Popular' THEN tu.TagName END) AS PopularTags,
+  COUNT(DISTINCT CASE WHEN tu.PopularityLevel = 'Common' THEN tu.TagName END) AS CommonTags,
+  COUNT(DISTINCT CASE WHEN tu.PopularityLevel = 'Rare' THEN tu.TagName END) AS RareTags,
+  COUNT(DISTINCT ps.UserId) AS ActiveEditors,
+  COUNT(DISTINCT CASE WHEN ps.EditCategory = 'Title/Tag Edit' THEN ps.HistoryId END) AS TitleTagEdits,
+  COUNT(DISTINCT CASE WHEN ps.EditCategory = 'Body Edit' THEN ps.HistoryId END) AS BodyEdits,
+  COUNT(DISTINCT CASE WHEN ps.EditCategory = 'Status Change' THEN ps.HistoryId END) AS StatusChanges,
+  AVG(ps.TimeBetweenEdits) AS AvgTimeBetweenEdits,
+  MAX(ps.EditSequence) AS MaxEditSequence,
+  COUNT(DISTINCT CASE WHEN au.UserId IS NOT NULL THEN u.Id END) AS UsersWithPosts,
+  COUNT(DISTINCT CASE WHEN au.UserId IS NULL THEN u.Id END) AS UsersWithoutPosts,
+  (SELECT COUNT(*) FROM Badges) AS TotalBadges,
+  (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS TotalQuestionsInDB,
+  (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS TotalAnswersInDB,
+  ROUND(COUNT(DISTINCT ts.QuestionId) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0), 2) AS QuestionPercentage,
+  ROUND(COUNT(DISTINCT CASE WHEN qs.PostStatus = 'Closed' THEN qs.QuestionId END) * 100.0 / NULLIF(COUNT(DISTINCT ts.QuestionId), 0), 2) AS ClosedPercentage,
+  ROUND(AVG(CASE WHEN qs.AgeInDays IS NOT NULL THEN qs.AgeInDays END), 2) AS AvgQuestionAge,
+  (SELECT COUNT(DISTINCT PostId) FROM PostHistory) AS TotalPostHistoryRecords,
+  (SELECT COUNT(*) FROM Votes) AS TotalVotes,
+  (SELECT COUNT(*) FROM Comments) AS TotalComments,
+  (SELECT STRING_AGG(DISTINCT DisplayName, ', ') FROM Users WHERE Reputation > 10000 LIMIT 10) AS SampleHighReputationUsers,
+  (SELECT STRING_AGG(TagName, ', ') FROM TagUsage WHERE PopularityRank <= 5) AS Top5Tags,
+  COUNT(DISTINCT p.Id) AS UsersWithPosts2
+FROM Users u
+LEFT JOIN TopUsers tu ON u.Id = tu.UserId
+LEFT JOIN QuestionStats qs ON u.Id = qs.OwnerUserId
+LEFT JOIN ActivityStats ps ON u.Id = ps.HistoryUserId
+LEFT JOIN TagUsage tu ON TRUE
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN (
+  SELECT DISTINCT UserId FROM Posts
+) au ON u.Id = au.UserId
+LEFT JOIN Posts ts ON u.Id = ts.OwnerUserId AND ts.PostTypeId = 1
+WHERE u.Id IS NOT NULL
+GROUP BY 
+  CASE WHEN u.Reputation > 10000 THEN 'High' ELSE 'Not High' END,
+  CASE WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Medium' ELSE 'Not Medium' END,
+  CASE WHEN u.Reputation < 1000 THEN 'Low' ELSE 'Not Low' END
+HAVING 
+  COUNT(DISTINCT u.Id) > 0
+  OR COUNT(DISTINCT ts.QuestionId) > 0
+  OR COUNT(DISTINCT ts.QuestionId) IS NOT NULL
+ORDER BY COUNT(DISTINCT ts.QuestionId) DESC
+LIMIT 100;

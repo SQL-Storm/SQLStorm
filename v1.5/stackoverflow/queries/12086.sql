@@ -1,0 +1,135 @@
+-- {"query": "12086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 964} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC, P.CreationDate) AS GlobalRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        MAX(Score) AS MaxScore,
+        COUNT(Id) AS PostCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 1
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+PostHistorySummary AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditDate,
+        STRING_AGG(DISTINCT PH.UserId::text, ',') AS Editors
+    FROM 
+        Posts P
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        PH.PostHistoryTypeId IN (3, 5, 6, 7, 8, 9)
+    GROUP BY 
+        P.Id
+),
+ComplexPredicate AS (
+    SELECT 
+        RP.Id,
+        RP.PostTypeId,
+        RP.CreationDate,
+        RP.Score,
+        RP.ViewCount,
+        RP.OwnerUserId,
+        RP.OwnerDisplayName,
+        RP.UserRank,
+        RP.GlobalRank,
+        UAS.TotalPosts,
+        UAS.TotalComments,
+        UAS.UpVotes,
+        UAS.DownVotes,
+        PHS.TotalEdits,
+        PHS.LastEditDate,
+        PHS.Editors
+    FROM 
+        RankedPosts RP
+    JOIN 
+        UserActivity UAS ON RP.OwnerUserId = UAS.Id
+    LEFT JOIN 
+        PostHistorySummary PHS ON RP.Id = PHS.PostId
+    WHERE 
+        RP.GlobalRank <= 100 
+        AND UAS.TotalPosts > 5 
+        AND UAS.UpVotes - UAS.DownVotes > 10
+)
+SELECT 
+    CP.Id,
+    CP.PostTypeId,
+    CP.CreationDate,
+    CP.Score,
+    CP.ViewCount,
+    CP.OwnerUserId,
+    CP.OwnerDisplayName,
+    CP.UserRank,
+    CP.GlobalRank,
+    CP.TotalPosts,
+    CP.TotalComments,
+    CP.UpVotes,
+    CP.DownVotes,
+    CP.TotalEdits,
+    CP.LastEditDate,
+    CP.Editors,
+    TS.TagName,
+    TS.PostCount,
+    TS.AvgScore
+FROM 
+    ComplexPredicate CP
+LEFT JOIN 
+    TagStats TS ON CP.Id = ANY(string_to_array(TS.TagName, ',')::int[])
+ORDER BY 
+    CP.Score DESC, 
+    CP.CreationDate;

@@ -1,0 +1,76 @@
+WITH
+recent_posts AS (
+  SELECT p.Id, p.OwnerUserId, p.LastActivityDate, p.Score, p.ViewCount, p.Title, p.Tags, p.PostTypeId,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+),
+user_summary AS (
+  SELECT u.Id AS UserId,
+         COUNT(r.Id) AS posts_last_year,
+         COALESCE(SUM(r.Score), 0) AS total_post_score,
+         COALESCE(AVG(r.ViewCount), 0) AS avg_views
+  FROM Users u
+  LEFT JOIN recent_posts r ON r.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+upvotes_by_user AS (
+  SELECT p.OwnerUserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_received
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) AS badge_count,
+         STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS recent_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+all_users AS (
+  SELECT Id AS UserId FROM Users WHERE Reputation > 1000
+  UNION ALL
+  SELECT Id AS UserId FROM Users WHERE Reputation BETWEEN 500 AND 1000
+)
+SELECT
+  u.Id AS user_id,
+  u.DisplayName,
+  COALESCE(ub.badge_count, 0) AS badge_count,
+  COALESCE(ub.recent_badges, '') AS recent_badges,
+  COALESCE(usb.upvotes_received, 0) AS upvotes_received,
+  COALESCE(us.posts_last_year, 0) AS posts_last_year,
+  COALESCE(us.total_post_score, 0) AS total_post_score,
+  COALESCE(us.avg_views, 0) AS avg_views,
+  (
+    SELECT json_agg(JSON_BUILD_OBJECT('title', t.Title, 'last_activity', t.LastActivityDate, 'views', t.ViewCount, 'score', t.Score))
+    FROM (
+      SELECT t.Title, t.LastActivityDate, t.ViewCount, t.Score
+      FROM Posts t
+      WHERE t.OwnerUserId = u.Id
+      ORDER BY t.LastActivityDate DESC
+      LIMIT 5
+    ) t
+  ) AS top5_posts,
+  CASE
+    WHEN u.LastAccessDate IS NULL THEN 'never'
+    ELSE to_char(u.LastAccessDate, 'YYYY-MM-DD"T"HH24:MI:SS')
+  END AS last_access_iso
+FROM all_users a
+JOIN Users u ON u.Id = a.UserId
+LEFT JOIN user_badges ub ON ub.UserId = u.Id
+LEFT JOIN upvotes_by_user usb ON usb.OwnerUserId = u.Id
+LEFT JOIN user_summary us ON us.UserId = u.Id
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  ub.badge_count,
+  ub.recent_badges,
+  usb.upvotes_received,
+  us.posts_last_year,
+  us.total_post_score,
+  us.avg_views,
+  u.LastAccessDate
+ORDER BY u.Reputation DESC NULLS LAST
+LIMIT 100;

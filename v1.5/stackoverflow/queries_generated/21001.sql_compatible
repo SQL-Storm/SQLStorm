@@ -1,0 +1,134 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '365 days'
+),
+HighActivityPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Title,
+        p.Tags,
+        COALESCE(p.ClosedDate, p.LastActivityDate) AS LastEventDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory
+    FROM Posts p
+    WHERE p.Score > 5
+      AND (p.ViewCount > 1000 OR p.CommentCount > 10)
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+UserPostStats AS (
+    SELECT 
+        au.Id AS UserId,
+        au.Reputation,
+        au.RepRank,
+        COUNT(hap.Id) AS PostCount,
+        AVG(hap.Score) AS AvgPostScore,
+        SUM(hap.ViewCount) AS TotalViews,
+        MAX(hap.CreationDate) AS MostRecentPost,
+        STRING_AGG(
+            SUBSTRING(hap.Tags FROM 2 FOR POSITION('><' IN hap.Tags) - 2),
+            ', '
+            ORDER BY hap.CreationDate DESC
+        ) AS TopTags
+    FROM ActiveUsers au
+    LEFT JOIN HighActivityPosts hap ON au.Id = hap.OwnerUserId
+    GROUP BY au.Id, au.Reputation, au.RepRank
+    HAVING COUNT(hap.Id) > 0
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        STRING_AGG(b.Name, '; ') AS BadgeNames
+    FROM Badges b
+    WHERE b.Date > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY b.UserId, b.Class
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        AVG(v.BountyAmount) AS AvgBounty
+    FROM Votes v
+    WHERE v.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+      AND v.VoteTypeId IN (2, 3, 8, 9)
+    GROUP BY v.PostId, v.VoteTypeId
+)
+SELECT 
+    ups.UserId,
+    ups.Reputation,
+    ups.RepRank,
+    ups.PostCount,
+    ROUND( ups.AvgPostScore, 2) AS AvgPostScore,
+    ups.TotalViews,
+    ups.PostCount * ups.Reputation AS InfluenceScore,
+    COALESCE(ba.BadgeCount, 0) AS RecentBadges,
+    CASE 
+        WHEN ups.PostCount > 50 AND ups.RepRank <= 100 THEN 'Power User'
+        WHEN ups.PostCount > 10 AND ups.Reputation > 5000 THEN 'Expert'
+        ELSE 'Active'
+    END AS UserTier,
+    LEFT(ups.TopTags, 100) || CASE WHEN LENGTH(ups.TopTags) > 100 THEN '...' ELSE '' END AS TagSummary,
+    vp.VoteCount AS TotalPostVotes,
+    (ups.TotalViews / NULLIF(ups.PostCount, 0)) AS ViewsPerPost,
+    GREATEST(
+        EXTRACT(EPOCH FROM (cast('2024-10-01' as date) - ups.MostRecentPost)) / 86400,
+        1
+    ) AS DaysSinceLastPost,
+    COALESCE(
+        ba.BadgeNames,
+        CASE 
+            WHEN ups.PostCount = 0 THEN 'No recent badges or posts'
+            ELSE 'Active without badges'
+        END,
+        'Unknown'
+    ) AS BadgeInfo,
+    RANK() OVER (
+        PARTITION BY 
+            CASE 
+                WHEN ups.PostCount > 50 AND ups.RepRank <= 100 THEN 'Power User'
+                WHEN ups.PostCount > 10 AND ups.Reputation > 5000 THEN 'Expert'
+                ELSE 'Active'
+            END 
+        ORDER BY ups.InfluenceScore DESC
+    ) AS TierRank
+FROM UserPostStats ups
+LEFT OUTER JOIN BadgeAnalysis ba ON ups.UserId = ba.UserId
+LEFT OUTER JOIN (
+    SELECT 
+        hap.OwnerUserId,
+        SUM(COALESCE(vp.VoteCount, 0)) AS VoteCount,
+        MAX(vp.PostId) AS SamplePostId
+    FROM HighActivityPosts hap
+    LEFT JOIN VotePatterns vp ON hap.Id = vp.PostId
+    GROUP BY hap.OwnerUserId
+) vp ON ups.UserId = vp.OwnerUserId
+WHERE ups.RepRank <= 500
+  AND (ups.TotalViews > 10000 OR ups.PostCount > 20)
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM PostHistory ph 
+      WHERE ph.UserId = ups.UserId 
+        AND ph.PostHistoryTypeId = 12
+        AND ph.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+  )
+  AND ups.MostRecentPost > cast('2024-10-01' as date) - INTERVAL '90 days'
+ORDER BY ups.InfluenceScore DESC, ups.RepRank ASC
+LIMIT 100;

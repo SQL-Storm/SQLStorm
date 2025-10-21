@@ -1,0 +1,84 @@
+WITH TopTags AS (
+    SELECT unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS TagName, COUNT(*) AS TagCount
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY TagName
+    ORDER BY TagCount DESC
+    LIMIT 10
+),
+TopQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, u.DisplayName AS OwnerName, u.Reputation AS OwnerReputation
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND EXISTS (
+        SELECT 1 FROM TopTags t WHERE strpos(p.Tags, concat('<', t.TagName, '>')) > 0
+    ) AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT ParentId AS QuestionId, COUNT(*) AS AnswerCount, AVG(Score) AS AvgAnswerScore,
+           MAX(Score) AS MaxAnswerScore,
+           COUNT(CASE WHEN Score >= 5 THEN 1 END) AS HighScoreAnswers
+    FROM Posts
+    WHERE PostTypeId = 2 AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY ParentId
+),
+QuestionVotes AS (
+    SELECT p.Id AS QuestionId,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountyStarts,
+           SUM(COALESCE(v.BountyAmount,0)) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY p.Id
+),
+UserBadges AS (
+    SELECT UserId,
+           COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+CloseReasonsCount AS (
+    SELECT ph.PostId,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS TimesClosed,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS TimesReopened,
+           STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasonNames
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+)
+SELECT 
+    tq.Id AS QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score AS QuestionScore,
+    tq.ViewCount,
+    tq.OwnerName,
+    tq.OwnerReputation,
+    COALESCE(ab.AnswerCount, 0) AS AnswerCount,
+    COALESCE(ab.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(ab.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(ab.HighScoreAnswers, 0) AS HighScoreAnswers,
+    COALESCE(qv.UpVotes, 0) AS UpVotes,
+    COALESCE(qv.DownVotes, 0) AS DownVotes,
+    COALESCE(qv.BountyStarts, 0) AS BountyStarts,
+    COALESCE(qv.TotalBounty, 0) AS TotalBounty,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    crc.TimesClosed,
+    crc.TimesReopened,
+    crc.CloseReasonNames,
+    tt.TagName AS TopTag
+FROM TopQuestions tq
+LEFT JOIN AnswerStats ab ON tq.Id = ab.QuestionId
+LEFT JOIN QuestionVotes qv ON tq.Id = qv.QuestionId
+LEFT JOIN UserBadges ub ON tq.OwnerUserId = ub.UserId
+LEFT JOIN CloseReasonsCount crc ON tq.Id = crc.PostId
+JOIN TopTags tt ON strpos(tq.Tags, concat('<', tt.TagName, '>')) > 0
+ORDER BY (COALESCE(qv.UpVotes,0) - COALESCE(qv.DownVotes,0) + COALESCE(ab.MaxAnswerScore,0) + COALESCE(ub.GoldBadges,0) * 5) DESC
+LIMIT 50;

@@ -1,0 +1,80 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Posts p
+    INNER JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > date '2024-10-01' - interval '30' day
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId, 
+        COUNT(Id) AS PostCount, 
+        AVG(Score) AS AvgScore
+    FROM 
+        Posts
+    GROUP BY 
+        UserId
+    HAVING 
+        COUNT(Id) > 10
+),
+PostTags AS (
+    SELECT 
+        p.Id AS PostId, 
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') AS Tags
+    FROM 
+        Posts p
+)
+SELECT 
+    RecentPosts.Id, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.OwnerReputation, 
+    RecentPosts.VoteCount, 
+    RecentPosts.UpVoteCount, 
+    RecentPosts.DownVoteCount,
+    COALESCE(TopUsers.PostCount, 0) AS TopUserPostCount,
+    COALESCE(TopUsers.AvgScore, 0) AS TopUserAvgScore,
+    STRING_AGG(DISTINCT pt.Tags, ', ') AS Tags
+FROM 
+    RecentPosts
+LEFT JOIN 
+    TopUsers ON RecentPosts.OwnerUserId = TopUsers.UserId
+LEFT JOIN 
+    PostTags pt ON RecentPosts.Id = pt.PostId
+GROUP BY 
+    RecentPosts.Id, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.OwnerReputation, 
+    RecentPosts.VoteCount, 
+    RecentPosts.UpVoteCount, 
+    RecentPosts.DownVoteCount, 
+    TopUsers.PostCount, 
+    TopUsers.AvgScore
+ORDER BY 
+    RecentPosts.Score DESC, 
+    RecentPosts.ViewCount DESC, 
+    RecentPosts.CreationDate DESC
+LIMIT 10;

@@ -1,0 +1,107 @@
+-- {"query": "6034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 897} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.Body,
+    p.FavoriteCount,
+    p.ContentLicense,
+    -- compute a complex derived column: recency bucket
+    CASE
+      WHEN p.LastActivityDate >= current_date - interval '7 days' THEN 'last_7_days'
+      WHEN p.LastActivityDate >= current_date - interval '30 days' THEN 'last_30_days'
+      WHEN p.LastActivityDate >= current_date - interval '90 days' THEN 'last_90_days'
+      ELSE 'older'
+    END AS activity_bucket,
+    -- window function placeholder: rank posts by score within each bucket and post type
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId, 
+      CASE
+        WHEN p.LastActivityDate >= current_date - interval '7 days' THEN 'last_7_days'
+        WHEN p.LastActivityDate >= current_date - interval '30 days' THEN 'last_30_days'
+        WHEN p.LastActivityDate >= current_date - interval '90 days' THEN 'last_90_days'
+        ELSE 'older'
+      END
+      ORDER BY p.Score DESC, p.LastActivityDate DESC) AS rn_in_bucket
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  LEFT JOIN Tags t ON p.Id = t.WikiPostId
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND (p.ViewCount > 0 OR p.Score > 0)
+    AND (p.OwnerUserId IS NOT NULL)
+),
+Aggregated AS (
+  SELECT
+    rp.activity_bucket,
+    rp.PostTypeId,
+    COUNT(*) AS total_posts,
+    AVG(rp.Score) AS avg_score,
+    SUM(rp.ViewCount) AS total_views,
+    MAX(rp.LastActivityDate) AS most_recent_activity
+  FROM RankedPosts rp
+  GROUP BY rp.activity_bucket, rp.PostTypeId
+),
+TopByBucket AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.LastActivityDate,
+    rp.PostTypeId,
+    rp.ParentId,
+    rp.AcceptedAnswerId,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.Body,
+    rp.FavoriteCount,
+    rp.ContentLicense,
+    rp.activity_bucket,
+    rp.rn_in_bucket
+  FROM RankedPosts rp
+  WHERE rp.rn_in_bucket <= 5
+)
+SELECT
+  t.activity_bucket,
+  t.PostTypeId,
+  t.total_posts,
+  a.avg_score,
+  a.total_views,
+  t.Title,
+  t.OwnerUserId,
+  u.DisplayName,
+  t.CreationDate,
+  t.Score,
+  t.ViewCount,
+  t.Tags,
+  t.CommentCount,
+  t.LastActivityDate,
+  (SELECT STRING_AGG(lt.Name, ',')
+     FROM PostLinks pl2
+     JOIN Posts p2 ON pl2.RelatedPostId = p2.Id
+     JOIN LinkTypes lt ON pl2.LinkTypeId = lt.Id
+     WHERE pl2.PostId = t.Id) AS linked_types,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId = 2) AS upvotes_from_votes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId = 3) AS downvotes_from_votes
+FROM TopByBucket t
+JOIN Aggregated a ON t.PostTypeId = a.PostTypeId AND t.activity_bucket = a.activity_bucket
+LEFT JOIN Users u ON t.OwnerUserId = u.Id
+ORDER BY t.activity_bucket, t.PostTypeId, t.rn_in_bucket;

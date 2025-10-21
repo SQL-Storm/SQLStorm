@@ -1,0 +1,47 @@
+WITH TopUsers AS (
+    SELECT u.Id AS UserId, u.Reputation, u.DisplayName,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+           COALESCE(SUM(COALESCE(v.BountyAmount, 0)), 0) AS TotalBounties
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING SUM(COALESCE(v.BountyAmount, 0)) > 100 OR u.Reputation > 10000
+),
+PostAnalytics AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.Score, p.ViewCount,
+           (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p.Id) AS AvgCommentScore,
+           STRING_AGG(SPLIT_PART(t.TagName, '-', 1), ', ') AS SimplifiedTags,
+           CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1 AND (p.ViewCount > 1000 OR p.Score > 50)
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.ClosedDate
+),
+BadgeSummary AS (
+    SELECT b.UserId, COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = TRUE
+    GROUP BY b.UserId
+)
+SELECT tu.UserId, tu.DisplayName, tu.ReputationRank, tu.TotalBounties,
+       pa.PostId, pa.Score, pa.AvgCommentScore, pa.SimplifiedTags, pa.Status,
+       bs.GoldBadges, bs.SilverBadges,
+       (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > bs.LatestBadgeDate) AS EditsAfterLatestBadge,
+       COALESCE(NULLIF(pa.ViewCount / NULLIF(pa.Score, 0), 0), 0) AS ViewToScoreRatio
+FROM TopUsers tu
+LEFT JOIN PostAnalytics pa ON pa.OwnerUserId = tu.UserId
+LEFT JOIN BadgeSummary bs ON bs.UserId = tu.UserId
+WHERE tu.ReputationRank <= 100
+   OR EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3)
+UNION ALL
+SELECT tu.UserId, tu.DisplayName || ' (High Activity)', tu.ReputationRank, tu.TotalBounties,
+       NULL, NULL, NULL, NULL, NULL,
+       bs.GoldBadges, bs.SilverBadges,
+       (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = tu.UserId) AND v.VoteTypeId = 2) AS TotalUpvotes,
+       0
+FROM TopUsers tu
+INNER JOIN BadgeSummary bs ON bs.UserId = tu.UserId
+WHERE bs.GoldBadges > 5 AND tu.TotalBounties > 500
+ORDER BY ReputationRank, GoldBadges DESC;

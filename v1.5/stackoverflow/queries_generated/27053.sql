@@ -1,0 +1,121 @@
+-- {"query": "27053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1412} 
+
+WITH RecentPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+    LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+    COALESCE(p.ParentId, -1) AS ParentId,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+       CreationDate > DATEADD(MONTH, -3, GetDate()) then 1 ELSE 0 END AS IsRecentPost,
+       rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+  FROM
+    Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE
+    p.PostTypeId IN (1, 2)
+),
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    SUM(p.Score) AS TotalPostScore,
+    COUNT(p.Id) AS TotalPosts,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+  FROM
+    Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE
+    u.LastAccessDate > DATEADD(MONTH, -6, GetDate())
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+HighEngagementPosts AS (
+    Select *, (AnswerCount + CommentCount + FavoriteCount) AS EngagementScore
+    FROM RecentPosts
+)
+SELECT
+  rp.PostId,
+  rp.PostTypeId,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.OwnerUserId,
+  rp.LastEditorUserId,
+  rp.LastEditDate,
+  rp.Title,
+  rp.Tags,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.OwnerDisplayName,
+  rp.OwnerReputation,
+  rp.PreviousScore,
+  rp.NextScore,
+  rp.ParentId,
+  rp.AcceptedAnswerId,
+  au.ReputationRank,
+  au.TotalPostScore,
+  au.TotalPosts,
+  hep.EngagementScore,
+  (CASE
+    WHEN rp.PostTypeId = 1 THEN 'Question'
+    WHEN rp.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END) AS PostTypeName,
+  (CASE
+    WHEN LEN(rp.Title) > 50 THEN SUBSTRING(rp.Title, 1, 50) + '...'
+    ELSE rp.Title
+  END) AS ShortTitle,
+  (CASE
+    WHEN rp.OwnerDisplayName IS NULL THEN 'Anonymous'
+    ELSE rp.OwnerDisplayName
+  END) AS CleanOwnerDisplayName,
+  (CASE
+    WHEN rp.ViewCount IS NULL THEN 0
+    ELSE rp.ViewCount
+  END) AS CleanViewCount,
+  hep.EngagementScore * rp.ViewCount AS WeightedEngagementScore,
+  (CASE
+    WHEN rp.IsRecentPost = 1 THEN 'Recent'
+    ELSE 'Old'
+  END) AS RecentPostStatus,
+  (SELECT COUNT(*)
+   FROM Votes v
+   WHERE v.PostId = rp.PostId AND v.VoteTypeId = 2) AS UpvoteCount,
+  (SELECT COUNT(DISTINCT v.UserId)
+   FROM Votes v
+   WHERE v.PostId = rp.PostId AND v.VoteTypeId = 2) AS DistinctUpvoters,
+  (CASE WHEN p.OwnerUserId = (SELECT MIN(UserId) FROM Users u2 WHERE u2.Reputation > 10000) THEN 'Top User' ELSE 'Regular User' END ) as OwnerType, (SELECT AVG(u3.Reputation) FROM Users u3 WHERE Reputation > 10000) as AvgHighReputation, rp.UserPostRank,
+ --User stats for all linked posts
+  (SELECT SUM(Substring(Comment, CharIndex('<', Comment), CharIndex('>', Comment, CharIndex('<', Comment))) AS Int) from (SELECT Id FROM Posts  pl where pl.TagBased=1 )statextract (rp.Body) ) as CommentCountState,
+    (SELECT BIGGEST.PostId
+   FROM PostHistory ph
+   WHERE ph.PostId = rp.AnswerCount
+   AND PostHistoryTypesId NOT IN (1,5)
+   ) as BiggestAnswerId
+
+FROM
+  RecentPosts rp
+  JOIN ActiveUsers au ON rp.OwnerUserId = au.UserId
+  JOIN HighEngagementPosts hep ON rp.PostId = hep.PostId
+ORDER BY
+  rp.CreationDate,
+  rp.Score DESC,
+  rp.OwnerReputation DESC;

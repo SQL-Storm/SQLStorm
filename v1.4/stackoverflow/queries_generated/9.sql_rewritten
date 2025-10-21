@@ -1,0 +1,139 @@
+-- {"query": "9.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 998} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.Tags,
+    p.AnswerCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName
+  FROM Posts p
+  WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  FROM Posts p
+  JOIN RecentActivePosts rap ON rap.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+TagCounts AS (
+  SELECT TagName, COUNT(*) AS TagCount
+  FROM TopTags
+  GROUP BY TagName
+),
+UsersWithBadges AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class,
+    b.TagBased
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.Reputation > 1000
+),
+DeltaPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    CASE
+      WHEN p.AcceptedAnswerId IS NULL THEN 0
+      ELSE 1
+    END AS HasAcceptedAnswer,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+    AND p.PostTypeId = 1
+),
+CorrelatedVotes AS (
+  SELECT
+    d.PostId,
+    d.OwnerUserId,
+    d.Title,
+    d.LastActivityDate,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    v.UserId AS VoterId,
+    u.DisplayName AS VoterName
+  FROM DeltaPosts d
+  LEFT JOIN Votes v ON v.PostId = d.PostId
+  LEFT JOIN Users u ON u.Id = v.UserId
+  WHERE v.VoteTypeId IN (2, 3) -- UpMod / DownMod
+),
+WindowedScore AS (
+  SELECT
+    d.PostId,
+    d.OwnerUserId,
+    d.Title,
+    d.LastActivityDate,
+    d.Score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END) OVER (PARTITION BY d.PostId) AS NetScoreFromVotes,
+    ROW_NUMBER() OVER (PARTITION BY d.OwnerUserId ORDER BY d.LastActivityDate DESC) AS SeqForUser
+  FROM DeltaPosts d
+  LEFT JOIN Votes v ON v.PostId = d.PostId
+  GROUP BY d.PostId, d.OwnerUserId, d.Title, d.LastActivityDate, d.Score
+)
+SELECT
+  rap.PostId,
+  rap.PostTypeId,
+  rap.Title,
+  rap.OwnerUserId,
+  rap.OwnerDisplayName,
+  rap.CreationDate,
+  rap.LastActivityDate,
+  rap.ViewCount,
+  rap.Score,
+  rap.AdditionalInfo
+FROM RecentActivePosts rap
+LEFT JOIN (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(*) AS TotalVotes
+  FROM Votes
+  GROUP BY PostId
+) v ON v.PostId = rap.PostId
+LEFT JOIN (
+  SELECT
+    PostId,
+    MAX(Aggregated) AS AdditionalInfo
+  FROM (
+    SELECT
+      p.Id AS PostId,
+      CONCAT_WS(' | ',
+        'Tags:' , COALESCE(p.Tags, ''),
+        'Answers:' , COALESCE(p.AnswerCount::text, '0'),
+        'Views:' , p.ViewCount::text,
+        'Score:' , p.Score::text
+      ) AS Aggregated
+    FROM Posts p
+  ) t
+  GROUP BY PostId
+) a ON a.PostId = rap.PostId
+ORDER BY rap.LastActivityDate DESC
+LIMIT 100;

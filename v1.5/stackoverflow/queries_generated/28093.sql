@@ -1,0 +1,57 @@
+-- {"query": "28093.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1451} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Location,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Location
+), PostDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS CalculatedAnswers,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS Tags,
+        COALESCE(ph.Comment, 'No close reason') AS CloseReason,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    pd.Title,
+    CONCAT_WS(' - ', us.DisplayName, COALESCE(us.Location, 'Unknown')) AS AuthorInfo,
+    pd.Score * 1.0 / NULLIF(pd.ViewCount, 0) AS ScorePerView,
+    pd.EditCount,
+    pd.CalculatedAnswers - pd.AnswerCount AS AnswerDiscrepancy,
+    (SELECT COUNT(*) FROM UNNEST(pd.Tags) AS t WHERE t LIKE '%sql%') AS SQLTagCount,
+    us.BadgeCount,
+    us.ReputationRank,
+    pd.CloseReason,
+    AVG(pd.Score) OVER (PARTITION BY us.Location) AS AvgLocationScore,
+    SUM(us.VoteCount) OVER (ORDER BY us.ReputationRank) AS CumulativeVotes
+FROM PostDetails pd
+INNER JOIN UserStats us ON pd.Id IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id)
+WHERE pd.Score > 100
+    AND pd.CreationDate BETWEEN '2010-01-01' AND '2020-01-01'
+    AND (us.BadgeCount > 10 OR us.ReputationRank <= 5)
+    AND pd.HasAcceptedAnswer = 1
+HAVING AnswerDiscrepancy BETWEEN -2 AND 2
+ORDER BY ScorePerView DESC
+LIMIT 100;

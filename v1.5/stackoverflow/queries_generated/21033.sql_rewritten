@@ -1,0 +1,155 @@
+-- {"query": "21033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1566} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) AS ActivityRank,
+        COUNT(DISTINCT ph.Id) AS EditCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.PostTypeId IN (1, 2) 
+        AND p.CreationDate >= u.CreationDate 
+        AND p.Score > -5
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (4, 5, 6)  -- Edits
+        AND ph.CreationDate > p.CreationDate
+        AND ph.UserId = u.Id
+    WHERE u.Reputation > 100
+        AND u.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+HighScoringPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostTitle,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Score >= 10
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate - INTERVAL '30 days')
+),
+LinkStats AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) AS OutboundLinks,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateLinks,
+        STRING_AGG(DISTINCT pt.Name, ', ') AS LinkTypesUsed
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p ON pl.PostId = p.Id
+    WHERE p.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY pl.PostId
+),
+BadgeAchievers AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        STRING_AGG(DISTINCT b.Name, ' | ') AS BadgeNames
+    FROM Badges b
+    WHERE b.Date > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 2
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    COALESCE(hsp.PostCount, 0) AS HighScoringPostsCount,
+    COALESCE(hsp.AvgScore, 0) AS AvgHighScore,
+    COALESCE(ls.OutboundLinks, 0) AS TotalOutboundLinks,
+    COALESCE(ba.TotalBadges, 0) AS TotalBadges,
+    ua.ActivityRank,
+    CONCAT(
+        COALESCE(ua.DisplayName, 'Anonymous'),
+        ' (Rep: ',
+        ua.Reputation,
+        ', Posts: ',
+        ua.PostCount,
+        ')'
+    ) AS UserSummary,
+    CASE 
+        WHEN ua.PostCount > 50 AND ba.GoldBadges > 0 THEN 'Power User'
+        WHEN ua.EditCount > 20 THEN 'Active Editor'
+        WHEN hsp.PostCount > 5 THEN 'High Scorer'
+        ELSE 'Regular'
+    END AS UserCategory,
+    GREATEST(
+        COALESCE(ua.AvgPostScore, 0),
+        COALESCE(hsp.AvgScore, 0),
+        1
+    ) AS EffectiveScore,
+    hsp.PostStatus,
+    (SELECT STRING_AGG(c.Text, ' | ')
+     FROM Comments c 
+     WHERE c.PostId = hsp.HighScoringPostId 
+     AND c.Score > 0 
+     AND c.CreationDate > hsp.PostCreationDate - INTERVAL '7 days'
+     LIMIT 3) AS TopComments
+FROM UserActivity ua
+FULL OUTER JOIN (
+    SELECT 
+        hsp.OwnerUserId,
+        COUNT(*) AS PostCount,
+        AVG(hsp.Score) AS AvgScore,
+        MAX(hsp.Id) AS HighScoringPostId,
+        MAX(hsp.PostStatus) AS PostStatus
+    FROM HighScoringPosts hsp
+    GROUP BY hsp.OwnerUserId
+) hsp ON ua.UserId = hsp.OwnerUserId
+LEFT JOIN LinkStats ls ON hsp.HighScoringPostId = ls.PostId
+LEFT JOIN BadgeAchievers ba ON ua.UserId = ba.UserId
+WHERE ua.ActivityRank <= 100
+    OR (hsp.PostCount IS NOT NULL AND hsp.PostCount > 10)
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Overall Stats' AS DisplayName,
+    SUM(ua.Reputation) AS Reputation,
+    SUM(ua.PostCount) AS PostCount,
+    SUM(ua.QuestionCount) AS QuestionCount,
+    SUM(ua.AnswerCount) AS AnswerCount,
+    SUM(COALESCE(hsp.PostCount, 0)) AS HighScoringPostsCount,
+    AVG(COALESCE(hsp.AvgScore, 0)) AS AvgHighScore,
+    SUM(COALESCE(ls.OutboundLinks, 0)) AS TotalOutboundLinks,
+    SUM(COALESCE(ba.TotalBadges, 0)) AS TotalBadges,
+    NULL AS ActivityRank,
+    'Aggregate Statistics' AS UserSummary,
+    'Summary' AS UserCategory,
+    AVG(GREATEST(COALESCE(ua.AvgPostScore, 0), COALESCE(hsp.AvgScore, 0), 1)) AS EffectiveScore,
+    NULL AS PostStatus,
+    NULL AS TopComments
+FROM UserActivity ua
+FULL OUTER JOIN (
+    SELECT hsp.OwnerUserId, COUNT(*) AS PostCount, AVG(hsp.Score) AS AvgScore
+    FROM HighScoringPosts hsp GROUP BY hsp.OwnerUserId
+) hsp ON ua.UserId = hsp.OwnerUserId
+LEFT JOIN LinkStats ls ON hsp.HighScoringPostId = ls.PostId
+LEFT JOIN BadgeAchievers ba ON ua.UserId = ba.UserId
+ORDER BY 
+    CASE WHEN UserId IS NULL THEN 0 ELSE 1 END,
+    COALESCE(ua.ActivityRank, 999),
+    EffectiveScore DESC NULLS LAST;

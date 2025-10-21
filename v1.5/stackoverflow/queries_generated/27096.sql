@@ -1,0 +1,133 @@
+-- {"query": "27096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1591} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS TotalDownVotesReceived,
+        COALESCE(SUM(c.Id), 0) AS TotalComments,
+        COALESCE(MAX(p.Score), 0) AS MaxPostScore
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE
+        u.CreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '1 year'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COUNT(c.Id) AS CommentCount,
+        SUM(v.VoteTypeId = 2) AS UpVotes,
+        SUM(v.VoteTypeId = 3) AS DownVotes
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '6 months'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title, p.Tags, u.DisplayName, p.AnswerCount
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    WHERE
+        b.Date >= DATE_TRUNC('month', NOW()) - INTERVAL '1 year'
+    GROUP BY
+        b.UserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.LastAccessDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    ua.TotalComments,
+    ua.MaxPostScore,
+    bs.TotalBadges,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    pa.PostId,
+    pa.PostTypeId,
+    pa.PostCreationDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.Title,
+    pa.Tags,
+    pa.OwnerDisplayName,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.UpVotes,
+    pa.DownVotes,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostStatus,
+    p.LastActivityDate,
+    STRING_AGG(t.TagName, ', ') AS TagList,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId
+FROM
+    UserActivity ua
+LEFT JOIN
+    BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN
+    PostActivity pa ON ua.UserId = pa.OwnerUserId
+LEFT JOIN
+    Posts p ON pa.PostId = p.Id
+LEFT JOIN
+    Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+WHERE
+    (ua.TotalPosts > 10 OR ua.TotalComments > 50)
+    AND pa.PostCreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '3 months'
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.LastAccessDate,
+    ua.TotalPosts, ua.TotalQuestions, ua.TotalAnswers, ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived, ua.TotalComments, ua.MaxPostScore,
+    bs.TotalBadges, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges,
+    pa.PostId, pa.PostTypeId, pa.PostCreationDate, pa.Score, pa.ViewCount,
+    pa.Title, pa.Tags, pa.OwnerDisplayName, pa.AnswerCount, pa.CommentCount,
+    pa.UpVotes, pa.DownVotes, p.ClosedDate, p.CommunityOwnedDate, p.LastActivityDate,
+    p.AcceptedAnswerId
+ORDER BY
+    ua.Reputation DESC, pa.Score DESC, pa.ViewCount DESC;
+ 

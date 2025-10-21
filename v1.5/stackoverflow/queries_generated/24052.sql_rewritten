@@ -1,0 +1,110 @@
+-- {"query": "24052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2098} 
+WITH
+  -- Extract question rows and split tags
+  question_data AS (
+    SELECT
+      p.Id                      AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.AnswerCount,
+      p.AcceptedAnswerId,
+      p.CreationDate           AS QuestionCreated,
+      UNNEST(
+        STRING_TO_ARRAY(
+          SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags)-2),
+          '><'
+        )
+      )                         AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ),
+  tags_parsed AS (
+    SELECT
+      q.QuestionId,
+      q.Tag,
+      COUNT(*) FILTER (WHERE t.TagName = q.Tag) AS TagMatches
+    FROM question_data q
+    LEFT JOIN Tags t ON t.TagName = q.Tag
+    GROUP BY q.QuestionId, q.Tag
+  ),
+  -- User reputation
+  user_info AS (
+    SELECT Id, Reputation, DisplayName
+    FROM Users
+  ),
+  -- Aggregate votes per post
+  vote_sums AS (
+    SELECT
+      v.PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)   AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)   AS DownVotes,
+      SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS TotalVotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ),
+  -- First answer timestamp
+  first_answer AS (
+    SELECT
+      a.ParentId        AS QuestionId,
+      MIN(a.CreationDate) AS FirstAnswerDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+  ),
+  -- Duplicate links
+  duplicate_links AS (
+    SELECT
+      pl.PostId          AS SourceQuestionId,
+      pl.RelatedPostId   AS DuplicateOfQuestionId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+  ),
+  -- Window function to rank answers per question
+  answer_rank AS (
+    SELECT
+      a.ParentId,
+      a.Id            AS AnswerId,
+      a.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+  )
+SELECT
+  q.Title,
+  COALESCE(ui.Reputation, 0)              AS OwnerReputation,
+  COALESCE(vs.UpVotes, 0)                 AS UpVotes,
+  COALESCE(vs.DownVotes, 0)               AS DownVotes,
+  COALESCE(vs.TotalVotes, 0)              AS TotalVotes,
+  COALESCE(ar.AnswerCount, 0)             AS TotalAnswers,
+  COALESCE(af.FirstAnswerDate, NULL)      AS FirstAnswerDate,
+  COUNT(DISTINCT q.Tag)                   AS TagCount,
+  STRING_AGG(DISTINCT q.Tag, ',' ORDER BY q.Tag) AS Tags,
+  STRING_AGG(DISTINCT t.Tag, ',' ORDER BY t.Tag) AS TagsMatched,
+  CASE
+    WHEN dl.DuplicateOfQuestionId IS NOT NULL THEN 'Duplicate'
+    ELSE 'Primary'
+  END                                      AS LinkStatus,
+  STRING_AGG(CASE WHEN ar.AnswerRank = 1 THEN ar.AnswerId::text END, ',' ORDER BY ar.AnswerRank) AS FirstAnswers
+FROM question_data q
+LEFT JOIN user_info ui                 ON ui.Id = q.OwnerUserId
+LEFT JOIN vote_sums vs                 ON vs.PostId = q.QuestionId
+LEFT JOIN answer_counts ar             ON ar.QuestionId = q.QuestionId
+LEFT JOIN first_answer af              ON af.QuestionId = q.QuestionId
+LEFT JOIN duplicate_links dl           ON dl.SourceQuestionId = q.QuestionId
+LEFT JOIN tags_parsed t                ON t.QuestionId = q.QuestionId
+LEFT JOIN answer_rank ar               ON ar.ParentId = q.QuestionId
+WHERE q.AnswerCount > 0
+  AND (
+    COALESCE(vs.TotalVotes, 0) + q.AnswerCount
+  ) > 100
+GROUP BY
+  q.Title,
+  ui.Reputation,
+  vs.UpVotes,
+  vs.DownVotes,
+  vs.TotalVotes,
+  ar.AnswerCount,
+  af.FirstAnswerDate,
+  dl.DuplicateOfQuestionId
+ORDER BY q.QuestionCreated DESC
+LIMIT 250;

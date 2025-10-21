@@ -1,0 +1,83 @@
+-- {"query": "23058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 853} 
+WITH TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1), 0) AS GoldBadges
+    FROM Users u
+    WHERE u.Reputation > 1000 AND (u.Location IS NOT NULL OR u.AboutMe LIKE '%SQL%')
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL) AS AvgBounty,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS TagArray,
+        CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 10000
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        SUM(p.Score) AS TotalAnswerScore,
+        MAX(p.LastActivityDate) AS LatestAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+    HAVING COUNT(*) > 5
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.RankInLocation,
+    tu.GoldBadges,
+    qs.PostId,
+    qs.Title,
+    qs.ViewCount,
+    qs.Score,
+    qs.AvgBounty,
+    qs.TagArray[1] || '|' || COALESCE(qs.TagArray[2], 'N/A') AS TopTags,
+    COALESCE(as1.AnswerCount, 0) AS AnswerCount,
+    COALESCE(as1.TotalAnswerScore, 0) AS TotalAnswerScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qs.PostId AND c.Score > 0 AND c.Text LIKE '%interesting%') AS PositiveComments,
+    CASE WHEN ph.CloseCount > 0 THEN 'HasClosures' ELSE 'NoClosures' END AS ClosureHistory
+FROM TopUsers tu
+LEFT OUTER JOIN Posts p ON p.OwnerUserId = tu.UserId AND p.PostTypeId = 1
+INNER JOIN QuestionStats qs ON qs.PostId = p.Id
+LEFT OUTER JOIN AnswerStats as1 ON as1.QuestionId = qs.PostId
+LEFT OUTER JOIN (
+    SELECT PostId, COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 35)  -- Close or Migrate Away
+    GROUP BY PostId
+) ph ON ph.PostId = qs.PostId
+WHERE tu.GoldBadges >= 1 OR qs.Status = 'Open'
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Aggregate' AS DisplayName,
+    SUM(tu.Reputation) AS Reputation,
+    NULL AS RankInLocation,
+    SUM(tu.GoldBadges) AS GoldBadges,
+    NULL AS PostId,
+    NULL AS Title,
+    SUM(qs.ViewCount) AS ViewCount,
+    AVG(qs.Score) AS Score,
+    AVG(qs.AvgBounty) AS AvgBounty,
+    'All Tags' AS TopTags,
+    SUM(COALESCE(as1.AnswerCount, 0)) AS AnswerCount,
+    SUM(COALESCE(as1.TotalAnswerScore, 0)) AS TotalAnswerScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.Score > 0) AS PositiveComments,
+    'Summary' AS ClosureHistory
+FROM TopUsers tu
+CROSS JOIN QuestionStats qs
+LEFT OUTER JOIN AnswerStats as1 ON as1.QuestionId = qs.PostId
+GROUP BY 'Aggregate'
+ORDER BY Reputation DESC NULLS LAST;

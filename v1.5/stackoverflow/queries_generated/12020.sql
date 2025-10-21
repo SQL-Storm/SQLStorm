@@ -1,0 +1,112 @@
+-- {"query": "12020.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 915} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        Id, 
+        PostTypeId, 
+        Score, 
+        ViewCount, 
+        CreationDate, 
+        OwnerUserId, 
+        OwnerDisplayName
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+),
+AggregatedData AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(P.Score) AS AvgScore,
+        SUM(P.ViewCount) AS TotalViews
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.TagName = ANY(string_to_array(P.Tags, '<'))
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersPosted,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+PostHistorySummary AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        COUNT(DISTINCT PH.Id) AS TotalEdits,
+        MAX(PH.CreationDate) AS LastEditDate,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END), 0) AS BodyEdits,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (1, 4) THEN 1 ELSE 0 END), 0) AS TitleEdits,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (3, 6) THEN 1 ELSE 0 END), 0) AS TagEdits
+    FROM 
+        Posts P
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        P.Id, P.Title
+)
+SELECT 
+    AD.TagName,
+    AD.TotalPosts,
+    AD.TotalQuestions,
+    AD.TotalAnswers,
+    AD.AvgScore,
+    AD.TotalViews,
+    UA.DisplayName,
+    UA.QuestionsPosted,
+    UA.AnswersPosted,
+    UA.UpVotesReceived,
+    UA.DownVotesReceived,
+    PHS.Title,
+    PHS.TotalEdits,
+    PHS.LastEditDate,
+    PHS.BodyEdits,
+    PHS.TitleEdits,
+    PHS.TagEdits
+FROM 
+    AggregatedData AD
+JOIN 
+    UserActivity UA ON AD.TagName = ANY(string_to_array(UA.DisplayName, ' '))
+LEFT JOIN 
+    PostHistorySummary PHS ON AD.TagName = PHS.Title
+ORDER BY 
+    AD.TotalViews DESC, 
+    UA.UpVotesReceived DESC;

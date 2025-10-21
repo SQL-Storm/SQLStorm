@@ -1,0 +1,339 @@
+-- {"query": "8046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3015} 
+with
+-- recent active users with badge diversity
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.location,
+    count(distinct b.name) filter (where b.tagbased = 0) as named_badges,
+    count(distinct b.name) filter (where b.tagbased = 1) as tag_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location
+),
+-- questions with engagement metrics
+q as (
+  select
+    p.id as question_id,
+    p.owneruserid as asker_id,
+    p.creationdate as question_date,
+    p.title,
+    p.tags,
+    p.score as q_score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.closeddate,
+    coalesce(p.commentcount, 0) as q_commentcount
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- answers with quality metrics and accepted flag
+a as (
+  select
+    p.id as answer_id,
+    p.parentid as question_id,
+    p.owneruserid as answerer_id,
+    p.creationdate as answer_date,
+    p.score as a_score,
+    coalesce(p.commentcount, 0) as a_commentcount,
+    case when p.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+  from posts p
+  join posts q on q.id = p.parentid and q.posttypeid = 1
+  where p.posttypeid = 2
+),
+-- votes summary per post
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_votes,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by v.postid
+),
+-- comments summary per post
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by c.postid
+),
+-- post history events of interest
+history_flags as (
+  select
+    ph.postid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as first_closed_or_migrated,
+    count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits_applied,
+    count(*) filter (where ph.posthistorytypeid in (52)) as times_hot,
+    count(*) filter (where ph.posthistorytypeid in (53)) as times_unhot,
+    count(*) filter (where ph.posthistorytypeid in (19)) as times_protected
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by ph.postid
+),
+-- linkages: duplicates and general links
+link_agg as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+    count(*) filter (where pl.linktypeid = 1) as linked_links,
+    count(*) as total_links
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by pl.postid
+),
+-- tag explode for questions using documented split
+q_tags as (
+  select
+    q.question_id,
+    lower(trim(tg)) as tag
+  from q
+  cross join lateral unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tg
+),
+-- tag weights based on global tag stats
+tag_weights as (
+  select
+    t.tagname as tag,
+    t.count as global_count,
+    case
+      when t.count = 0 then 0.0
+      when t.count < 100 then 2.0
+      when t.count < 1000 then 1.2
+      else 0.6
+    end as rarity_weight
+  from tags t
+),
+-- aggregate tag features per question
+q_tag_features as (
+  select
+    qt.question_id,
+    count(*) as tag_count,
+    min(tw.global_count) as min_tag_popularity,
+    max(tw.global_count) as max_tag_popularity,
+    avg(coalesce(tw.rarity_weight, 1.0)) as avg_rarity_weight,
+    string_agg(qt.tag, ',' order by qt.tag) as tag_list_csv
+  from q_tags qt
+  left join tag_weights tw on tw.tag = qt.tag
+  group by qt.question_id
+),
+-- answer quality per question with window ranks
+answer_stats as (
+  select
+    a.question_id,
+    count(*) as answers_total,
+    sum(case when a.is_accepted = 1 then 1 else 0 end) as accepted_answers,
+    max(a.a_score) as max_answer_score,
+    avg(a.a_score::numeric) as avg_answer_score,
+    max(a.answer_date) as last_answer_date
+  from a
+  group by a.question_id
+),
+-- pick top 3 answers per question by score with ties via dense_rank
+top_answers as (
+  select *
+  from (
+    select
+      a.question_id,
+      a.answer_id,
+      a.answerer_id,
+      a.a_score,
+      a.is_accepted,
+      dense_rank() over (partition by a.question_id order by a.a_score desc nulls last, a.answer_date asc) as rk
+    from a
+  ) s
+  where s.rk <= 3
+),
+-- user engagement combining askers and answerers
+user_engagement as (
+  select
+    q.question_id,
+    q.asker_id as user_id
+  from q
+  union
+  select
+    a.question_id,
+    a.answerer_id
+  from a
+),
+-- user-level aggregates for those engaged on each question
+user_engagement_stats as (
+  select
+    ue.question_id,
+    count(distinct ue.user_id) as distinct_participants,
+    avg(ru.reputation::numeric) as avg_participant_rep,
+    sum(coalesce(ru.total_badges, 0)) as total_participant_badges,
+    max(ru.last_badge_date) as most_recent_badge among_participants
+  from user_engagement ue
+  left join recent_users ru on ru.user_id = ue.user_id
+  group by ue.question_id
+),
+-- compute activity recency and growth windows on questions
+question_activity as (
+  select
+    q.question_id,
+    q.question_date,
+    coalesce(ca.comment_count, 0) + coalesce(va.upvotes, 0) + coalesce(va.downvotes, 0) as interaction_count,
+    greatest(coalesce(ca.last_comment_date, q.question_date), q.question_date) as last_interaction_date,
+    coalesce(va.upvotes, 0) as q_upvotes,
+    coalesce(va.downvotes, 0) as q_downvotes,
+    coalesce(va.bounty_amount, 0) as total_bounty_amount
+  from q
+  left join comment_agg ca on ca.postid = q.question_id
+  left join vote_agg va on va.postid = q.question_id
+),
+-- rolling metrics per month for questions using window frames
+question_monthly as (
+  select
+    date_trunc('month', qa.question_date) as month_bucket,
+    count(*) as questions_in_month,
+    avg(qa.interaction_count::numeric) as avg_interactions_in_month,
+    sum(case when qa.interaction_count > 0 then 1 else 0 end) as active_questions_in_month
+  from question_activity qa
+  group by date_trunc('month', qa.question_date)
+),
+-- rank questions by a composite score
+ranked_questions as (
+  select
+    q.question_id,
+    q.title,
+    q.asker_id,
+    q.q_score,
+    q.viewcount,
+    q.favoritecount,
+    q.answercount,
+    q.closeddate,
+    q.tags,
+    qtf.avg_rarity_weight,
+    qtf.tag_count,
+    qtf.tag_list_csv,
+    asg.answers_total,
+    asg.accepted_answers,
+    asg.max_answer_score,
+    asg.avg_answer_score,
+    qa.interaction_count,
+    qa.last_interaction_date,
+    qa.q_upvotes,
+    qa.q_downvotes,
+    qa.total_bounty_amount,
+    ues.distinct_participants,
+    ues.avg_participant_rep,
+    ues.total_participant_badges,
+    ues.most_recent_badge among_participants,
+    la.duplicate_links,
+    la.linked_links,
+    la.total_links,
+    hf.first_closed_or_migrated,
+    hf.suggested_edits_applied,
+    hf.times_hot,
+    hf.times_unhot,
+    hf.times_protected,
+    -- composite score with null-safe arithmetic
+    (
+      coalesce(q.q_score,0)*1.0
+      + coalesce(qa.q_upvotes,0)*0.8
+      - coalesce(qa.q_downvotes,0)*0.9
+      + coalesce(asg.max_answer_score,0)*0.6
+      + coalesce(asg.accepted_answers,0)*2.0
+      + greatest(0, 5 - coalesce(qtf.tag_count,0)) * 0.2
+      + coalesce(q.favoritecount,0) * 0.5
+      + log(1 + coalesce(q.viewcount,0))::numeric
+      + case when q.closeddate is null then 1.0 else -2.0 end
+      + coalesce(ues.avg_participant_rep,0) * 0.001
+      + coalesce(ues.distinct_participants,0) * 0.3
+      + coalesce(qa.total_bounty_amount,0) * 0.01
+      - coalesce(la.duplicate_links,0) * 1.5
+      + coalesce(hf.suggested_edits_applied,0) * 0.4
+      + coalesce(hf.times_hot,0) * 1.2
+      - coalesce(hf.times_unhot,0) * 0.5
+    ) as composite_score
+  from q
+  left join q_tag_features qtf on qtf.question_id = q.question_id
+  left join answer_stats asg on asg.question_id = q.question_id
+  left join question_activity qa on qa.question_id = q.question_id
+  left join user_engagement_stats ues on ues.question_id = q.question_id
+  left join link_agg la on la.postid = q.question_id
+  left join history_flags hf on hf.postid = q.question_id
+),
+-- correlate with monthly baselines
+scored_with_baseline as (
+  select
+    rq.*,
+    date_trunc('month', (select question_date from q where q.question_id = rq.question_id)) as month_bucket,
+    (
+      select avg(composite_score)
+      from ranked_questions rq2
+      where date_trunc('month', (select question_date from q where q.question_id = rq2.question_id)) =
+            date_trunc('month', (select question_date from q where q.question_id = rq.question_id))
+    ) as month_avg_score
+  from ranked_questions rq
+),
+-- final ranking with window functions
+final_rank as (
+  select
+    s.*,
+    (s.composite_score - coalesce(s.month_avg_score, 0)) as score_above_month_avg,
+    percent_rank() over (order by s.composite_score) as pr_global,
+    dense_rank() over (partition by s.month_bucket order by s.composite_score desc nulls last) as rk_in_month,
+    row_number() over (order by s.composite_score desc nulls last, s.viewcount desc nulls last) as rk_global
+  from scored_with_baseline s
+)
+select
+  f.rk_global,
+  f.rk_in_month,
+  f.month_bucket,
+  f.question_id,
+  f.title,
+  f.tags,
+  f.tag_list_csv,
+  f.tag_count,
+  f.q_score,
+  f.viewcount,
+  f.favoritecount,
+  f.answercount,
+  f.accepted_answers,
+  f.max_answer_score,
+  f.avg_answer_score,
+  f.q_upvotes,
+  f.q_downvotes,
+  f.total_bounty_amount,
+  f.distinct_participants,
+  round(f.avg_participant_rep,2) as avg_participant_rep,
+  f.total_participant_badges,
+  f.interaction_count,
+  f.last_interaction_date,
+  f.duplicate_links,
+  f.linked_links,
+  f.total_links,
+  f.suggested_edits_applied,
+  f.times_hot,
+  f.times_unhot,
+  f.times_protected,
+  f.first_closed_or_migrated,
+  round(f.composite_score::numeric,3) as composite_score,
+  round(f.score_above_month_avg::numeric,3) as score_above_month_avg
+from final_rank f
+where (f.closeddate is null or f.times_hot > 0)
+  and coalesce(f.tag_count,0) between 1 and 7
+  and not exists (
+    select 1
+    from postlinks pl
+    where pl.postid = f.question_id
+      and pl.linktypeid = 3
+      and pl.creationdate >= f.question_date
+  )
+order by f.rk_global
+limit 200;

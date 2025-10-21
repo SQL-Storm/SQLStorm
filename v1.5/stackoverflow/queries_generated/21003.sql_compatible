@@ -1,0 +1,117 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.UserId = u.Id
+    WHERE u.Reputation > 100 AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 0 OR SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) > 0
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC, p.Score DESC) AS ViewRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 
+                CONCAT('Closed: ', crt.Name, ' on ', TO_CHAR(p.ClosedDate, 'YYYY-MM-DD'))
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 
+                CONCAT('Community: ', TO_CHAR(p.CommunityOwnedDate, 'YYYY-MM-DD'))
+            ELSE NULL 
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS SMALLINT) = crt.Id
+    WHERE p.PostTypeId = 1 
+        AND (p.Score > 50 OR p.ViewCount > 10000 OR p.AnswerCount > 10)
+        AND p.Tags IS NOT NULL 
+        AND LENGTH(REGEXP_REPLACE(p.Tags, '<[^>]*>', '', 'g')) > 10
+),
+UserPostMetrics AS (
+    SELECT 
+        au.UserId,
+        au.PostCount,
+        au.AvgPostScore,
+        COUNT(hp.PostId) AS HighImpactPostCount,
+        SUM(CASE WHEN hp.ViewRank <= 5 THEN 1 ELSE 0 END) AS TopRankedPosts,
+        AVG(hp.ViewCount) AS AvgHighImpactViews,
+        STRING_AGG(DISTINCT COALESCE(hp.Title, ''), '; ') AS PostTitles,
+        MAX(CASE WHEN hp.PostStatus LIKE 'Closed:%' THEN 1 ELSE 0 END) AS HasClosedPosts
+    FROM ActiveUsers au
+    LEFT JOIN HighImpactPosts hp ON au.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = hp.PostId)
+    GROUP BY au.UserId, au.PostCount, au.AvgPostScore
+)
+SELECT 
+    u.DisplayName,
+    u.Location,
+    u.Reputation,
+    upm.PostCount,
+    upm.HighImpactPostCount,
+    upm.TopRankedPosts,
+    upm.AvgHighImpactViews,
+    upm.PostTitles,
+    upm.HasClosedPosts,
+    au.CloseReopenCount,
+    (upm.HighImpactPostCount * 1.0 / NULLIF(upm.PostCount, 0)) AS ImpactRatio,
+    CASE 
+        WHEN upm.AvgPostScore > au.AvgPostScore THEN 'Above Average'
+        WHEN upm.AvgPostScore < au.AvgPostScore THEN 'Below Average'
+        ELSE 'Average'
+    END AS PerformanceCategory,
+    COALESCE(b.Name, 'No Badges') AS TopBadge,
+    ROW_NUMBER() OVER (ORDER BY upm.AvgHighImpactViews DESC, upm.HighImpactPostCount DESC) AS OverallRank,
+    NTILE(4) OVER (ORDER BY upm.ImpactRatio DESC) AS Quartile
+FROM UserPostMetrics upm
+INNER JOIN Users u ON upm.UserId = u.Id
+INNER JOIN ActiveUsers au ON upm.UserId = au.UserId
+LEFT JOIN (
+    SELECT 
+        UserId,
+        Name,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Date DESC, Class ASC) AS rn
+    FROM Badges 
+    WHERE Class = 1
+) b ON u.Id = b.UserId AND b.rn = 1
+WHERE upm.HighImpactPostCount > 0 
+    AND (u.Location ILIKE '%USA%' OR u.Location IS NULL)
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.PostId IN (SELECT PostId FROM HighImpactPosts WHERE OwnerUserId = u.Id) 
+        AND v.VoteTypeId = 3
+        AND v.UserId != u.Id
+        GROUP BY v.PostId 
+        HAVING COUNT(*) > 5
+    )
+UNION ALL
+SELECT 
+    'Community Aggregate' AS DisplayName,
+    NULL AS Location,
+    SUM(u.Reputation) AS Reputation,
+    SUM(upm.PostCount) AS PostCount,
+    SUM(upm.HighImpactPostCount) AS HighImpactPostCount,
+    SUM(upm.TopRankedPosts) AS TopRankedPosts,
+    AVG(upm.AvgHighImpactViews) AS AvgHighImpactViews,
+    NULL AS PostTitles,
+    MAX(upm.HasClosedPosts) AS HasClosedPosts,
+    SUM(au.CloseReopenCount) AS CloseReopenCount,
+    (SUM(upm.HighImpactPostCount) * 1.0 / NULLIF(SUM(upm.PostCount), 0)) AS ImpactRatio,
+    'Community' AS PerformanceCategory,
+    NULL AS TopBadge,
+    NULL AS OverallRank,
+    NULL AS Quartile
+FROM UserPostMetrics upm
+INNER JOIN Users u ON upm.UserId = u.Id
+INNER JOIN ActiveUsers au ON upm.UserId = au.UserId
+ORDER BY OverallRank;

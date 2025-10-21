@@ -1,0 +1,165 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 day' from users)
+),
+hot_questions as (
+  select p.id as question_id,
+         p.owneruserid as asker_id,
+         p.creationdate as asked_at,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.tags
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 day' from posts where posttypeid = 1)
+    and p.score >= 5
+    and p.viewcount >= 1000
+),
+accepted_answers as (
+  select q.id as question_id,
+         q.acceptedanswerid as answer_id,
+         a.owneruserid as answerer_id,
+         a.creationdate as answered_at,
+         a.score as answer_score
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+    and q.acceptedanswerid is not null
+),
+tag_expanded as (
+  select hq.question_id,
+         unnest(string_to_array(substring(hq.tags from 2 for char_length(hq.tags) - 2), '><')) as tag
+  from hot_questions hq
+  where hq.tags is not null and hq.tags like '<%>'
+),
+tag_stats as (
+  select te.tag,
+         count(distinct te.question_id) as questions_with_tag,
+         sum(hq.viewcount) as total_views,
+         avg(hq.score) as avg_score,
+         percentile_cont(0.9) within group (order by hq.viewcount) as p90_views
+  from tag_expanded te
+  join hot_questions hq on hq.question_id = te.question_id
+  group by te.tag
+  having count(*) >= 5
+),
+question_activity as (
+  select p.id as post_id,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(distinct c.id) as comments,
+         count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+         sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as total_bounty
+  from posts p
+  left join votes v on v.postid = p.id
+  left join comments c on c.postid = p.id
+  where p.posttypeid in (1,2)
+  group by p.id
+),
+asker_answerer_pairs as (
+  select aa.question_id,
+         hq.asker_id,
+         aa.answerer_id,
+         ra.displayname as asker_name,
+         rr.displayname as answerer_name,
+         ra.reputation as asker_rep,
+         rr.reputation as answerer_rep,
+         aa.answered_at,
+         hq.asked_at,
+         extract(epoch from (aa.answered_at - hq.asked_at))/3600.0 as hours_to_accept
+  from accepted_answers aa
+  join hot_questions hq on hq.question_id = aa.question_id
+  left join users ra on ra.id = hq.asker_id
+  left join users rr on rr.id = aa.answerer_id
+),
+dupe_graph as (
+  select pl.relatedpostid as canonical_id,
+         count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+edits_last_year as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as content_edits,
+         count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_events
+  from posthistory ph
+  where ph.creationdate >= (select max(creationdate) - interval '365 day' from posthistory)
+  group by ph.postid
+),
+quality_score as (
+  select p.id as post_id,
+         qa.upvotes,
+         qa.downvotes,
+         coalesce(qa.total_bounty,0) as total_bounty,
+         coalesce(el.content_edits,0) as content_edits,
+         coalesce(el.mod_events,0) as mod_events,
+         greatest(0, qa.upvotes - qa.downvotes) +
+         least(50, coalesce(qa.total_bounty,0)/50.0) +
+         least(20, coalesce(el.content_edits,0)) -
+         least(10, coalesce(el.mod_events,0)) as qscore
+  from posts p
+  left join question_activity qa on qa.post_id = p.id
+  left join edits_last_year el on el.postid = p.id
+  where p.posttypeid = 1
+),
+ranked_questions as (
+  select hq.question_id,
+         hq.score,
+         hq.viewcount,
+         hq.answercount,
+         qs.qscore,
+         dense_rank() over (order by qs.qscore desc nulls last, hq.viewcount desc, hq.score desc) as qrank
+  from hot_questions hq
+  left join quality_score qs on qs.post_id = hq.question_id
+),
+question_tags_agg as (
+  select te.question_id,
+         array_agg(distinct te.tag order by te.tag) as tags
+  from tag_expanded te
+  group by te.question_id
+),
+final as (
+  select rq.qrank,
+         rq.question_id,
+         p.title,
+         rq.viewcount,
+         rq.score as post_score,
+         rq.answercount,
+         cast(round(cast(qs.qscore as numeric), 2) as numeric) as quality_score,
+         coalesce(dg.dup_count,0) as duplicate_of_count,
+         aa.asker_id,
+         aa.answerer_id,
+         aa.asker_name,
+         aa.answerer_name,
+         aa.asker_rep,
+         aa.answerer_rep,
+         cast(round(cast(aa.hours_to_accept as numeric) ,2) as numeric) as hours_to_accept,
+         qs.tags,
+         ts.tag as top_tag_by_views,
+         ts.total_views as top_tag_total_views,
+         ts.avg_score as top_tag_avg_score,
+         qa.upvotes,
+         qa.downvotes,
+         qa.comments,
+         qa.total_bounty
+  from ranked_questions rq
+  join posts p on p.id = rq.question_id
+  left join asker_answerer_pairs aa on aa.question_id = rq.question_id
+  left join question_tags_agg qs on qs.question_id = rq.question_id
+  left join dupe_graph dg on dg.canonical_id = rq.question_id
+  left join question_activity qa on qa.post_id = rq.question_id
+  left join lateral (
+    select t2.tag, t2.total_views, t2.avg_score
+    from tag_stats t2
+    join tag_expanded te2 on te2.tag = t2.tag and te2.question_id = rq.question_id
+    order by t2.total_views desc
+    limit 1
+  ) ts on true
+)
+select *
+from final
+where qrank <= 200
+order by qrank, viewcount desc;

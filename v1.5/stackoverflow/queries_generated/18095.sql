@@ -1,0 +1,159 @@
+-- {"query": "18095.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1171} 
+
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      (
+        SELECT
+          COUNT(c.Id)
+        FROM
+          Comments c
+        WHERE
+          c.PostId = p.Id
+      ) AS CommentCountOnQuestion,
+      (
+        SELECT
+          COUNT(ph.Id)
+        FROM
+          PostHistory ph
+        WHERE
+          ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 6)
+      ) AS EditCountOnQuestion,
+      (
+        SELECT
+          MAX(CAST(ph.Comment AS INT))
+        FROM
+          PostHistory ph
+        WHERE
+          ph.PostId = p.Id
+          AND ph.PostHistoryTypeId = 10
+      ) AS CloseReasonId
+    FROM
+      Posts p
+      JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+  ),
+  AnswerDetails AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId,
+      au.DisplayName AS OwnerDisplayName,
+      a.CreationDate AS AnswerCreationDate,
+      a.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankByScore,
+      CASE
+        WHEN p.AcceptedAnswerId = a.Id THEN 1
+        ELSE 0
+      END AS IsAcceptedAnswer
+    FROM
+      Posts a
+      JOIN Posts p
+      ON a.ParentId = p.Id
+      JOIN Users au
+      ON a.OwnerUserId = au.Id
+    WHERE
+      a.PostTypeId = 2
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS TotalVotes,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+      Votes
+    WHERE
+      UserId IS NOT NULL
+      AND VoteTypeId IN (2, 3)
+    GROUP BY
+      UserId
+  ),
+  PostTagAnalysis AS (
+    SELECT
+      p.Id AS PostId,
+      p.Tags,
+      TRIM(LOWER(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''))) AS CleanedTags,
+      CASE
+        WHEN p.Tags IS NULL THEN 0
+        ELSE LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1
+      END AS NumberOfTags
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 1
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.OwnerDisplayName AS QuestionOwner,
+  qd.QuestionCreationDate,
+  qd.QuestionScore,
+  qd.AnswerCount,
+  qd.FavoriteCount,
+  qd.QuestionViewCount,
+  qd.CommentCountOnQuestion,
+  qd.EditCountOnQuestion,
+  cr.Name AS CloseReasonName,
+  pta.NumberOfTags,
+  pta.CleanedTags,
+  COALESCE(ua.UpVotes, 0) AS QuestionOwnerUpVotes,
+  COALESCE(ua.DownVotes, 0) AS QuestionOwnerDownVotes,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks
+    WHERE
+      PostId = qd.QuestionId AND LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  (
+    SELECT
+      MAX(ad.AnswerScore)
+    FROM
+      AnswerDetails ad
+    WHERE
+      ad.QuestionId = qd.QuestionId
+  ) AS HighestAnswerScore,
+  (
+    SELECT
+      ad.OwnerDisplayName
+    FROM
+      AnswerDetails ad
+    WHERE
+      ad.QuestionId = qd.QuestionId
+      AND ad.IsAcceptedAnswer = 1
+  ) AS AcceptedAnswerOwner
+FROM
+  QuestionDetails qd
+LEFT JOIN
+  PostTagAnalysis pta
+  ON qd.QuestionId = pta.PostId
+LEFT JOIN
+  UserActivity ua
+  ON qd.OwnerUserId = ua.UserId
+LEFT JOIN
+  CloseReasonTypes cr
+  ON qd.CloseReasonId = cr.Id
+WHERE
+  qd.QuestionScore > 10
+  AND qd.AnswerCount BETWEEN 2 AND 10
+  AND qd.QuestionViewCount > 1000
+  AND qd.QuestionOwnerUpVotes > 500
+  AND SUBSTRING(qd.QuestionTitle FROM 1 FOR 5) = 'How '
+ORDER BY
+  qd.QuestionScore DESC,
+  qd.QuestionCreationDate ASC
+LIMIT 100;

@@ -1,0 +1,134 @@
+-- {"query": "47016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 36704, "output_tokens": 32666} 
+
+WITH RECURSIVE user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedAnswers
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag_arr(tag) ON TRUE
+    JOIN Tags t ON t.TagName = tag_arr.tag
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.Score > 0
+        AND u.Reputation > 1000
+    GROUP BY u.Id, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+badge_rankings AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        DENSE_RANK() OVER (PARTITION BY b.Class ORDER BY COUNT(*) DESC) AS ClassRank,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Badges b
+    WHERE b.TagBased = B'0'
+    GROUP BY b.UserId, b.Name, b.Class
+),
+post_history_analytics AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) AS RollbackCount,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.CreationDate END) AS FirstPostDate,
+        MAX(ph.CreationDate) AS LastActivityDate,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 52 THEN 1 ELSE 0 END) AS TimesHotQuestion
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+comment_engagement AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        MAX(c.Score) AS MaxCommentScore,
+        STRING_AGG(DISTINCT c.UserDisplayName, ', ' ORDER BY c.Score DESC) FILTER (WHERE c.Score >= 5) AS TopCommenters
+    FROM Comments c
+    WHERE c.CreationDate >= CURRENT_DATE - INTERVAL '365 days'
+    GROUP BY c.PostId
+),
+voting_patterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBounty,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) AS BountyCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.CreationDate) AS MedianVoteTime
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3,8)
+    GROUP BY v.PostId
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    EXTRACT(EPOCH FROM (COALESCE(q.ClosedDate, CURRENT_TIMESTAMP) - q.CreationDate))/3600 AS HoursToClose,
+    qu.DisplayName AS QuestionAuthor,
+    qu.Reputation AS QuestionAuthorRep,
+    ue_q.TotalScore AS AuthorTagScore,
+    ue_q.PostCount AS AuthorTagPosts,
+    br_q.BadgeCount AS AuthorGoldBadges,
+    pha.EditCount,
+    pha.RollbackCount,
+    pha.UniqueEditors,
+    pha.TimesHotQuestion,
+    ce.CommentCount,
+    ce.AvgCommentScore,
+    ce.TopCommenters,
+    vp.UpVotes,
+    vp.DownVotes,
+    vp.TotalBounty,
+    CASE 
+        WHEN vp.DownVotes > 0 THEN CAST(vp.UpVotes AS FLOAT) / vp.DownVotes 
+        ELSE vp.UpVotes 
+    END AS VoteRatio,
+    COUNT(DISTINCT a.Id) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN a.Score >= 10 THEN a.Id END) AS HighScoreAnswers,
+    AVG(a.Score) AS AvgAnswerScore,
+    MAX(a.Score) AS BestAnswerScore,
+    MIN(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60) AS MinutesToFirstAnswer,
+    AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600) AS AvgHoursToAnswer,
+    STRING_AGG(DISTINCT au.DisplayName, ', ' ORDER BY a.Score DESC) FILTER (WHERE a.Score >= 5) AS TopAnswerers,
+    COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostCount,
+    COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+    RANK() OVER (PARTITION BY DATE_TRUNC('month', q.CreationDate) ORDER BY q.Score DESC) AS MonthlyRank,
+    DENSE_RANK() OVER (ORDER BY q.ViewCount DESC) AS ViewRank,
+    NTILE(100) OVER (ORDER BY q.Score) AS ScorePercentile
+FROM Posts q
+JOIN Users qu ON q.OwnerUserId = qu.Id
+LEFT JOIN user_expertise ue_q ON qu.Id = ue_q.UserId 
+    AND ue_q.TagName = (SELECT tag FROM string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><') AS tag LIMIT 1)
+LEFT JOIN badge_rankings br_q ON qu.Id = br_q.UserId AND br_q.Class = 1
+LEFT JOIN post_history_analytics pha ON q.Id = pha.PostId
+LEFT JOIN comment_engagement ce ON q.Id = ce.PostId
+LEFT JOIN voting_patterns vp ON q.Id = vp.PostId
+LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+LEFT JOIN Users au ON a.OwnerUserId = au.Id
+LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+WHERE q.PostTypeId = 1
+    AND q.CreationDate >= CURRENT_DATE - INTERVAL '730 days'
+    AND q.Score >= 10
+    AND q.ViewCount >= 1000
+    AND LENGTH(q.Body) >= 500
+GROUP BY 
+    q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount,
+    q.ClosedDate, q.CreationDate, qu.DisplayName, qu.Reputation,
+    ue_q.TotalScore, ue_q.PostCount, br_q.BadgeCount,
+    pha.EditCount, pha.RollbackCount, pha.UniqueEditors, pha.TimesHotQuestion,
+    ce.CommentCount, ce.AvgCommentScore, ce.TopCommenters,
+    vp.UpVotes, vp.DownVotes, vp.TotalBounty
+HAVING COUNT(DISTINCT a.Id) >= 3
+ORDER BY q.Score * LOG(q.ViewCount + 1) DESC
+LIMIT 100;

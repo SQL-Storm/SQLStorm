@@ -1,0 +1,122 @@
+-- {"query": "53007.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2646, "output_tokens": 1180} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE 0 END) AS TotalBounty
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    GROUP BY v.PostId, p.OwnerUserId
+),
+CommentStats AS (
+    SELECT 
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.UserId
+),
+PostHistoryEdits AS (
+    SELECT 
+        ph.PostId,
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9) THEN 1 END) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    GROUP BY ph.PostId, p.OwnerUserId
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+),
+TopTags AS (
+    SELECT TagName, TagCount, TagRank
+    FROM TagPopularity
+    WHERE TagRank <= 10
+),
+UserTopTags AS (
+    SELECT 
+        u.Id AS UserId,
+        STRING_AGG(SUBSTRING(pt.Tags, 2, LENGTH(pt.Tags)-2), ', ') AS UserTags
+    FROM Users u
+    JOIN Posts pt ON u.Id = pt.OwnerUserId AND pt.PostTypeId = 1
+    WHERE pt.Tags LIKE ANY (SELECT '%' || TagName || '%' FROM TopTags)
+    GROUP BY u.Id
+),
+AggregatedData AS (
+    SELECT 
+        ua.UserId,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.TotalScore,
+        ua.AvgViewCount,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.LastPostDate,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.TagBasedBadges,
+        COALESCE(SUM(va.Upvotes), 0) AS TotalUpvotes,
+        COALESCE(SUM(va.Downvotes), 0) AS TotalDownvotes,
+        COALESCE(SUM(va.TotalBounty), 0) AS TotalBountyEarned,
+        cs.TotalComments,
+        cs.AvgCommentScore,
+        COALESCE(SUM(pe.EditCount), 0) AS TotalEdits,
+        MAX(pe.LastEditDate) AS LatestEdit,
+        utt.UserTags
+    FROM UserActivity ua
+    LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+    LEFT JOIN VoteAnalysis va ON ua.UserId = va.UserId
+    LEFT JOIN CommentStats cs ON ua.UserId = cs.UserId
+    LEFT JOIN PostHistoryEdits pe ON ua.UserId = pe.UserId
+    LEFT JOIN UserTopTags utt ON ua.UserId = utt.UserId
+    GROUP BY 
+        ua.UserId, ua.Reputation, ua.TotalPosts, ua.TotalScore, ua.AvgViewCount,
+        ua.QuestionsAsked, ua.AnswersGiven, ua.LastPostDate,
+        bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, bs.TagBasedBadges,
+        cs.TotalComments, cs.AvgCommentScore, utt.UserTags
+)
+SELECT 
+    ad.*,
+    RANK() OVER (ORDER BY ad.Reputation DESC) AS ReputationRank,
+    RANK() OVER (ORDER BY ad.TotalScore DESC) AS ScoreRank,
+    RANK() OVER (ORDER BY ad.TotalUpvotes DESC) AS UpvoteRank,
+    DENSE_RANK() OVER (PARTITION BY YEAR(ad.LastPostDate), MONTH(ad.LastPostDate) ORDER BY ad.TotalPosts DESC) AS MonthlyPostRank
+FROM AggregatedData ad
+WHERE ad.Reputation > 1000
+  AND ad.TotalPosts > 50
+  AND ad.UserTags IS NOT NULL
+ORDER BY ad.Reputation DESC, ad.TotalScore DESC
+LIMIT 1000;

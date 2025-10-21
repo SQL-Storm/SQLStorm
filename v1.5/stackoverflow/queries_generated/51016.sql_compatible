@@ -1,0 +1,158 @@
+WITH 
+question_stats AS (
+    SELECT 
+        p.Id AS question_id,
+        p.CreationDate AS q_creation_date,
+        p.Score AS q_score,
+        p.ViewCount AS q_views,
+        p.AnswerCount AS q_answers,
+        p.CommentCount AS q_comments,
+        p.FavoriteCount AS q_favorites,
+        u.Reputation AS owner_rep,
+        u.UpVotes AS owner_upvotes,
+        u.DownVotes AS owner_downvotes,
+        b.class AS top_badge_class,
+        t.TagName AS primary_tag
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            UserId, 
+            MAX(Class) as class
+        FROM Badges 
+        WHERE Name IN ('Guru', 'Sportsmanship', 'Investor', 'Enthusiast', 'Scholar')
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT 
+            SUBSTRING(Tags FROM 2 FOR POSITION('><' IN Tags) - 2) AS first_tag,
+            Id
+        FROM Posts 
+        WHERE PostTypeId = 1 
+        AND Tags LIKE '<%><%'
+    ) tag_extract ON p.Id = tag_extract.Id
+    LEFT JOIN Tags t ON tag_extract.first_tag = t.TagName
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= '2020-01-01'
+    AND (p.DeletionDate IS NULL OR p.DeletionDate IS NULL)
+    AND p.Score >= -5
+),
+answer_stats AS (
+    SELECT 
+        p.Id AS answer_id,
+        p.PostId AS question_id,
+        p.Score AS a_score,
+        p.CreationDate AS a_creation_date,
+        CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS is_accepted,
+        a_user.Reputation AS answerer_rep
+    FROM Posts p
+    INNER JOIN question_stats q ON p.PostId = q.question_id
+    INNER JOIN Users a_user ON p.OwnerUserId = a_user.Id
+    WHERE p.PostTypeId = 2 
+    AND p.CreationDate <= q.q_creation_date + INTERVAL '30 days'
+    AND p.DeletionDate IS NULL
+),
+comment_stats AS (
+    SELECT 
+        c.PostId AS question_id,
+        COUNT(c.Id) AS total_comments,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(CASE WHEN c.UserId IS NOT NULL THEN 1 END) AS user_comments,
+        COUNT(CASE WHEN c.UserId IS NULL THEN 1 END) AS anon_comments
+    FROM Comments c
+    INNER JOIN question_stats qs ON c.PostId = qs.question_id
+    WHERE c.CreationDate <= qs.q_creation_date + INTERVAL '7 days'
+    GROUP BY c.PostId
+),
+vote_analysis AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS favorites,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS accepts,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN u.Reputation END) AS avg_voter_rep
+    FROM Votes v
+    LEFT JOIN Users u ON v.UserId = u.Id
+    WHERE v.VoteTypeId IN (1,2,3,5)
+    GROUP BY v.PostId
+),
+history_events AS (
+    SELECT 
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS total_edits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS close_votes,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS reopen_votes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS last_edit_date,
+        COUNT(DISTINCT ph.UserId) AS unique_editors
+    FROM PostHistory ph
+    INNER JOIN question_stats qs ON ph.PostId = qs.question_id
+    WHERE ph.CreationDate > qs.q_creation_date
+    AND ph.CreationDate <= qs.q_creation_date + INTERVAL '30 days'
+    GROUP BY ph.PostId
+),
+link_network AS (
+    SELECT 
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS outbound_links,
+        COUNT(DISTINCT pl.RelatedPostId) AS unique_targets,
+        AVG(pl.RelatedPostId - pl.PostId) AS avg_target_distance
+    FROM PostLinks pl
+    INNER JOIN question_stats qs ON pl.PostId = qs.question_id
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+)
+SELECT 
+    qs.question_id,
+    qs.q_creation_date,
+    qs.q_score,
+    qs.q_views,
+    qs.q_answers,
+    COALESCE(as_.total_answers, 0) AS total_answers,
+    COALESCE(as_.avg_answer_score, 0) AS avg_answer_score,
+    COALESCE(as_.accepted_count, 0) AS accepted_answers,
+    COALESCE(cs.total_comments, 0) AS total_comments,
+    COALESCE(va.upvotes, 0) AS upvotes,
+    COALESCE(va.downvotes, 0) AS downvotes,
+    COALESCE(va.favorites, 0) AS favorites,
+    COALESCE(he.total_edits, 0) AS total_edits,
+    COALESCE(he.close_votes, 0) AS close_votes,
+    COALESCE(ln.outbound_links, 0) AS outbound_links,
+    qs.owner_rep,
+    qs.owner_upvotes,
+    qs.owner_downvotes,
+    qs.top_badge_class,
+    qs.primary_tag,
+    -- Composite performance metrics
+    (qs.q_score * 0.4 + COALESCE(as_.avg_answer_score, 0) * 0.3 + qs.q_views / 1000.0 * 0.2 + qs.q_favorites * 0.1) AS engagement_score,
+    CASE 
+        WHEN qs.q_score >= 10 AND COALESCE(as_.total_answers, 0) >= 3 THEN 'High Impact'
+        WHEN qs.q_views >= 1000 OR COALESCE(va.upvotes, 0) >= 50 THEN 'Popular'
+        WHEN COALESCE(he.close_votes, 0) > 0 THEN 'Controversial'
+        ELSE 'Standard'
+    END AS question_category,
+    -- Time-based analysis
+    EXTRACT(EPOCH FROM (COALESCE(he.last_edit_date, qs.q_creation_date) - qs.q_creation_date)) / 3600 AS hours_to_last_edit,
+    -- User expertise ratio
+    CASE 
+        WHEN qs.owner_rep > 0 THEN (CAST(qs.owner_upvotes AS float) / NULLIF(CAST(qs.owner_downvotes AS float), 0) + 1)::numeric(4,2) 
+        ELSE 0 
+    END AS expertise_ratio
+FROM question_stats qs
+LEFT JOIN (
+    SELECT 
+        question_id,
+        COUNT(answer_id) AS total_answers,
+        AVG(a_score) AS avg_answer_score,
+        COUNT(is_accepted) FILTER (WHERE is_accepted = 1) AS accepted_count,
+        COUNT(DISTINCT answerer_rep) AS unique_answerers
+    FROM answer_stats
+    GROUP BY question_id
+) as_ ON qs.question_id = as_.question_id
+LEFT JOIN comment_stats cs ON qs.question_id = cs.question_id
+LEFT JOIN vote_analysis va ON qs.question_id = va.PostId
+LEFT JOIN history_events he ON qs.question_id = he.PostId
+LEFT JOIN link_network ln ON qs.question_id = ln.PostId
+WHERE qs.q_creation_date >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+ORDER BY engagement_score DESC, qs.q_views DESC
+LIMIT 10000;

@@ -1,0 +1,104 @@
+WITH ranked_posts AS (
+    SELECT  p.Id,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.CreationDate,
+            p.AcceptedAnswerId,
+            p.ParentId,
+            COALESCE(v.TotalUpVotes, 0)   AS up_votes,
+            COALESCE(v.TotalDownVotes, 0) AS down_votes,
+            COALESCE(v.TotalFavorites, 0) AS favorites,
+            COALESCE(v.TotalBounties, 0)  AS bounties,
+            COALESCE(v.TotalDeletes, 0)   AS deletes,
+            COALESCE(v.TotalUndeletes, 0) AS undeletes,
+            COALESCE(v.TotalCloseVotes, 0) AS close_votes,
+            COALESCE(v.TotalReopenVotes, 0) AS reopen_votes,
+            COALESCE(v.AverageCloseTime, 0) AS avg_close_time_sec
+    FROM    Posts p
+    LEFT JOIN (
+        SELECT  PostId,
+                COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS TotalUpVotes,
+                COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS TotalDownVotes,
+                COUNT(CASE WHEN VoteTypeId = 5 THEN 1 END) AS TotalFavorites,
+                SUM(CASE WHEN VoteTypeId IN (8,9) THEN BountyAmount ELSE 0 END) AS TotalBounties,
+                COUNT(CASE WHEN VoteTypeId = 10 THEN 1 END) AS TotalDeletes,
+                COUNT(CASE WHEN VoteTypeId = 11 THEN 1 END) AS TotalUndeletes,
+                COUNT(CASE WHEN VoteTypeId = 6 THEN 1 END) AS TotalCloseVotes,
+                COUNT(CASE WHEN VoteTypeId = 7 THEN 1 END) AS TotalReopenVotes
+        FROM    Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT  p.Id AS closed_post_id,
+                EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) AS AverageCloseTime
+        FROM    Posts p
+        WHERE   p.ClosedDate IS NOT NULL
+    ) c ON p.Id = c.closed_post_id
+),
+user_stats AS (
+    SELECT  u.Id AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.Id END) AS QuestionsAsked,
+            COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.Id END) AS AnswersGiven,
+            SUM(rp.up_votes)   AS TotalUpVotes,
+            SUM(rp.down_votes) AS TotalDownVotes,
+            SUM(rp.favorites)  AS TotalFavorites,
+            SUM(rp.bounties)   AS TotalBounties,
+            SUM(rp.deletes)    AS TotalDeletes,
+            SUM(rp.undeletes)  AS TotalUndeletes,
+            SUM(rp.close_votes) AS TotalCloseVotes,
+            SUM(rp.reopen_votes) AS TotalReopenVotes,
+            AVG(rp.avg_close_time_sec) AS AvgCloseTimeSeconds,
+            JSON_ARRAYAGG(
+                JSON_OBJECT(
+                    'postId', rp.Id,
+                    'type', rp.PostTypeId,
+                    'score', rp.Score,
+                    'tags', rp.Tags,
+                    'bodyLength', LENGTH(rp.Body)
+                )
+            ) FILTER (WHERE rp.PostTypeId = 2) AS DetailedAnswers
+    FROM    Users u
+    LEFT JOIN ranked_posts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+badge_counts AS (
+    SELECT  b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM    Badges b
+    GROUP BY b.UserId
+)
+SELECT  us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.CreationDate,
+        us.QuestionsAsked,
+        us.AnswersGiven,
+        us.TotalUpVotes,
+        us.TotalDownVotes,
+        us.TotalFavorites,
+        us.TotalBounties,
+        us.TotalDeletes,
+        us.TotalUndeletes,
+        us.TotalCloseVotes,
+        us.TotalReopenVotes,
+        us.AvgCloseTimeSeconds,
+        us.DetailedAnswers,
+        COALESCE(bc.GoldBadges,0)   AS GoldBadges,
+        COALESCE(bc.SilverBadges,0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+        (ordRanking.rank - 1) AS RankRank
+FROM    user_stats us
+LEFT JOIN badge_counts bc ON us.UserId = bc.UserId
+LEFT JOIN (
+    SELECT  UserId,
+            RANK() OVER (ORDER BY Reputation DESC, AnswersGiven DESC) AS rank
+    FROM    user_stats
+) ordRanking ON us.UserId = ordRanking.UserId
+WHERE   us.QuestionsAsked >= 1
+ORDER BY us.Reputation DESC, us.AnswersGiven DESC
+LIMIT 100;

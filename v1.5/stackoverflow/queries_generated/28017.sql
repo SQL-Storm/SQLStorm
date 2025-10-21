@@ -1,0 +1,64 @@
+-- {"query": "28017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1497} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Location,
+        COALESCE(u.WebsiteUrl, 'No Website') AS Website,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(p.Score) OVER (PARTITION BY u.Location) AS AvgLocationScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocalRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.Location
+),
+PostAnalysis AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        ph.CreationDate AS LastEditDate,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ' > ') WITHIN GROUP (ORDER BY p.CreationDate DESC) AS TagEvolution,
+        (SELECT MIN(Date) FROM Badges WHERE UserId = p.OwnerUserId) AS FirstBadgeDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4,5,6)
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+)
+SELECT 
+    us.DisplayName,
+    us.Location,
+    pa.TagEvolution,
+    pa.MovingAvgScore,
+    (pa.Score * 0.5 + COALESCE(SUM(v.BountyAmount), 0)) * CASE WHEN us.GoldBadges > 0 THEN 1.2 ELSE 1 END AS WeightedScore,
+    DENSE_RANK() OVER (ORDER BY (pa.Score * 0.5 + COALESCE(SUM(v.BountyAmount), 0)) DESC) AS ScoreRank,
+    EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = pa.Id AND pl.LinkTypeId = 3) AS HasDuplicates,
+    CASE 
+        WHEN pa.NextPostScore > pa.Score THEN 'Improving'
+        WHEN pa.NextPostScore < pa.Score THEN 'Declining'
+        ELSE 'Stable' 
+    END AS PerformanceTrend,
+    COALESCE((SELECT STRING_AGG(Name, ', ') FROM Badges WHERE UserId = us.Id AND Class = 1), 'No Gold') AS TopBadges
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = (SELECT OwnerUserId FROM Posts WHERE Id = pa.Id)
+LEFT JOIN Votes v ON pa.Id = v.PostId AND v.VoteTypeId = 8
+WHERE us.TotalPosts > 100
+    AND us.GlobalRank < 1000
+    AND pa.MovingAvgScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    AND us.Id IN (
+        SELECT UserId FROM Badges WHERE Class = 1
+        INTERSECT
+        SELECT OwnerUserId FROM Posts WHERE PostTypeId = 6
+    )
+GROUP BY us.DisplayName, us.Location, us.GoldBadges, pa.TagEvolution, pa.MovingAvgScore, pa.Score, pa.NextPostScore, pa.Id
+HAVING COUNT(v.Id) > 5 OR SUM(v.BountyAmount) > 100
+ORDER BY WeightedScore DESC, pa.MovingAvgScore DESC
+LIMIT 100;

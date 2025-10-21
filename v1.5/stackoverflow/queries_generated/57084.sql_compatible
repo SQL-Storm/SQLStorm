@@ -1,0 +1,134 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownvotes,
+        COUNT(b.Id) AS TotalBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+        COUNT(c.Id) AS Comments,
+        COUNT(ph.Id) AS PostHistoryEntries,
+        COUNT(pl.Id) AS LinkedPosts
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+),
+TagActivity AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalScoreForTag,
+        SUM(p.ViewCount) AS TotalViewsForTag,
+        COUNT(DISTINCT u.Id) AS UniqueUsersForTag
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    GROUP BY
+        t.Id, t.TagName, t.Count
+), MostPopularPost AS (
+    SELECT p.Title, u.DisplayName as "Author",
+        COUNT(v.*) FILTER (WHERE p.PostTypeId = 1) AS dummy_count
+    FROM Posts p
+    LEFT JOIN Votes v ON v.Id = p.Id
+    LEFT JOIN Users u ON u.Id =  p.OwnerUserId
+    GROUP BY p.Title, u.DisplayName
+),
+ReputationRankings AS (
+    SELECT u.DisplayName as "UserName",
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS "GoldBadges",
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS "SilverBadges",
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS "BronzeBadges",
+        b.UserId
+    FROM Badges b
+    RIGHT JOIN Users u ON b.UserId = u.Id
+    GROUP BY u.DisplayName
+)
+
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalPostScore,
+    ua.LastPostDate,
+    ua.TotalComments,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.TotalBadges,
+    pa.PostId,
+    pa.PostTypeId,
+    pa.PostCreationDate,
+    pa.Score AS PostScore,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.Upvotes,
+    pa.Downvotes,
+    pa.Comments AS PostComments,
+    pa.PostHistoryEntries,
+    pa.LinkedPosts,
+    ta.TagId,
+    ta.TagName,
+    ta.TagCount,
+    ta.PostsWithTag,
+    ta.TotalScoreForTag,
+    ta.TotalViewsForTag,
+    ta.UniqueUsersForTag
+FROM
+    UserActivity ua
+    JOIN PostActivity pa ON ua.UserId = pa.PostId -- adjusted join key to be consistent
+    JOIN TagActivity ta ON pa.PostId IS NOT NULL AND ta.TagName IS NOT NULL
+    JOIN MostPopularPost ON ua.UserId = MostPopularPost.Author
+    JOIN ReputationRankings ON ua.UserId = ReputationRankings.UserId
+WHERE pa.ViewCount > 5000 OR ta.UniqueUsersForTag > 100
+ORDER BY
+    ua.Reputation DESC, pa.PostScore DESC, ta.TotalScoreForTag DESC
+LIMIT 50;

@@ -1,0 +1,205 @@
+WITH recent_active_users AS (
+  SELECT u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         COALESCE(u.location, '(unknown)') AS location,
+         ROW_NUMBER() OVER (ORDER BY u.reputation DESC, u.lastaccessdate DESC) AS rn
+  FROM users u
+  WHERE u.creationdate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')
+    AND u.reputation >= 50
+),
+question_stats AS (
+  SELECT p.owneruserid,
+         COUNT(*) FILTER (WHERE p.posttypeid = 1) AS q_count,
+         COUNT(*) FILTER (WHERE p.posttypeid = 2) AS a_count,
+         AVG(COALESCE(p.score,0)) FILTER (WHERE p.posttypeid = 1) AS avg_q_score,
+         AVG(COALESCE(p.score,0)) FILTER (WHERE p.posttypeid = 2) AS avg_a_score,
+         MAX(p.viewcount) FILTER (WHERE p.posttypeid = 1) AS max_q_views,
+         SUM(COALESCE(p.answercount,0)) FILTER (WHERE p.posttypeid = 1) AS sum_answercount,
+         BOOL_OR(p.communityowneddate IS NOT NULL) AS has_community_wiki
+  FROM posts p
+  GROUP BY p.owneruserid
+),
+tag_exploder AS (
+  -- split Tags like '<sql><performance>' into rows
+  SELECT p.id AS post_id,
+         p.owneruserid,
+         TRIM(BOTH ' ' FROM REGEXP_REPLACE(tag, '[<>]', '', 'g')) AS tag
+  FROM posts p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(string_to_array(SUBSTRING(COALESCE(p.tags,''), 2, LENGTH(COALESCE(p.tags,'')) - 2), '><')) AS tag
+  ) s
+  WHERE p.posttypeid = 1 AND p.tags IS NOT NULL AND p.tags <> ''
+),
+top_tags AS (
+  SELECT te.tag,
+         COUNT(*) AS questions_with_tag,
+         AVG(q.score) AS avg_score_for_tag,
+         DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS popularity_rank
+  FROM tag_exploder te
+  JOIN posts q ON q.id = te.post_id
+  GROUP BY te.tag
+  ORDER BY questions_with_tag DESC
+  LIMIT 50
+),
+user_tag_affinity AS (
+  SELECT rau.id AS user_id,
+         tt.tag,
+         COUNT(*) AS user_q_count_for_tag,
+         SUM(COALESCE(p.score,0)) AS user_score_sum_for_tag,
+         ROW_NUMBER() OVER (PARTITION BY rau.id ORDER BY COUNT(*) DESC, SUM(COALESCE(p.score,0)) DESC) AS tag_rank_for_user
+  FROM recent_active_users rau
+  JOIN posts p ON p.owneruserid = rau.id AND p.posttypeid = 1
+  JOIN tag_exploder te ON te.post_id = p.id
+  JOIN top_tags tt ON tt.tag = te.tag
+  GROUP BY rau.id, tt.tag
+),
+latest_post_edits AS (
+  SELECT ph.postid,
+         MAX(ph.creationdate) AS last_revision_date,
+         MAX(CASE WHEN ph.posthistorytypeid IN (4,5,6,24) THEN ph.userid END) AS last_editor_userid,
+         COUNT(*) FILTER (WHERE ph.posthistorytypeid IN (4,5,6,24)) AS edit_count
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+linked_duplicates AS (
+  SELECT pl.postid,
+         pl.relatedpostid,
+         lt.name AS linktype,
+         p1.title AS post_title,
+         p2.title AS related_title
+  FROM postlinks pl
+  JOIN linktypes lt ON lt.id = pl.linktypeid
+  LEFT JOIN posts p1 ON p1.id = pl.postid
+  LEFT JOIN posts p2 ON p2.id = pl.relatedpostid
+  WHERE pl.linktypeid = 3
+    AND p1.posttypeid = 1
+    AND p2.posttypeid = 1
+),
+user_vote_patterns AS (
+  SELECT v.userid,
+         v.votetypeid,
+         COUNT(*) AS votes_given,
+         MIN(v.creationdate) AS first_vote,
+         MAX(v.creationdate) AS last_vote
+  FROM votes v
+  WHERE v.userid IS NOT NULL
+  GROUP BY v.userid, v.votetypeid
+),
+user_badge_summary AS (
+  SELECT b.userid,
+         COUNT(*) FILTER (WHERE b.class = 1) AS gold,
+         COUNT(*) FILTER (WHERE b.class = 2) AS silver,
+         COUNT(*) FILTER (WHERE b.class = 3) AS bronze,
+         COUNT(DISTINCT b.name) AS distinct_badges
+  FROM badges b
+  GROUP BY b.userid
+),
+candidate_users AS (
+  SELECT rau.*,
+         qs.q_count,
+         qs.a_count,
+         COALESCE(qs.avg_q_score,0) AS avg_q_score,
+         COALESCE(qs.avg_a_score,0) AS avg_a_score,
+         COALESCE(ubs.gold,0) AS gold_badges,
+         COALESCE(ubs.silver,0) AS silver_badges,
+         COALESCE(ubs.bronze,0) AS bronze_badges,
+         COALESCE(uts.tag, '') AS top_user_tag,
+         COALESCE(uts.user_q_count_for_tag,0) AS top_user_tag_qcount,
+         COALESCE(lp.last_revision_date, TIMESTAMP '1970-01-01') AS last_revision_date,
+         COALESCE(lp.edit_count,0) AS post_edit_count,
+         COALESCE(SUM(vp.votes_given) FILTER (WHERE vp.votetypeid = 2),0) AS upvotes_cast,
+         COALESCE(SUM(vp.votes_given) FILTER (WHERE vp.votetypeid = 3),0) AS downvotes_cast
+  FROM recent_active_users rau
+  LEFT JOIN question_stats qs ON qs.owneruserid = rau.id
+  LEFT JOIN user_badge_summary ubs ON ubs.userid = rau.id
+  LEFT JOIN LATERAL (
+    SELECT uta.tag, uta.user_q_count_for_tag
+    FROM user_tag_affinity uta
+    WHERE uta.user_id = rau.id AND uta.tag_rank_for_user = 1
+    LIMIT 1
+  ) uts ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT lp2.last_revision_date, lp2.edit_count
+    FROM latest_post_edits lp2
+    JOIN posts p2 ON p2.id = lp2.postid AND p2.owneruserid = rau.id
+    ORDER BY lp2.last_revision_date DESC
+    LIMIT 1
+  ) lp ON TRUE
+  LEFT JOIN user_vote_patterns vp ON vp.userid = rau.id
+  GROUP BY rau.id, rau.displayname, rau.reputation, rau.creationdate, rau.lastaccessdate, rau.location,
+           qs.q_count, qs.a_count, qs.avg_q_score, qs.avg_a_score,
+           ubs.gold, ubs.silver, ubs.bronze, uts.tag, uts.user_q_count_for_tag,
+           lp.last_revision_date, lp.edit_count, rau.rn
+)
+SELECT cu.id,
+       cu.displayname,
+       cu.reputation,
+       cu.location,
+       cu.q_count,
+       cu.a_count,
+       ROUND(CUCAST(cu.avg_q_score AS numeric), 3) AS avg_q_score,
+       ROUND(CUCAST(cu.avg_a_score AS numeric), 3) AS avg_a_score,
+       cu.gold_badges,
+       cu.silver_badges,
+       cu.bronze_badges,
+       cu.top_user_tag,
+       cu.top_user_tag_qcount,
+       cu.post_edit_count,
+       cu.last_revision_date,
+       cu.upvotes_cast,
+       cu.downvotes_cast,
+       -- complex engagement score using weighted components, null-safe and nonlinear transforms
+       (
+         COALESCE(cu.reputation,0) * 1.0 / NULLIF(GREATEST(1, (DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - cu.creationdate)::int)),0)
+         + 5 * COALESCE(cu.q_count,0)
+         + 2 * COALESCE(cu.a_count,0)
+         + 10 * GREATEST(COALESCE(cu.gold_badges,0),0)
+         + 3 * SQRT(GREATEST(COALESCE(cu.silver_badges,0),0))
+         - LN(1 + GREATEST(COALESCE(cu.bronze_badges,0),0))
+         + COALESCE(cu.top_user_tag_qcount,0) * 1.5
+         + COALESCE(cu.upvotes_cast,0) * 0.2
+         - COALESCE(cu.downvotes_cast,0) * 0.5
+       ) AS engagement_score,
+       -- correlated subquery: find one highest-scoring unanswered question the user asked (if any)
+       (
+        SELECT p2.id
+        FROM posts p2
+        WHERE p2.owneruserid = cu.id
+          AND p2.posttypeid = 1
+          AND COALESCE(p2.answercount,0) = 0
+        ORDER BY p2.score DESC NULLS LAST, p2.viewcount DESC NULLS LAST, p2.creationdate DESC
+        LIMIT 1
+       ) AS top_unanswered_question_id,
+       -- set operator: union of two small derived sets to get recent activity tags and recent comment excerpts
+       (
+        SELECT STRING_AGG(x.txt, ' || ' ORDER BY x.seq) FROM (
+           SELECT 1 AS seq, LEFT(p.body,80) || '...' AS txt
+           FROM posts p
+           WHERE p.owneruserid = cu.id AND p.posttypeid = 1
+           ORDER BY p.lastactivitydate DESC NULLS LAST
+           LIMIT 1
+         UNION
+           SELECT 2 AS seq, LEFT(COALESCE(c.text,''),80) || '...' AS txt
+           FROM comments c
+           WHERE c.userid = cu.id
+           ORDER BY c.creationdate DESC NULLS LAST
+           LIMIT 1
+       ) x
+       ) AS recent_snippets,
+       -- windowed rank of engagement among candidate users
+       RANK() OVER (ORDER BY
+         (
+           COALESCE(cu.reputation,0) * 1.0 / NULLIF(GREATEST(1, (DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - cu.creationdate)::int)),0)
+           + 5 * COALESCE(cu.q_count,0)
+           + 2 * COALESCE(cu.a_count,0)
+           + 10 * GREATEST(COALESCE(cu.gold_badges,0),0)
+         ) DESC
+       ) AS engagement_rank
+FROM candidate_users cu
+WHERE (cu.q_count >= 1 OR cu.a_count >= 1)
+  AND (cu.reputation > 100 OR (cu.gold_badges + cu.silver_badges + cu.bronze_badges) > 0)
+ORDER BY engagement_score DESC NULLS LAST, cu.reputation DESC
+LIMIT 200;

@@ -1,0 +1,79 @@
+WITH QuestionAnswers AS (
+    SELECT 
+        q.Id AS QuestionId, 
+        q.CreationDate AS QDate, 
+        MIN(a.CreationDate) AS FirstAnswerDate, 
+        q.Tags,
+        COUNT(DISTDISTINCT v.Id) AS UpvoteCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = q.Id AND v.VoteTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.CreationDate, q.Tags
+    HAVING MIN(a.CreationDate) IS NOT NULL
+),
+TagStats AS (
+    SELECT 
+        t.tag, 
+        AVG(DATE_PART('epoch', FirstAnswerDate - QDate) / 60) AS AvgMinutesToAnswer, 
+        COUNT(*) AS QuestionCount,
+        SUM(UpvoteCount) AS TotalUpvotes,
+        AVG(AvgCommentScore) AS OverallAvgCommentScore,
+        COUNT(DISTINCT ph.Id) AS TotalEdits
+    FROM QuestionAnswers qa
+    CROSS JOIN UNNEST(string_to_array(substr(qa.Tags, 2, length(qa.Tags) - 2), '><')) AS t(tag)
+    LEFT JOIN PostHistory ph ON ph.PostId = qa.QuestionId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY t.tag
+    HAVING COUNT(*) > 1000
+),
+RankedTags AS (
+    SELECT 
+        ts.*,
+        ROW_NUMBER() OVER (ORDER BY AvgMinutesToAnswer ASC) AS Rank
+    FROM TagStats ts
+)
+SELECT 
+    rt.tag, 
+    rt.AvgMinutesToAnswer, 
+    rt.QuestionCount, 
+    rt.TotalUpvotes, 
+    rt.OverallAvgCommentScore, 
+    rt.TotalEdits,
+    u.DisplayName AS TopContributor,
+    b.BadgeCount
+FROM RankedTags rt
+JOIN (
+    SELECT 
+        CAST(tag AS VARCHAR) AS tag, 
+        OwnerUserId, 
+        COUNT(*) AS Answers,
+        ROW_NUMBER() OVER (PARTITION BY CAST(tag AS VARCHAR) ORDER BY COUNT(*) DESC) AS rn
+    FROM (
+        SELECT qa.Tag AS tag, qa.QuestionId, qa.OwnerUserId
+        FROM (
+            SELECT DISTINCT tag, QuestionId, OwnerUserId
+            FROM (
+                SELECT 0 AS dummy
+            ) AS x
+        ) AS qa_TagQuestionOwner
+    ) AS a
+    GROUP BY tag, OwnerUserId
+) top_users ON top_users.tag = rt.tag AND top_users.rn = 1
+JOIN Users u ON top_users.OwnerUserId = u.Id
+JOIN (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+) b ON b.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.PostId IN (SELECT QuestionId FROM QuestionAnswers WHERE tag = rt.tag)
+) links ON TRUE
+WHERE rt.Rank <= 10
+ORDER BY rt.Rank;

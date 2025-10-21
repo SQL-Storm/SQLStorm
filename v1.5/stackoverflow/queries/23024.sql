@@ -1,0 +1,75 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS PostCount,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        STRING_AGG(COALESCE(p.Tags, ''), ', ') AS AllTags
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY u.Id
+    HAVING COUNT(p.Id) > 0 OR AVG(COALESCE(p.Score, 0)) IS NOT NULL
+),
+BadgeStats AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        COUNT(*) AS TotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY MAX(Date) DESC) AS BadgeRank
+    FROM Badges
+    GROUP BY UserId
+),
+TopVotedPosts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        v.VoteTypeId,
+        COUNT(v.Id) AS VoteCount,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(v.Id) DESC) AS VoteRank
+    FROM Posts p
+    INNER JOIN Votes v ON p.Id = v.PostId
+    WHERE v.VoteTypeId = 2
+    GROUP BY p.OwnerUserId, p.Id, v.VoteTypeId
+),
+CorrelatedSubqueryExample AS (
+    SELECT 
+        u.Id AS UserId,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighScoreComments
+    FROM Users u
+)
+SELECT 
+    u.DisplayName,
+    COALESCE(ups.PostCount, 0) AS PostCount,
+    COALESCE(ups.AvgScore, 0) AS AvgPostScore,
+    bs.GoldBadges,
+    bs.TotalBadges,
+    tvp.VoteCount AS TopPostVotes,
+    cse.HighScoreComments,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'High Rep'
+        WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Medium Rep'
+        ELSE 'Low Rep' 
+    END AS RepCategory,
+    NULLIF(ups.AllTags, '') AS TagsSummary,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS OverallRank
+FROM Users u
+LEFT OUTER JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT OUTER JOIN BadgeStats bs ON u.Id = bs.UserId AND bs.BadgeRank = 1
+INNER JOIN TopVotedPosts tvp ON u.Id = tvp.OwnerUserId AND tvp.VoteRank = 1
+LEFT OUTER JOIN CorrelatedSubqueryExample cse ON u.Id = cse.UserId
+WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users) OR bs.GoldBadges > 0
+UNION ALL
+SELECT 
+    'Anonymous' AS DisplayName,
+    0 AS PostCount,
+    0 AS AvgPostScore,
+    0 AS GoldBadges,
+    0 AS TotalBadges,
+    0 AS TopPostVotes,
+    0 AS HighScoreComments,
+    'None' AS RepCategory,
+    NULL AS TagsSummary,
+    0 AS OverallRank
+ORDER BY OverallRank DESC
+LIMIT 100;

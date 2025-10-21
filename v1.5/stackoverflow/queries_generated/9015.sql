@@ -1,0 +1,168 @@
+-- {"query": "9015.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5416} 
+
+WITH
+-- aggregate badges per user over the last year
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                           AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(b.Name || '(' || b.Class || ')', ',') AS BadgeList
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+-- rank users by reputation
+UserRank AS (
+    SELECT
+        u.Id,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+    FROM Users u
+),
+-- recent posts with calculated metrics and correlated subquery
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        COALESCE(p.Score,0) AS PostScore,
+        COALESCE(p.ViewCount,0) AS Views,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body,'<code>',''))) / LENGTH('<code>') AS CodeSnippets,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = p.Id 
+              AND c.CreationDate > p.CreationDate
+        ) AS NewComments,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL       THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Open'
+        END AS Status,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS TypeRank
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+-- count link types per post
+LinkStats AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Linked'    THEN 1 ELSE 0 END) AS OutgoingLinks,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+-- explode tags for questions
+TaggedQuestions AS (
+    SELECT
+        p.Id,
+        UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+-- count questions per tag
+TagQuestionCounts AS (
+    SELECT
+        t.Tag,
+        COUNT(DISTINCT t.Id) AS QuestionCount
+    FROM TaggedQuestions t
+    GROUP BY t.Tag
+),
+-- choose top tags above average question count
+TopTags AS (
+    SELECT Tag
+    FROM TagQuestionCounts
+    WHERE QuestionCount > (SELECT AVG(QuestionCount) FROM TagQuestionCounts)
+)
+-- main result combining users, badges, posts, links and tags
+SELECT
+    ud.Id               AS UserId,
+    ud.DisplayName,
+    ur.ReputationRank,
+    bs.TotalBadges,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.BadgeList,
+    pd.Id               AS PostId,
+    pd.PostTypeName,
+    pd.PostScore,
+    pd.Views,
+    pd.CodeSnippets,
+    pd.NewComments,
+    pd.Status,
+    pd.TypeRank,
+    COALESCE(ls.OutgoingLinks,0)  AS OutgoingLinks,
+    COALESCE(ls.DuplicateLinks,0) AS DuplicateLinks,
+    tq.Tag
+FROM UserRank ur
+JOIN Users ud               ON ur.Id = ud.Id
+LEFT JOIN BadgeSummary bs   ON ud.Id = bs.UserId
+LEFT JOIN PostDetails pd    ON ud.Id = pd.OwnerUserId
+LEFT JOIN LinkStats ls      ON pd.Id = ls.PostId
+JOIN TaggedQuestions tq     ON pd.Id = tq.Id
+WHERE tq.Tag IN (SELECT Tag FROM TopTags)
+  AND EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.PostId = pd.Id
+        AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod')
+        AND v.CreationDate > pd.CreationDate + INTERVAL '1 day'
+  )
+UNION
+-- include users with NULL views on top tags (no recent posts)
+SELECT
+    ud.Id,
+    ud.DisplayName,
+    ur.ReputationRank,
+    COALESCE(bs.TotalBadges,0),
+    COALESCE(bs.GoldBadges,0),
+    COALESCE(bs.SilverBadges,0),
+    COALESCE(bs.BronzeBadges,0),
+    COALESCE(bs.BadgeList,''),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    0,
+    0,
+    tt.Tag
+FROM TopTags tt
+JOIN Users ud               ON ud.Id IN (SELECT u1.Id FROM Users u1 WHERE u1.Views IS NULL)
+JOIN UserRank ur            ON ud.Id = ur.Id
+LEFT JOIN BadgeSummary bs   ON ud.Id = bs.UserId
+EXCEPT
+-- exclude any user records with missing EmailHash
+SELECT
+    u.Id,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE u.EmailHash IS NULL
+;

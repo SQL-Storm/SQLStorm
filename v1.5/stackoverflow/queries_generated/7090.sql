@@ -1,0 +1,186 @@
+-- {"query": "7090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2561} 
+with
+-- recent active questions with tag-parsed array and title word count
+RecentQuestions as (
+  select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         coalesce(p.Tags,'') as RawTags,
+         -- parse tags from format like '<tag1><tag2>'
+         regexp_split_to_array(substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,'')) - 2,0)), '><') as TagArray,
+         -- approximate title complexity
+         array_length(regexp_split_to_array(coalesce(p.Title,''), '\s+'),1) as TitleWords
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '2 years'
+),
+-- compute for each question aggregations of answers, top answer, and average answer score
+AnswerStats as (
+  select q.Id as QuestionId,
+         count(a.Id) filter (where a.Id is not null) as AnswerCountCalc,
+         max(a.Score) filter (where a.Id is not null) as MaxAnswerScore,
+         -- pick top scoring answer id (ties broken by CreationDate asc)
+         (select a2.Id
+          from Posts a2
+          where a2.ParentId = q.Id and a2.PostTypeId = 2
+          order by a2.Score desc nulls last, a2.CreationDate asc
+          limit 1) as TopAnswerId,
+         avg(a.Score) filter (where a.Id is not null) as AvgAnswerScore
+  from RecentQuestions q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  group by q.Id
+),
+-- enrich users: counts, reputation bands, latest activity, badge summary
+UserSummary as (
+  select u.Id as UserId, u.DisplayName, u.Reputation,
+         case
+           when u.Reputation >= 100000 then 'Legend'
+           when u.Reputation >= 10000 then 'Expert'
+           when u.Reputation >= 1000 then 'Experienced'
+           when u.Reputation >= 100 then 'Contributor'
+           else 'Newbie'
+         end as RepBand,
+         u.CreationDate, u.LastAccessDate,
+         coalesce((select count(*) from Posts p2 where p2.OwnerUserId = u.Id),0) as PostsCount,
+         coalesce((select count(*) from Comments c where c.UserId = u.Id),0) as CommentsCount,
+         coalesce((select string_agg(distinct b.Name || ':' || b.Class, ', ' order by b.Class desc, b.Date desc)
+                   from Badges b where b.UserId = u.Id), '') as BadgesSummary,
+         -- most recent post title snippet
+         (select substring(p3.Title from 1 for 100) from Posts p3 where p3.OwnerUserId = u.Id order by p3.LastActivityDate desc limit 1) as LatestPostTitle
+  from Users u
+),
+-- tag popularity (from Questions only) with sample question id and last activity for tag
+TagPopularity as (
+  select t.tag as TagName,
+         count(*) as QuestionCount,
+         max(p.LastActivityDate) as LastActivity,
+         min(p.Id) as SampleQuestionId,
+         avg(p.ViewCount) as AvgViews,
+         percentile_cont(0.5) within group (order by p.Score) as MedianScore
+  from (
+    select p.Id, unnest(
+      regexp_split_to_array(substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,'')) - 2,0)), '><')
+    ) as tag, p.LastActivityDate, p.ViewCount, p.Score
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+      and p.CreationDate >= now() - interval '5 years'
+  ) p
+  group by ttag := tag
+),
+-- compute diverse set: for each recent question, latest comment (if any), latest edit from PostHistory, and link counts
+QuestionEnrichment as (
+  select q.*, a.AnswerCountCalc, a.MaxAnswerScore, a.TopAnswerId, a.AvgAnswerScore,
+         us.DisplayName as OwnerName, us.RepBand, us.BadgesSummary,
+         c.LatestCommentId, c.LatestCommentText, c.LatestCommentDate,
+         ph.LatestEditDate, ph.LatestEditorId, ph.LatestEditSummary,
+         pl.TotalLinksOut, pl.TotalDuplicatesIn
+  from RecentQuestions q
+  left join AnswerStats a on a.QuestionId = q.Id
+  left join UserSummary us on us.UserId = q.OwnerUserId
+  left join lateral (
+    select c.Id as LatestCommentId, substring(c.Text from 1 for 200) as LatestCommentText, c.CreationDate as LatestCommentDate
+    from Comments c
+    where c.PostId = q.Id
+    order by c.CreationDate desc
+    limit 1
+  ) c on true
+  left join lateral (
+    select max(ph.CreationDate) as LatestEditDate,
+           max(ph.UserId) as LatestEditorId,
+           substring(max(coalesce(ph.Comment,ph.Text)) from 1 for 200) as LatestEditSummary
+    from PostHistory ph
+    where ph.PostId = q.Id
+  ) ph on true
+  left join lateral (
+    select count(*) filter (where pl.PostId = q.Id) as TotalLinksOut,
+           count(*) filter (where pl.RelatedPostId = q.Id and pl.LinkTypeId = 3) as TotalDuplicatesIn
+    from PostLinks pl
+  ) pl on true
+),
+-- Windowed ranking of enriched questions by a heuristic score mixing views, score, answers, recency and owner reputation
+RankedQuestions as (
+  select qe.*,
+         -- heuristic: weighted z-scores and null-safe fills
+         (
+           coalesce(qe.ViewCount,0)::numeric * 0.3
+           + coalesce(qe.Score,0)::numeric * 25
+           + coalesce(qe.AnswerCountCalc,0)::numeric * 50
+           + coalesce(qe.MaxAnswerScore,0)::numeric * 10
+           + (case when qe.TopAnswerId is not null then 500 else 0 end)
+           - extract(epoch from (now() - qe.CreationDate)) / 86400.0 * 1.5
+           + (case when qe.RepBand = 'Legend' then 1000 when qe.RepBand = 'Expert' then 400 when qe.RepBand = 'Experienced' then 150 when qe.RepBand = 'Contributor' then 50 else 0 end)
+         ) as HeuristicScore,
+         rank() over (order by (
+           coalesce(qe.ViewCount,0)::numeric * 0.3
+           + coalesce(qe.Score,0)::numeric * 25
+           + coalesce(qe.AnswerCountCalc,0)::numeric * 50
+           + coalesce(qe.MaxAnswerScore,0)::numeric * 10
+           + (case when qe.TopAnswerId is not null then 500 else 0 end)
+           - extract(epoch from (now() - qe.CreationDate)) / 86400.0 * 1.5
+           + (case when qe.RepBand = 'Legend' then 1000 when qe.RepBand = 'Expert' then 400 when qe.RepBand = 'Experienced' then 150 when qe.RepBand = 'Contributor' then 50 else 0 end)
+         ) desc) as HeuristicRank
+  from QuestionEnrichment qe
+),
+-- pick tag co-occurrence: for top N questions, find top co-occurring tags
+TopCoTags as (
+  select tq.Id as QuestionId, tag as CoTag, count(*) as CoCount
+  from RankedQuestions tq
+  left join lateral (
+    select unnest(tq.TagArray) as tag
+  ) tags on true
+  where tq.HeuristicRank <= 200
+  group by tq.Id, tag
+),
+-- identify suspicious posts: high negative score answers, or many deletes in posthistory
+Suspicious as (
+  select p.Id, p.PostTypeId, p.Score, p.OwnerUserId,
+         exists(select 1 from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 12) as EverDeleted,
+         (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotesCount,
+         (select count(*) from PostHistory ph2 where ph2.PostId = p.Id and ph2.PostHistoryTypeId in (12,13)) as DeleteUndeleteEvents
+  from Posts p
+  where p.PostTypeId in (1,2)
+    and (p.Score < -5 or exists(select 1 from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 12))
+)
+-- Final selection: get top 100 ranked questions joined with tag popularity, sample user metrics, co-tags and suspicious indicators for their top answers
+select rq.HeuristicRank,
+       rq.Id as QuestionId,
+       rq.Title,
+       rq.OwnerUserId,
+       coalesce(rq.OwnerName, '(deleted)') as OwnerName,
+       rq.RepBand,
+       rq.HeuristicScore,
+       rq.CreationDate,
+       rq.Score as QuestionScore,
+       rq.ViewCount,
+       coalesce(rq.AnswerCountCalc,0) as AnswerCount,
+       rq.MaxAnswerScore,
+       rq.AvgAnswerScore,
+       rq.TopAnswerId,
+       -- top answer summary via correlated subquery
+       (select row_to_json(ra.*) from (
+          select a.Id as AnswerId, a.OwnerUserId as AnswerOwner, a.Score as AnswerScore, a.CreationDate as AnswerCreated,
+                 substring(a.Body from 1 for 200) as AnswerSnippet,
+                 coalesce((select count(*) from Comments c where c.PostId = a.Id),0) as AnswerCommentCount,
+                 coalesce((select sum(case when v.VoteTypeId=2 then 1 when v.VoteTypeId=3 then -1 else 0 end) from Votes v where v.PostId = a.Id),0) as NetVotes
+          from Posts a
+          where a.Id = rq.TopAnswerId
+       ) ra) as TopAnswerSummary,
+       -- co-tags aggregated
+       (select string_agg(distinct t.tag, ', ' order by count(*) desc) from (
+          select unnest(rq.TagArray) as tag
+       ) t) as Tags,
+       -- join with tag popularity for first tag listed
+       (select tp.QuestionCount from TagPopularity tp where tp.TagName = (rq.TagArray[1]) limit 1) as PrimaryTagQuestionCount,
+       (select tp.AvgViews from TagPopularity tp where tp.TagName = (rq.TagArray[1]) limit 1) as PrimaryTagAvgViews,
+       -- latest activity reasons
+       rq.LatestCommentDate, rq.LatestEditDate, rq.LatestEditSummary,
+       rq.TotalLinksOut, rq.TotalDuplicatesIn,
+       -- suspicious indicator for question and its top answer
+       (select s.EverDeleted from Suspicious s where s.Id = rq.Id) as QuestionEverDeleted,
+       (select s.DownVotesCount from Suspicious s where s.Id = rq.TopAnswerId) as TopAnswerDownVotes,
+       -- windowed percentiles across ranked set
+       percentile_disc(0.25) within group (order by HeuristicScore) over () as P25_Score,
+       percentile_disc(0.50) within group (order by HeuristicScore) over () as Median_Score,
+       percentile_disc(0.75) within group (order by HeuristicScore) over () as P75_Score
+from RankedQuestions rq
+left join TagPopularity tp on tp.TagName = rq.TagArray[1]
+order by rq.HeuristicRank
+limit 100;

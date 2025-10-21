@@ -1,0 +1,127 @@
+WITH RECURSIVE date_series AS (
+    SELECT DATE_TRUNC('month', MIN(CreationDate)) AS month_start
+    FROM Posts
+    WHERE PostTypeId = 1
+    UNION ALL
+    SELECT month_start + INTERVAL '1 month'
+    FROM date_series
+    WHERE month_start < DATE_TRUNC('month', CAST('2024-10-01' AS DATE))
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answer_count,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        STDDEV(p.Score) AS score_stddev,
+        MAX(p.Score) AS max_answer_score,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 2
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    CROSS JOIN LATERAL (
+        SELECT tag AS tag
+        FROM (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><')) AS tag) AS s
+    ) AS tag_array
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE p.Score > 0
+        AND q.ClosedDate IS NULL
+        AND u.Reputation > 1000
+    GROUP BY u.Id, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+monthly_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS activity_month,
+        p.OwnerUserId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers_given,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS question_score,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS answer_score,
+        COUNT(DISTINCT c.Id) AS comments_made,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_cast,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edits_made,
+        LAG(COUNT(DISTINCT p.Id), 1) OVER (PARTITION BY p.OwnerUserId ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_posts,
+        LAG(COUNT(DISTINCT p.Id), 12) OVER (PARTITION BY p.OwnerUserId ORDER BY DATE_TRUNC('month', p.CreationDate)) AS year_ago_posts
+    FROM Posts p
+    LEFT JOIN Comments c ON c.UserId = p.OwnerUserId 
+        AND DATE_TRUNC('month', c.CreationDate) = DATE_TRUNC('month', p.CreationDate)
+    LEFT JOIN Votes v ON v.UserId = p.OwnerUserId 
+        AND DATE_TRUNC('month', v.CreationDate) = DATE_TRUNC('month', p.CreationDate)
+    LEFT JOIN PostHistory ph ON ph.UserId = p.OwnerUserId 
+        AND DATE_TRUNC('month', ph.CreationDate) = DATE_TRUNC('month', p.CreationDate)
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY DATE_TRUNC('month', p.CreationDate), p.OwnerUserId
+),
+badge_progression AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        b.Name AS badge_name,
+        b.Date AS earned_date,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS cumulative_badges,
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date))) / 86400.0 AS days_since_last,
+        FIRST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS first_badge_date,
+        CASE 
+            WHEN CAST(b.TagBased AS INTEGER) = 1 THEN 'tag'
+            ELSE 'named'
+        END AS badge_type
+    FROM Badges b
+),
+network_analysis AS (
+    SELECT 
+        p1.OwnerUserId AS user1,
+        p2.OwnerUserId AS user2,
+        COUNT(DISTINCT p1.Id) AS interactions,
+        MIN(LEAST(p1.CreationDate, p2.CreationDate)) AS first_interaction,
+        MAX(GREATEST(p1.CreationDate, p2.CreationDate)) AS last_interaction,
+        AVG(ABS(p1.Score - p2.Score)) AS avg_score_diff,
+        CORR(p1.Score, p2.Score) AS score_correlation
+    FROM Posts p1
+    INNER JOIN Posts p2 ON p1.ParentId = p2.ParentId OR p1.Id = p2.ParentId OR p2.Id = p1.ParentId
+    WHERE p1.OwnerUserId < p2.OwnerUserId
+        AND p1.OwnerUserId IS NOT NULL
+        AND p2.OwnerUserId IS NOT NULL
+    GROUP BY p1.OwnerUserId, p2.OwnerUserId
+    HAVING COUNT(DISTINCT p1.Id) >= 3
+)
+SELECT 
+    ds.month_start,
+    COUNT(DISTINCT ma.OwnerUserId) AS active_users,
+    AVG(ma.questions_asked) AS avg_questions,
+    AVG(ma.answers_given) AS avg_answers,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY (ma.question_score + ma.answer_score)) AS score_p25,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY (ma.question_score + ma.answer_score)) AS score_median,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY (ma.question_score + ma.answer_score)) AS score_p75,
+    COUNT(DISTINCT ue.UserId) FILTER (WHERE ue.tag_rank = 1) AS top_experts,
+    AVG(CASE WHEN ue.tag_rank = 1 THEN (ue.accepted_answers * 1.0 / NULLIF(ue.answer_count, 0)) END) AS expert_acceptance_rate,
+    COUNT(DISTINCT bp.UserId) FILTER (WHERE bp.Class = 1 AND DATE_TRUNC('month', bp.earned_date) = ds.month_start) AS gold_badges_earned,
+    COUNT(DISTINCT bp.UserId) FILTER (WHERE bp.Class = 2 AND DATE_TRUNC('month', bp.earned_date) = ds.month_start) AS silver_badges_earned,
+    COUNT(DISTINCT bp.UserId) FILTER (WHERE bp.Class = 3 AND DATE_TRUNC('month', bp.earned_date) = ds.month_start) AS bronze_badges_earned,
+    AVG(bp.days_since_last) FILTER (WHERE DATE_TRUNC('month', bp.earned_date) = ds.month_start) AS avg_days_between_badges,
+    COUNT(DISTINCT na.user1) + COUNT(DISTINCT na.user2) AS network_participants,
+    AVG(na.interactions) AS avg_network_interactions,
+    AVG(EXTRACT(EPOCH FROM (na.last_interaction - na.first_interaction)) / 86400.0) AS avg_relationship_duration_days,
+    COALESCE(AVG(na.score_correlation), 0) AS avg_score_correlation,
+    SUM(ma.edits_made) AS total_edits,
+    SUM(ma.comments_made) AS total_comments,
+    AVG(CASE WHEN ma.prev_month_posts IS NOT NULL THEN (ma.questions_asked + ma.answers_given) * 1.0 / NULLIF(ma.prev_month_posts, 0) - 1 ELSE NULL END) AS month_over_month_growth,
+    AVG(CASE WHEN ma.year_ago_posts IS NOT NULL THEN (ma.questions_asked + ma.answers_given) * 1.0 / NULLIF(ma.year_ago_posts, 0) - 1 ELSE NULL END) AS year_over_year_growth,
+    STDDEV(ma.question_score + ma.answer_score) AS score_variance,
+    COUNT(DISTINCT ma.OwnerUserId) FILTER (WHERE ma.questions_asked > 0 AND ma.answers_given > 0) AS users_both_qa,
+    COUNT(DISTINCT ma.OwnerUserId) FILTER (WHERE ma.questions_asked > 0 AND ma.answers_given = 0) AS question_only_users,
+    COUNT(DISTINCT ma.OwnerUserId) FILTER (WHERE ma.questions_asked = 0 AND ma.answers_given > 0) AS answer_only_users
+FROM date_series ds
+LEFT JOIN monthly_activity ma ON ma.activity_month = ds.month_start
+LEFT JOIN user_expertise ue ON ue.UserId = ma.OwnerUserId
+LEFT JOIN badge_progression bp ON bp.UserId = ma.OwnerUserId
+LEFT JOIN network_analysis na ON (na.user1 = ma.OwnerUserId OR na.user2 = ma.OwnerUserId)
+    AND na.first_interaction <= ds.month_start + INTERVAL '1 month'
+    AND na.last_interaction >= ds.month_start
+WHERE ds.month_start >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+GROUP BY ds.month_start
+ORDER BY ds.month_start DESC
+LIMIT 100;

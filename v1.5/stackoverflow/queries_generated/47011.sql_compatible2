@@ -1,0 +1,146 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.PostId) AS direct_posts,
+        0 AS level
+    FROM Tags t
+    JOIN Posts p ON p.Id IN (t.ExcerptPostId, t.WikiPostId)
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p2.Tags, 2, length(p2.Tags) - 2), '><')) AS tag_name, p2.Id AS PostId
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1 AND p2.Tags IS NOT NULL
+    ) pt ON pt.tag_name = t.TagName
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.direct_posts,
+        th.level + 1
+    FROM Tags t
+    JOIN tag_hierarchy th ON t.Id <> th.Id
+    WHERE th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        SUM(p.Score) AS total_score_in_tag,
+        AVG(p.Score) AS avg_score_in_tag,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.TagBased = TRUE AND b.Name = t.TagName) AS tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank,
+        NTILE(100) OVER (PARTITION BY t.TagName ORDER BY COUNT(DISTINCT p.Id)) AS answer_percentile
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) AS tag_name
+    ) AS tag_split ON TRUE
+    JOIN Tags t ON t.TagName = tag_split.tag_name
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 5000
+      AND p.Score > 0
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        pt.Name AS post_type,
+        COUNT(DISTINCT p.Id) AS post_count,
+        AVG(p.Score) AS avg_score,
+        STDDEV(p.Score) AS score_stddev,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_authors,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS total_views,
+        AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0) AS avg_activity_hours,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS edit_count,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        AVG(COUNT(DISTINCT p.Id)) OVER (PARTITION BY pt.Name) AS dummy_grouped_calc, -- placeholder to satisfy GROUP BY consistency if needed
+        LAG(COUNT(DISTINCT p.Id), 1) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_count,
+        LEAD(COUNT(DISTINCT p.Id), 1) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS next_month_count
+    FROM Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), pt.Name
+),
+vote_network AS (
+    SELECT 
+        v1.UserId AS voter_id,
+        p.OwnerUserId AS recipient_id,
+        COUNT(*) AS vote_count,
+        SUM(CASE WHEN v1.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v1.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        ARRAY_AGG(DISTINCT t.tag_name) AS common_tags
+    FROM Votes v1
+    JOIN Posts p ON p.Id = v1.PostId
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(COALESCE(p.Tags, q.Tags), 2, length(COALESCE(p.Tags, q.Tags)) - 2), '><')) AS tag_name
+        FROM Posts q
+        WHERE q.Id = COALESCE(p.ParentId, p.Id)
+    ) AS t ON TRUE
+    WHERE v1.UserId IS NOT NULL
+      AND p.OwnerUserId IS NOT NULL
+      AND v1.VoteTypeId IN (2, 3)
+      AND v1.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY v1.UserId, p.OwnerUserId
+    HAVING COUNT(*) >= 5
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.Reputation,
+    ue.answers_in_tag,
+    ue.total_score_in_tag,
+    ue.avg_score_in_tag,
+    ue.median_score,
+    ue.accepted_answers,
+    ue.tag_badges,
+    ue.tag_rank,
+    ue.answer_percentile,
+    th.direct_posts AS tag_total_posts,
+    tp.avg_score AS recent_month_avg_score,
+    tp.score_stddev,
+    tp.unique_authors,
+    tp.total_views,
+    tp.avg_activity_hours,
+    tp.edit_count,
+    tp.comment_count,
+    COALESCE(tp.post_count - tp.prev_month_count, 0) AS month_over_month_change,
+    vn.vote_count AS votes_given_to_others,
+    vn.upvotes AS upvotes_given,
+    vn.downvotes AS downvotes_given,
+    CARDINALITY(vn.common_tags) AS common_tag_count,
+    ROW_NUMBER() OVER (PARTITION BY ue.TagName ORDER BY ue.total_score_in_tag DESC) AS final_rank
+FROM user_expertise ue
+JOIN tag_hierarchy th ON th.TagName = ue.TagName
+LEFT JOIN temporal_patterns tp ON tp.month = DATE_TRUNC('month', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month')
+    AND tp.post_type = 'Answer'
+LEFT JOIN LATERAL (
+    SELECT 
+        vn.voter_id,
+        SUM(vn.vote_count) AS vote_count,
+        SUM(vn.upvotes) AS upvotes,
+        SUM(vn.downvotes) AS downvotes,
+        ARRAY_AGG(DISTINCT tag) AS common_tags
+    FROM vote_network vn
+    CROSS JOIN LATERAL UNNEST(vn.common_tags) AS tag
+    WHERE vn.voter_id = ue.UserId
+      AND tag = ue.TagName
+    GROUP BY vn.voter_id
+) vn ON vn.voter_id = ue.UserId
+WHERE ue.tag_rank <= 100
+  AND th.level = 0
+ORDER BY ue.TagName, final_rank
+LIMIT 5000;

@@ -1,0 +1,222 @@
+-- {"query": "19077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3308} 
+WITH UserReputationSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        -- Calculate account age in days
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS AccountAgeDays,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersOwned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(P.Score) AS AvgPostScoreOwned,
+        SUM(P.ViewCount) AS TotalPostViewCountOwned,
+        SUM(P.AnswerCount) AS TotalAnswersReceived, -- Only for questions owned
+        SUM(P.FavoriteCount) AS TotalFavoritesReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScoreMade,
+        COUNT(DISTINCT V.PostId) AS TotalPostsVotedOn,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS TotalUpVotesCast,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS TotalDownVotesCast,
+        -- Check for specific badge class presence
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+        MAX(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS HasBronzeBadge,
+        -- Identify users with highly upvoted answers
+        MAX(CASE WHEN P_ANS.PostTypeId = 2 AND P_ANS.Score > 100 THEN 1 ELSE 0 END) AS HasHighlyUpvotedAnswer
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P_ANS ON U.Id = P_ANS.OwnerUserId AND P_ANS.PostTypeId = 2 -- To check for highly upvoted answers
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostLifecycleAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Tags,
+        -- Count unique edits for the post (PostHistoryTypeId in 4, 5, 6 for edits)
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        -- Check if post has ever been closed
+        MAX(CASE WHEN PH_CLOSE.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        -- Check if post has ever been reopened
+        MAX(CASE WHEN PH_REOPEN.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        -- Identify posts with content changes in Body/Title
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (2,5,8) AND LENGTH(PH.Text) > 0 THEN 1 ELSE 0 END) AS HasBodyHistory,
+        -- Calculate days from creation to last edit
+        EXTRACT(EPOCH FROM (P.LastEditDate - P.CreationDate)) / (60 * 60 * 24) AS DaysToLastEdit,
+        -- Find the last non-empty comment text for the post (correlated subquery for this post)
+        (
+            SELECT COALESCE(C_LAST.Text, '')
+            FROM Comments C_LAST
+            WHERE C_LAST.PostId = P.Id AND C_LAST.Text IS NOT NULL
+            ORDER BY C_LAST.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCommentText
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistory PH_CLOSE ON P.Id = PH_CLOSE.PostId AND PH_CLOSE.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_REOPEN ON P.Id = PH_REOPEN.PostId AND PH_REOPEN.PostHistoryTypeId = 11
+    WHERE P.PostTypeId = 1 -- Focus on questions
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate,
+        P.CommunityOwnedDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Tags
+),
+TagStats AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><'))) AS TagName,
+        P.Id AS PostId,
+        P.OwnerUserId
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2 -- Ensure tags exist and are not just '<>'
+),
+PopularTags AS (
+    SELECT
+        TS.TagName,
+        COUNT(DISTINCT TS.PostId) AS TaggedPostCount,
+        COUNT(DISTINCT TS.OwnerUserId) AS UniqueTagUsers
+    FROM TagStats TS
+    GROUP BY TS.TagName
+    HAVING COUNT(DISTINCT TS.PostId) > 100 -- Only consider reasonably popular tags
+),
+PostLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostCount,
+        -- Find the latest creation date of a linked post
+        MAX(CASE WHEN PL.LinkTypeId = 1 THEN PL.CreationDate ELSE NULL END) AS LatestLinkedPostDate
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+DiverseActiveUsers AS (
+    -- Users who posted at least one question or answer in the last year
+    SELECT DISTINCT P.OwnerUserId AS UserId, 'RecentPoster' AS ActivityType
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL AND P.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' AND P.PostTypeId IN (1, 2)
+    UNION ALL
+    -- Users who have received a Gold badge
+    SELECT DISTINCT B.UserId, 'GoldBadgeHolder' AS ActivityType
+    FROM Badges B
+    WHERE B.Class = 1
+    UNION ALL
+    -- Users who have made a comment with score > 5
+    SELECT DISTINCT C.UserId, 'HighScoreCommenter' AS ActivityType
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL AND C.Score > 5
+)
+SELECT
+    URS.UserId,
+    URS.DisplayName,
+    URS.Reputation,
+    URS.UserCreationDate,
+    URS.LastAccessDate,
+    URS.AccountAgeDays,
+    URS.UserViews,
+    URS.UserUpVotesGiven,
+    URS.UserDownVotesGiven,
+    URS.TotalPostsOwned,
+    URS.QuestionsOwned,
+    URS.AnswersOwned,
+    URS.TotalPostScoreOwned,
+    URS.AvgPostScoreOwned,
+    URS.TotalPostViewCountOwned,
+    URS.TotalAnswersReceived,
+    URS.TotalFavoritesReceived,
+    URS.TotalCommentsMade,
+    URS.TotalCommentScoreMade,
+    URS.HasGoldBadge,
+    URS.HasSilverBadge,
+    URS.HasBronzeBadge,
+    URS.HasHighlyUpvotedAnswer,
+    -- User-level calculated metrics
+    COALESCE(URS.Reputation / NULLIF(URS.AccountAgeDays, 0), 0) AS AvgDailyReputationGain,
+    COALESCE(CAST(URS.UserUpVotesGiven AS DECIMAL) / NULLIF(URS.UserDownVotesGiven, 0), 0) AS UpToDownVoteRatioGiven,
+    -- Aggregated post-level metrics for questions owned by the user
+    SUM(PLA.LinkedPostCount) AS TotalLinkedPostsForUserQuestions,
+    SUM(PLA.DuplicatePostCount) AS TotalDuplicatePostsForUserQuestions,
+    AVG(PLA.LinkedPostCount) AS AvgLinkedPostsPerQuestion,
+    AVG(PLA.DuplicatePostCount) AS AvgDuplicatePostsPerQuestion,
+    SUM(CASE WHEN PLA.LatestLinkedPostDate > URS.LastAccessDate THEN 1 ELSE 0 END) AS LinkedPostsAfterLastAccess, -- Example of date comparison
+    -- Post lifecycle metrics for user's questions
+    AVG(PLCA.EditCount) AS AvgEditCountPerQuestion,
+    SUM(CASE WHEN PLCA.WasClosed = 1 THEN 1 ELSE 0 END) AS TotalClosedQuestionsOwned,
+    SUM(CASE WHEN PLCA.WasReopened = 1 THEN 1 ELSE 0 END) AS TotalReopenedQuestionsOwned,
+    SUM(CASE WHEN PLCA.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalCommunityOwnedQuestions,
+    -- Complex string and NULL logic for latest comment text
+    MAX(CASE
+            WHEN PLCA.LatestCommentText IS NOT NULL AND LENGTH(PLCA.LatestCommentText) > 20
+            THEN SUBSTRING(PLCA.LatestCommentText, 1, 50) || '...'
+            ELSE COALESCE(PLCA.LatestCommentText, '[No Comment]')
+        END) AS LongestRecentCommentSnippet,
+    -- Window function: Rank users by reputation within their account age bracket (e.g., created within the same year)
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM URS.UserCreationDate) ORDER BY URS.Reputation DESC) AS RankByReputationInCreationYear,
+    -- Window function: Moving average of post scores for user's questions, ordered by creation date
+    AVG(PLCA.PostScore) OVER (PARTITION BY URS.UserId ORDER BY PLCA.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgQuestionScore,
+    -- Correlated Subquery: Check if user has posts linked to highly viewed questions
+    (
+        SELECT COUNT(DISTINCT PL_INNER.RelatedPostId)
+        FROM PostLinks PL_INNER
+        JOIN Posts P_RELATED ON PL_INNER.RelatedPostId = P_RELATED.Id
+        WHERE PL_INNER.PostId IN (SELECT PLCA_INNER.PostId FROM PostLifecycleAnalysis PLCA_INNER WHERE PLCA_INNER.OwnerUserId = URS.UserId)
+          AND PL_INNER.LinkTypeId = 1
+          AND P_RELATED.ViewCount > 50000
+    ) AS LinkedToHighViewQuestionsCount,
+    -- Subquery: Get top 3 most common tags for the user's questions
+    (
+        SELECT STRING_AGG(PT_USER.TagName, ', ')
+        FROM (
+            SELECT
+                TS_USER.TagName,
+                COUNT(TS_USER.PostId) AS TagUsageCount
+            FROM TagStats TS_USER
+            WHERE TS_USER.OwnerUserId = URS.UserId
+            GROUP BY TS_USER.TagName
+            ORDER BY TagUsageCount DESC, TS_USER.TagName ASC
+            LIMIT 3
+        ) AS PT_USER
+    ) AS Top3QuestionTags,
+    -- Complex predicate: User with high daily reputation and multiple closed questions
+    (URS.Reputation > 10000 AND COALESCE(URS.Reputation / NULLIF(URS.AccountAgeDays, 0), 0) > 20 AND SUM(CASE WHEN PLCA.WasClosed = 1 THEN 1 ELSE 0 END) > 5) AS HighReputationAndMultipleClosedQuestions,
+    COUNT(DISTINCT DAU.ActivityType) AS DistinctActiveUserActivities -- Count how many types of activities from DiverseActiveUsers the user participated in
+FROM UserReputationSummary URS
+LEFT JOIN PostLifecycleAnalysis PLCA ON URS.UserId = PLCA.OwnerUserId
+LEFT JOIN PostLinkAnalysis PLA ON PLCA.PostId = PLA.PostId
+LEFT JOIN DiverseActiveUsers DAU ON URS.UserId = DAU.UserId
+WHERE
+    URS.Reputation > 5000 -- Filter for more active/established users
+    AND URS.AccountAgeDays > 365 -- At least one year old account
+    AND URS.QuestionsOwned > 0 AND URS.AnswersOwned > 0 -- Ensure user has asked and answered
+GROUP BY
+    URS.UserId, URS.DisplayName, URS.Reputation, URS.UserCreationDate, URS.LastAccessDate,
+    URS.AccountAgeDays, URS.UserViews, URS.UpVotesGiven, URS.DownVotesGiven,
+    URS.TotalPostsOwned, URS.QuestionsOwned, URS.AnswersOwned, URS.TotalPostScoreOwned,
+    URS.AvgPostScoreOwned, URS.TotalPostViewCountOwned, URS.TotalAnswersReceived,
+    URS.TotalFavoritesReceived, URS.TotalCommentsMade, URS.TotalCommentScoreMade,
+    URS.HasGoldBadge, URS.HasSilverBadge, URS.HasBronzeBadge, URS.HasHighlyUpvotedAnswer
+HAVING
+    COUNT(PLCA.PostId) > 5 -- At least 5 questions to analyze post lifecycle for
+    AND COUNT(DISTINCT DAU.ActivityType) >= 2 -- User must participate in at least 2 types of activities defined in DiverseActiveUsers
+ORDER BY
+    AvgDailyReputationGain DESC, URS.Reputation DESC
+LIMIT 1000;

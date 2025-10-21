@@ -1,0 +1,143 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore,
+        (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400) AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        SUBSTRING(unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')), 1, 35) AS Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId, Tag
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY b.Name) AS GoldBadgeNames,
+        MAX(b.Date) AS LastBadgeDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) DESC) AS GoldBadgeRank
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentAnalysis AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS HighScoreComments,
+        STDDEV_SAMP(c.Score) AS CommentScoreStdDev
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+        AND c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY c.UserId
+),
+EditHistory AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.PostId END) AS EditedPosts,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.PostId END) AS RolledBackPosts,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate) AS PrevEditDate,
+        ph.CreationDate,
+        FIRST_VALUE(ph.Comment) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS LastEditComment
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+),
+VotePatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountiesStarted,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount,
+        CASE 
+            WHEN COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) = 0 THEN NULL
+            ELSE CAST(COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS FLOAT) / NULLIF(COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END), 0)
+        END AS UpvoteDownvoteRatio
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+SELECT 
+    uam.DisplayName,
+    CONCAT(UPPER(SUBSTRING(uam.Location FROM 1 FOR 2)), LOWER(SUBSTRING(uam.Location FROM 3))) AS FormattedLocation,
+    uam.Reputation,
+    ROUND(uam.AccountAgeDays, 1) AS AccountAgeDays,
+    uam.TotalPosts,
+    (uam.QuestionCount + uam.AnswerCount) AS QAPosts,
+    ROUND(uam.AvgPostScore, 2) AS AvgPostScore,
+    uam.MedianPostScore,
+    COALESCE(te.Tag, 'No Tags') AS TopTag,
+    COALESCE(te.TagTotalScore, 0) AS TopTagScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    ba.GoldBadgeNames,
+    CASE 
+        WHEN ba.LastBadgeDate IS NULL THEN 'Never'
+        WHEN ba.LastBadgeDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days' THEN 'Recently Active'
+        WHEN ba.LastBadgeDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days' THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS BadgeActivityStatus,
+    COALESCE(ca.TotalComments, 0) AS CommentCount,
+    ROUND(COALESCE(ca.AvgCommentLength, 0), 1) AS AvgCommentLength,
+    COALESCE(ca.HighScoreComments, 0) AS PopularComments,
+    COALESCE(eh.EditedPosts, 0) AS PostsEdited,
+    COALESCE(eh.RolledBackPosts, 0) AS PostsRolledBack,
+    CONCAT(vp.UpvotesCast, '/', vp.DownvotesCast) AS VotePattern,
+    ROUND(COALESCE(vp.UpvoteDownvoteRatio, 0), 2) AS VoteRatio,
+    COALESCE(vp.TotalBountyAmount, 0) AS BountyGenerosity,
+    RANK() OVER (ORDER BY uam.Reputation DESC) AS ReputationRank,
+    DENSE_RANK() OVER (ORDER BY uam.TotalPosts DESC NULLS LAST) AS PostCountRank,
+    NTILE(10) OVER (ORDER BY COALESCE(te.TagTotalScore, 0)) AS TagScoreDecile,
+    CASE 
+        WHEN uam.Reputation > 10000 AND ba.GoldBadges > 5 AND uam.AvgPostScore > 10 THEN 'Elite'
+        WHEN uam.Reputation > 5000 OR ba.GoldBadges > 2 THEN 'Expert'
+        WHEN uam.Reputation > 1000 AND uam.TotalPosts > 50 THEN 'Active Contributor'
+        WHEN uam.TotalPosts > 10 THEN 'Regular User'
+        ELSE 'Beginner'
+    END AS UserTier,
+    GREATEST(
+        0,
+        (uam.Reputation / NULLIF(uam.AccountAgeDays, 0) * 10) +
+        COALESCE(ba.GoldBadges, 0) * 100 +
+        COALESCE(te.TagTotalScore, 0) / 10 +
+        COALESCE(ca.HighScoreComments, 0) * 5
+    ) AS CompositeScore
+FROM UserActivityMetrics uam
+LEFT JOIN TagExpertise te ON uam.Id = te.OwnerUserId AND te.TagRank = 1
+LEFT JOIN BadgeAchievements ba ON uam.Id = ba.UserId
+LEFT JOIN CommentAnalysis ca ON uam.Id = ca.UserId
+LEFT JOIN (
+    SELECT DISTINCT UserId, 
+           COUNT(DISTINCT PostId) AS EditedPosts,
+           COUNT(DISTINCT CASE WHEN PostHistoryTypeId IN (7,8,9) THEN PostId END) AS RolledBackPosts
+    FROM EditHistory
+    GROUP BY UserId
+) eh ON uam.Id = eh.UserId
+LEFT JOIN VotePatterns vp ON uam.Id = vp.UserId
+WHERE uam.TotalPosts > 0
+    OR ba.GoldBadges > 0
+    OR ca.TotalComments > 10
+ORDER BY CompositeScore DESC, uam.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,310 @@
+with recent_years as (
+  select generate_series(date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)) - interval '4 years', date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)), interval '1 year') as year_start
+),
+question_core as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.Title,
+    p.Tags,
+    date_trunc('year', p.CreationDate) as year_start
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select min(year_start) from recent_years)
+),
+question_tags as (
+  select
+    qc.QuestionId,
+    unnest(string_to_array(substring(qc.Tags, 2, length(qc.Tags)-2), '><')) as tag,
+    qc.year_start
+  from question_core qc
+  where qc.Tags is not null and qc.Tags <> ''
+),
+top_tags as (
+  select qt.tag, count(*) as q_count
+  from question_tags qt
+  group by qt.tag
+  having count(*) >= 50
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select
+    a.QuestionId,
+    min(a.AnswerCreationDate) as FirstAnswerDate
+  from answers a
+  group by a.QuestionId
+),
+answer_stats as (
+  select
+    a.QuestionId,
+    count(*) as AnswerCount,
+    avg(a.AnswerScore) as AvgAnswerScore,
+    sum(case when a.AnswerScore > 0 then 1 else 0 end) as PosAnswers,
+    sum(case when a.AnswerScore < 0 then 1 else 0 end) as NegAnswers
+  from answers a
+  group by a.QuestionId
+),
+question_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Votes v
+  join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+  group by v.PostId
+),
+comment_stats as (
+  select
+    c.PostId as QuestionId,
+    count(*) as CommentCount,
+    max(c.Score) as MaxCommentScore,
+    avg(c.Score) as AvgCommentScore
+  from Comments c
+  join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+  group by c.PostId
+),
+accepted_answer_owner as (
+  select
+    q.Id as QuestionId,
+    a.OwnerUserId as AcceptedAnswerOwnerId
+  from Posts q
+  join Posts a on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    date_trunc('year', u.CreationDate) as UserCreationYear,
+    u.UpVotes as UserUpVotes,
+    u.DownVotes as UserDownVotes,
+    coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm
+  from Users u
+),
+hot_history as (
+  select
+    ph.PostId as QuestionId,
+    min(case when ph.PostHistoryTypeId = 52 then ph.CreationDate end) as FirstHotDate,
+    count(case when ph.PostHistoryTypeId = 52 then 1 end) as HotEntries
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (52, 53)
+  group by ph.PostId
+),
+closure as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedDate,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+duplicates as (
+  select
+    pl.PostId as QuestionId,
+    count(*) as DupeLinks,
+    min(pl.CreationDate) as FirstDupeLinkDate
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+linked as (
+  select
+    pl.RelatedPostId as QuestionId,
+    count(*) as LinkedByOthers
+  from PostLinks pl
+  where pl.LinkTypeId = 1
+  group by pl.RelatedPostId
+),
+badge_dist as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+    sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+    sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+    count(*) filter (where b.TagBased = 1) as TagBadges
+  from Badges b
+  group by b.UserId
+),
+question_enriched as (
+  select
+    qc.QuestionId,
+    qc.year_start,
+    qc.Score,
+    qc.ViewCount,
+    qc.OwnerUserId,
+    qc.AcceptedAnswerId,
+    qc.Title,
+    qc.Tags,
+    qs.UpVotes,
+    qs.DownVotes,
+    qs.Favorites,
+    cs.CommentCount,
+    cs.MaxCommentScore,
+    cs.AvgCommentScore,
+    as2.AnswerCount,
+    as2.AvgAnswerScore,
+    as2.PosAnswers,
+    as2.NegAnswers,
+    fa.FirstAnswerDate,
+    hh.FirstHotDate,
+    hh.HotEntries,
+    cl.FirstClosedDate,
+    cl.LastReopenedDate,
+    cl.CloseEvents,
+    cl.ReopenEvents,
+    dp.DupeLinks,
+    dp.FirstDupeLinkDate,
+    lk.LinkedByOthers
+  from question_core qc
+  left join question_votes qs on qs.QuestionId = qc.QuestionId
+  left join comment_stats cs on cs.QuestionId = qc.QuestionId
+  left join answer_stats as2 on as2.QuestionId = qc.QuestionId
+  left join first_answer fa on fa.QuestionId = qc.QuestionId
+  left join hot_history hh on hh.QuestionId = qc.QuestionId
+  left join closure cl on cl.QuestionId = qc.QuestionId
+  left join duplicates dp on dp.QuestionId = qc.QuestionId
+  left join linked lk on lk.QuestionId = qc.QuestionId
+),
+question_user as (
+  select
+    qe.*,
+    ua.Reputation as OwnerRep,
+    ua.LocationNorm as OwnerLocation,
+    bd.Gold as OwnerGold,
+    bd.Silver as OwnerSilver,
+    bd.Bronze as OwnerBronze,
+    bd.TagBadges as OwnerTagBadges
+  from question_enriched qe
+  left join user_activity ua on ua.UserId = qe.OwnerUserId
+  left join badge_dist bd on bd.UserId = qe.OwnerUserId
+),
+accepted_meta as (
+  select
+    q.QuestionId,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+    case when q.AcceptedAnswerId is not null then
+      case when aa.OwnerUserId = q.OwnerUserId then 1 else 0 end
+    else 0 end as AcceptedByAsker,
+    aa.OwnerUserId as AcceptedOwnerId
+  from question_enriched q
+  left join Posts aa on aa.Id = q.AcceptedAnswerId
+),
+accepted_owner_profile as (
+  select
+    am.QuestionId,
+    am.HasAccepted,
+    am.AcceptedByAsker,
+    ua.Reputation as AcceptedOwnerRep,
+    bd.Gold as AcceptedOwnerGold,
+    bd.Silver as AcceptedOwnerSilver,
+    bd.Bronze as AcceptedOwnerBronze
+  from accepted_meta am
+  left join user_activity ua on ua.UserId = am.AcceptedOwnerId
+  left join badge_dist bd on bd.UserId = am.AcceptedOwnerId
+),
+tag_rollup as (
+  select
+    qt.year_start,
+    qt.tag,
+    count(distinct qt.QuestionId) as QuestionsWithTag
+  from question_tags qt
+  join top_tags t on t.tag = qt.tag
+  group by qt.year_start, qt.tag
+),
+location_rollup as (
+  select
+    qu.year_start,
+    qu.OwnerLocation,
+    count(*) as QuestionsFromLocation,
+    avg(qu.Score::numeric) as AvgScoreFromLocation,
+    avg(qu.ViewCount::numeric) as AvgViewsFromLocation
+  from question_user qu
+  group by qu.year_start, qu.OwnerLocation
+),
+question_ranked as (
+  select
+    qu.*,
+    ao.AcceptedOwnerRep,
+    ao.AcceptedOwnerGold,
+    ao.AcceptedOwnerSilver,
+    ao.AcceptedOwnerBronze,
+    am.HasAccepted,
+    am.AcceptedByAsker,
+    row_number() over (
+      partition by qu.year_start
+      order by
+        coalesce(qu.Score,0) * 2
+        + coalesce(qu.UpVotes,0)
+        - coalesce(qu.DownVotes,0)
+        + coalesce(qu.Favorites,0)
+        + coalesce(qu.LinkedByOthers,0)
+        + coalesce(qu.ViewCount,0)/100.0
+        + coalesce(qu.AnswerCount,0)
+        + case when am.HasAccepted = 1 then 5 else 0 end
+        + case when qu.FirstHotDate is not null then 8 else 0 end
+        desc,
+        qu.QuestionId
+    ) as popularity_rank
+  from question_user qu
+  left join accepted_owner_profile ao on ao.QuestionId = qu.QuestionId
+  left join accepted_meta am on am.QuestionId = qu.QuestionId
+)
+select
+  ry.year_start::date as year,
+  tt.tag,
+  tr.QuestionsWithTag,
+  lr.OwnerLocation,
+  lr.QuestionsFromLocation,
+  round(lr.AvgScoreFromLocation, 2) as AvgScoreFromLocation,
+  round(lr.AvgViewsFromLocation, 2) as AvgViewsFromLocation,
+  qr.QuestionId,
+  qr.Title,
+  qr.Score,
+  qr.ViewCount,
+  coalesce(qr.UpVotes,0) as UpVotes,
+  coalesce(qr.DownVotes,0) as DownVotes,
+  coalesce(qr.Favorites,0) as Favorites,
+  coalesce(qr.AnswerCount,0) as AnswerCount,
+  qr.HasAccepted,
+  qr.AcceptedByAsker,
+  qr.OwnerRep,
+  qr.OwnerGold,
+  qr.OwnerSilver,
+  qr.OwnerBronze,
+  qr.AcceptedOwnerRep,
+  qr.AcceptedOwnerGold,
+  qr.AcceptedOwnerSilver,
+  qr.AcceptedOwnerBronze,
+  qr.HotEntries,
+  qr.CloseEvents,
+  qr.ReopenEvents,
+  qr.DupeLinks,
+  qr.LinkedByOthers,
+  qr.popularity_rank
+from recent_years ry
+join tag_rollup tr on tr.year_start = ry.year_start
+join top_tags tt on tt.tag = tr.tag
+join location_rollup lr on lr.year_start = ry.year_start
+join question_ranked qr
+  on qr.year_start = ry.year_start
+  and position('<' || tt.tag || '>' in qr.Tags) > 0
+  and qr.OwnerLocation = lr.OwnerLocation
+where qr.popularity_rank <= 50
+order by ry.year_start, tt.tag, lr.OwnerLocation, qr.popularity_rank;

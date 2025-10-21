@@ -1,0 +1,133 @@
+WITH recent_posts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    REGEXP_SUBSTR(p.Tags, '<([^>]+)>', 1, 1, NULL, 1) AS first_tag,
+    p.CreationDate,
+    DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+latest_question AS (
+  SELECT rp.OwnerUserId, rp.Id AS QuestionId, rp.Title, rp.first_tag
+  FROM recent_posts rp
+  WHERE rp.rn = 1
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT b.Id)                            AS badge_count,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)     AS gold_badges,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+      AS recent_comments
+  FROM Users u
+  LEFT JOIN Badges b   ON b.UserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  GROUP BY u.Id
+),
+recent_votes AS (
+  SELECT
+    v.UserId,
+    vt.Name                 AS vote_type,
+    ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS rn
+  FROM Votes v
+  JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+filtered_users AS (
+  SELECT u.Id
+  FROM Users u
+  WHERE u.EmailHash IS NOT NULL
+    AND u.Views > 100
+),
+inactive_users AS (
+  SELECT u.Id
+  FROM Users u
+  WHERE u.LastAccessDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+default_users AS (
+  SELECT
+    -1                                      AS Id,
+    'Anonymous' AS DisplayName,
+    0                                       AS badge_count,
+    0                                       AS gold_badges,
+    0                                       AS recent_comments,
+    NULL                                    AS Title,
+    NULL                                    AS first_tag,
+    0                                       AS above_avg_posts,
+    'Other'                                 AS rep_bucket,
+    'NoVotes'                               AS most_recent_vote_type,
+    0                                       AS total_upvotes_for_user_posts
+)
+SELECT
+  u.Id,
+  u.DisplayName,
+  us.badge_count,
+  us.gold_badges,
+  us.recent_comments,
+  lq.Title,
+  lq.first_tag,
+  (
+    SELECT COUNT(*)
+    FROM Posts p2
+    WHERE p2.OwnerUserId = u.Id
+      AND p2.Score > (SELECT AVG(p3.Score) FROM Posts p3)
+  ) AS above_avg_posts,
+  CASE
+    WHEN u.Reputation > (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Reputation) FROM Users)
+      THEN 'Top10Percent'
+    ELSE 'Other'
+  END AS rep_bucket,
+  COALESCE(rv.vote_type, 'NoVotes') AS most_recent_vote_type,
+  (
+    SELECT COUNT(*)
+    FROM Votes v2
+    WHERE v2.PostId IN (
+      SELECT p4.Id
+      FROM Posts p4
+      WHERE p4.OwnerUserId = u.Id
+    )
+      AND v2.VoteTypeId = 2
+  ) AS total_upvotes_for_user_posts
+FROM Users u
+LEFT JOIN user_stats us        ON us.UserId = u.Id
+LEFT JOIN latest_question lq   ON lq.OwnerUserId = u.Id
+LEFT JOIN recent_votes rv      ON rv.UserId = u.Id AND rv.rn = 1
+WHERE u.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  AND u.Location IS NOT NULL
+
+UNION ALL
+
+SELECT * FROM default_users
+
+INTERSECT
+
+SELECT
+  fu.Id,
+  NULL AS DisplayName,
+  0                           AS badge_count,
+  0                           AS gold_badges,
+  0                           AS recent_comments,
+  NULL AS Title,
+  NULL AS first_tag,
+  0                           AS above_avg_posts,
+  'Other'                    AS rep_bucket,
+  'NoVotes'                  AS most_recent_vote_type,
+  0                           AS total_upvotes_for_user_posts
+FROM filtered_users fu
+
+EXCEPT
+
+SELECT
+  iu.Id,
+  NULL AS DisplayName,
+  NULL AS badge_count,
+  NULL AS gold_badges,
+  NULL AS recent_comments,
+  NULL AS Title,
+  NULL AS first_tag,
+  NULL AS above_avg_posts,
+  NULL AS rep_bucket,
+  NULL AS most_recent_vote_type,
+  NULL AS total_upvotes_for_user_posts
+FROM inactive_users iu;

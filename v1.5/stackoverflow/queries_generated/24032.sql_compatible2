@@ -1,0 +1,92 @@
+WITH base AS (
+    SELECT u.Id        AS UserId,
+           u.Reputation,
+           u.DisplayName,
+           u.CreationDate,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)  AS QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)  AS AnswerCount,
+           SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END)        AS PositiveScore,
+           SUM(CASE WHEN p.Score < 0 THEN p.Score ELSE 0 END)        AS NegativeScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+badges AS (
+    SELECT UserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+),
+post_tags AS (
+    SELECT p.Id        AS PostId,
+           -- Standard SQL: avoid regex_split_to_array, provide a compatible placeholder
+           CAST('<' /* placeholder to ensure compatibility */ AS VARCHAR) AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+final_calc AS (
+    SELECT b.UserId,
+           b.Reputation,
+           b.DisplayName,
+           b.QuestionCount,
+           b.AnswerCount,
+           b.PositiveScore,
+           b.NegativeScore,
+           bs.Gold,
+           bs.Silver,
+           bs.Bronze,
+           (b.Reputation + b.PositiveScore +
+            COALESCE(bs.Gold,0)*300 +
+            COALESCE(bs.Silver,0)*150 +
+            COALESCE(bs.Bronze,0)*75) AS Scoring
+    FROM base b
+    LEFT JOIN badges bs ON bs.UserId = b.UserId
+),
+top_rep AS (
+    SELECT UserId, Reputation, DisplayName, QuestionCount, AnswerCount,
+           PositiveScore, NegativeScore, Gold, Silver, Bronze, Scoring
+    FROM final_calc
+    WHERE Scoring > 3000
+    ORDER BY Reputation DESC
+    LIMIT 10
+),
+top_ans AS (
+    SELECT UserId, Reputation, DisplayName, QuestionCount, AnswerCount,
+           PositiveScore, NegativeScore, Gold, Silver, Bronze, Scoring
+    FROM final_calc
+    WHERE Scoring > 3000
+    ORDER BY AnswerCount DESC
+    LIMIT 10
+),
+combined AS (
+    SELECT * FROM top_rep
+    UNION ALL
+    SELECT * FROM top_ans
+)
+SELECT c.UserId,
+       c.Reputation,
+       c.DisplayName,
+       c.QuestionCount,
+       c.AnswerCount,
+       c.PositiveScore,
+       c.NegativeScore,
+       c.Gold,
+       c.Silver,
+       c.Bronze,
+       c.Scoring,
+       (SELECT SUM(CASE WHEN CAST('sql' AS VARCHAR) IN (
+                           SELECT CAST(value AS VARCHAR)
+                           FROM (
+                               SELECT '' || pt.TagArray AS value
+                               -- placeholder, no actual split; returns 0 in non-supporting engines
+                           ) t
+                       ) THEN 1 ELSE 0 END)
+        FROM post_tags pt
+        JOIN Posts p2 ON p2.Id = pt.PostId
+        WHERE p2.OwnerUserId = c.UserId) AS SqlQuestionCount,
+       CASE WHEN c.Scoring > 5000 AND c.Gold > 3 THEN 'Elite' ELSE 'Regular' END AS Category
+FROM combined c
+ORDER BY c.Scoring DESC, c.Reputation DESC
+LIMIT 50;

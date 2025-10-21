@@ -1,0 +1,179 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+    WHERE t.Count > 1000
+  UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rh.Level + 1,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy rh ON t.ExcerptPostId = rh.WikiPostId
+    WHERE rh.Level < 3
+),
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(vb.UpVoteCount, 0)) OVER (PARTITION BY p.Id) AS TotalUpVotes,
+        SUM(vd.DownVoteCount) OVER (PARTITION BY p.Id) AS TotalDownVotes,
+        AVG(p.Score) OVER (PARTITION BY substring(p.Tags from '<([^>]+)>')) AS AvgScoreByTag,
+        ROW_NUMBER() OVER (PARTITION BY substring(p.Tags from '<([^>]+)>') ORDER BY p.Score DESC) AS RankWithinTag
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) vb ON vb.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) vd ON vd.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, vb.UpVoteCount, vd.DownVoteCount
+),
+LatestEdits AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.CreationDate AS LastEditDate,
+        ph.UserId AS LastEditorUserId,
+        ph.UserDisplayName AS LastEditorDisplayName,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11,14) -- Title/Body/Tags edits and close/reopen and suggested edits
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id) AS AvgPostScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS VARCHAR) = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10
+),
+QuestionAnswerVotes AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS QuestionUpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS QuestionDownVotes,
+        COUNT(DISTINCT CASE WHEN v_answer.VoteTypeId = 2 THEN v_answer.Id END) AS AnswersUpVotes,
+        COUNT(DISTINCT CASE WHEN v_answer.VoteTypeId = 3 THEN v_answer.Id END) AS AnswersDownVotes
+    FROM Posts q
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v_answer ON v_answer.PostId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    COALESCE(NULLIF(qs.Tags, ''), '<no_tag>') AS TagList,
+    qs.AnswerCount,
+    qa.QuestionUpVotes,
+    qa.QuestionDownVotes,
+    qa.AnswersUpVotes,
+    qa.AnswersDownVotes,
+    us.DisplayName AS QuestionOwner,
+    us.Reputation AS OwnerReputation,
+    us.BadgeCount AS OwnerBadgeCount,
+    us.QuestionsPosted AS OwnerQuestions,
+    us.AnswersPosted AS OwnerAnswers,
+    ce.CloseDate,
+    ce.CloseReason,
+    le.LastEditDate,
+    le.LastEditorUserId,
+    le.LastEditorDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY substring(qs.Tags from '<([^>]+)>') ORDER BY qs.Score DESC, qs.ViewCount DESC) AS TagRank,
+    REGEXP_REPLACE(qs.Title, '[^a-zA-Z0-9 ]', '', 'g') AS NormalizedTitle,
+    LENGTH(qs.Tags) - LENGTH(REPLACE(qs.Tags, '><', '')) + 1 AS TagCount,
+    (CASE WHEN qs.AnswerCount > 0 THEN (qs.Score::float / qs.AnswerCount) ELSE NULL END) AS ScorePerAnswer,
+    (CASE WHEN us.Reputation > 10000 THEN 'HighRep' ELSE 'LowRep' END) AS ReputationClass
+FROM QuestionStats qs
+LEFT JOIN UserActivity us ON us.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = qs.QuestionId)
+LEFT JOIN ClosedQuestions ce ON ce.PostId = qs.QuestionId
+LEFT JOIN LatestEdits le ON le.PostId = qs.QuestionId
+LEFT JOIN QuestionAnswerVotes qa ON qa.QuestionId = qs.QuestionId
+WHERE qs.RankWithinTag <= 10
+  AND (qs.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) OR qa.QuestionUpVotes > 5)
+ORDER BY qs.Score DESC, qs.ViewCount DESC
+OFFSET 10 LIMIT 20
+
+UNION ALL
+
+SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    '<union_only>' AS TagList,
+    0 AS AnswerCount,
+    0 AS QuestionUpVotes,
+    0 AS QuestionDownVotes,
+    0 AS AnswersUpVotes,
+    0 AS AnswersDownVotes,
+    NULL AS QuestionOwner,
+    NULL AS OwnerReputation,
+    NULL AS OwnerBadgeCount,
+    NULL AS OwnerQuestions,
+    NULL AS OwnerAnswers,
+    NULL AS CloseDate,
+    NULL AS CloseReason,
+    NULL AS LastEditDate,
+    NULL AS LastEditorUserId,
+    NULL AS LastEditorDisplayName,
+    NULL AS TagRank,
+    NULL AS NormalizedTitle,
+    NULL AS TagCount,
+    NULL AS ScorePerAnswer,
+    NULL AS ReputationClass
+FROM Posts p
+WHERE p.PostTypeId = 1 AND p.Score < 0
+ORDER BY p.CreationDate DESC
+LIMIT 5;

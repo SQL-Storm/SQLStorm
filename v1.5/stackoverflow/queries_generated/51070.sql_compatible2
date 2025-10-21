@@ -1,0 +1,95 @@
+WITH top_users AS (
+    SELECT u.Id, u.Reputation, u.DisplayName,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING u.Reputation > 1000 AND COUNT(DISTINCT p.Id) > 10
+),
+user_engagement AS (
+    SELECT tu.Id, tu.Reputation, tu.question_count, tu.answer_count,
+           AVG(p.Score) AS avg_question_score,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS net_votes,
+           COUNT(DISTINCT c.Id) AS comment_count
+    FROM top_users tu
+    JOIN Posts p ON p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id AND c.UserId = tu.Id
+    GROUP BY tu.Id, tu.Reputation, tu.question_count, tu.answer_count
+),
+tag_activity AS (
+    SELECT p.Id AS post_id, 
+           (SELECT array_agg(DISTINCT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS tags),
+           ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2
+),
+popular_tags AS (
+    SELECT t.TagName, t.Count, COUNT(DISTINCT p.Id) AS usage_count,
+           AVG(p.Score) AS avg_score
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+time_based_interactions AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        COUNT(DISTINCT p.Id) AS posts_created,
+        AVG(p.Score) AS avg_score,
+        COUNT(DISTINCT u.Id) AS unique_users,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (5,6,4) THEN 1 ELSE 0 END) AS edits_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2,3) THEN v.Id END) AS votes_count
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+complex_network AS (
+    SELECT 
+        ue.Id AS user_id,
+        ue.Reputation,
+        pt.TagName AS popular_tag,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts,
+        AVG(p.Score) AS linked_avg_score,
+        COUNT(DISTINCT c.Id) AS comments_on_linked
+    FROM user_engagement ue
+    JOIN Posts p ON p.OwnerUserId = ue.Id AND p.PostTypeId = 1
+    JOIN popular_tags pt ON p.Tags LIKE '%' || pt.TagName || '%'
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    LEFT JOIN Comments c ON c.PostId = pl.RelatedPostId
+    GROUP BY ue.Id, ue.Reputation, pt.TagName
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 5
+)
+SELECT 
+    cn.user_id,
+    u.DisplayName,
+    cn.Reputation,
+    cn.popular_tag,
+    ue.question_count,
+    ue.answer_count,
+    ue.net_votes,
+    ue.avg_question_score,
+    cn.linked_posts,
+    cn.linked_avg_score,
+    cn.comments_on_linked,
+    tb.posts_created,
+    tb.votes_count,
+    tb.edits_count,
+    RANK() OVER (ORDER BY cn.linked_posts DESC, ue.net_votes DESC) AS engagement_rank,
+    (ue.question_count * ue.avg_question_score + ue.answer_count * cn.comments_on_linked) AS weight ed_impact
+FROM complex_network cn
+JOIN user_engagement ue ON ue.Id = cn.user_id
+JOIN Users u ON u.Id = cn.user_id
+JOIN Posts p ON p.OwnerUserId = cn.user_id
+JOIN time_based_interactions tb ON tb.month = DATE_TRUNC('month', p.CreationDate)
+WHERE tb.posts_created > 100
+  AND cn.linked_avg_score > 5
+ORDER BY engagement_rank
+LIMIT 100;

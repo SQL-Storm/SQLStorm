@@ -1,0 +1,286 @@
+WITH PostActivity AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.Score, 0) + COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) as ActivityScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate,
+        DATEDIFF(COALESCE(DAY, 0), LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), p.CreationDate) as DaysSinceLastPost,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 10 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END as VotingCategory
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01' 
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as TotalAnswers,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(AVG(p.Score), 0) as AverageScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        CASE 
+            WHEN MAX(p.CreationDate) >= '2023-01-01' THEN 'Active'
+            WHEN MAX(p.CreationDate) >= '2022-01-01' THEN 'ModeratelyActive'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        NTILE(4) OVER (ORDER BY COALESCE(SUM(p.Score), 0)) as PerformanceQuartile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) * 100 as TagPercentile
+    FROM Tags t
+    WHERE t.Count >= 100
+),
+PostTagAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Tags,
+        pa.PostType,
+        pa.VotingCategory,
+        pa.Score,
+        pa.ViewCount,
+        pa.ActivityScore,
+        pa.UserPostRank,
+        pa.DaysSinceLastPost,
+        CASE 
+            WHEN pa.Tags IS NOT NULL AND pa.Tags != '' THEN 
+                ARRAY_LENGTH(string_to_array(SUBSTRING(pa.Tags, 2, LENGTH(pa.Tags) - 2), '><'), 1)
+            ELSE 0 
+        END as NumberOfTags,
+        CASE 
+            WHEN pa.Tags IS NOT NULL AND pa.Tags != '' THEN 
+                REGEXP_REPLACE(pa.Tags, '[<>]', '', 'g')
+            ELSE ''
+        END as CleanedTags,
+        TRIM(BOTH ' ' FROM (
+            COALESCE(REPLACE(pa.Title, '<', ''), '') || 
+            COALESCE(' ' || SUBSTRING(pa.Tags, 2, LENGTH(pa.Tags) - 2), '')
+        )) as TitleAndTagsCombined
+    FROM PostActivity pa
+),
+EngagementMetrics AS (
+    SELECT 
+        pta.PostId,
+        pta.Title,
+        pta.Tags,
+        pta.TitleAndTagsCombined,
+        CASE 
+            WHEN pta.NumberOfTags > 3 THEN 'ManyTags'
+            WHEN pta.NumberOfTags > 1 THEN 'SomeTags'
+            ELSE 'FewTags'
+        END as TagDensityLevel,
+        pta.VotingCategory,
+        pta.Score,
+        pta.ViewCount,
+        pta.ActivityScore,
+        pta.DaysSinceLastPost,
+        CASE 
+            WHEN pta.DaysSinceLastPost IS NULL THEN 'NewPost'
+            WHEN pta.DaysSinceLastPost <= 7 THEN 'Recent'
+            ELSE 'Old'
+        END as PostRecency,
+        ROW_NUMBER() OVER (PARTITION BY pta.TagDensityLevel ORDER BY pta.ActivityScore DESC) as RankWithinTagDensity,
+        NTH_VALUE(pta.TitleAndTagsCombined, 1) OVER (
+            PARTITION BY pta.VotingCategory 
+            ORDER BY pta.ActivityScore DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) as TopVotedPostTitle,
+        FIRST_VALUE(pta.Score) OVER (
+            PARTITION BY pta.VotingCategory 
+            ORDER BY pta.ActivityScore DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) as MaxScoreInVotingCategory,
+        FIRST_VALUE(pta.PostId) OVER (
+            PARTITION BY pta.VotingCategory 
+            ORDER BY pta.ActivityScore DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) as TopVotedPostId
+    FROM PostTagAnalysis pta
+),
+UserPostPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalQuestions,
+        us.TotalAnswers,
+        us.TotalScore,
+        us.AverageScore,
+        us.ActivityLevel,
+        us.PerformanceQuartile,
+        CASE 
+            WHEN us.PerformanceQuartile = 4 THEN 'TopPerformer'
+            WHEN us.PerformanceQuartile = 3 THEN 'HighPerformer'
+            WHEN us.PerformanceQuartile = 2 THEN 'MediumPerformer'
+            ELSE 'LowPerformer'
+        END as PerformanceTier,
+        ROW_NUMBER() OVER (ORDER BY us.TotalScore DESC) as OverallRank,
+        LAG(us.TotalScore) OVER (ORDER BY us.TotalScore DESC) as PreviousScore,
+        us.TotalScore - LAG(us.TotalScore) OVER (ORDER BY us.TotalScore DESC) as ScoreDifference
+    FROM UserStats us
+),
+ComplexFiltering AS (
+    SELECT 
+        emp.PostId,
+        emp.Title,
+        emp.Tags,
+        emp.TagDensityLevel,
+        emp.VotingCategory,
+        emp.Score,
+        emp.ViewCount,
+        emp.ActivityScore,
+        emp.PostRecency,
+        emp.RankWithinTagDensity,
+        emp.TopVotedPostTitle,
+        emp.MaxScoreInVotingCategory,
+        emp.TopVotedPostId,
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        upp.TotalPosts,
+        upp.PerformanceTier,
+        upp.OverallRank,
+        upp.ScoreDifference
+    FROM EngagementMetrics emp
+    INNER JOIN UserPostPerformance upp ON upp.UserId = (
+        SELECT p.OwnerUserId 
+        FROM Posts p 
+        WHERE p.Id = emp.PostId 
+        AND p.OwnerUserId IS NOT NULL
+    )
+    WHERE UPPER(emp.Title) LIKE '%SQL%' 
+    OR UPPER(emp.Tags) LIKE '%SQL%'
+    OR (emp.VotingCategory = 'HighlyVoted' AND emp.Score > 200)
+    OR (emp.TagDensityLevel = 'ManyTags' AND emp.ViewCount > 1000)
+),
+FinalAnalysis AS (
+    SELECT 
+        cf.PostId,
+        cf.Title,
+        cf.Tags,
+        cf.TagDensityLevel,
+        cf.VotingCategory,
+        cf.Score,
+        cf.ViewCount,
+        cf.ActivityScore,
+        cf.PostRecency,
+        cf.RankWithinTagDensity,
+        cf.TopVotedPostTitle,
+        cf.MaxScoreInVotingCategory,
+        cf.TopVotedPostId,
+        cf.UserId,
+        cf.DisplayName,
+        cf.Reputation,
+        cf.TotalPosts,
+        cf.PerformanceTier,
+        cf.OverallRank,
+        cf.ScoreDifference,
+        CASE 
+            WHEN cf.Reputation > 10000 AND cf.TotalPosts > 100 THEN 'EliteUser'
+            WHEN cf.Reputation > 5000 AND cf.TotalPosts > 50 THEN 'ExperiencedUser'
+            WHEN cf.Reputation > 1000 AND cf.TotalPosts > 10 THEN 'BeginnerUser'
+            ELSE 'NewUser'
+        END as UserCategory,
+        DENSE_RANK() OVER (ORDER BY cf.Reputation DESC, cf.TotalScore DESC) as CombinedRank,
+        NTH_VALUE(cf.Title, 1) OVER (
+            ORDER BY cf.ActivityScore DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) as MostActivePostTitle,
+        PERCENT_RANK() OVER (ORDER BY cf.ActivityScore) * 100 as ActivityPercentile,
+        CASE 
+            WHEN cf.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverage'
+            WHEN cf.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.8 THEN 'NearAverage'
+            ELSE 'BelowAverage'
+        END as ScorePerformance,
+        ROW_NUMBER() OVER (
+            PARTITION BY cf.PostRecency, cf.PerformanceTier 
+            ORDER BY cf.ActivityScore DESC
+        ) as RecencyPerformanceRank
+    FROM ComplexFiltering cf
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.Tags,
+    fa.TagDensityLevel,
+    fa.VotingCategory,
+    fa.Score,
+    fa.ViewCount,
+    fa.ActivityScore,
+    fa.PostRecency,
+    fa.RankWithinTagDensity,
+    fa.TopVotedPostTitle,
+    fa.MaxScoreInVotingCategory,
+    fa.TopVotedPostId,
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.PerformanceTier,
+    fa.OverallRank,
+    fa.ScoreDifference,
+    fa.UserCategory,
+    fa.CombinedRank,
+    fa.MostActivePostTitle,
+    fa.ActivityPercentile,
+    fa.ScorePerformance,
+    fa.RecencyPerformanceRank,
+    CASE 
+        WHEN COALESCE(fa.ViewCount, 0) > 0 AND COALESCE(fa.Score, 0) > 0 THEN 
+            CAST(fa.ViewCount AS FLOAT) / NULLIF(fa.Score, 0)
+        ELSE NULL 
+    END as ViewScoreRatio,
+    CASE 
+        WHEN fa.Score > 100 THEN 'HotPost'
+        WHEN fa.Score > 50 THEN 'PopularPost'
+        WHEN fa.Score > 10 THEN 'RegularPost'
+        ELSE 'LowPost'
+    END as PostPopularity,
+    ROW_NUMBER() OVER (PARTITION BY fa.UserCategory ORDER BY fa.ActivityScore DESC) as CategoryRank
+FROM FinalAnalysis fa
+WHERE fa.CombinedRank <= 500 
+AND fa.Reputation >= 1000
+AND fa.TotalPosts >= 10
+AND fa.Score > 0
+ORDER BY fa.ActivityScore DESC, fa.CombinedRank ASC, fa.Reputation DESC
+LIMIT 100;

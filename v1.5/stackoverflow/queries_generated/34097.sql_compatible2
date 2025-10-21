@@ -1,0 +1,116 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(DISTINCT b.Id) AS BadgeCount,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation >= 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserPosts AS (
+    SELECT p.OwnerUserId AS UserId,
+           COUNT(*) AS TotalPosts,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+           AVG(p.Score) AS AvgPostScore,
+           SUM(p.ViewCount) AS TotalViews,
+           AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgAnswersPerQuestion,
+           COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 10) AS TimesPostsClosed
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+UserVotes AS (
+    SELECT v.UserId,
+           COUNT(*) AS TotalVotesGiven,
+           COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotesGiven,
+           COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesGiven,
+           COUNT(DISTINCT v.PostId) AS DistinctPostsVotedOn
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserComments AS (
+    SELECT c.UserId,
+           COUNT(*) AS TotalComments,
+           AVG(LENGTH(c.Text)) AS AvgCommentLength,
+           MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserLinkStats AS (
+    SELECT p.OwnerUserId AS UserId,
+           COUNT(DISTINCT pl.PostId) AS PostsThatLinkOthers,
+           COUNT(DISTINCT pl.RelatedPostId) AS PostsLinkedToOthers,
+           COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateLinks
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY p.OwnerUserId
+),
+UserTagInterest AS (
+    SELECT u.Id AS UserId,
+           COUNT(DISTINCT CAST(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS text)) AS DistinctTagsUsed,
+           STRING_AGG(DISTINCT CAST(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS text), ',' ORDER BY COUNT(p.Id) DESC) AS TagsSummary
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY u.Id
+),
+UserActivityScore AS (
+    SELECT u.Id AS UserId,
+           (COALESCE(up.TotalPosts,0) * 1.5) +
+           (COALESCE(uv.TotalVotesGiven,0) * 0.5) + 
+           (COALESCE(uc.TotalComments,0) * 0.3) +
+           (COALESCE(tu.GoldBadges,0) * 10) +
+           (COALESCE(tu.SilverBadges,0) * 5) +
+           (COALESCE(tu.BronzeBadges,0) * 2) AS ActivityScore
+    FROM Users u
+    LEFT JOIN UserPosts up ON up.UserId = u.Id
+    LEFT JOIN UserVotes uv ON uv.UserId = u.Id
+    LEFT JOIN UserComments uc ON uc.UserId = u.Id
+    LEFT JOIN TopUsers tu ON tu.Id = u.Id
+)
+SELECT 
+    tu.DisplayName,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.GoldBadges, 
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    ROUND(up.AvgPostScore,2) AS AvgPostScore,
+    up.TotalViews,
+    ROUND(up.AvgAnswersPerQuestion,2) AS AvgAnswersPerQuestion,
+    up.TimesPostsClosed,
+    uv.TotalVotesGiven,
+    uv.UpVotesGiven,
+    uv.DownVotesGiven,
+    uv.DistinctPostsVotedOn,
+    uc.TotalComments,
+    ROUND(uc.AvgCommentLength,2) AS AvgCommentLength,
+    uc.LastCommentDate,
+    uls.PostsThatLinkOthers,
+    uls.PostsLinkedToOthers,
+    uls.DuplicateLinks,
+    COALESCE(uti.DistinctTagsUsed,0) AS DistinctTagsUsed,
+    uti.TagsSummary,
+    ROUND(uas.ActivityScore,2) AS ActivityScore,
+    tu.LastPostDate
+FROM TopUsers tu
+LEFT JOIN UserPosts up ON up.UserId = tu.Id
+LEFT JOIN UserVotes uv ON uv.UserId = tu.Id
+LEFT JOIN UserComments uc ON uc.UserId = tu.Id
+LEFT JOIN UserLinkStats uls ON uls.UserId = tu.Id
+LEFT JOIN UserTagInterest uti ON uti.UserId = tu.Id
+LEFT JOIN UserActivityScore uas ON uas.UserId = tu.Id
+ORDER BY uas.ActivityScore DESC NULLS LAST, tu.Reputation DESC
+LIMIT 100;

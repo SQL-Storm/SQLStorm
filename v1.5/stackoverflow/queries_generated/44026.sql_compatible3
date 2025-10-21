@@ -1,0 +1,81 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.Title, 
+        p.Tags, 
+        p.OwnerUserId, 
+        u.Reputation, 
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN p.AnswerCount 
+            ELSE 0 
+        END AS AnswerCount,
+        CASE
+            WHEN p.PostTypeId = 1 THEN p.FavoriteCount
+            ELSE 0
+        END AS FavoriteCount,
+        p.CommentCount,
+        p.ViewCount,
+        p.Score,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate
+            ELSE DATE '2099-01-01'
+        END AS ClosedDate,
+        CASE
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN p.CommunityOwnedDate
+            ELSE DATE '2099-01-01' 
+        END AS CommunityOwnedDate,
+        COALESCE(b.Name, '') AS Badge,
+        COALESCE(b.Class, 0) AS BadgeClass,
+        COALESCE(b.TagBased, 0) AS TagBasedBadge
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    cte.*,
+    CASE
+        WHEN AnswerCount > 0 THEN 'Answered'
+        WHEN FavoriteCount > 0 THEN 'Favorited'
+        WHEN CommentCount > 0 THEN 'Commented'
+        WHEN ViewCount > 100 THEN 'Viewed'
+        ELSE 'Other'
+    END AS PostStatus,
+    CASE 
+        WHEN ClosedDate < DATE '2099-01-01' THEN 'Closed'
+        WHEN CommunityOwnedDate < DATE '2099-01-01' THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostState,
+    DATEDIFF(LastActivityDate, PostCreationDate) AS DaysActive,
+    DATEDIFF(LastAccessDate, UserCreationDate) AS UserDaysActive
+FROM cte
+GROUP BY
+    cte.Id,
+    cte.PostTypeId,
+    cte.Title,
+    cte.Tags,
+    cte.OwnerUserId,
+    cte.Reputation,
+    cte.UserCreationDate,
+    cte.LastAccessDate,
+    cte.AnswerCount,
+    cte.FavoriteCount,
+    cte.CommentCount,
+    cte.ViewCount,
+    cte.Score,
+    cte.PostCreationDate,
+    cte.LastEditDate,
+    cte.LastActivityDate,
+    cte.ClosedDate,
+    cte.CommunityOwnedDate,
+    cte.Badge,
+    cte.BadgeClass,
+    cte.TagBasedBadge
+ORDER BY AnswerCount DESC, FavoriteCount DESC, CommentCount DESC, ViewCount DESC, Score DESC
+LIMIT 1000;

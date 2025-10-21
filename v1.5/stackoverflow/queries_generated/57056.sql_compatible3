@@ -1,0 +1,109 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) AS TotalVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistory,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+),
+TagStats AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AverageScore
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON CAST(t.Id AS VARCHAR) = CAST(p.Tags AS VARCHAR)
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.LastPostActivity,
+    ua.LastCommentDate,
+    ua.LastVoteDate,
+    pm.PostId,
+    pm.OwnerUserId,
+    pm.PostTypeId,
+    pm.PostCreationDate,
+    pm.Score AS PostScore,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.TotalVotes AS PostTotalVotes,
+    pm.TotalComments AS PostTotalComments,
+    pm.TotalPostHistory,
+    pm.LastEditDate,
+    ts.TagId,
+    ts.TagName,
+    ts.TagCount,
+    ts.PostsWithTag,
+    ts.TotalViews,
+    ts.TotalScore,
+    ts.AverageScore
+FROM
+    UserActivity ua
+JOIN
+    PostMetrics pm ON ua.UserId = pm.OwnerUserId
+LEFT JOIN
+    TagStats ts ON POSITION('<' || ts.TagName || '>' IN REPLACE(COALESCE(pm.Tags, ''), ' ', '')) > 0
+WHERE
+    ua.TotalPosts > 10
+    AND pm.ViewCount > 100
+    AND ts.PostsWithTag > 5
+ORDER BY
+    ua.Reputation DESC,
+    pm.Score DESC,
+    ts.TotalViews DESC
+LIMIT 100;

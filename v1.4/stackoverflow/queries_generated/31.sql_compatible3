@@ -1,0 +1,92 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+recent_activity AS (
+  SELECT
+    u.Id AS UserId,
+    MAX(v.CreationDate) AS LastVoteDate,
+    SUM(CASE WHEN v.VoteTypeId IN (2,6,10,11) THEN 1 ELSE 0 END) AS NegativeVotesCast,
+    SUM(CASE WHEN v.VoteTypeId IN (2,6,8,9,14,15,16) THEN 1 ELSE 0 END) AS SpecialVotes
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id
+),
+tag_topics AS (
+  SELECT
+    t.WikiPostId,
+    t.Count AS TagCount,
+    t.IsModeratorOnly
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+complex_post_metrics AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    pc.TagCount,
+    pc.IsModeratorOnly,
+    COALESCE(vs.UpModCount, 0) AS UpModCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS UpModCount
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) vs ON vs.PostId = p.Id
+  LEFT JOIN tag_topics pc ON pc.WikiPostId = p.Id
+  WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  t.PostCount,
+  t.TotalQuestionViews,
+  t.TotalAnswerScore,
+  r.LastVoteDate,
+  r.NegativeVotesCast,
+  r.SpecialVotes,
+  p.PostId,
+  p.PostTypeId,
+  p.Score,
+  p.ViewCount,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.LastActivityDate,
+  p.Title,
+  p.Tags,
+  p.TagCount,
+  p.IsModeratorOnly,
+  p.UpModCount,
+  CAST(p.Score AS DOUBLE PRECISION) / NULLIF(p.ViewCount, 0) AS ScorePerView,
+  (p.LastActivityDate - p.CreationDate) AS ActivitySpan,
+  CASE
+    WHEN p.PostTypeId = 1 THEN 'Question'
+    WHEN p.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind,
+  CONCAT_WS(' | ', p.Title, COALESCE(p.Tags, 'NoTags')) AS TitleWithTags,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.PostId) AS CommentCount
+FROM top_users u
+LEFT JOIN recent_activity r ON r.UserId = u.UserId
+LEFT JOIN complex_post_metrics p ON p.OwnerUserId = u.UserId
+ORDER BY u.Reputation DESC, u.UserId
+LIMIT 100;

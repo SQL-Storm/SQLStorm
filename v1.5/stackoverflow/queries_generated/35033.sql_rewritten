@@ -1,0 +1,92 @@
+-- {"query": "35033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 714} 
+WITH TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        COUNT(a.Id) AS AnswerCount,
+        ARRAY(
+            SELECT t
+            FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t
+        ) AS TagList
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+        AND p.Score > 10
+        AND p.ViewCount > 1000
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.OwnerUserId, p.Tags
+    ORDER BY 
+        p.Score DESC, p.ViewCount DESC
+    LIMIT 50
+),
+AnswerStats AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswersLastMonth,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2
+        AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+    GROUP BY 
+        a.ParentId
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM
+        Comments c
+    WHERE
+        c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+    GROUP BY
+        c.PostId
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    tq.QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.TagList,
+    tq.AnswerCount AS TotalAnswers,
+    COALESCE(ans.AnswersLastMonth, 0) AS AnswersLastMonth,
+    COALESCE(ans.AvgAnswerScore, 0) AS AvgAnswerScoreLastMonth,
+    COALESCE(ans.PositiveAnswers, 0) AS PositiveAnswersLastMonth,
+    COALESCE(cs.CommentCount, 0) AS CommentsLastMonth,
+    COALESCE(cs.AvgCommentScore, 0) AS AvgCommentScoreLastMonth,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation AS UserReputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges
+FROM
+    TopQuestions tq
+    LEFT JOIN AnswerStats ans ON tq.QuestionId = ans.QuestionId
+    LEFT JOIN CommentStats cs ON tq.QuestionId = cs.PostId
+    LEFT JOIN Users u ON tq.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCounts ub ON u.Id = ub.UserId
+ORDER BY
+    tq.Score DESC,
+    tq.ViewCount DESC;

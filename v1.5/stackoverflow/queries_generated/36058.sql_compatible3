@@ -1,0 +1,51 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+  COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+  COUNT(c.Id) AS CommentCount,
+  COUNT(CASE WHEN pv.VoteTypeId = 14 THEN pv.Id END) AS ModeratorVotes,
+  ARRAY_AGG(DISTINCT t.TagName) AS Tags,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.LastActivityDate
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes pv ON pv.PostId = p.Id AND pv.VoteTypeId IN (14, 15, 16)
+  LEFT JOIN LATERAL (
+    SELECT t.TagName
+    FROM Tags t
+    WHERE t.Id IN (
+      SELECT CAST(TRIM(x) AS INTEGER)
+      FROM UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ',')) AS x
+    )
+  ) t ON TRUE
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName,
+  u.Reputation,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.LastActivityDate
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

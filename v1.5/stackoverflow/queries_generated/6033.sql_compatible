@@ -1,0 +1,127 @@
+WITH tagged_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(ut.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Users ut ON p.OwnerUserId = ut.Id
+  WHERE p.PostTypeId IN (1, 2)
+),
+recent_activity AS (
+  SELECT
+    ta.PostId,
+    ta.PostTypeId,
+    ta.CreationDate,
+    ta.Title,
+    ta.Tags,
+    ta.OwnerDisplayName,
+    ta.OwnerReputation,
+    ta.Score,
+    ta.ViewCount,
+    ta.LastActivityDate,
+    ta.AnswerCount,
+    ta.CommentCount,
+    ta.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY ta.PostTypeId
+                       ORDER BY ta.LastActivityDate DESC NULLS LAST) AS rn_type
+  FROM tagged_activity ta
+),
+aggregated AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.Title,
+    CASE
+      WHEN ra.PostTypeId = 1 THEN
+        (
+          SELECT string_agg(t, ',')
+          FROM (
+            SELECT unnest(string_to_array(substring(ra.Tags, 2, length(ra.Tags) - 2), '><')) AS t
+          ) AS s
+        )
+      ELSE NULL
+    END AS tag_sem
+  FROM recent_activity ra
+)
+SELECT
+  a.PostId,
+  a.PostTypeId,
+  a.Title,
+  a.Tags,
+  a.OwnerDisplayName,
+  a.OwnerReputation,
+  a.Score,
+  a.ViewCount,
+  a.LastActivityDate,
+  a.AnswerCount,
+  a.CommentCount,
+  a.FavoriteCount,
+  SUM(CASE WHEN v.VoteTypeId IN (2, 14, 16) THEN 1 ELSE 0 END) OVER (PARTITION BY a.PostId) AS UpOrModeratorVotes,
+  SUM(CASE WHEN v.VoteTypeId IN (3, 10, 12) THEN 1 ELSE 0 END) OVER (PARTITION BY a.PostId) AS DownVotes,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.PostId AND c.UserId IS NOT NULL) AS CommentersCount,
+  EXISTS (
+    SELECT 1 FROM PostLinks pl
+    WHERE pl.PostId = a.PostId
+      AND pl.LinkTypeId = 1
+  ) AS HasLinkedPost,
+  NULL AS BenchmarkRowMarker
+FROM (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.Title,
+    ra.Tags,
+    ra.OwnerDisplayName,
+    ra.OwnerReputation,
+    ra.Score,
+    ra.ViewCount,
+    ra.LastActivityDate,
+    ra.AnswerCount,
+    ra.CommentCount,
+    ra.FavoriteCount
+  FROM recent_activity ra
+  WHERE ra.rn_type = 1
+  UNION ALL
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    u.DisplayName,
+    COALESCE(u.Reputation, 0),
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days'
+) a
+LEFT JOIN Votes v ON v.PostId = a.PostId
+GROUP BY
+  a.PostId,
+  a.PostTypeId,
+  a.Title,
+  a.Tags,
+  a.OwnerDisplayName,
+  a.OwnerReputation,
+  a.Score,
+  a.ViewCount,
+  a.LastActivityDate,
+  a.AnswerCount,
+  a.CommentCount,
+  a.FavoriteCount;

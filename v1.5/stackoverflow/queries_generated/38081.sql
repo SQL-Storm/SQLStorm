@@ -1,0 +1,162 @@
+-- {"query": "38081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1802} 
+WITH recent_years AS (
+  SELECT date_trunc('year', now()) - (n || ' years')::interval AS yr_start,
+         date_trunc('year', now()) - ((n - 1) || ' years')::interval AS yr_end,
+         EXTRACT(YEAR FROM date_trunc('year', now()) - (n || ' years')::interval)::int AS year
+  FROM generate_series(1, 5) AS s(n)
+),
+question_base AS (
+  SELECT p.Id, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags, p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (SELECT min(yr_start) FROM recent_years)
+),
+accepted_latency AS (
+  SELECT q.Id AS QuestionId,
+         a.Id AS AcceptedId,
+         a.CreationDate AS AcceptedDate,
+         EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS hours_to_accept
+  FROM question_base q
+  JOIN Posts a ON a.Id = q.AcceptedAnswerId
+),
+first_answer_latency AS (
+  SELECT q.Id AS QuestionId,
+         MIN(a.CreationDate) AS FirstAnswerDate,
+         EXTRACT(EPOCH FROM (MIN(a.CreationDate) - q.CreationDate)) / 3600.0 AS hours_to_first_answer
+  FROM question_base q
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY q.Id, q.CreationDate
+),
+q_votes AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+dup_links AS (
+  SELECT pl.PostId AS dup_id, COUNT(*) AS dup_count
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.PostId
+),
+comment_stats AS (
+  SELECT c.PostId,
+         COUNT(*) AS comment_count,
+         AVG(NULLIF(c.Score, 0)) AS avg_comment_score_nonzero,
+         MAX(c.Score) AS max_comment_score
+  FROM Comments c
+  GROUP BY c.PostId
+),
+user_quality AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         COALESCE(b_gold.gold, 0) AS gold_badges,
+         COALESCE(b_silver.silver, 0) AS silver_badges,
+         COALESCE(b_bronze.bronze, 0) AS bronze_badges,
+         (COALESCE(b_gold.gold,0) * 9 + COALESCE(b_silver.silver,0) * 3 + COALESCE(b_bronze.bronze,0)) AS badge_score
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS gold FROM Badges WHERE Class = 1 GROUP BY UserId
+  ) b_gold ON b_gold.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS silver FROM Badges WHERE Class = 2 GROUP BY UserId
+  ) b_silver ON b_silver.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS bronze FROM Badges WHERE Class = 3 GROUP BY UserId
+  ) b_bronze ON b_bronze.UserId = u.Id
+),
+tag_explode AS (
+  SELECT q.Id AS QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag
+  FROM question_base q
+  WHERE q.Tags IS NOT NULL AND q.Tags LIKE '<%>'
+),
+yearly_tag_agg AS (
+  SELECT ry.year,
+         te.tag,
+         COUNT(*) AS questions,
+         AVG(q.Score) AS avg_score,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) AS p50_score,
+         AVG(q.ViewCount) AS avg_views,
+         AVG(q.AnswerCount) AS avg_answercount,
+         AVG(fa.hours_to_first_answer) AS avg_hours_to_first_answer,
+         AVG(al.hours_to_accept) AS avg_hours_to_accept,
+         SUM(COALESCE(v.upvotes,0)) AS upvotes,
+         SUM(COALESCE(v.downvotes,0)) AS downvotes,
+         SUM(COALESCE(v.favorites,0)) AS favorites,
+         SUM(COALESCE(dl.dup_count,0)) AS duplicates,
+         AVG(COALESCE(cs.comment_count,0)) AS avg_comments,
+         AVG(COALESCE(cs.avg_comment_score_nonzero,0)) AS avg_comment_score_nonzero,
+         MAX(COALESCE(cs.max_comment_score,0)) AS max_comment_score,
+         AVG(COALESCE(uq.Reputation,0)) AS avg_owner_rep,
+         AVG(COALESCE(uq.badge_score,0)) AS avg_owner_badge_score
+  FROM recent_years ry
+  JOIN question_base q
+    ON q.CreationDate >= ry.yr_start AND q.CreationDate < ry.yr_end
+  LEFT JOIN tag_explode te ON te.QuestionId = q.Id
+  LEFT JOIN q_votes v ON v.PostId = q.Id
+  LEFT JOIN dup_links dl ON dl.dup_id = q.Id
+  LEFT JOIN comment_stats cs ON cs.PostId = q.Id
+  LEFT JOIN accepted_latency al ON al.QuestionId = q.Id
+  LEFT JOIN first_answer_latency fa ON fa.QuestionId = q.Id
+  LEFT JOIN user_quality uq ON uq.UserId = q.OwnerUserId
+  GROUP BY ry.year, te.tag
+),
+ranked_tags AS (
+  SELECT yt.*,
+         RANK() OVER (PARTITION BY yt.year ORDER BY yt.questions DESC, yt.avg_score DESC) AS q_rank,
+         RANK() OVER (PARTITION BY yt.year ORDER BY (yt.upvotes - yt.downvotes) DESC) AS net_vote_rank,
+         RANK() OVER (PARTITION BY yt.year ORDER BY yt.avg_hours_to_first_answer NULLS LAST) AS slow_answer_rank,
+         RANK() OVER (PARTITION BY yt.year ORDER BY yt.avg_views DESC) AS views_rank
+  FROM yearly_tag_agg yt
+),
+yearly_summary AS (
+  SELECT ry.year,
+         COUNT(*) FILTER (WHERE q.PostTypeId = 1) AS total_questions,
+         AVG(q.Score) AS avg_q_score,
+         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q.ViewCount) AS p95_views,
+         AVG(fa.hours_to_first_answer) AS avg_hours_to_first_answer_all,
+         AVG(al.hours_to_accept) AS avg_hours_to_accept_all,
+         SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*),0) AS acceptance_ratio
+  FROM recent_years ry
+  JOIN question_base q
+    ON q.CreationDate >= ry.yr_start AND q.CreationDate < ry.yr_end
+  LEFT JOIN accepted_latency al ON al.QuestionId = q.Id
+  LEFT JOIN first_answer_latency fa ON fa.QuestionId = q.Id
+  GROUP BY ry.year
+)
+SELECT r.year,
+       r.tag,
+       r.questions,
+       r.avg_score,
+       r.p50_score,
+       r.avg_views,
+       r.avg_answercount,
+       r.avg_hours_to_first_answer,
+       r.avg_hours_to_accept,
+       r.upvotes,
+       r.downvotes,
+       r.favorites,
+       r.duplicates,
+       r.avg_comments,
+       r.avg_comment_score_nonzero,
+       r.max_comment_score,
+       r.avg_owner_rep,
+       r.avg_owner_badge_score,
+       r.q_rank,
+       r.net_vote_rank,
+       r.slow_answer_rank,
+       r.views_rank,
+       ys.total_questions,
+       ys.avg_q_score,
+       ys.p95_views,
+       ys.avg_hours_to_first_answer_all,
+       ys.avg_hours_to_accept_all,
+       ys.acceptance_ratio
+FROM ranked_tags r
+JOIN yearly_summary ys USING (year)
+WHERE r.tag IS NOT NULL
+  AND r.q_rank <= 25
+ORDER BY r.year DESC, r.q_rank ASC;

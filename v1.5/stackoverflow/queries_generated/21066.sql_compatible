@@ -1,0 +1,66 @@
+WITH ActiveUsers AS (
+    SELECT u.Id AS UserId, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+           LAG(u.Reputation) OVER (ORDER BY u.Reputation DESC) AS PrevRep
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+QuestionStats AS (
+    SELECT p.Id AS PostId, p.OwnerUserId,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+           AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN EXTRACT(epoch FROM v.CreationDate) END) AS AvgVoteDateEpoch,
+           STRING_AGG(DISTINCT LEFT(t.TagName, 10), ',') AS TopTags
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    GROUP BY p.Id, p.OwnerUserId
+    HAVING COUNT(v.Id) > 10
+),
+DetailedMetrics AS (
+    SELECT au.UserId, au.Reputation, au.RepRank,
+           COALESCE(qs.UpVotes, 0) AS TotalUpVotes,
+           COALESCE(qs.DownVotes, 0) AS TotalDownVotes,
+           (COALESCE(qs.UpVotes, 0) - COALESCE(qs.DownVotes, 0)) / NULLIF(au.Reputation, 0) AS VoteRatio,
+           CASE 
+               WHEN au.PrevRep IS NULL THEN au.Reputation
+               WHEN au.Reputation - au.PrevRep > 500 THEN 'High Gainer'
+               WHEN au.Reputation < au.PrevRep THEN 'Decliner'
+               ELSE 'Stable'
+           END AS RepTrend,
+           ph.Comment,
+           ph.Text
+    FROM ActiveUsers au
+    LEFT OUTER JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId
+    LEFT OUTER JOIN PostHistory ph ON ph.UserId = au.UserId 
+        AND ph.PostHistoryTypeId IN (4,5,6)
+        AND ph.CreationDate = (SELECT MAX(ph2.CreationDate) 
+                               FROM PostHistory ph2 
+                               WHERE ph2.UserId = au.UserId 
+                                 AND ph2.PostHistoryTypeId IN (4,5,6))
+    WHERE au.RepRank <= 100
+      OR (qs.UpVotes > 50 AND qs.DownVotes < 5)
+)
+SELECT dm.*, 
+       RANK() OVER (PARTITION BY dm.RepTrend ORDER BY dm.VoteRatio DESC) AS TrendRank,
+       (SELECT STRING_AGG(DISTINCT b.Name, '; ') 
+        FROM Badges b 
+        WHERE b.UserId = dm.UserId 
+          AND b.Class = 1 
+          AND b.Date > CAST('2024-10-01' AS date) - INTERVAL '1 year') AS GoldBadges,
+       (SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = dm.UserId 
+          AND c.Score > (SELECT AVG(c2.Score) FROM Comments c2 WHERE c2.UserId IS NOT NULL)
+          AND LENGTH(c.Text) > 100) AS QualityComments
+FROM DetailedMetrics dm
+WHERE dm.VoteRatio IS NOT NULL
+  AND (dm.TotalUpVotes > 20 OR dm.RepTrend = 'High Gainer')
+UNION ALL
+SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL AS GoldBadges, NULL
+FROM (SELECT 1 AS dummy LIMIT 0) AS empty
+ORDER BY VoteRatio DESC NULLS LAST, RepRank
+LIMIT 50;

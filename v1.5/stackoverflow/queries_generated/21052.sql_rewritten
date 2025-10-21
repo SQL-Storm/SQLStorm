@@ -1,0 +1,110 @@
+-- {"query": "21052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1419} 
+WITH active_users AS (
+  SELECT u.Id, u.DisplayName,
+         COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) OVER (PARTITION BY u.Id) AS positive_post_count,
+         AVG(p.Score) OVER (PARTITION BY u.Id) AS avg_post_score,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rep_rank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+  WHERE u.Reputation > 1000 AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+),
+edited_posts AS (
+  SELECT ph.PostId,
+         STRING_AGG(ph.Comment, ' | ' ORDER BY ph.CreationDate DESC) FILTER (WHERE ph.Comment IS NOT NULL) AS edit_comments,
+         COUNT(*) OVER (PARTITION BY ph.PostId) AS edit_count,
+         LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_edit_date
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edits to title, body, tags
+    AND ph.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+  GROUP BY ph.PostId, ph.CreationDate
+),
+linked_activity AS (
+  SELECT pl.PostId,
+         COUNT(DISTINCT pl.RelatedPostId) AS external_links,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_links
+  FROM PostLinks pl
+  JOIN Posts p ON pl.PostId = p.Id
+  WHERE p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+  GROUP BY pl.PostId
+),
+gold_holders AS (
+  SELECT DISTINCT b.UserId
+  FROM Badges b
+  WHERE b.Class = 1 AND b.TagBased = TRUE
+),
+complex_scores AS (
+  SELECT p.Id AS post_id,
+         p.Title,
+         p.Score * (COALESCE(v.upvotes, 0) - COALESCE(v.downvotes, 0)) AS adjusted_score,
+         CASE 
+           WHEN p.ViewCount > 10000 THEN 'High Visibility'
+           WHEN p.ViewCount > 1000 THEN 'Medium Visibility'
+           ELSE 'Low Visibility'
+         END AS visibility_tier,
+         COALESCE(ep.edit_comments, 'No edits') AS recent_edits,
+         COALESCE(la.external_links, 0) AS link_out_count,
+         ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS score_rank_within_type,
+         NTILE(4) OVER (ORDER BY p.CreationDate) AS creation_quartile,
+         LAG(p.Score) OVER (ORDER BY p.CreationDate) AS prev_post_score,
+         LEAD(p.Score) OVER (ORDER BY p.CreationDate) AS next_post_score,
+         FIRST_VALUE(p.Title) OVER (ORDER BY p.Score DESC ROWS UNBOUNDED PRECEDING) AS top_scoring_title,
+         CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+              WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+              WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 'Has Accepted Answer'
+              ELSE 'Active' END AS post_status
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON p.Id = v.PostId
+  LEFT JOIN edited_posts ep ON p.Id = ep.PostId
+  LEFT JOIN linked_activity la ON p.Id = la.PostId
+  WHERE p.DeletionDate IS NULL 
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    AND (p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 OR p.PostTypeId = 2)
+),
+top_contributors AS (
+  SELECT au.Id, au.DisplayName, au.rep_rank, au.positive_post_count,
+         (SELECT COUNT(*) FROM Badges b WHERE b.UserId = au.Id AND b.Class = 1) AS gold_badges_count,
+         (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+          FROM Badges b 
+          JOIN Tags t ON b.TagBased = 1 
+          WHERE b.UserId = au.Id AND b.Date > cast('2024-10-01' as date) - INTERVAL '1 year') AS recent_tags
+  FROM active_users au
+  WHERE au.rep_rank <= 100
+)
+SELECT 
+  cs.post_id, cs.Title, cs.adjusted_score, cs.visibility_tier, cs.post_status,
+  tc.DisplayName AS owner_name, tc.gold_badges_count,
+  CASE 
+    WHEN cs.link_out_count > 5 THEN 'Highly Linked'
+    WHEN cs.link_out_count > 0 THEN 'Linked'
+    ELSE 'Isolated'
+  END AS link_category,
+  COALESCE(
+    SUBSTRING(cs.recent_edits FROM 1 FOR 100), 
+    'No detailed edit history'
+  ) AS edit_summary,
+  GREATEST(cs.score_rank_within_type, 1) AS relative_popularity,
+  CASE 
+    WHEN cs.prev_post_score IS NULL OR cs.adjusted_score > COALESCE(cs.prev_post_score, 0) THEN 'Improving'
+    WHEN cs.adjusted_score < COALESCE(cs.next_post_score, 0) THEN 'Declining'
+    ELSE 'Stable'
+  END AS score_trend,
+  (cs.adjusted_score * LOG(cs.ViewCount + 1)) / NULLIF(cs.edit_count, 0) AS engagement_ratio,
+  CASE WHEN gh.UserId IS NOT NULL THEN 'Gold Tag Expert' ELSE 'Standard User' END AS expertise_level
+FROM complex_scores cs
+JOIN Posts p ON cs.post_id = p.Id
+LEFT JOIN top_contributors tc ON p.OwnerUserId = tc.Id
+LEFT JOIN gold_holders gh ON p.OwnerUserId = gh.UserId
+WHERE cs.adjusted_score > 0 
+  AND (cs.post_status != 'Closed' OR cs.ViewCount > 5000)
+  AND tc.DisplayName IS NOT NULL
+  AND NOT (cs.Title ILIKE '%spam%' OR cs.Title ILIKE '%test%')
+  AND COALESCE(la.duplicate_links, 0) < 3
+ORDER BY cs.adjusted_score DESC, cs.ViewCount DESC, tc.rep_rank ASC
+LIMIT 50;

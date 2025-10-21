@@ -1,0 +1,121 @@
+-- {"query": "80.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 716} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    COALESCE(b.Class, 0) AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId = 1  -- questions
+),
+RecentActivity AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.UserName,
+    rp.UserId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.BadgeName,
+    rp.BadgeDate,
+    RANK() OVER (
+      PARTITION BY rp.OwnerUserId
+      ORDER BY rp.LastActivityDate DESC, rp.Score DESC
+    ) AS rn_by_owner
+  FROM RankedPosts rp
+  WHERE rp.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TotalTagUsage
+  FROM Tags t
+  GROUP BY t.TagName
+  ORDER BY TotalTagUsage DESC
+  LIMIT 5
+),
+CrossJoinStats AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.UserName,
+    ra.Score,
+    ra.ViewCount,
+    ra.Tags,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.BadgeName,
+    ra.BadgeDate,
+    t0.TotalTagUsage
+  FROM RecentActivity ra
+  CROSS JOIN TopTags t0
+  WHERE POSITION(t0.TagName IN ra.Tags) > 0
+),
+Windowed AS (
+  SELECT
+    cj.PostId,
+    cj.Title,
+    cj.UserName,
+    cj.Score,
+    cj.ViewCount,
+    cj.Tags,
+    cj.CreationDate,
+    cj.LastActivityDate,
+    cj.BadgeName,
+    cj.BadgeDate,
+    cj.TotalTagUsage,
+    ROW_NUMBER() OVER (
+      PARTITION BY cj.UserId
+      ORDER BY cj.LastActivityDate DESC, cj.Score DESC
+    ) AS seq_by_user
+  FROM CrossJoinStats cj
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.UserName,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.CreationDate,
+  w.LastActivityDate,
+  w.BadgeName,
+  w.BadgeDate,
+  w.TotalTagUsage,
+  w.seq_by_user
+FROM Windowed w
+WHERE w.seq_by_user <= 3
+ORDER BY w.LastActivityDate DESC, w.Score DESC
+LIMIT 100;

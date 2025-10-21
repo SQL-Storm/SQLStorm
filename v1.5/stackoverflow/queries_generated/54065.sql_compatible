@@ -1,0 +1,68 @@
+WITH tag_post_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                        AS QuestionCount,
+        SUM(p.Score)                                       AS TotalScore,
+        AVG(p.Score)                                       AS AvgScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)   AS TotalUpvotes
+    FROM Tags t
+    JOIN Posts p ON CAST(',' || p.Tags || ',' AS TEXT) LIKE '%,' || t.TagName || ',%'
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+top_user_per_tag AS (
+    SELECT
+        t.TagName,
+        u.Id                                          AS UserId,
+        u.DisplayName,
+        COUNT(p.Id)                                   AS UserQuestionCount,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY COUNT(p.Id) DESC) AS rn
+    FROM Tags t
+    JOIN Posts p ON CAST(',' || p.Tags || ',' AS TEXT) LIKE '%,' || t.TagName || ',%'
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, u.Id, u.DisplayName
+),
+best_user AS (
+    SELECT
+        TagName,
+        UserId,
+        DisplayName,
+        UserQuestionCount
+    FROM top_user_per_tag
+    WHERE rn = 1
+),
+duplicate_info AS (
+    SELECT
+        pl.RelatedPostId          AS OriginalId,
+        pl.PostId                 AS DuplicateId,
+        DATEDIFF(day, p_orig.CreationDate, p_dup.CreationDate) AS DaysBetween
+    FROM PostLinks pl
+    JOIN Posts p_orig ON p_orig.Id = pl.RelatedPostId
+    JOIN Posts p_dup  ON p_dup.Id  = pl.PostId
+    WHERE pl.LinkTypeId = 3
+)
+SELECT
+    tps.TagName,
+    tps.QuestionCount,
+    tps.TotalScore,
+    tps.AvgScore,
+    tps.TotalUpvotes,
+    bu.UserId,
+    bu.DisplayName,
+    bu.UserQuestionCount,
+    di.OriginalId,
+    di.DuplicateId,
+    di.DaysBetween
+FROM tag_post_stats tps
+JOIN best_user bu ON bu.TagName = tps.TagName
+LEFT JOIN duplicate_info di 
+    ON di.OriginalId = (
+        SELECT MAX(up.Id)
+        FROM Posts up
+        WHERE up.PostTypeId = 1
+          AND CAST(',' || up.Tags || ',' AS TEXT) LIKE '%,' || tps.TagName || ',%'
+    )
+ORDER BY tps.QuestionCount DESC, tps.AvgScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

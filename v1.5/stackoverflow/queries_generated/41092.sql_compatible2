@@ -1,0 +1,41 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.Body AS PostBody,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    COUNT(DISTINCT COALESCE(pt.Id, NULL)) AS AnswerCount,
+    AVG(b.Date) AS AvgBadgeDate,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    COUNT(DISTINCT t.Id) AS TagCount
+FROM 
+    Posts AS p
+JOIN 
+    Users AS u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes AS v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments AS c ON p.Id = c.PostId
+LEFT JOIN 
+    PostLinks AS pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Posts AS pt ON p.Id = pt.ParentId
+LEFT JOIN 
+    Badges AS b ON u.Id = b.UserId
+LEFT JOIN 
+    PostHistory AS ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags AS t ON p.Id = t.PostId
+GROUP BY 
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Body, u.DisplayName, u.Reputation
+ORDER BY 
+    p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 100;

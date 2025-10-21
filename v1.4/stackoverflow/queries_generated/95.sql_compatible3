@@ -1,0 +1,63 @@
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+  AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+  MAX(p.LastActivityDate) AS LastActive,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NetScore,
+  COALESCE(b.CountBadges, 0) AS BadgeCount,
+  STRING_AGG(CAST(bt.Class AS VARCHAR) || ':' || b.Name, ',') AS BadgeSummary
+FROM
+  Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId, COUNT(*) AS CountBadges
+  FROM Badges
+  GROUP BY UserId
+) AS b ON b.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId, STRING_AGG(CAST(Class AS VARCHAR) || ':' || Name, ',') AS BadgeNames
+  FROM Badges b2
+  JOIN (
+    SELECT 1 AS Class, 'Gold' AS Name
+    UNION ALL SELECT 2, 'Silver'
+    UNION ALL SELECT 3, 'Bronze'
+  ) AS cls ON b2.Class = cls.Class
+  GROUP BY UserId
+) AS bb ON bb.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId, COUNT(*) AS Class
+  FROM Badges
+  GROUP BY UserId
+) AS bt ON bt.UserId = u.Id
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    MIN(p.CreationDate) AS FirstPostDate
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+) AS fp ON fp.OwnerUserId = u.Id
+WHERE
+  u.CreationDate >= (DATE '2024-10-01' - INTERVAL '5' YEAR)
+  AND u.LastAccessDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+  AND EXISTS (
+    SELECT 1
+    FROM Posts p2
+    WHERE p2.OwnerUserId = u.Id
+      AND p2.PostTypeId IN (1, 2)
+      AND p2.Score > 0
+  )
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  b.CountBadges
+ORDER BY
+  NetScore DESC,
+  LastActive DESC
+LIMIT 100;

@@ -1,0 +1,131 @@
+-- {"query": "24089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3533} 
+
+WITH
+  -- Top scored questions per user
+  top_posts AS (
+    SELECT
+        p.Id          AS post_id,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 50
+  ),
+  -- Tag frequency inside questions
+  tag_pop AS (
+    SELECT
+        p.Id        AS post_id,
+        t.tag_name,
+        COUNT(*)    AS tag_occurrence
+    FROM Posts p
+    CROSS APPLY (
+      SELECT TRIM(both '><' FROM unnest(string_to_array(p.Tags, '&gt;')) ) AS tag_name
+    ) t
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, t.tag_name
+  ),
+  -- Rolling reputation per month for users
+  rep_trend AS (
+    SELECT
+        u.Id                         AS user_id,
+        DATE_TRUNC('month', u.CreationDate) AS month_start,
+        SUM(u.Reputation) OVER (PARTITION BY u.Id ORDER BY DATE_TRUNC('month', u.CreationDate) ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_reputation
+    FROM Users u
+  ),
+  -- Vote aggregates per post
+  votes_summary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes
+    FROM Votes v
+    GROUP BY v.PostId
+  ),
+  -- Comment activity per post
+  comment_jump AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id)                    AS comment_count,
+        SUM(c.Score)                   AS comment_score_sum,
+        SUM(CASE WHEN u.Reputation IS NOT NULL THEN 1 ELSE 0 END) AS users_with_reputation
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+    GROUP BY c.PostId
+  ),
+  -- Combine everything for further processing
+  combined AS (
+    SELECT
+        tp.post_id,
+        tp.OwnerUserId,
+        tp.Score,
+        tp.CreationDate,
+        tp.ViewCount,
+        tp.Tags,
+        tp.Title,
+        tp.Body,
+        ts.tag_occurrence,
+        ts.tag_name,
+        vt.upvotes,
+        vt.downvotes,
+        vt.accepted_votes,
+        cj.comment_count,
+        cj.comment_score_sum,
+        cj.users_with_reputation,
+        rp.running_reputation
+    FROM top_posts tp
+    LEFT JOIN tag_pop ts ON ts.post_id = tp.post_id
+    LEFT JOIN votes_summary vt ON vt.PostId = tp.post_id
+    LEFT JOIN comment_jump cj ON cj.PostId = tp.post_id
+    LEFT JOIN rep_trend rp ON rp.user_id = tp.OwnerUserId
+                           AND rp.month_start = DATE_TRUNC('month', tp.CreationDate)
+  ),
+  -- Assign rounded engagement category
+  categorized AS (
+    SELECT
+        c.*,
+        CASE
+            WHEN c.comment_count IS NULL THEN 0
+            ELSE c.comment_count
+        END                      AS comment_cnt,
+        ROUND((c.Score + COALESCE(c.upvotes,0)*10 - COALESCE(c.downvotes,0)*5)::numeric, 1) AS adjusted_score,
+        CASE
+            WHEN c.comment_count > 10 AND c.upvotes > c.downvotes THEN 'High engagement'
+            WHEN c.comment_count <= 10 AND c.Score > 200  THEN 'High score, low comments'
+            ELSE 'Normal'
+        END                        AS engagement_category
+    FROM combined c
+  )
+SELECT
+    post_id,
+    OwnerUserId,
+    Title,
+    tag_name,
+    Score,
+    upvotes,
+    downvotes,
+    accepted_votes,
+    comment_cnt,
+    comment_score_sum,
+    users_with_reputation,
+    running_reputation,
+    tag_occurrence,
+    adjusted_score,
+    engagement_category,
+    (Score * 1.0) / NULLIF(ViewCount,0)                           AS score_per_view,
+    comment_score_sum / NULLIF(comment_cnt,0)                     AS avg_comment_score,
+    CONCAT_WS(' | ', 
+              COALESCE(tag_name,''), 
+              TO_CHAR(adjusted_score, 'FM999999999.0'))           AS composite_key
+FROM categorized
+WHERE ViewCount > 100
+  AND (running_reputation IS NOT NULL OR users_with_reputation > 0)
+  AND (Score > 100 OR comment_score_sum > 0)
+ORDER BY adjusted_score DESC, comment_cnt DESC
+LIMIT 50;

@@ -1,0 +1,76 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    INNER JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > DATE '2024-10-01' - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        OwnerUserId AS UserId, 
+        COUNT(*) AS TotalPosts, 
+        SUM(Score) AS TotalScore, 
+        SUM(ViewCount) AS TotalViews, 
+        SUM(AnswerCount) AS TotalAnswers, 
+        SUM(CommentCount) AS TotalComments
+    FROM 
+        Posts
+    GROUP BY 
+        OwnerUserId
+),
+BadgeSummary AS (
+    SELECT 
+        OwnerUserId AS UserId, 
+        COUNT(*) AS TotalBadges, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        OwnerUserId
+)
+SELECT 
+    rp.Id, 
+    rp.PostTypeId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.AnswerCount, 
+    rp.CommentCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    ua.TotalPosts, 
+    ua.TotalScore, 
+    ua.TotalViews, 
+    ua.TotalAnswers, 
+    ua.TotalComments, 
+    bs.TotalBadges, 
+    bs.GoldBadges, 
+    bs.SilverBadges, 
+    bs.BronzeBadges
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN 
+    BadgeSummary bs ON rp.OwnerUserId = bs.UserId
+ORDER BY 
+    rp.CreationDate DESC, 
+    ua.TotalScore DESC, 
+    bs.TotalBadges DESC
+LIMIT 10;

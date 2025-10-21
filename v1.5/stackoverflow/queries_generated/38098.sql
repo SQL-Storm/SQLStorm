@@ -1,0 +1,264 @@
+-- {"query": "38098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2631} 
+WITH recent_year AS (
+  SELECT date_trunc('year', max(CreationDate)) AS year_start
+  FROM Posts
+),
+-- Active users with at least N posts in recent year and high feedback
+active_users AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    COUNT(*) AS posts_count,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS question_views,
+    SUM(p.Score) AS total_post_score
+  FROM Posts p
+  CROSS JOIN recent_year ry
+  WHERE p.OwnerUserId IS NOT NULL
+    AND p.CreationDate >= ry.year_start
+  GROUP BY p.OwnerUserId
+  HAVING COUNT(*) >= 10
+),
+-- User quality metrics
+user_quality AS (
+  SELECT
+    u.Id AS user_id,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views AS profile_views,
+    a.posts_count,
+    a.question_views,
+    a.total_post_score,
+    COALESCE(SUM(CASE b.Class WHEN 1 THEN 5 WHEN 2 THEN 2 WHEN 3 THEN 1 END), 0) AS badge_points,
+    COUNT(b.Id) FILTER (WHERE b.Date >= (SELECT year_start FROM recent_year)) AS recent_badges
+  FROM active_users a
+  JOIN Users u ON u.Id = a.user_id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views, a.posts_count, a.question_views, a.total_post_score
+),
+-- Questions and their accepted answerer
+qa AS (
+  SELECT
+    q.Id AS question_id,
+    q.OwnerUserId AS asker_id,
+    q.Score AS q_score,
+    q.ViewCount AS q_views,
+    q.CreationDate AS q_date,
+    q.Tags,
+    aa.OwnerUserId AS answerer_id,
+    EXTRACT(EPOCH FROM (aa.CreationDate - q.CreationDate)) AS accept_latency_sec
+  FROM Posts q
+  JOIN Posts aa ON aa.Id = q.AcceptedAnswerId
+  WHERE q.PostTypeId = 1
+    AND q.AcceptedAnswerId IS NOT NULL
+),
+-- Tag extraction and normalization
+question_tags AS (
+  SELECT
+    qa.question_id,
+    lower(trim(tag)) AS tag
+  FROM qa
+  CROSS JOIN LATERAL unnest(string_to_array(substring(qa.Tags, 2, length(qa.Tags)-2), '><')) AS tag
+),
+-- Per user tag performance
+user_tag_perf AS (
+  SELECT
+    qa.answerer_id AS user_id,
+    qt.tag,
+    COUNT(*) AS accepted_answers,
+    AVG(qa.accept_latency_sec) AS avg_accept_latency_sec,
+    AVG(qa.q_score) AS avg_q_score,
+    AVG(qa.q_views) AS avg_q_views
+  FROM qa
+  JOIN question_tags qt ON qt.question_id = qa.question_id
+  GROUP BY qa.answerer_id, qt.tag
+),
+-- Recent comment sentiment proxy and activity
+recent_comment_stats AS (
+  SELECT
+    c.UserId AS user_id,
+    COUNT(*) AS comments_made,
+    AVG(c.Score) AS avg_comment_score,
+    MAX(c.CreationDate) AS last_comment_at
+  FROM Comments c
+  CROSS JOIN recent_year ry
+  WHERE c.UserId IS NOT NULL
+    AND c.CreationDate >= ry.year_start
+  GROUP BY c.UserId
+),
+-- Vote behavior around accepted answers
+vote_agg AS (
+  SELECT
+    v.UserId AS user_id,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_cast,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_cast,
+    COUNT(*) FILTER (WHERE v.VoteTypeId IN (8,9)) AS bounties_interactions,
+    SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId IN (8,9)) AS bounty_total
+  FROM Votes v
+  CROSS JOIN recent_year ry
+  WHERE v.UserId IS NOT NULL
+    AND v.CreationDate >= ry.year_start
+  GROUP BY v.UserId
+),
+-- Duplicate handling and link graph centrality proxy
+link_graph AS (
+  SELECT
+    pl.RelatedPostId AS target_post_id,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS inbound_links,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS inbound_dupes
+  FROM PostLinks pl
+  GROUP BY pl.RelatedPostId
+),
+post_centrality AS (
+  SELECT
+    p.Id AS post_id,
+    COALESCE(l.inbound_links, 0) AS inbound_links,
+    COALESCE(l.inbound_dupes, 0) AS inbound_dupes,
+    (COALESCE(l.inbound_links,0) * 1.0 + COALESCE(l.inbound_dupes,0) * 3.0) AS centrality_score
+  FROM Posts p
+  LEFT JOIN link_graph l ON l.target_post_id = p.Id
+),
+user_centrality AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    SUM(pc.centrality_score) AS total_centrality,
+    SUM(pc.inbound_dupes) AS dupes_pointing_to_posts
+  FROM post_centrality pc
+  JOIN Posts p ON p.Id = pc.post_id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+-- Post edit and moderation history
+edit_events AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)) AS edits_count,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,14,19,31,33,34)) AS mod_actions_count,
+    MIN(ph.CreationDate) AS first_event_at,
+    MAX(ph.CreationDate) AS last_event_at
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+user_edit_activity AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    SUM(e.edits_count) AS total_edits,
+    SUM(e.mod_actions_count) AS total_mod_actions,
+    COUNT(*) FILTER (WHERE e.edits_count > 0) AS posts_ever_edited
+  FROM edit_events e
+  JOIN Posts p ON p.Id = e.PostId
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+-- Tag specialization score per user: concentration of accepted answers across tags
+tag_specialization AS (
+  SELECT
+    ut.user_id,
+    SUM(ut.accepted_answers) AS total_accepts,
+    MAX(ut.accepted_answers) AS max_tag_accepts,
+    COUNT(*) AS tag_count,
+    SUM( (ut.accepted_answers::decimal / NULLIF(SUM(ut.accepted_answers) OVER (PARTITION BY ut.user_id),0))^2 ) OVER (PARTITION BY ut.user_id) AS hhi -- Herfindahl index
+  FROM user_tag_perf ut
+),
+-- Aggregate question closure and protection interactions
+question_moderation AS (
+  SELECT
+    q.OwnerUserId AS user_id,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS closures,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 19) AS protections,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS reopens
+  FROM Posts q
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10,11,19)
+  WHERE q.PostTypeId = 1 AND q.OwnerUserId IS NOT NULL
+  GROUP BY q.OwnerUserId
+),
+-- Compute a composite ranking score
+scored_users AS (
+  SELECT
+    uq.user_id,
+    uq.Reputation,
+    uq.UpVotes,
+    uq.DownVotes,
+    uq.profile_views,
+    uq.posts_count,
+    uq.question_views,
+    uq.total_post_score,
+    uq.badge_points,
+    uq.recent_badges,
+    COALESCE(rcs.comments_made,0) AS comments_made,
+    COALESCE(rcs.avg_comment_score,0) AS avg_comment_score,
+    COALESCE(va.upvotes_cast,0) AS upvotes_cast,
+    COALESCE(va.downvotes_cast,0) AS downvotes_cast,
+    COALESCE(va.bounties_interactions,0) AS bounties_interactions,
+    COALESCE(va.bounty_total,0) AS bounty_total,
+    COALESCE(uc.total_centrality,0) AS total_centrality,
+    COALESCE(uc.dupes_pointing_to_posts,0) AS dupes_pointing_to_posts,
+    COALESCE(ue.total_edits,0) AS total_edits,
+    COALESCE(ue.total_mod_actions,0) AS total_mod_actions,
+    COALESCE(ue.posts_ever_edited,0) AS posts_ever_edited,
+    COALESCE(ts.total_accepts,0) AS total_accepts,
+    COALESCE(ts.max_tag_accepts,0) AS max_tag_accepts,
+    COALESCE(ts.tag_count,0) AS tag_count,
+    COALESCE(ts.hhi,0) AS tag_hhi,
+    (
+      -- Weighted composite score for benchmarking
+      uq.Reputation * 0.002
+      + uq.total_post_score * 0.5
+      + uq.question_views * 0.0002
+      + uq.badge_points * 1.5
+      + COALESCE(va.upvotes_cast,0) * 0.05
+      - COALESCE(va.downvotes_cast,0) * 0.02
+      + COALESCE(va.bounty_total,0) * 0.001
+      + COALESCE(uc.total_centrality,0) * 0.1
+      + COALESCE(ue.total_edits,0) * 0.05
+      - COALESCE(qm.closures,0) * 0.2
+      + COALESCE(qm.reopens,0) * 0.1
+      + COALESCE(qm.protections,0) * 0.05
+      + COALESCE(ts.hhi,0) * 10.0
+    ) AS composite_score
+  FROM user_quality uq
+  LEFT JOIN recent_comment_stats rcs ON rcs.user_id = uq.user_id
+  LEFT JOIN vote_agg va ON va.user_id = uq.user_id
+  LEFT JOIN user_centrality uc ON uc.user_id = uq.user_id
+  LEFT JOIN user_edit_activity ue ON ue.user_id = uq.user_id
+  LEFT JOIN tag_specialization ts ON ts.user_id = uq.user_id
+  LEFT JOIN question_moderation qm ON qm.user_id = uq.user_id
+),
+-- Top tags per user (string aggregation for output size stress)
+top_tags AS (
+  SELECT
+    ut.user_id,
+    string_agg(format('%s:%s', ut.tag, ut.accepted_answers), ',' ORDER BY ut.accepted_answers DESC, ut.tag) AS tag_breakdown
+  FROM user_tag_perf ut
+  GROUP BY ut.user_id
+)
+SELECT
+  su.user_id,
+  u.DisplayName,
+  u.Location,
+  su.Reputation,
+  su.posts_count,
+  su.total_post_score,
+  su.question_views,
+  su.badge_points,
+  su.recent_badges,
+  su.comments_made,
+  su.avg_comment_score,
+  su.upvotes_cast,
+  su.downvotes_cast,
+  su.bounties_interactions,
+  su.bounty_total,
+  su.total_centrality,
+  su.dupes_pointing_to_posts,
+  su.total_edits,
+  su.total_mod_actions,
+  su.posts_ever_edited,
+  su.total_accepts,
+  su.max_tag_accepts,
+  su.tag_count,
+  ROUND(su.tag_hhi::numeric, 4) AS tag_hhi,
+  ROUND(su.composite_score::numeric, 4) AS composite_score,
+  COALESCE(tt.tag_breakdown, '') AS top_tag_breakdown
+FROM scored_users su
+JOIN Users u ON u.Id = su.user_id
+ORDER BY su.composite_score DESC, su.Reputation DESC, su.total_post_score DESC
+LIMIT 200;

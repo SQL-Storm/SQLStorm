@@ -1,0 +1,103 @@
+WITH TagStats AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LatestQuestionDate
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1
+                 AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.Id, t.TagName
+),
+UserTagContributions AS (
+    SELECT
+        ts.TagId,
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        SUM(p.Score) AS TotalScore,
+        ROW_NUMBER() OVER (PARTITION BY ts.TagId ORDER BY SUM(p.Score) DESC) AS RankByScore
+    FROM TagStats ts
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', (SELECT TagName FROM Tags WHERE Id = ts.TagId), '>%')
+    JOIN Users u ON u.Id = COALESCE(p.OwnerUserId, -1)
+    GROUP BY ts.TagId, u.Id, u.DisplayName
+),
+TopContributors AS (
+    SELECT *
+    FROM UserTagContributions
+    WHERE RankByScore <= 5
+),
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+PostRecentActivity AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        COALESCE(rv.VoteTypeId, 0) AS LatestVoteType,
+        rv.CreationDate AS LatestVoteDate
+    FROM Posts p
+    LEFT JOIN RecentVotes rv ON rv.PostId = p.Id AND rv.rn = 1
+    WHERE p.PostTypeId = 1
+),
+BadgeAggregates AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.AvgScore,
+    ts.LatestQuestionDate,
+    COALESCE(json_agg(
+        json_build_object(
+            'UserId', tc.UserId,
+            'DisplayName', tc.DisplayName,
+            'QuestionsAsked', tc.QuestionsAsked,
+            'AnswersPosted', tc.AnswersPosted,
+            'TotalScore', tc.TotalScore,
+            'RankByScore', tc.RankByScore,
+            'GoldBadges', COALESCE(b.GoldBadges, 0),
+            'SilverBadges', COALESCE(b.SilverBadges, 0),
+            'BronzeBadges', COALESCE(b.BronzeBadges, 0)
+        )
+    ) FILTER (WHERE tc.UserId IS NOT NULL), '[]') AS TopContributors,
+    COALESCE(json_agg(
+        json_build_object(
+            'PostId', pra.Id,
+            'Title', pra.Title,
+            'CreationDate', pra.CreationDate,
+            'Score', pra.Score,
+            'LatestVoteType', pra.LatestVoteType,
+            'LatestVoteDate', pra.LatestVoteDate
+        )
+    ) FILTER (WHERE pra.Id IS NOT NULL), '[]') AS RecentActiveQuestions
+FROM TagStats ts
+LEFT JOIN TopContributors tc ON tc.TagId = ts.TagId
+LEFT JOIN BadgeAggregates b ON b.UserId = tc.UserId
+LEFT JOIN PostRecentActivity pra ON FALSE
+GROUP BY
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.AvgScore,
+    ts.LatestQuestionDate
+ORDER BY ts.TotalScore DESC
+LIMIT 20;

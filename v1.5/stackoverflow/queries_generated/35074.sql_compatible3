@@ -1,0 +1,68 @@
+WITH TopTagUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        SUM(p.Score) AS TotalScore,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        DENSE_RANK() OVER(PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM 
+        Posts p
+        INNER JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN (
+            SELECT
+                CAST(unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS text) AS TagName
+            FROM Posts p
+        ) t ON p.Tags IS NOT NULL
+    WHERE 
+        p.PostTypeId IN (1,2)
+    GROUP BY 
+        u.Id, u.DisplayName, t.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) >= 10
+), 
+TagBestAnswers AS (
+    SELECT
+        t.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.AnswerCount,
+        p.CreationDate,
+        DENSE_RANK() OVER(PARTITION BY t.TagName ORDER BY p.Score DESC, p.CreationDate ASC) AS TagPostRank
+    FROM
+        Posts p
+        LEFT JOIN (
+            SELECT
+                CAST(unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS text) AS TagName
+            FROM Posts p
+        ) t ON p.Tags IS NOT NULL
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 5
+        AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+    )
+SELECT
+    tbu.TagName,
+    tbu.DisplayName AS TopUser,
+    tbu.TotalScore,
+    tbu.PostCount,
+    tba.PostId AS TopPostId,
+    tba.Score AS TopPostScore,
+    tba.AnswerCount AS TopPostAnswers,
+    tba.CreationDate AS TopPostDate,
+    u2.DisplayName AS TopPostOwner,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tba.PostId) AS TopPostComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tba.PostId AND v.VoteTypeId = 2) AS TopPostUpvotes
+FROM
+    TopTagUsers tbu
+    INNER JOIN TagBestAnswers tba
+        ON tbu.TagName = tba.TagName AND tba.TagPostRank = 1
+    INNER JOIN Posts p2
+        ON p2.Id = tba.PostId
+    LEFT JOIN Users u2
+        ON u2.Id = p2.OwnerUserId
+WHERE
+    tbu.TagRank = 1
+ORDER BY
+    tbu.TotalScore DESC, tbu.TagName
+LIMIT 50;

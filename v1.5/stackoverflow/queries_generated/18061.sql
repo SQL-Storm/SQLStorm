@@ -1,0 +1,127 @@
+-- {"query": "18061.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1139} 
+
+WITH
+  RankedPostHistory AS (
+    SELECT
+      PostId,
+      PostHistoryTypeId,
+      UserId,
+      ROW_NUMBER() OVER (PARTITION BY PostId, PostHistoryTypeId ORDER BY CreationDate DESC) as rn
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId IN (2, 5) /* Edit Body */
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      rph.UserId,
+      u.DisplayName AS EditorDisplayName,
+      rph.CreationDate AS EditDate
+    FROM RankedPostHistory rph
+    JOIN Users u
+      ON rph.UserId = u.Id
+    WHERE
+      rph.rn = 1
+  ),
+  PostLinkCounts AS (
+    SELECT
+      PostId,
+      COUNT(Id) AS TotalLinks
+    FROM PostLinks
+    GROUP BY
+      PostId
+  ),
+  UserPostSummary AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(CASE WHEN pt.Name = 'Question' THEN p.Id ELSE NULL END) AS QuestionCount,
+      COUNT(CASE WHEN pt.Name = 'Answer' THEN p.Id ELSE NULL END) AS AnswerCount,
+      SUM(CASE WHEN pt.Name = 'Question' THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+      AVG(CASE WHEN pt.Name = 'Question' THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY
+      p.OwnerUserId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COALESCE(ups.QuestionCount, 0) AS UserQuestions,
+  COALESCE(ups.AnswerCount, 0) AS UserAnswers,
+  COALESCE(ups.TotalQuestionScore, 0) AS TotalQuestionScore,
+  COALESCE(ups.TotalAnswerScore, 0) AS TotalAnswerScore,
+  CASE
+    WHEN ups.LastPostDate IS NULL THEN 'Never'
+    ELSE CAST(ups.LastPostDate AS VARCHAR)
+  END AS LastActivity,
+  COALESCE(le.EditCount, 0) AS BodyEditCount,
+  COALESCE(pl.TotalLinks, 0) AS LinkedPosts,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Badges b
+      WHERE
+        b.UserId = u.Id AND b.Name LIKE '%er' AND b.Class = 1
+    ) THEN 'Has Gold Badge'
+    ELSE 'No Gold Badge'
+  END AS GoldBadgeStatus,
+  COALESCE(u.Reputation, 0) AS Reputation,
+  CASE
+    WHEN u.Views > 100000 THEN 'High Views'
+    WHEN u.Views > 10000 THEN 'Medium Views'
+    ELSE 'Low Views'
+  END AS ViewCategory,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR TRIM(u.WebsiteUrl) = '' THEN 'No Website'
+    ELSE 'Has Website'
+  END AS WebsiteStatus,
+  SUM(CASE WHEN c.Score > 10 THEN 1 ELSE 0 END) AS HighScoreComments,
+  COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+  CASE
+    WHEN COUNT(DISTINCT p.Id) > 0 THEN (
+      SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(DISTINCT p.Id)
+    )
+    ELSE 0.0
+  END AS NegativeScorePostPercentage
+FROM Users u
+LEFT JOIN UserPostSummary ups
+  ON u.Id = ups.OwnerUserId
+LEFT JOIN (
+  SELECT
+    UserId,
+    COUNT(*) AS EditCount
+  FROM LatestEdits
+  GROUP BY
+    UserId
+) le
+  ON u.Id = le.UserId
+LEFT JOIN PostLinkCounts pl
+  ON u.Id = pl.PostId
+LEFT JOIN Posts p
+  ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c
+  ON p.Id = c.PostId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  ups.QuestionCount,
+  ups.AnswerCount,
+  ups.TotalQuestionScore,
+  ups.TotalAnswerScore,
+  ups.LastPostDate,
+  le.EditCount,
+  pl.TotalLinks,
+  u.Reputation,
+  u.Views,
+  u.WebsiteUrl
+HAVING
+  COALESCE(ups.QuestionCount, 0) + COALESCE(ups.AnswerCount, 0) > 10
+ORDER BY
+  Reputation DESC
+LIMIT 100;

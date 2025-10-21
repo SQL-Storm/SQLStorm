@@ -1,0 +1,97 @@
+WITH UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+    SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Id > 0 AND p.OwnerUserId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+  HAVING SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) > 50
+),
+PowerUsers AS (
+  SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    UserCreationDate,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalQuestions,
+    TotalAnswers,
+    AvgAnswerScore,
+    (Reputation * 0.15) + (GoldBadges * 100) + (SilverBadges * 50) + (BronzeBadges * 25) + (COALESCE(AvgAnswerScore, 0) * 10) + (QuestionsWithAcceptedAnswer * 20) + ((SELECT COUNT(*) FROM Votes v WHERE v.UserId = um.UserId AND v.VoteTypeId = 2) * 0.5) AS PowerScore
+  FROM UserMetrics um
+),
+RankedUsers AS (
+  SELECT *, ROW_NUMBER() OVER (ORDER BY PowerScore DESC) as Rank
+  FROM PowerUsers
+  WHERE PowerScore > 1000
+),
+TopUsersAnalysis AS (
+  SELECT
+    r.UserId,
+    r.Rank,
+    (
+      SELECT tag
+      FROM (
+        SELECT UNNEST(string_to_array(substr(q.Tags, 2, length(q.Tags) - 2), '><')) AS tag, COUNT(*) as tag_count
+        FROM Posts a
+        JOIN Posts q ON a.ParentId = q.Id
+        WHERE a.OwnerUserId = r.UserId AND a.PostTypeId = 2 AND q.Tags IS NOT NULL
+        GROUP BY tag
+        ORDER BY tag_count DESC, tag ASC
+        LIMIT 1
+      ) AS top_tag
+    ) AS MostFrequentTag,
+    (
+      SELECT AVG(EXTRACT(EPOCH FROM a.CreationDate) - EXTRACT(EPOCH FROM q.CreationDate)) / 3600.0
+      FROM Posts q
+      JOIN Posts a ON q.AcceptedAnswerId = a.Id
+      WHERE q.PostTypeId = 1 AND q.OwnerUserId = r.UserId
+    ) AS AvgHoursToAcceptedAnswer,
+    (
+        SELECT Score
+        FROM Posts
+        WHERE PostTypeId = 2 AND OwnerUserId = r.UserId
+        ORDER BY CreationDate DESC
+        LIMIT 1
+    ) AS LatestAnswerScore
+  FROM RankedUsers r
+  WHERE r.Rank <= 100
+)
+SELECT
+  ru.Rank,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.UserCreationDate,
+  CAST(ru.PowerScore AS INT) AS PowerScore,
+  ru.TotalQuestions,
+  ru.TotalAnswers,
+  CAST(ru.AvgAnswerScore AS DECIMAL(10, 2)) AS AvgAnswerScore,
+  ru.GoldBadges,
+  ru.SilverBadges,
+  ru.BronzeBadges,
+  tua.MostFrequentTag,
+  CAST(tua.AvgHoursToAcceptedAnswer AS DECIMAL(10, 2)) AS AvgHoursToAcceptedAnswer,
+  tua.LatestAnswerScore,
+  (SELECT COUNT(DISTINCT c.UserId)
+   FROM Comments c
+   JOIN Posts p ON c.PostId = p.Id
+   WHERE p.OwnerUserId = ru.UserId
+  ) AS UniqueCommentersOnPosts,
+  CAST(ru.AvgAnswerScore / NULLIF((SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND Score > 0), 0) AS DECIMAL(10, 2)) AS RelativePerformanceRatio
+FROM RankedUsers ru
+JOIN TopUsersAnalysis tua ON ru.UserId = tua.UserId
+WHERE ru.Rank <= 100
+ORDER BY ru.Rank;

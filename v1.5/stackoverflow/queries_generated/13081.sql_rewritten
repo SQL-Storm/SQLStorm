@@ -1,0 +1,76 @@
+-- {"query": "13081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 699} 
+WITH UserActivity AS (
+    SELECT 
+        UserId, 
+        COUNT(DISTINCT PostId) AS PostsCreated,
+        SUM(Score) AS TotalScore,
+        MAX(CreationDate) AS LastPostCreationDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY UserId
+),
+TopTags AS (
+    SELECT 
+        UNNEST(string_to_array(substring(Tags, 2, length(Tags)-2), ''><'')) AS Tag,
+        COUNT(*) AS TagFrequency
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    GROUP BY Tag
+),
+UserTopTags AS (
+    SELECT
+        UserId,
+        ARRAY_AGG(Tag ORDER BY TagFrequency DESC LIMIT 5) AS TopFiveTags
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            t.Tag,
+            COUNT(*) AS TagCount
+        FROM Posts p
+        CROSS JOIN UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'')) AS t(Tag)
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId, t.Tag
+    ) tmp
+    GROUP BY UserId
+),
+PostEdits AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.PostId
+),
+UserPerformance AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ua.PostsCreated,
+        COALESCE(ua.TotalScore, 0) AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(ua.TotalScore, 0) DESC) AS ScoreRank,
+        utt.TopFiveTags,
+        pe.EditCount,
+        pe.LastEditDate
+    FROM Users u
+    LEFT JOIN UserActivity ua ON u.Id = ua.UserId
+    LEFT JOIN UserTopTags utt ON u.Id = utt.UserId
+    LEFT JOIN PostEdits pe ON u.Id = pe.UserId
+    WHERE u.Reputation > 1000
+)
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.PostsCreated,
+    up.TotalScore,
+    up.ScoreRank,
+    up.TopFiveTags,
+    COALESCE(up.EditCount, 0) AS EditCount,
+    up.LastEditDate,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = up.UserId AND b.Class = 1) AS GoldBadges,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = up.UserId AND PostTypeId = 2) AS AvgAnswerScore
+FROM UserPerformance up
+WHERE up.ScoreRank <= 100
+ORDER BY up.ScoreRank;

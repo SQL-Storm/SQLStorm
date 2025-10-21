@@ -1,0 +1,203 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_creation_date
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= TIMESTAMP '2010-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answers,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ' | ') as all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2008-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 
+                CASE 
+                    WHEN ph.Comment LIKE '%duplicate%' THEN 'DUPLICATE'
+                    WHEN ph.Comment LIKE '%off-topic%' THEN 'OFF_TOPIC'
+                    WHEN ph.Comment LIKE '%subjective%' THEN 'SUBJECTIVE'
+                    ELSE 'OTHER'
+                END
+            WHEN ph.PostHistoryTypeId = 16 THEN 'COMMUNITY_OWNED'
+            WHEN ph.PostHistoryTypeId = 14 THEN 'LOCKED'
+            WHEN ph.PostHistoryTypeId = 15 THEN 'UNLOCKED'
+            ELSE 'OTHER'
+        END as activity_type,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as activity_rank,
+        COUNT(*) OVER (PARTITION BY ph.PostId) as total_activities
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= TIMESTAMP '2015-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'POPULAR'
+            WHEN t.Count > 500 THEN 'MODERATE'
+            WHEN t.Count > 100 THEN 'SMALL'
+            ELSE 'TINY'
+        END as tag_category,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as prev_count,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as percentile_rank
+    FROM Tags t
+    WHERE t.Count > 10
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        DATE_PART('day', AGE(p.LastActivityDate, p.CreationDate)) as days_since_creation,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN p.Score / (p.AnswerCount + 1.0)
+            ELSE p.Score
+        END as score_per_answer,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as score_rank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as view_rank,
+        DENSE_RANK() OVER (ORDER BY p.AnswerCount DESC) as answer_rank,
+        AVG(p.Score) OVER () as overall_avg_score,
+        MAX(p.Score) OVER () as max_score,
+        MIN(p.Score) OVER () as min_score,
+        STDDEV_SAMP(p.Score) OVER () as score_stddev
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= TIMESTAMP '2012-01-01'
+)
+SELECT 
+    'BENCHMARK_RESULT' as query_type,
+    COUNT(*) as total_records,
+    COUNT(DISTINCT rs.Id) as distinct_posts,
+    COUNT(DISTINCT us.UserId) as distinct_users,
+    COUNT(DISTINCT ps.QuestionId) as distinct_questions,
+    COUNT(DISTINCT ta.TagName) as distinct_tags,
+    COUNT(DISTINCT pa.PostId) as distinct_activities,
+    SUM(CASE WHEN rs.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+    SUM(CASE WHEN rs.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+    AVG(rs.Score) as avg_score,
+    AVG(us.total_score) as avg_user_score,
+    MAX(rs.ViewCount) as max_views,
+    MAX(us.total_posts) as max_posts_per_user,
+    MIN(pa.activity_rank) as min_activity_rank,
+    STRING_AGG(DISTINCT CASE WHEN ps.score_rank <= 10 THEN ps.Title END, ' | ') as top_questions,
+    STRING_AGG(DISTINCT CASE WHEN us.total_posts >= 50 THEN us.DisplayName END, ' | ') as top_contributors,
+    STRING_AGG(DISTINCT CASE WHEN ta.tag_category = 'POPULAR' THEN ta.TagName END, ' | ') as popular_tags,
+    STRING_AGG(DISTINCT CASE WHEN rs.rn = 1 THEN rs.Title END, ' | ') as recent_posts,
+    COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score < rs.Score) as improved_posts,
+    COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score > rs.Score) as deteriorated_posts,
+    NULLIF(COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score = rs.Score), 0) as unchanged_posts,
+    AVG(pa.total_activities) as avg_activities_per_post,
+    MAX(ta.Count) as max_tag_count,
+    MIN(ta.Count) as min_tag_count,
+    AVG(ta.Count) as avg_tag_count,
+    CASE 
+        WHEN (COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score < rs.Score) * 100.0 / NULLIF(COUNT(*), 0)) > 50 THEN 'HIGH_IMPROVEMENT'
+        WHEN (COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score > rs.Score) * 100.0 / NULLIF(COUNT(*), 0)) > 50 THEN 'HIGH_DEGRADATION'
+        ELSE 'STABLE'
+    END as overall_trend,
+    NULLIF(SUM(CASE WHEN ps.score_rank <= 10 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 0) as top_question_percentage
+FROM RankedPosts rs
+FULL OUTER JOIN UserStats us ON rs.OwnerUserId = us.UserId
+FULL OUTER JOIN PostActivity pa ON rs.Id = pa.PostId
+FULL OUTER JOIN TagAnalysis ta ON rs.Tags IS NOT NULL AND STRING_TO_ARRAY(SUBSTRING(rs.Tags, 2, LENGTH(rs.Tags)-2), '><') && ARRAY[ta.TagName] 
+FULL OUTER JOIN QuestionStats ps ON rs.Id = ps.QuestionId
+WHERE (rs.Id IS NOT NULL OR us.UserId IS NOT NULL OR pa.PostId IS NOT NULL OR ta.TagName IS NOT NULL OR ps.QuestionId IS NOT NULL)
+    AND (rs.Score IS NOT NULL OR us.total_score IS NOT NULL OR pa.activity_rank IS NOT NULL OR ta.Count IS NOT NULL OR ps.Score IS NOT NULL)
+    AND (rs.CreationDate >= TIMESTAMP '2010-01-01' OR us.last_post_date >= TIMESTAMP '2010-01-01' OR pa.CreationDate >= TIMESTAMP '2010-01-01' OR ta.Count > 10 OR ps.CreationDate >= TIMESTAMP '2010-01-01')
+    AND (us.Reputation IS NOT NULL OR rs.OwnerUserId IS NOT NULL OR pa.UserId IS NOT NULL OR ta.TagName IS NOT NULL OR ps.QuestionId IS NOT NULL)
+    AND (ps.QuestionId IS NULL OR ps.Score >= 0)
+    AND (ta.Count IS NULL OR ta.Count > 0)
+    AND (us.UserId IS NULL OR us.total_posts > 0)
+    AND (rs.Id IS NULL OR rs.Id > 0)
+    AND (rs.Score IS NULL OR rs.Score BETWEEN -100 AND 1000)
+    AND (CASE 
+            WHEN ps.QuestionId IS NULL THEN FALSE
+            ELSE ps.Score IS NOT NULL OR ps.ViewCount IS NOT NULL OR ps.AnswerCount IS NOT NULL OR ps.CommentCount IS NOT NULL OR ps.FavoriteCount IS NOT NULL
+         END
+    OR CASE 
+            WHEN pa.PostId IS NULL THEN FALSE
+            ELSE pa.PostHistoryTypeId IS NOT NULL OR pa.UserId IS NOT NULL OR pa.Comment IS NOT NULL OR pa.activity_type IS NOT NULL 
+         END
+    OR CASE 
+            WHEN rs.Id IS NULL THEN FALSE
+            ELSE rs.PostTypeId IS NOT NULL OR rs.ParentId IS NOT NULL OR rs.OwnerUserId IS NOT NULL OR rs.Score IS NOT NULL OR rs.ViewCount IS NOT NULL
+         END
+    OR CASE 
+            WHEN us.UserId IS NULL THEN FALSE
+            ELSE us.TotalPosts IS NOT NULL OR us.DisplayName IS NOT NULL OR us.Reputation IS NOT NULL OR us.Views IS NOT NULL
+         END
+    OR CASE 
+            WHEN ta.TagName IS NULL THEN FALSE
+            ELSE ta.Count IS NOT NULL OR ta.IsModeratorOnly IS NOT NULL OR ta.IsRequired IS NOT NULL
+         END)
+GROUP BY 
+    CASE 
+        WHEN COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score < rs.Score) > 0 THEN 'IMPROVEMENT'
+        WHEN COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score > rs.Score) > 0 THEN 'DEGRADATION'
+        ELSE 'STABLE'
+    END,
+    CASE 
+        WHEN COUNT(DISTINCT ps.QuestionId) > 100 THEN 'HIGH_QUESTION_COUNT'
+        WHEN COUNT(DISTINCT ps.QuestionId) > 50 THEN 'MODERATE_QUESTION_COUNT'
+        ELSE 'LOW_QUESTION_COUNT'
+    END
+HAVING 
+    COUNT(*) > 0
+    AND COUNT(DISTINCT rs.Id) >= 100
+    AND COUNT(DISTINCT us.UserId) >= 10
+    AND COUNT(DISTINCT ps.QuestionId) >= 50
+    AND COUNT(DISTINCT ta.TagName) >= 20
+    AND COUNT(DISTINCT pa.PostId) >= 30
+    AND (COUNT(DISTINCT rs.Id) * COUNT(DISTINCT us.UserId) * COUNT(DISTINCT ps.QuestionId) * COUNT(DISTINCT ta.TagName) * COUNT(DISTINCT pa.PostId)) > 0
+    AND (COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score < rs.Score) * 100.0 / NULLIF(COUNT(*), 0)) >= 0
+    AND (COUNT(*) FILTER (WHERE rs.prev_score IS NOT NULL AND rs.prev_score > rs.Score) * 100.0 / NULLIF(COUNT(*), 0)) >= 0;

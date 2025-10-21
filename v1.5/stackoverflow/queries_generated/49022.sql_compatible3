@@ -1,0 +1,122 @@
+WITH RecentHighScoringAnswers AS (
+    SELECT
+        P.Id AS AnswerId,
+        P.ParentId AS QuestionId,
+        P.OwnerUserId AS AnswererUserId,
+        P.Score AS AnswerScore,
+        P.CreationDate AS AnswerCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.Tags AS QuestionTags
+    FROM Posts P
+    INNER JOIN Posts Q ON P.ParentId = Q.Id
+    WHERE
+        P.PostTypeId = 2
+        AND Q.PostTypeId = 1
+        AND P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5' YEAR)
+        AND Q.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5' YEAR)
+        AND P.Score >= 20
+        AND Q.Score >= 50
+        AND Q.ViewCount >= 1000
+),
+UserAnswerSummary AS (
+    SELECT
+        AnswererUserId,
+        COUNT(AnswerId) AS TotalAnswers,
+        SUM(AnswerScore) AS TotalAnswerScore,
+        AVG(AnswerScore) AS AvgAnswerScore,
+        MAX(AnswerScore) AS MaxAnswerScore,
+        COUNT(DISTINCT QuestionId) AS UniqueQuestionsAnswered,
+        SUM(QuestionScore) AS TotalQuestionScoreOfAnsweredQuestions,
+        SUM(QuestionViewCount) AS TotalQuestionViewCountOfAnsweredQuestions
+    FROM RecentHighScoringAnswers
+    GROUP BY AnswererUserId
+    HAVING COUNT(AnswerId) >= 5
+),
+UserTagContributions AS (
+    SELECT
+        rsa.AnswererUserId,
+        LOWER(tag) AS TagName,
+        COUNT(*) AS TagCount
+    FROM (
+        SELECT
+            rsa.AnswererUserId,
+            UNNEST(string_to_array(SUBSTRING(rsa.QuestionTags, 2, LENGTH(rsa.QuestionTags) - 2), '><')) AS tag
+        FROM RecentHighScoringAnswers rsa
+    ) t
+    WHERE t.tag IS NOT NULL
+    GROUP BY rsa.AnswererUserId, LOWER(tag)
+),
+TopTagsPerUser AS (
+    SELECT
+        utc.AnswererUserId,
+        STRING_AGG(utc.TagName || ' (' || utc.TagCount || ')', '; ' ORDER BY utc.TagCount DESC, utc.TagName ASC) AS TopContributedTags
+    FROM (
+        SELECT
+            AnswererUserId,
+            TagName,
+            TagCount,
+            ROW_NUMBER() OVER (PARTITION BY AnswererUserId ORDER BY TagCount DESC, TagName ASC) AS rn
+        FROM UserTagContributions
+    ) utc
+    WHERE utc.rn <= 5
+    GROUP BY utc.AnswererUserId
+),
+UserModerationActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseVoteCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenVoteCount
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5' YEAR)
+      AND ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.UserId
+),
+UserBadgeAchievements AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5' YEAR)
+    GROUP BY b.UserId
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.UpVotes AS UserUpVotes,
+    U.DownVotes AS UserDownVotes,
+    UAS.TotalAnswers,
+    UAS.AvgAnswerScore,
+    UAS.MaxAnswerScore,
+    UAS.UniqueQuestionsAnswered,
+    UAS.TotalQuestionScoreOfAnsweredQuestions,
+    UAS.TotalQuestionViewCountOfAnsweredQuestions,
+    TTPU.TopContributedTags,
+    COALESCE(UMA.CloseVoteCount, 0) AS UserCloseVotes,
+    COALESCE(UMA.ReopenVoteCount, 0) AS UserReopenVotes,
+    COALESCE(UBA.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBA.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBA.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBA.BronzeBadges, 0) AS BronzeBadges,
+    RANK() OVER (
+        ORDER BY
+            UAS.TotalAnswerScore DESC,
+            UAS.AvgAnswerScore DESC,
+            U.Reputation DESC,
+            COALESCE(UBA.GoldBadges, 0) DESC,
+            UAS.TotalAnswers DESC,
+            COALESCE(UMA.CloseVoteCount, 0) DESC
+    ) AS OverallRank
+FROM Users U
+INNER JOIN UserAnswerSummary UAS ON U.Id = UAS.AnswererUserId
+LEFT JOIN TopTagsPerUser TTPU ON U.Id = TTPU.AnswererUserId
+LEFT JOIN UserModerationActivity UMA ON U.Id = UMA.UserId
+LEFT JOIN UserBadgeAchievements UBA ON U.Id = UBA.UserId
+WHERE U.Reputation >= 1000
+ORDER BY OverallRank
+LIMIT 100;

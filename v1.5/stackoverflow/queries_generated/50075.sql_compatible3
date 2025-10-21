@@ -1,0 +1,76 @@
+WITH GoldBadgeUsers AS (
+    SELECT DISTINCT UserId
+    FROM Badges
+    WHERE Class = 1
+),
+UserActivity AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(ViewCount) AS TotalViewCount,
+        SUM(Score) AS TotalScore,
+        SUM(FavoriteCount) AS TotalFavorites,
+        AVG(CASE WHEN PostTypeId = 2 THEN Score END) AS AvgAnswerScore,
+        MIN(CreationDate) AS FirstPostDate,
+        MAX(LastActivityDate) AS LastActivityDate,
+        COUNT(CASE WHEN PostTypeId = 1 THEN AcceptedAnswerId END) AS AcceptedQuestions
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        UserId,
+        COUNT(*) AS CommentCount,
+        SUM(Score) AS TotalCommentScore
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserVoting AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCast,
+        SUM(BountyAmount) AS TotalBountyAmount
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    act.TotalPosts,
+    act.QuestionCount,
+    act.AnswerCount,
+    eng.CommentCount,
+    act.TotalViewCount,
+    ROUND(act.AvgAnswerScore, 2) AS AvgAnswerScore,
+    ROUND((act.AnswerCount * 100.0 / NULLIF(act.TotalPosts, 0)), 2) AS AnswerRatio,
+    ROUND((act.AcceptedQuestions * 100.0 / NULLIF(act.QuestionCount, 0)), 2) AS QuestionAcceptanceRate,
+    (EXTRACT(EPOCH FROM (act.LastActivityDate - u.CreationDate)) / 86400) AS AccountLifetimeDays,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC, COALESCE(act.TotalScore, 0) DESC) AS ReputationRank,
+    NTILE(100) OVER (ORDER BY act.TotalViewCount DESC) AS ViewCountPercentile,
+    LAG(u.DisplayName, 1, 'N/A') OVER (ORDER BY COALESCE(act.AvgAnswerScore, 0) DESC NULLS LAST) AS UserWithNextBestAvgAnswerScore
+FROM
+    Users u
+JOIN
+    GoldBadgeUsers gbu ON u.Id = gbu.UserId
+JOIN
+    UserActivity act ON u.Id = act.UserId
+LEFT JOIN
+    UserEngagement eng ON u.Id = eng.UserId
+LEFT JOIN
+    UserVoting vot ON u.Id = vot.UserId
+WHERE
+    u.Reputation > (SELECT AVG(Reputation) FROM Users)
+    AND act.TotalPosts > 0
+    AND act.LastActivityDate > (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '4 year'
+    AND (COALESCE(vot.UpVotesCast, 0) > (COALESCE(vot.DownVotesCast, 0) * 5) OR COALESCE(vot.DownVotesCast, 0) = 0)
+ORDER BY
+    u.Reputation DESC, act.AnswerCount DESC, act.TotalViewCount DESC
+LIMIT 200;

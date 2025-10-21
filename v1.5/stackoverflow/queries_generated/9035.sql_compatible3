@@ -1,0 +1,152 @@
+WITH
+  RecentGoldBadgers AS (
+    SELECT b.UserId,
+           COUNT(*) AS GoldBadges
+    FROM Badges b
+    WHERE b.Class = 1
+      AND b.Date >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY b.UserId
+  ),
+  UserMetrics AS (
+    SELECT u.Id           AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank,
+           COALESCE(r.GoldBadges, 0)               AS GoldBadges,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS QuestionsCount,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AnswersCount
+    FROM Users u
+    LEFT JOIN RecentGoldBadgers r
+      ON r.UserId = u.Id
+    LEFT JOIN Posts p
+      ON p.OwnerUserId = u.Id
+  ),
+  PostTagExplode AS (
+    SELECT p.Id AS PostId,
+           UNNEST(
+             string_to_array(
+               substring(p.Tags, 2, length(p.Tags) - 2),
+               '><'
+             )
+           ) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+  ),
+  TopTags AS (
+    SELECT Tag,
+           COUNT(*) AS TagUses
+    FROM PostTagExplode
+    GROUP BY Tag
+    HAVING COUNT(*) > 50
+  ),
+  CommentsWindow AS (
+    SELECT c.PostId,
+           ROW_NUMBER() OVER (PARTITION BY c.PostId
+                              ORDER BY c.Score DESC, c.CreationDate) AS CommentRank,
+           c.Text
+    FROM Comments c
+  ),
+  LinkOps AS (
+    SELECT pl.PostId,
+           lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt
+      ON lt.Id = pl.LinkTypeId
+  ),
+  AnswerLag AS (
+    SELECT p.Id           AS AnswerId,
+           p.ParentId     AS QuestionId,
+           LAG(p.Score) OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate) AS PrevAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+  ),
+  TagUnion AS (
+    SELECT TagName AS Name FROM Tags WHERE Count > 100
+    UNION
+    SELECT Tag     AS Name FROM TopTags
+  )
+SELECT *
+FROM (
+  SELECT
+    um.DisplayName,
+    um.Reputation,
+    um.GoldBadges,
+    um.QuestionsCount,
+    um.AnswersCount,
+    COALESCE(tt.TagUses, 0) AS PopularTagUses,
+    tue.Name              AS CombinedTagName,
+    COALESCE(lo.LinkTypeName, 'None') AS LastLinkType,
+    cw.Text               AS TopCommentText,
+    al.PrevAnswerScore,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = al.AnswerId
+          AND v.VoteTypeId = 2
+          AND v.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+      ) THEN 'RecentUpvoted'
+      ELSE 'Cold'
+    END AS AnswerStatus
+  FROM UserMetrics um
+  LEFT JOIN TopTags tt
+    ON tt.Tag = ANY(
+         string_to_array(
+           (
+             SELECT substring(p.Tags, 2, length(p.Tags) - 2)
+             FROM Posts p
+             WHERE p.OwnerUserId = um.UserId
+             LIMIT 1
+           ),
+           '><'
+         )
+       )
+  FULL OUTER JOIN TagUnion tue
+    ON tue.Name = tt.Tag
+  LEFT JOIN LinkOps lo
+    ON lo.PostId = (
+         SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = um.UserId
+         ORDER BY p.CreationDate DESC
+         LIMIT 1
+       )
+  LEFT JOIN CommentsWindow cw
+    ON cw.PostId = (
+         SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = um.UserId
+           AND p.PostTypeId = 1
+         LIMIT 1
+       )
+   AND cw.CommentRank = 1
+  LEFT JOIN AnswerLag al
+    ON al.QuestionId = (
+         SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = um.UserId
+           AND p.PostTypeId = 1
+         LIMIT 1
+       )
+  WHERE um.Rank <= 100
+
+  INTERSECT
+
+  SELECT
+    um2.DisplayName,
+    um2.Reputation,
+    um2.GoldBadges,
+    um2.QuestionsCount,
+    um2.AnswersCount,
+    0               AS PopularTagUses,
+    NULL            AS CombinedTagName,
+    'None'          AS LastLinkType,
+    NULL AS TopCommentText,
+    NULL AS PrevAnswerScore,
+    NULL AS AnswerStatus
+  FROM UserMetrics um2
+  WHERE um2.GoldBadges = 0
+) AS result
+ORDER BY Reputation DESC
+LIMIT 50;

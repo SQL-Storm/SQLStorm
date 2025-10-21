@@ -1,0 +1,128 @@
+WITH TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+    LIMIT 1000
+),
+UserPostMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        SUM(COALESCE(p.ViewCount, 0)) as TotalViews,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers
+    FROM Posts p
+    WHERE p.OwnerUserId IN (SELECT Id FROM TopUsersByReputation)
+        AND p.CreationDate >= '2020-01-01'
+    GROUP BY p.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) as TagBasedBadges
+    FROM Badges b
+    WHERE b.UserId IN (SELECT Id FROM TopUsersByReputation)
+    GROUP BY b.UserId
+),
+UserInteractionMetrics AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as UpvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as DownvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) as FavoritesCast,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) END) as TotalBountyOffered
+    FROM Votes v
+    WHERE v.UserId IN (SELECT Id FROM TopUsersByReputation)
+        AND v.CreationDate >= '2020-01-01'
+    GROUP BY v.UserId
+),
+PostEngagementMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.CommentCount) as AvgCommentsPerPost,
+        AVG(p.FavoriteCount) as AvgFavoritesPerPost,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        AVG(c.Score) as AvgCommentScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IN (SELECT Id FROM TopUsersByReputation)
+        AND p.CreationDate >= '2020-01-01'
+    GROUP BY p.OwnerUserId
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', '|'), '|')) as Tag,
+        COUNT(*) as TagUsageCount,
+        AVG(p.Score) as AvgScoreInTag
+    FROM Posts p
+    WHERE p.OwnerUserId IN (SELECT Id FROM TopUsersByReputation)
+        AND p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= '2020-01-01'
+    GROUP BY p.OwnerUserId, Tag
+),
+TopTagsPerUser AS (
+    SELECT 
+        OwnerUserId,
+        Tag,
+        TagUsageCount,
+        AvgScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagUsageCount DESC, AvgScoreInTag DESC) as TagRank
+    FROM TagExpertise
+)
+SELECT 
+    tu.Id as UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.ReputationRank,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - tu.CreationDate)) as AccountAgeDays,
+    COALESCE(upm.QuestionCount, 0) as QuestionsAsked,
+    COALESCE(upm.AnswerCount, 0) as AnswersGiven,
+    ROUND(COALESCE(upm.AvgQuestionScore, 0), 2) as AvgQuestionScore,
+    ROUND(COALESCE(upm.AvgAnswerScore, 0), 2) as AvgAnswerScore,
+    COALESCE(upm.TotalViews, 0) as TotalViewsOnPosts,
+    COALESCE(upm.QuestionsWithAcceptedAnswers, 0) as QuestionsWithAccepted,
+    COALESCE(ubs.GoldBadges, 0) as GoldBadgeCount,
+    COALESCE(ubs.SilverBadges, 0) as SilverBadgeCount,
+    COALESCE(ubs.BronzeBadges, 0) as BronzeBadgeCount,
+    COALESCE(ubs.TagBasedBadges, 0) as TagBasedBadgeCount,
+    COALESCE(uim.UpvotesCast, 0) as UpvotesCast,
+    COALESCE(uim.DownvotesCast, 0) as DownvotesCast,
+    COALESCE(uim.TotalBountyOffered, 0) as BountyPointsOffered,
+    ROUND(COALESCE(pem.AvgCommentsPerPost, 0), 2) as AvgCommentsPerPost,
+    ROUND(COALESCE(pem.AvgFavoritesPerPost, 0), 2) as AvgFavoritesPerPost,
+    COALESCE(pem.TotalComments, 0) as TotalCommentsReceived,
+    STRING_AGG(DISTINCT ttp.Tag || ':' || ttp.TagUsageCount, ', ' ORDER BY ttp.Tag || ':' || ttp.TagUsageCount) 
+        FILTER (WHERE ttp.TagRank <= 5) as Top5Tags,
+    CASE 
+        WHEN COALESCE(upm.AnswerCount, 0) > COALESCE(upm.QuestionCount, 0) * 3 THEN 'Answer-Focused'
+        WHEN COALESCE(upm.QuestionCount, 0) > COALESCE(upm.AnswerCount, 0) * 3 THEN 'Question-Focused'
+        ELSE 'Balanced'
+    END as UserActivityType
+FROM TopUsersByReputation tu
+LEFT JOIN UserPostMetrics upm ON tu.Id = upm.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON tu.Id = ubs.UserId
+LEFT JOIN UserInteractionMetrics uim ON tu.Id = uim.UserId
+LEFT JOIN PostEngagementMetrics pem ON tu.Id = pem.OwnerUserId
+LEFT JOIN TopTagsPerUser ttp ON tu.Id = ttp.OwnerUserId AND ttp.TagRank <= 5
+GROUP BY 
+    tu.Id, tu.DisplayName, tu.Reputation, tu.ReputationRank, tu.CreationDate,
+    upm.QuestionCount, upm.AnswerCount, upm.AvgQuestionScore, upm.AvgAnswerScore,
+    upm.TotalViews, upm.QuestionsWithAcceptedAnswers,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TagBasedBadges,
+    uim.UpvotesCast, uim.DownvotesCast, uim.TotalBountyOffered,
+    pem.AvgCommentsPerPost, pem.AvgFavoritesPerPost, pem.TotalComments
+HAVING COUNT(DISTINCT ttp.Tag) > 0
+ORDER BY tu.Reputation DESC, upm.AnswerCount DESC
+LIMIT 500;

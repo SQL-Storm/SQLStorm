@@ -1,0 +1,235 @@
+-- {"query": "7060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2804} 
+with
+-- active users with varied reputation segments and recent activity score
+user_activity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    greatest(0, date_part('day', now() - u.LastAccessDate)) as days_since_access,
+    -- composite activity score: recency, reputation, and badges
+    (coalesce(u.Reputation,0)::numeric / nullif(greatest(1, date_part('day', now() - u.CreationDate))),  ) as rep_per_day,
+    case
+      when u.Reputation >= 100000 then 'platinum'
+      when u.Reputation >= 20000 then 'gold'
+      when u.Reputation >= 5000 then 'silver'
+      when u.Reputation >= 500 then 'bronze'
+      else 'newbie'
+    end as rep_band
+  from Users u
+),
+-- badge aggregates per user (including tag-based separation)
+badge_aggr as (
+  select
+    b.UserId,
+    count(*) filter (where b.TagBased = 0) as named_badges,
+    count(*) filter (where b.TagBased = 1) as tag_badges,
+    sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 else 1 end) as weighted_badges,
+    max(b.Date) as last_badge_date
+  from Badges b
+  group by b.UserId
+),
+-- questions and derived tag metrics
+question_base as (
+  select
+    p.Id as QuestionId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    coalesce(p.Tags, '') as raw_tags,
+    -- split tags into one row per tag (Postgres string_to_array style used in schema note)
+    regexp_split_to_table(substring(coalesce(p.Tags,''), 2, greatest(0, length(coalesce(p.Tags,'')) - 2)), '><') as tag
+  from Posts p
+  where p.PostTypeId = 1
+),
+tag_stats as (
+  select
+    qb.tag,
+    count(*) as questions_with_tag,
+    avg(qb.Score) as avg_score,
+    percentile_cont(0.75) within group (order by qb.ViewCount) as view_75th,
+    sum(case when qb.AnswerCount = 0 then 1 else 0 end) as unanswered
+  from question_base qb
+  group by qb.tag
+),
+-- answers with link to question and acceptance info
+answer_base as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate,
+    case when q.AcceptedAnswerId = a.Id then true else false end as IsAccepted,
+    -- compute relative score to question
+    (a.Score::numeric - coalesce(q.Score,0)) as score_delta
+  from Posts a
+  left join Posts q on q.Id = a.ParentId
+  where a.PostTypeId = 2
+),
+-- voter behavior per question (complex correlated subquery)
+question_vote_behavior as (
+  select
+    q.Id as QuestionId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.CreationDate,
+    -- correlated subquery: recent upvote counts from distinct users in past 30 days
+    (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2 and v.CreationDate >= now() - interval '30 days') as recent_upvotes_30d,
+    (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3 and v.CreationDate >= now() - interval '365 days') as downvotes_1y,
+    -- fraction of votes that are upvotes historically (avoid div by zero)
+    (select
+       case when count(*) = 0 then null else sum(case when vt.VoteTypeId = 2 then 1 else 0 end)::numeric / count(*) end
+     from Votes vt where vt.PostId = q.Id) as pct_upvotes
+  from Posts q
+  where q.PostTypeId = 1
+),
+-- expensive text metrics and search-like expression evaluation
+post_text_metrics as (
+  select
+    p.Id as PostId,
+    length(coalesce(p.Title,'')) as title_len,
+    length(coalesce(p.Body,'')) as body_len,
+    (length(coalesce(p.Body,'')) - length(replace(coalesce(p.Body,''), '<code>', '')))/length('<code>') as code_tag_count,
+    -- approximate keyword density for 'performance' and 'sql'
+    (case when length(coalesce(p.Body,'')) > 0 then (length(lower(p.Body)) - length(replace(lower(p.Body),'performance','')))/length('performance')::numeric / greatest(1, length(p.Body)) else 0 end) as performance_density,
+    (case when length(coalesce(p.Body,'')) > 0 then (length(lower(p.Body)) - length(replace(lower(p.Body),'sql','')))/length('sql')::numeric / greatest(1, length(p.Body)) else 0 end) as sql_density
+  from Posts p
+  where p.PostTypeId in (1,2)
+),
+-- combine users with badges and activity, plus ranking window functions
+user_profile as (
+  select
+    ua.*,
+    coalesce(b.named_badges,0) as named_badges,
+    coalesce(b.tag_badges,0) as tag_badges,
+    coalesce(b.weighted_badges,0) as weighted_badges,
+    coalesce(b.last_badge_date, timestamp '1970-01-01') as last_badge_date,
+    -- user contribution counts
+    (select count(*) from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1) as questions_posted,
+    (select count(*) from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 2) as answers_posted,
+    -- recent activity: posts in last 90 days
+    (select count(*) from Posts p where p.OwnerUserId = ua.UserId and p.CreationDate >= now() - interval '90 days') as recent_posts_90d
+  from user_activity ua
+  left join badge_aggr b on b.UserId = ua.UserId
+),
+-- compute heavy join: for each question find top answerer and their stats
+question_top_answerers as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId as AskerId,
+    count(a.Id) filter (where a.PostTypeId = 2) as total_answers,
+    -- top answer by score, tiebreaker by earliest
+    (select a2.OwnerUserId from Posts a2 where a2.ParentId = q.Id and a2.PostTypeId = 2 order by a2.Score desc, a2.CreationDate asc limit 1) as TopAnswererId,
+    (select a2.Id from Posts a2 where a2.ParentId = q.Id and a2.PostTypeId = 2 order by a2.Score desc, a2.CreationDate asc limit 1) as TopAnswerId,
+    -- existence flags with outer join-like check
+    case when exists (select 1 from Posts a3 where a3.ParentId = q.Id and a3.Score >= 10) then true else false end as has_high_scoring_answer
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.OwnerUserId
+),
+-- assemble final heavy result set mixing everything and including set operators
+candidates as (
+  select
+    qta.QuestionId,
+    qta.Title,
+    qta.AskerId,
+    qta.TopAnswererId,
+    up.DisplayName as TopAnswererName,
+    up.Reputation as TopAnswererReputation,
+    up.reputation_per_day := null::numeric, -- placeholder to be replaced in outer select for complexity
+    qvb.recent_upvotes_30d,
+    qvb.downvotes_1y,
+    ptm.title_len,
+    ptm.body_len,
+    ts.tag as representative_tag,
+    ts.questions_with_tag,
+    ts.unanswered,
+    -- composite score mixing many things (deliberately convoluted)
+    (
+      coalesce(qta.total_answers,0) * 1.5
+      + coalesce(qvb.recent_upvotes_30d,0) * 0.75
+      + coalesce(up.Reputation,0)::numeric / nullif(greatest(1, date_part('day', now() - coalesce((select u.CreationDate from Users u where u.Id = up.Id), now()))),1)
+      - coalesce(qvb.downvotes_1y,0) * 0.5
+      + coalesce(ts.questions_with_tag,0)::numeric / nullif(coalesce(ts.unanswered,0)+1,1)
+      - (case when ptm.code_tag_count > 3 then 2 else 0 end)
+    ) as heuristic_score
+  from question_top_answerers qta
+  left join Posts p on p.Id = qta.QuestionId
+  left join question_vote_behavior qvb on qvb.QuestionId = qta.QuestionId
+  left join post_text_metrics ptm on ptm.PostId = qta.QuestionId
+  left join (
+    select distinct on (qb.QuestionId) qb.QuestionId, qb.tag
+    from question_base qb
+    order by qb.QuestionId, qb.tag
+  ) ts on ts.QuestionId = qta.QuestionId
+  left join Users up on up.Id = qta.TopAnswererId
+),
+-- create a complex ranked union of top candidates and recent hot questions
+hot_and_top as (
+  select
+    c.*,
+    row_number() over (order by c.heuristic_score desc nulls last) as rank_by_heuristic
+  from candidates c
+  where c.heuristic_score is not null
+  union
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId as AskerId,
+    null::int as TopAnswererId,
+    null::varchar as TopAnswererName,
+    null::int as TopAnswererReputation,
+    null::numeric as reputation_per_day,
+    (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2 and v.CreationDate >= now() - interval '7 days') as recent_upvotes_7d,
+    null::int as downvotes_1y,
+    length(coalesce(q.Title,'')) as title_len,
+    length(coalesce(q.Body,'')) as body_len,
+    null::varchar as representative_tag,
+    null::int as questions_with_tag,
+    null::int as unanswered,
+    (coalesce(q.Score,0) * 2 + coalesce(q.ViewCount,0)::numeric/1000) as heuristic_score
+  from Posts q
+  where q.PostTypeId = 1 and q.LastActivityDate >= now() - interval '7 days'
+)
+
+select
+  h.QuestionId,
+  left(h.Title, 200) as ShortTitle,
+  h.AskerId,
+  h.TopAnswererId,
+  h.TopAnswererName,
+  h.TopAnswererReputation,
+  -- complex null/COALESCE logic to produce a normalized reputation-per-day
+  coalesce(
+    (case when h.TopAnswererReputation is not null and h.TopAnswererReputation > 0
+          then h.TopAnswererReputation::numeric / nullif(date_part('day', now() - coalesce((select u.CreationDate from Users u where u.Id = h.TopAnswererId), now() )),0)
+          else null end),
+    0
+  ) as Normalized_Reputation_Per_Day,
+  h.recent_upvotes_30d,
+  h.downvotes_1y,
+  h.title_len,
+  h.body_len,
+  h.representative_tag,
+  h.questions_with_tag,
+  h.unanswered,
+  round(h.heuristic_score::numeric,3) as HeuristicScore,
+  h.rank_by_heuristic
+from hot_and_top h
+where
+  -- complicated predicate combining null-safe comparisons, regex, and numeric filters
+  (
+    (h.heuristic_score > 5 and coalesce(h.questions_with_tag,0) > 10)
+    or
+    (h.recent_upvotes_30d is not null and h.recent_upvotes_30d >= 3)
+    or
+    (h.title_len >= 60 and h.body_len >= 500 and (h.representative_tag ~* 'perf|sql|index|query'))
+  )
+  and (h.unanswered is null or h.unanswered < greatest(1, coalesce(h.questions_with_tag,0)/10))
+order by h.rank_by_heuristic nulls last, HeuristicScore desc
+limit 200;

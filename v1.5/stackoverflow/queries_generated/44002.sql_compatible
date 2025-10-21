@@ -1,0 +1,22 @@
+SELECT 
+  CAST(DATEDIFF(SECOND, p.CreationDate, p.LastEditDate) AS FLOAT) / NULLIF(DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate), 0) AS PostEditToActivityRatio,
+  CAST(p.CommentCount AS FLOAT) / NULLIF(DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate), 0) AS CommentPerSecond,
+  CAST(p.AnswerCount AS FLOAT) / NULLIF(DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate), 0) AS AnswerPerSecond,
+  CAST(p.ViewCount AS FLOAT) / NULLIF(DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate), 0) AS ViewPerSecond,
+  CAST(p.FavoriteCount AS FLOAT) / NULLIF(DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate), 0) AS FavoritePerSecond,
+  CAST(COALESCE(u.UpVotes, 0) AS FLOAT) / NULLIF(DATEDIFF(SECOND, u.CreationDate, u.LastAccessDate), 0) AS UpVotePerSecond,
+  CAST(COALESCE(u.DownVotes, 0) AS FLOAT) / NULLIF(DATEDIFF(SECOND, u.CreationDate, u.LastAccessDate), 0) AS DownVotePerSecond,
+  CAST(COALESCE(b.Count, 0) AS FLOAT) / NULLIF(DATEDIFF(SECOND, b.Date, TIMESTAMP '2024-10-01 12:34:56'), 0) AS BadgesPerSecond
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT 
+    UserId, 
+    COUNT(*) AS Count, 
+    MAX(Date) AS Date 
+  FROM Badges
+  GROUP BY UserId
+) b ON p.OwnerUserId = b.UserId
+WHERE p.PostTypeId = 1
+ORDER BY CAST(COALESCE(p.CommentCount, 0) AS FLOAT) / NULLIF(DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate), 0) DESC
+LIMIT 10;

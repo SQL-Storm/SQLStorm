@@ -1,0 +1,64 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId 
+    WHERE 
+        p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, u.DisplayName, p.Title, p.CreationDate, p.Score, p.ViewCount
+),
+TopPosts AS (
+    SELECT 
+        PostId, 
+        Title, 
+        OwnerDisplayName, 
+        CreationDate, 
+        Score, 
+        ViewCount, 
+        VoteCount
+    FROM 
+        RankedPosts
+    WHERE 
+        rn = 1
+    ORDER BY 
+        VoteCount DESC, 
+        Score DESC 
+    LIMIT 10
+)
+SELECT 
+    tp.Title,
+    tp.OwnerDisplayName,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    CASE 
+        WHEN tp.Score >= 50 THEN 'High Score' 
+        WHEN tp.Score < 50 AND tp.Score >= 10 THEN 'Medium Score' 
+        ELSE 'Low Score' 
+    END AS ScoreCategory,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+FROM 
+    TopPosts tp
+LEFT JOIN 
+    Posts p ON tp.PostId = p.Id
+LEFT JOIN 
+    UNNEST(string_to_array(p.Tags, ',')) AS tag_list(tag)
+LEFT JOIN 
+    Tags t ON t.TagName = TRIM(tag_list.tag)
+GROUP BY 
+    tp.Title, tp.OwnerDisplayName, tp.CreationDate, tp.Score, tp.ViewCount
+ORDER BY 
+    tp.Score DESC, 
+    tp.ViewCount DESC;

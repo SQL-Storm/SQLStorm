@@ -1,0 +1,211 @@
+-- {"query": "19098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3055} 
+
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE B.Class WHEN 1 THEN 5 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END) AS BadgeClassScore,
+        COALESCE(U.UpVotes - U.DownVotes + COUNT(DISTINCT P.Id) * 2 + COUNT(DISTINCT C.Id) * 0.5 + SUM(CASE B.Class WHEN 1 THEN 5 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END), 0) AS UserActivityScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        P.ClosedDate,
+        (P.Score * 3 + P.ViewCount * 0.1 + COALESCE(P.AnswerCount, 0) * 5 + P.CommentCount * 2 + COALESCE(P.FavoriteCount, 0) * 10) AS RawEngagementScore,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        (SELECT PH_Inner.Comment FROM PostHistory PH_Inner
+         WHERE PH_Inner.PostId = P.Id
+           AND PH_Inner.PostHistoryTypeId IN (4, 5, 6, 10) -- Edit Title, Edit Body, Edit Tags, Post Closed
+           AND PH_Inner.Comment IS NOT NULL
+         ORDER BY PH_Inner.CreationDate DESC
+         LIMIT 1) AS LastMajorEditComment,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN P.AcceptedAnswerId IS NOT NULL AND COALESCE(P.AnswerCount, 0) > 0 THEN 'Answered'
+            WHEN P.AnswerCount = 0 AND P.PostTypeId = 1 THEN 'Unanswered'
+            ELSE 'Active'
+        END AS PostStatusClassification,
+        P.Body AS PostBody -- Include body for string expressions later
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 14, 15, 16)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.Title, P.Tags, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, P.AcceptedAnswerId, P.Body
+),
+TagPopularity AS (
+    SELECT
+        unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName,
+        P.Id AS PostId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+),
+AggregatedTagStats AS (
+    SELECT
+        TP.TagName,
+        COUNT(DISTINCT TP.PostId) AS QuestionsTagged,
+        SUM(TP.Score) AS TotalTagScore,
+        AVG(TP.Score) AS AverageTagScore,
+        SUM(TP.ViewCount) AS TotalTagViews,
+        SUM(TP.AnswerCount) AS TotalTagAnswers
+    FROM TagPopularity TP
+    GROUP BY TP.TagName
+),
+AdvancedPostAnalysis AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostCreationDate,
+        PEM.PostScore,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.RawEngagementScore,
+        PEM.HasAcceptedAnswer,
+        PEM.PostStatusClassification,
+        PEM.Title,
+        PEM.Tags,
+        PEM.DistinctEditors,
+        PEM.LastMajorEditComment,
+        PEM.PostBody, -- Pass PostBody through
+        COALESCE(SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END), 0) AS LinkedPostCount,
+        COALESCE(SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END), 0) AS DuplicatePostCount,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM PEM.PostCreationDate), PEM.PostTypeId ORDER BY PEM.RawEngagementScore DESC) AS PostEngagementRank,
+        COALESCE(EXTRACT(DAY FROM (PEM.PostCreationDate - LAG(PEM.PostCreationDate) OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.PostCreationDate))), 0) AS DaysSinceLastPostByOwner,
+        NTILE(10) OVER (PARTITION BY EXTRACT(YEAR FROM PEM.PostCreationDate), EXTRACT(MONTH FROM PEM.PostCreationDate) ORDER BY PEM.ViewCount DESC) AS ViewCountPercentileGroup
+    FROM PostEngagementMetrics PEM
+    LEFT JOIN PostLinks PL ON PEM.PostId = PL.PostId OR PEM.PostId = PL.RelatedPostId
+    GROUP BY PEM.PostId, PEM.OwnerUserId, PEM.PostCreationDate, PEM.PostScore, PEM.ViewCount, PEM.AnswerCount, PEM.RawEngagementScore, PEM.HasAcceptedAnswer, PEM.PostStatusClassification, PEM.Title, PEM.Tags, PEM.DistinctEditors, PEM.LastMajorEditComment, PEM.PostBody
+),
+MonthlyVoteSummary AS (
+    SELECT
+        EXTRACT(YEAR FROM V.CreationDate) AS VoteYear,
+        EXTRACT(MONTH FROM V.CreationDate) AS VoteMonth,
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId IN (1, 2, 8, 9, 11, 15, 16) THEN 1 ELSE 0 END) AS MonthlyPositiveVotes,
+        SUM(CASE WHEN V.VoteTypeId IN (3, 4, 6, 7, 10, 12, 14) THEN 1 ELSE 0 END) AS MonthlyNegativeVotes,
+        COUNT(DISTINCT V.UserId) AS MonthlyUniqueVoters
+    FROM Votes V
+    WHERE V.CreationDate BETWEEN '2020-01-01' AND '2022-12-31'
+    GROUP BY EXTRACT(YEAR FROM V.CreationDate), EXTRACT(MONTH FROM V.CreationDate), V.PostId
+)
+SELECT
+    US.UserId,
+    US.DisplayName,
+    US.Reputation,
+    US.UserActivityScore,
+    US.TotalPosts,
+    US.TotalComments,
+    US.TotalBadges,
+    US.BadgeClassScore,
+    APA.PostId,
+    APA.Title AS PostTitle,
+    APA.PostCreationDate,
+    APA.PostScore,
+    APA.ViewCount,
+    APA.AnswerCount,
+    APA.RawEngagementScore,
+    APA.HasAcceptedAnswer,
+    APA.PostStatusClassification,
+    APA.DistinctEditors,
+    APA.LastMajorEditComment,
+    APA.LinkedPostCount,
+    APA.DuplicatePostCount,
+    APA.PostEngagementRank,
+    APA.DaysSinceLastPostByOwner,
+    APA.ViewCountPercentileGroup,
+    ATS.TagName AS MostRelevantTag,
+    COALESCE(ATS.TotalTagScore, 0) AS TagTotalScore,
+    COALESCE(ATS.AverageTagScore, 0.0) AS TagAverageScore,
+    COALESCE(MVS.MonthlyPositiveVotes, 0) AS MonthlyPositiveVotes,
+    COALESCE(MVS.MonthlyNegativeVotes, 0) AS MonthlyNegativeVotes,
+    ROUND(
+        COALESCE(
+            (US.UserActivityScore * 0.1)
+            + (APA.RawEngagementScore / NULLIF(APA.ViewCount, 0) * 100)
+            + (ATS.AverageTagScore / NULLIF(ATS.QuestionsTagged, 0) * 5)
+            + (COALESCE(MVS.MonthlyPositiveVotes, 0) - COALESCE(MVS.MonthlyNegativeVotes, 0))
+            + (CASE WHEN APA.HasAcceptedAnswer THEN 20 ELSE 0 END)
+            + (CASE WHEN US.TotalBadges > 100 THEN 50 ELSE 0 END)
+            + (LENGTH(APA.PostBody) / 1000.0) * 0.5, -- Factor in body length for answers/questions
+            0.0
+        )::numeric, 2
+    ) AS CompositeScore,
+    CASE
+        WHEN APA.Title ILIKE '%performance%' OR APA.Title ILIKE '%benchmark%' OR APA.Tags ILIKE '%<performance>%' THEN 'PerformanceRelated'
+        WHEN APA.LastMajorEditComment ILIKE '%fix%' OR APA.LastMajorEditComment ILIKE '%bug%' OR APA.Title ILIKE '%bug%' THEN 'MaintenanceRelated'
+        ELSE 'General'
+    END AS PostKeywordCategory,
+    EXISTS (
+        SELECT 1
+        FROM Badges B_inner
+        WHERE B_inner.UserId = US.UserId
+          AND B_inner.Class = 1
+          AND B_inner.TagBased = TRUE
+          AND B_inner.Name IN ('sql', 'database', 'performance', 'indexing', 'optimization')
+    ) AS HasRelevantGoldTagBadge,
+    (SELECT AVG(P_other.Score)
+     FROM Posts P_other
+     WHERE P_other.OwnerUserId = APA.OwnerUserId
+       AND EXTRACT(YEAR FROM P_other.CreationDate) = EXTRACT(YEAR FROM APA.PostCreationDate)
+       AND P_other.Id != APA.PostId
+       AND P_other.PostTypeId = APA.PostTypeId
+    ) AS AvgOtherPostsScoreByOwnerInYear
+FROM UserStats US
+LEFT JOIN AdvancedPostAnalysis APA ON US.UserId = APA.OwnerUserId
+LEFT JOIN AggregatedTagStats ATS ON APA.Tags ILIKE '%' || ATS.TagName || '%'
+LEFT JOIN MonthlyVoteSummary MVS ON APA.PostId = MVS.PostId
+                                AND EXTRACT(YEAR FROM APA.PostCreationDate) = MVS.VoteYear
+                                AND EXTRACT(MONTH FROM APA.PostCreationDate) = MVS.VoteMonth
+WHERE
+    US.Reputation > 5000
+    AND US.DisplayName IS NOT NULL AND LENGTH(TRIM(US.DisplayName)) > 5
+    AND US.UserActivityScore > 200
+    AND APA.PostId IS NOT NULL
+    AND APA.PostStatusClassification IN ('Answered', 'Active')
+    AND APA.PostEngagementRank <= 250
+    AND (APA.LinkedPostCount > 0 OR APA.DuplicatePostCount > 0 OR APA.DaysSinceLastPostByOwner BETWEEN 1 AND 90)
+    AND (
+        (APA.Tags ILIKE '%<sql>%' OR APA.Tags ILIKE '%<optimization>%')
+        AND (APA.ViewCount > 1000 AND APA.AnswerCount >= 2)
+        OR
+        (APA.PostTypeId = 2 AND APA.PostScore > 50 AND LENGTH(APA.PostBody) > 500)
+    )
+    AND (COALESCE(MVS.MonthlyPositiveVotes, 0) > COALESCE(MVS.MonthlyNegativeVotes, 0) * 1.5 OR MVS.MonthlyUniqueVoters IS NULL)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory PH_Del
+        WHERE PH_Del.PostId = APA.PostId
+          AND PH_Del.PostHistoryTypeId = 12
+    )
+ORDER BY
+    CompositeScore DESC,
+    US.Reputation DESC,
+    APA.RawEngagementScore DESC
+LIMIT 1000;

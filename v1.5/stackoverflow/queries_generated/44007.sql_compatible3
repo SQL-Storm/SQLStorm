@@ -1,0 +1,43 @@
+SELECT 
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS PostAgeDays,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN DATEDIFF(day, p.CreationDate, p.ClosedDate) ELSE NULL END AS PostClosedDays,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN DATEDIFF(day, p.CreationDate, p.CommunityOwnedDate) ELSE NULL END AS PostCommunityOwnedDays,
+    COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT pl.Id) AS PostLinkCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 7 THEN 1 ELSE 0 END) AS ReopenVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS DeletionVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 11 THEN 1 ELSE 0 END) AS UndeletionVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 12 THEN 1 ELSE 0 END) AS SpamVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 14 THEN 1 ELSE 0 END) AS ModeratorNominationVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 15 THEN 1 ELSE 0 END) AS ModeratorReviewVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 16 THEN 1 ELSE 0 END) AS ApproveEditSuggestionVoteCount
+FROM Posts p
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+GROUP BY 
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.CreationDate
+ORDER BY PostAgeDays DESC;

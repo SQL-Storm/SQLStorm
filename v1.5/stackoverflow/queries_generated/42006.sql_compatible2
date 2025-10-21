@@ -1,0 +1,64 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id, 
+        P.PostTypeId, 
+        P.Score, 
+        P.ViewCount, 
+        P.CreationDate, 
+        U.Reputation, 
+        COUNT(C.Id) AS CommentCount,
+        COUNT(V.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS PostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) AND 
+        P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1 year'
+    GROUP BY 
+        P.Id, U.Reputation
+), 
+TopUsers AS (
+    SELECT 
+        U.Id, 
+        U.Reputation, 
+        U.CreationDate, 
+        COUNT(B.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        U.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1 year'
+    GROUP BY 
+        U.Id, U.Reputation, U.CreationDate
+)
+SELECT 
+    RP.Id AS PostId, 
+    RP.PostTypeId, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.CreationDate AS PostCreationDate, 
+    TU.Id AS UserId, 
+    TU.Reputation, 
+    TU.CreationDate AS UserCreationDate, 
+    RP.CommentCount, 
+    RP.VoteCount, 
+    RP.PostRank, 
+    TU.UserRank
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+WHERE 
+    RP.PostRank <= 10 AND 
+    TU.UserRank <= 10
+ORDER BY 
+    RP.Score DESC, 
+    TU.Reputation DESC;

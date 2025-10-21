@@ -1,0 +1,216 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(DATEDIFF(day, u.CreationDate, TIMESTAMP '2024-10-01 12:34:56') AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Active'
+            ELSE 'New'
+        END as UserStatus,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, TotalPosts, TotalScore, ScoreRank, PostRank
+    FROM UserActivityStats
+    WHERE ScoreRank <= 100
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CAST(DATEDIFF(day, p.CreationDate, TIMESTAMP '2024-10-01 12:34:56') AS INTEGER) as AgeInDays,
+        CASE 
+            WHEN p.Score > 10 THEN 'High Engagement'
+            WHEN p.Score > 5 THEN 'Medium Engagement'
+            WHEN p.Score > 0 THEN 'Low Engagement'
+            ELSE 'No Votes'
+        END as EngagementLevel,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as OwnerAvgScore,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END as QuestionStatus
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CAST(DATEDIFF(day, a.CreationDate, TIMESTAMP '2024-10-01 12:34:56') AS INTEGER) as AgeInDays,
+        CASE 
+            WHEN a.Score > 10 THEN 'High Value'
+            WHEN a.Score > 5 THEN 'Medium Value'
+            WHEN a.Score > 0 THEN 'Low Value'
+            ELSE 'No Value'
+        END as ValueLevel,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as AnswerRank
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+),
+UserActivityWithTags AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.Comments,
+        ua.Badges,
+        ua.TotalScore,
+        ua.TotalViews,
+        ua.LastPostDate,
+        ua.AccountAgeDays,
+        ua.UserStatus,
+        ua.PostRank,
+        ua.ScoreRank,
+        STRING_AGG(COALESCE(t.TagName, ''), ', ' ORDER BY t.TagName) as UserTags
+    FROM UserActivityStats ua
+    LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+    LEFT JOIN (
+        SELECT p.Id, UNNEST(STRING_TO_ARRAY(p.Tags, '><')) as TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.Tags != ''
+    ) tag ON p.Id = tag.Id
+    LEFT JOIN Tags t ON TRIM(tag.TagName, '<>') = t.TagName
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.TotalPosts, ua.Questions, ua.Answers, 
+             ua.Comments, ua.Badges, ua.TotalScore, ua.TotalViews, ua.LastPostDate, 
+             ua.AccountAgeDays, ua.UserStatus, ua.PostRank, ua.ScoreRank
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.AgeInDays,
+        q.EngagementLevel,
+        q.ScoreRank,
+        q.OwnerAvgScore,
+        q.QuestionStatus,
+        CASE 
+            WHEN q.AnswerCount = 0 THEN 'No Answers'
+            WHEN q.AnswerCount < 5 THEN 'Few Answers'
+            WHEN q.AnswerCount < 10 THEN 'Some Answers'
+            ELSE 'Many Answers'
+        END as AnswerAvailability,
+        (q.Score * 1.0 / NULLIF(q.ViewCount, 0)) as ScoreToViewRatio,
+        PERCENT_RANK() OVER (ORDER BY q.Score) as ScorePercentile,
+        LAG(q.Score, 1) OVER (ORDER BY q.CreationDate) as PreviousScore,
+        LEAD(q.Score, 1) OVER (ORDER BY q.CreationDate) as NextScore,
+        AVG(q.Score) OVER (ORDER BY q.CreationDate ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) as MovingAvgScore
+    FROM QuestionAnalysis q
+)
+SELECT 
+    cpa.QuestionId,
+    cpa.Title,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.CreationDate,
+    cpa.OwnerUserId,
+    cpa.OwnerName,
+    cpa.AgeInDays,
+    cpa.EngagementLevel,
+    cpa.ScoreRank,
+    cpa.OwnerAvgScore,
+    cpa.QuestionStatus,
+    cpa.AnswerAvailability,
+    ROUND(cpa.ScoreToViewRatio, 4) as ScoreToViewRatio,
+    ROUND(cpa.ScorePercentile, 3) as ScorePercentile,
+    COALESCE(cpa.PreviousScore, 0) as PreviousScore,
+    COALESCE(cpa.NextScore, 0) as NextScore,
+    ROUND(cpa.MovingAvgScore, 2) as MovingAvgScore,
+    CASE 
+        WHEN cpa.ScoreToViewRatio > 0.05 THEN 'Highly Engaging'
+        WHEN cpa.ScoreToViewRatio > 0.01 THEN 'Moderately Engaging'
+        WHEN cpa.ScoreToViewRatio > 0 THEN 'Low Engagement'
+        ELSE 'No Engagement'
+    END as EngagementCategory,
+    ROW_NUMBER() OVER (ORDER BY cpa.Score DESC) as OverallRank,
+    DENSE_RANK() OVER (ORDER BY cpa.OwnerUserId) as UserQuestionRank,
+    COUNT(*) OVER () as TotalQuestions,
+    COUNT(*) OVER (PARTITION BY cpa.OwnerUserId) as UserQuestionCount,
+    (SELECT COUNT(*) FROM AnswerAnalysis aa WHERE aa.QuestionId = cpa.QuestionId) as AnswerCountActual,
+    (SELECT COUNT(*) FROM Comments cm WHERE cm.PostId = cpa.QuestionId) as CommentCountActual,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cpa.QuestionId AND v.VoteTypeId IN (2, 3)) as VoteCount,
+    (SELECT AVG(AnswerScore) FROM (
+        SELECT a.Score as AnswerScore
+        FROM AnswerAnalysis a
+        WHERE a.QuestionId = cpa.QuestionId
+    ) sub) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Badges b INNER JOIN Posts p ON b.UserId = p.OwnerUserId WHERE p.Id = cpa.QuestionId AND b.Name = 'Great Question') as GreatQuestionBadgeCount,
+    (SELECT COUNT(*) FROM VoteTypes vt WHERE vt.Id IN (2, 3) AND EXISTS (
+        SELECT 1 FROM Votes v WHERE v.PostId = cpa.QuestionId AND v.VoteTypeId = vt.Id
+    )) as VoteTypeCount,
+    CASE 
+        WHEN cpa.AgeInDays > 365 THEN 'Legacy'
+        WHEN cpa.AgeInDays < 30 THEN 'Fresh'
+        ELSE 'Regular'
+    END as QuestionAgeGroup,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = cpa.QuestionId) THEN 'Linked'
+        ELSE 'Unlinked'
+    END as LinkStatus
+FROM ComplexPostAnalysis cpa
+WHERE cpa.Score > 0 
+    AND cpa.AgeInDays < 3650
+    AND cpa.OwnerAvgScore > 5
+    AND (cpa.QuestionStatus IN ('Open', 'Answered') OR cpa.QuestionStatus IS NULL)
+ORDER BY cpa.Score DESC, cpa.CreationDate DESC
+OFFSET 0 ROWS
+FETCH NEXT 5000 ROWS ONLY;

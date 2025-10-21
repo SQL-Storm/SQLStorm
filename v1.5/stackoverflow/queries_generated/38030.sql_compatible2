@@ -1,0 +1,201 @@
+with recent_users as (
+    select u.id as user_id, u.displayname, u.reputation, u.creationdate
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+hot_questions as (
+    select p.id as question_id,
+           p.creationdate,
+           p.title,
+           p.tags,
+           p.viewcount,
+           p.score,
+           p.ownERuserid as owner_user_id,
+           coalesce(p.answercount, 0) as answercount
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+      and p.viewcount is not null
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answer_user_id,
+           a.score as answer_score,
+           a.creationdate as answer_date
+    from posts a
+    where a.posttypeid = 2
+),
+first_answer as (
+    select a.question_id,
+           min(a.answer_date) as first_answer_date
+    from answers a
+    group by a.question_id
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+           count(*) as total_votes
+    from votes v
+    where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+    group by v.postid
+),
+comments_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           sum(greatest(c.score,0)) as comment_score_nonneg,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+    group by c.postid
+),
+dup_links as (
+    select pl.postid as question_id,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+           count(*) filter (where pl.linktypeid = 1) as linked_links
+    from postlinks pl
+    where pl.creationdate >= (select max(creationdate) - interval '365 days' from postlinks)
+    group by pl.postid
+),
+closed_reasons as (
+    select ph.postid as question_id,
+           max(ph.creationdate) as last_close_date,
+           max(case when ph.posthistorytypeid = 10 then ph.comment end) as close_reason_id_str
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_expanded as (
+    select hq.question_id,
+           unnest(string_to_array(substring(hq.tags, 2, length(hq.tags)-2), '><')) as tag
+    from hot_questions hq
+    where hq.tags is not null and hq.tags like '<%>'
+),
+tag_stats as (
+    select te.tag,
+           count(distinct te.question_id) as tag_questions,
+           sum(hq.viewcount) as tag_views,
+           avg(hq.score) as tag_avg_score
+    from tag_expanded te
+    join hot_questions hq on hq.question_id = te.question_id
+    group by te.tag
+    having count(distinct te.question_id) >= 50
+),
+owner_badges as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_metrics as (
+    select
+        hq.question_id,
+        hq.creationdate as question_date,
+        hq.title,
+        hq.tags,
+        hq.viewcount,
+        hq.score as question_score,
+        hq.answercount,
+        hq.owner_user_id,
+        fa.first_answer_date,
+        extract(epoch from (fa.first_answer_date - hq.creationdate))/3600.0 as hours_to_first_answer,
+        va.upvotes,
+        va.downvotes,
+        va.favorites,
+        va.bounty_started,
+        va.bounty_awarded,
+        va.total_votes,
+        ca.comment_count,
+        ca.comment_score_nonneg,
+        ca.last_comment_date,
+        dl.duplicate_links,
+        dl.linked_links,
+        cr.last_close_date,
+        cr.close_reason_id_str
+    from hot_questions hq
+    left join first_answer fa on fa.question_id = hq.question_id
+    left join votes_agg va on va.postid = hq.question_id
+    left join comments_agg ca on ca.postid = hq.question_id
+    left join dup_links dl on dl.question_id = hq.question_id
+    left join closed_reasons cr on cr.question_id = hq.question_id
+),
+owner_enriched as (
+    select
+        qm.*,
+        u.displayname as owner_displayname,
+        u.reputation as owner_reputation,
+        u.views as owner_profile_views,
+        coalesce(ob.total_badges,0) as owner_total_badges,
+        coalesce(ob.gold_badges,0) as owner_gold_badges,
+        coalesce(ob.silver_badges,0) as owner_silver_badges,
+        coalesce(ob.bronze_badges,0) as owner_bronze_badges
+    from question_metrics qm
+    left join users u on u.id = qm.owner_user_id
+    left join owner_badges ob on ob.userid = qm.owner_user_id
+),
+ranked_by_tag as (
+    select
+        oe.*,
+        te.tag,
+        ts.tag_questions,
+        ts.tag_views,
+        ts.tag_avg_score,
+        rank() over (partition by te.tag order by oe.viewcount desc, oe.question_score desc, oe.question_id) as tag_view_rank,
+        dense_rank() over (partition by te.tag order by coalesce(oe.hours_to_first_answer, 1e9)) as tag_speed_rank
+    from owner_enriched oe
+    left join tag_expanded te on te.question_id = oe.question_id
+    left join tag_stats ts on ts.tag = te.tag
+),
+final_scored as (
+    select
+        rbt.*,
+        (
+            0.40 * ln(1 + greatest(rbt.viewcount,0)) +
+            0.25 * coalesce(rbt.upvotes,0) -
+            0.15 * coalesce(rbt.downvotes,0) +
+            0.10 * coalesce(rbt.favorites,0) +
+            0.20 * coalesce(rbt.question_score,0) +
+            0.10 * coalesce(rbt.linked_links,0) -
+            0.10 * coalesce(rbt.duplicate_links,0) +
+            0.08 * ln(1 + coalesce(rbt.comment_count,0)) +
+            0.12 * case when rbt.hours_to_first_answer is null then -5 else greatest(0, 48 - rbt.hours_to_first_answer)/48 end * 10 +
+            0.05 * ln(1 + coalesce(rbt.owner_reputation,0)) +
+            0.03 * coalesce(rbt.owner_gold_badges,0) +
+            0.02 * coalesce(rbt.owner_silver_badges,0) +
+            0.01 * coalesce(rbt.owner_bronze_badges,0)
+        ) as composite_score
+    from ranked_by_tag rbt
+)
+select
+    fs.question_id,
+    fs.title,
+    fs.tag,
+    fs.viewcount,
+    fs.question_score,
+    fs.upvotes,
+    fs.downvotes,
+    fs.favorites,
+    fs.answercount,
+    round(fs.hours_to_first_answer::numeric, 2) as hours_to_first_answer,
+    fs.owner_user_id,
+    fs.owner_displayname,
+    fs.owner_reputation,
+    fs.owner_total_badges,
+    fs.tag_questions,
+    fs.tag_view_rank,
+    fs.tag_speed_rank,
+    round(fs.composite_score::numeric, 3) as composite_score,
+    fs.last_close_date,
+    fs.close_reason_id_str
+from final_scored fs
+where fs.tag_questions is not null
+QUALIFY ROW_NUMBER() OVER (PARTITION BY fs.tag ORDER BY fs.composite_score DESC, fs.viewcount DESC, fs.question_id) <= 10
+ORDER BY fs.composite_score DESC, fs.viewcount DESC, fs.question_id;

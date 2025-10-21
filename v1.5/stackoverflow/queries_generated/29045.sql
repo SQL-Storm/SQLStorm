@@ -1,0 +1,244 @@
+-- {"query": "29045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2268} 
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName as OwnerDisplayName,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END as PostType,
+    COALESCE(p.AnswerCount, 0) as AnswerCount,
+    COALESCE(p.CommentCount, 0) as CommentCount,
+    COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.ParentId IS NOT NULL THEN 'Answer'
+        ELSE 'Question'
+    END as PostStatus,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)),
+        0
+    ) as TotalVotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+        0
+    ) as UpVotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+        0
+    ) as DownVotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+        0
+    ) as CommentCountActual,
+    COALESCE(
+        (SELECT COUNT(DISTINCT UserId) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,4,5,6)),
+        0
+    ) as EditorCount,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId IN (1,4,5,6) THEN 
+                    'Edit by ' || COALESCE(ph.UserDisplayName, 'Unknown') || ' on ' || ph.CreationDate::DATE::VARCHAR
+                WHEN ph.PostHistoryTypeId = 10 THEN 
+                    'Closed on ' || ph.CreationDate::DATE::VARCHAR
+                WHEN ph.PostHistoryTypeId = 11 THEN 
+                    'Reopened on ' || ph.CreationDate::DATE::VARCHAR
+                WHEN ph.PostHistoryTypeId IN (12,13) THEN 
+                    'Deleted/Restored on ' || ph.CreationDate::DATE::VARCHAR
+                ELSE 'Other'
+            END,
+            '; '
+            ORDER BY ph.CreationDate
+        )
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,4,5,6,10,11,12,13)
+    ) as HistorySummary,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 1),
+        0
+    ) as GoldBadgesCount,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 2),
+        0
+    ) as SilverBadgesCount,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 3),
+        0
+    ) as BronzeBadgesCount,
+    CASE 
+        WHEN p.Title IS NULL OR LENGTH(TRIM(p.Title)) = 0 THEN 'No Title'
+        WHEN LENGTH(p.Title) < 10 THEN 'Very Short Title'
+        WHEN LENGTH(p.Title) BETWEEN 10 AND 50 THEN 'Medium Title'
+        WHEN LENGTH(p.Title) > 50 THEN 'Long Title'
+        ELSE 'Regular Title'
+    END as TitleLengthCategory,
+    CASE 
+        WHEN p.Score IS NULL OR p.Score = 0 THEN 'No Score'
+        WHEN p.Score < 0 THEN 'Negative Score'
+        WHEN p.Score BETWEEN 1 AND 10 THEN 'Low Score'
+        WHEN p.Score BETWEEN 11 AND 100 THEN 'Medium Score'
+        WHEN p.Score > 100 THEN 'High Score'
+        ELSE 'Unknown Score'
+    END as ScoreCategory,
+    PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+    RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as PostingOrder,
+    LAG(p.Score) OVER (ORDER BY p.CreationDate) as PreviousScore,
+    LEAD(p.Score) OVER (ORDER BY p.CreationDate) as NextScore,
+    ABS(p.Score - LAG(p.Score) OVER (ORDER BY p.CreationDate)) as ScoreChangeFromPrevious,
+    COALESCE(
+        (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id),
+        0
+    ) as AvgVoteScore,
+    (
+        SELECT STRING_AGG(
+            REPLACE(
+                REGEXP_REPLACE(
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(
+                                    REPLACE(
+                                        REPLACE(
+                                            REPLACE(p.Tags, '<', ''), 
+                                        '>', ''), 
+                                    '/', ''), 
+                                '?', ''), 
+                            '!', ''), 
+                        '@', ''), 
+                    '&', ''), 
+                '(?:^|\\s)\w{1,2}(?:\\s|$)', ' ', 'g'),
+            ' '
+        )
+        FROM Posts p 
+        WHERE p.Id = p.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) as CleanTagList,
+    CASE 
+        WHEN p.Tags IS NOT NULL AND p.Tags ILIKE '%<%' THEN 
+            (SELECT COUNT(*) FROM unnest(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '>')) AS tag WHERE tag <> '') 
+        ELSE 0 
+    END as TagCount,
+    CASE 
+        WHEN p.OwnerUserId IS NULL THEN 
+            CASE 
+                WHEN p.OwnerDisplayName IS NOT NULL THEN 'Anonymous User' 
+                ELSE 'No Owner' 
+            END
+        ELSE 'Registered User'
+    END as UserStatus,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) as DuplicateLinksCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3
+    ) as IsDuplicateOfCount,
+    (
+        SELECT STRING_AGG(
+            COALESCE(pl.PostId::VARCHAR, '') || ' <-> ' || COALESCE(pl.RelatedPostId::VARCHAR, '') || ' (' || COALESCE(lt.Name, '') || ')',
+            E'\n'
+        )
+        FROM PostLinks pl 
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+        WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    ) as RelatedLinksInfo,
+    (
+        SELECT AVG(ph.PostHistoryTypeId) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) as AvgHistoryType,
+    (
+        SELECT MIN(ph.CreationDate) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) as FirstHistoryDate,
+    (
+        SELECT MAX(ph.CreationDate) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) as LastHistoryDate,
+    DATEDIFF('day', p.CreationDate, COALESCE(
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id),
+        p.CreationDate
+    )) as DaysActive,
+    CASE 
+        WHEN DATEDIFF('day', p.CreationDate, NOW()) = 0 THEN 'Today'
+        WHEN DATEDIFF('day', p.CreationDate, NOW()) BETWEEN 1 AND 7 THEN 'This Week'
+        WHEN DATEDIFF('day', p.CreationDate, NOW()) BETWEEN 8 AND 30 THEN 'This Month'
+        WHEN DATEDIFF('day', p.CreationDate, NOW()) > 30 THEN 'Older'
+        ELSE 'Unknown Age'
+    END as PostingAgeCategory
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE 
+    p.PostTypeId IN (1,2) 
+    AND p.CreationDate >= '2020-01-01'
+    AND (
+        p.Score >= 10 
+        OR p.AnswerCount >= 5
+        OR EXISTS (
+            SELECT 1 
+            FROM Comments c 
+            WHERE c.PostId = p.Id 
+            AND c.CreationDate >= '2020-01-01'
+            AND c.Score >= 5
+        )
+    )
+    AND (
+        p.Tags IS NULL 
+        OR p.Tags LIKE '%<%' 
+        OR p.Tags LIKE '%>%'
+    )
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 12
+    )
+    AND (
+        COALESCE(p.ViewCount, 0) > 0
+        OR COALESCE(p.Score, 0) > 0
+        OR COALESCE(p.AnswerCount, 0) > 0
+    )
+    AND (
+        COALESCE(p.FavoriteCount, 0) > 0
+        OR (
+            EXISTS (
+                SELECT 1 
+                FROM Votes v 
+                WHERE v.PostId = p.Id 
+                AND v.VoteTypeId = 5
+            )
+        )
+    )
+    AND (
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate >= '2020-01-01') >= 3
+        OR (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id) >= 10
+    )
+    AND COALESCE(
+        (SELECT COUNT(DISTINCT UserId) FROM PostHistory ph WHERE ph.PostId = p.Id),
+        0
+    ) > 0
+    AND p.Id % 7 = 0
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate ASC
+LIMIT 1000;

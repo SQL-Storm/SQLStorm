@@ -1,0 +1,106 @@
+WITH ActiveUsers AS (
+  SELECT u.Id, u.DisplayName, u.Reputation,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank
+  FROM Users u
+  WHERE u.Reputation > 1000
+    AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+HighActivityPosts AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount,
+         p.CreationDate,
+         COUNT(ph.Id) OVER (PARTITION BY p.Id) as EditCount,
+         AVG(CAST(ph.CreationDate AS timestamp) - CAST(p.CreationDate AS timestamp)) OVER (PARTITION BY p.OwnerUserId) as AvgEditTime
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+    AND ph.PostHistoryTypeId IN (5, 6)
+  WHERE p.PostTypeId = 1
+    AND p.ViewCount > 10000
+    AND p.Score > 0
+),
+LinkedNetworks AS (
+  SELECT pl.PostId,
+         COUNT(DISTINCT pl.RelatedPostId) as LinkDegree,
+         STRING_AGG(DISTINCT t.TagName, ', ') as ConnectedTags
+  FROM PostLinks pl
+  JOIN Posts p ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON p.Title ILIKE '%' || t.TagName || '%'
+    OR p.Tags LIKE '%' || t.TagName || '%'
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.PostId
+  HAVING COUNT(DISTINCT pl.RelatedPostId) > 1
+),
+UserBadgesSummary AS (
+  SELECT b.UserId,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldCount,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverCount,
+         COUNT(*) as TotalBadges,
+         MAX(b.Date) as LatestBadgeDate
+  FROM Badges b
+  WHERE b.TagBased = TRUE
+  GROUP BY b.UserId
+)
+SELECT 
+  au.DisplayName as TopUser,
+  au.Reputation,
+  au.RepRank,
+  hap.Title as FeaturedQuestion,
+  hap.Score as QuestionScore,
+  hap.ViewCount,
+  COALESCE(hap.EditCount, 0) as Edits,
+  hap.AvgEditTime,
+  COALESCE(ln.LinkDegree, 0) as DuplicateNetworkSize,
+  CASE 
+    WHEN ln.ConnectedTags IS NULL THEN 'Isolated'
+    WHEN LENGTH(ln.ConnectedTags) > 50 THEN LEFT(ln.ConnectedTags, 50) || '...'
+    ELSE ln.ConnectedTags 
+  END as TagConnections,
+  COALESCE(ubs.GoldCount, 0) as GoldBadges,
+  COALESCE(ubs.SilverCount, 0) as SilverBadges,
+  COALESCE(ubs.TotalBadges, 0) as TotalBadges,
+  DENSE_RANK() OVER (ORDER BY hap.ViewCount * hap.Score DESC) as PopularityRank,
+  (au.Reputation * 0.4 + 
+   COALESCE(hap.ViewCount, 0) * 0.3 + 
+   COALESCE(hap.Score, 0) * 0.2 + 
+   COALESCE(ln.LinkDegree, 0) * 10) as InfluenceScore,
+  COALESCE(
+    STRING_AGG(
+      DISTINCT CASE 
+        WHEN hap.CreationDate > cast('2024-10-01' as date) - INTERVAL '7 days' THEN 'Recent'
+        WHEN COALESCE(ubs.LatestBadgeDate, DATE '1900-01-01') > cast('2024-10-01' as date) - INTERVAL '30 days' THEN 'Active'
+        ELSE 'Established'
+      END, ' | '
+      ORDER BY hap.CreationDate DESC
+    ), 'No Recent Activity'
+  ) as ActivitySummary
+FROM ActiveUsers au
+INNER JOIN HighActivityPosts hap ON au.Id = hap.OwnerUserId
+LEFT JOIN LinkedNetworks ln ON hap.Id = ln.PostId
+LEFT JOIN UserBadgesSummary ubs ON au.Id = ubs.UserId
+WHERE (hap.ViewCount * 1.0 / NULLIF(hap.EditCount, 0)) > 1000
+   OR hap.EditCount IS NULL
+UNION ALL
+SELECT 
+  'Anonymous Contributors' as TopUser,
+  0 as Reputation,
+  999 as RepRank,
+  'Community Wiki Posts' as FeaturedQuestion,
+  SUM(p.Score) as QuestionScore,
+  SUM(p.ViewCount) as ViewCount,
+  COUNT(ph.Id) as Edits,
+  AVG(EXTRACT(EPOCH FROM ph.CreationDate - p.CreationDate)) as AvgEditTime,
+  0 as DuplicateNetworkSize,
+  'Community' as TagConnections,
+  0 as GoldBadges,
+  0 as SilverBadges,
+  0 as TotalBadges,
+  1 as PopularityRank,
+  0 as InfluenceScore,
+  'Community Driven' as ActivitySummary
+FROM Posts p
+FULL OUTER JOIN PostHistory ph ON p.Id = ph.PostId
+WHERE p.CommunityOwnedDate IS NOT NULL
+  AND p.PostTypeId = 1
+GROUP BY 
+  CASE WHEN false THEN NULL ELSE NULL END
+ORDER BY PopularityRank ASC, InfluenceScore DESC
+LIMIT 50;

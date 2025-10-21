@@ -1,0 +1,86 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.LastActivityDate,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostTypeDescription,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+    COALESCE(p.ParentId, 0) AS ParentId,
+    COALESCE(p.ClosedDate, DATE '1900-01-01') AS ClosedDate,
+    COALESCE(p.CommunityOwnedDate, DATE '1900-01-01') AS CommunityOwnedDate,
+    COALESCE(p.ContentLicense, 'Unknown') AS ContentLicense,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountActual,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) AS VoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Name LIKE '%Question%' AND b.Date >= p.CreationDate) AS QuestionBadgesCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Name LIKE '%Answer%' AND b.Date >= p.CreationDate) AS AnswerBadgesCount,
+    (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id) AS AverageVoteScore,
+    (SELECT Text FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate DESC LIMIT 1) AS LatestComment,
+    (SELECT Name FROM PostHistoryTypes pht WHERE pht.Id IN (
+        SELECT DISTINCT PostHistoryTypeId FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (1,4,6,10,12,14,15,19,20,35,36)
+    ) LIMIT 1) AS LastPostHistoryAction,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) AS HistoryCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) AS OutgoingLinks,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id) AS IncomingLinks,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id) AS ChildPostsCount,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM (
+            SELECT TRIM(SUBSTRING(p.Tags, n.number + 1, POSITION('>' IN SUBSTR(p.Tags, n.number + 1)) - n.number - 1)) AS TagName
+            FROM (
+                SELECT 1 AS number UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+                UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+            ) AS n
+            WHERE n.number <= LENGTH(p.Tags)
+              AND SUBSTRING(p.Tags FROM n.number FOR 1) = '<'
+              AND POSITION('>' IN SUBSTR(p.Tags, n.number)) > 0
+        ) AS t WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+    ) AS TagList,
+    (SELECT TOP 1 ph.CreationDate FROM PostHistory ph 
+     WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13) 
+     ORDER BY ph.CreationDate DESC) AS LastModerationActionDate,
+    (SELECT TOP 1 ph.Comment FROM PostHistory ph 
+     WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10) 
+     ORDER BY ph.CreationDate DESC) AS LastCloseReason,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS BountyCount,
+    (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBountyAmount,
+    (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.UserId IS NOT NULL) AS UniqueEditorsCount,
+    (SELECT TOP 1 ph.UserDisplayName FROM PostHistory ph WHERE ph.PostId = p.Id ORDER BY ph.CreationDate DESC) AS LastEditorDisplayName,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = p.OwnerUserId AND p3.PostTypeId = 1 AND p3.CreationDate >= DATE '2023-01-01') AS RecentQuestionsCount,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = p.OwnerUserId AND p4.PostTypeId = 2 AND p4.CreationDate >= DATE '2023-01-01') AS RecentAnswersCount,
+    (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = p.OwnerUserId AND p5.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p6.Score) FROM Posts p6 WHERE p6.OwnerUserId = p.OwnerUserId AND p6.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p7 WHERE p7.OwnerUserId = p.OwnerUserId AND p7.PostTypeId IN (1,2) AND p7.Score > 100) AS HighScorePostCount
+FROM Posts p
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.CreationDate >= DATE '2022-01-01'
+  AND p.PostTypeId IN (1, 2)
+  AND p.Score >= 0
+  AND (p.Tags IS NOT NULL AND p.Tags <> '')
+  AND (p.ViewCount > 100 OR p.Score > 50 OR p.CommentCount > 5 OR p.FavoriteCount > 2)
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 1000 OFFSET 0

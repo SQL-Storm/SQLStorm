@@ -1,0 +1,56 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    u.DisplayName AS OwnerDisplayName,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT a.Id) AS AnswerCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS Rank
+  FROM 
+    Posts p
+  LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+  LEFT JOIN 
+    Posts a ON a.ParentId = p.Id AND p.PostTypeId = 1
+  WHERE 
+    p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    AND p.PostTypeId = 1
+  GROUP BY 
+    p.Id, p.Title, p.CreationDate, p.Score, u.DisplayName
+),
+HighScoringPosts AS (
+  SELECT 
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.OwnerDisplayName,
+    rp.CommentCount,
+    rp.AnswerCount
+  FROM 
+    RankedPosts rp
+  WHERE 
+    rp.Rank <= 5
+)
+SELECT 
+  hsp.Title,
+  hsp.OwnerDisplayName,
+  hsp.Score,
+  hsp.CommentCount,
+  hsp.AnswerCount,
+  ph.TypeName AS PostHistoryTypeName,
+  COUNT(ph.Id) AS HistoryActionCount
+FROM 
+  HighScoringPosts hsp
+LEFT JOIN 
+  PostHistory ph ON hsp.PostId = ph.PostId
+WHERE 
+  ph.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+GROUP BY 
+  hsp.Title, hsp.OwnerDisplayName, hsp.Score, hsp.CommentCount, hsp.AnswerCount, ph.TypeName
+ORDER BY 
+  hsp.Score DESC, hsp.Title ASC;

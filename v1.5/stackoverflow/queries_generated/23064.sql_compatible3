@@ -1,0 +1,64 @@
+WITH ActiveUsers AS (
+    SELECT u.Id AS UserId, u.Reputation, u.DisplayName,
+           ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation,
+           COALESCE(NULLIF(u.AboutMe, ''), 'No bio') AS UserBio
+    FROM Users u
+    WHERE u.Reputation > 1000 AND u.Location IS NOT NULL
+),
+QuestionPosts AS (
+    SELECT p.Id AS PostId, p.Title, p.Tags, p.Score, p.ViewCount, p.OwnerUserId,
+           STRING_AGG(SPLIT_PART(t.tag, '>', 1), ',') AS TagList
+    FROM Posts p
+    CROSS JOIN LATERAL regexp_split_to_array(substr(p.Tags, 2, length(p.Tags) - 2), E'><') AS t(tag)
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+    GROUP BY p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.OwnerUserId
+    HAVING COUNT(t.tag) >= 2
+),
+EditHistory AS (
+    SELECT ph.PostId, COUNT(*) AS EditCount,
+           MAX(ph.CreationDate) AS LastEdit,
+           (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId IN (4, 5, 6)) AS MajorEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId BETWEEN 4 AND 9
+    GROUP BY ph.PostId
+),
+VoteSummary AS (
+    SELECT v.PostId, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END) AS NetVotes,
+           AVG(v.BountyAmount) FILTER (WHERE v.VoteTypeId IN (8, 9)) AS AvgBounty
+    FROM Votes v
+    GROUP BY v.PostId
+),
+CombinedData AS (
+    SELECT qp.PostId, qp.Title, qp.TagList, qp.Score + COALESCE(vs.NetVotes, 0) AS TotalScore,
+           au.DisplayName, au.RankInLocation,
+           eh.EditCount, eh.MajorEdits,
+           CASE WHEN qp.ViewCount > 10000 THEN 'Popular' ELSE 'Standard' END AS Popularity,
+           ROW_NUMBER() OVER (ORDER BY qp.Score DESC) AS OverallRank
+    FROM QuestionPosts qp
+    LEFT OUTER JOIN ActiveUsers au ON qp.OwnerUserId = au.UserId
+    LEFT OUTER JOIN EditHistory eh ON qp.PostId = eh.PostId
+    LEFT OUTER JOIN VoteSummary vs ON qp.PostId = vs.PostId
+    WHERE au.RankInLocation <= 5 OR eh.EditCount > 10
+),
+LinkedPosts AS (
+    SELECT pl.PostId, COUNT(DISTINCT pl.RelatedPostId) AS LinkedCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+)
+SELECT cd.PostId, cd.Title, cd.TagList, cd.TotalScore, cd.DisplayName, cd.RankInLocation,
+       COALESCE(lp.LinkedCount, 0) AS LinkedCount,
+       (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cd.PostId AND c.Score > 0) AS PositiveComments,
+       CASE WHEN cd.EditCount IS NULL THEN 'No edits' ELSE CONCAT('Edits: ', cd.EditCount, ' (Major: ', cd.MajorEdits, ')') END AS EditSummary
+FROM CombinedData cd
+LEFT OUTER JOIN LinkedPosts lp ON cd.PostId = lp.PostId
+WHERE cd.OverallRank <= 100
+UNION ALL
+SELECT p.Id AS PostId, p.Title, 'Unlinked Questions' AS TagList, p.Score AS TotalScore, u.DisplayName, NULL AS RankInLocation,
+       0 AS LinkedCount, 0 AS PositiveComments, 'N/A' AS EditSummary
+FROM Posts p
+LEFT OUTER JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1 AND p.Id NOT IN (SELECT PostId FROM PostLinks)
+AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 1)
+ORDER BY TotalScore DESC
+LIMIT 200;

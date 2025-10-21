@@ -1,0 +1,149 @@
+-- {"query": "27070.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1604} 
+WITH RankedUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.DisplayName,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM
+        Users U
+    WHERE
+        U.Reputation > 1000 AND U.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+ActiveUsers AS (
+    SELECT
+        RU.UserId,
+        RU.Reputation,
+        RU.DisplayName,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(COUNT(P.Id), 0) AS TotalPosts,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COALESCE(COUNT(C.Id), 0) AS TotalComments,
+        COALESCE(SUM(V.VoteTypeId = 2), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(V.VoteTypeId = 3), 0) AS TotalDownVotesReceived,
+        COALESCE(SUM(A.Score), 0) AS TotalAnswerScore,
+        COALESCE(COUNT(A.Id), 0) AS TotalAnswers
+    FROM
+        RankedUsers RU
+    LEFT JOIN
+        Posts P ON RU.UserId = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON RU.UserId = C.UserId
+    LEFT JOIN
+        Votes V ON RU.UserId = V.UserId
+    LEFT JOIN
+        Posts A ON RU.UserId = A.OwnerUserId AND A.PostTypeId = 2
+    GROUP BY
+        RU.UserId, RU.Reputation, RU.DisplayName
+),
+TagStats AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count,
+        COUNT(P.Id) AS Questions,
+        COUNT(DISTINCT A.Id) AS Answers,
+        SUM(V.VoteTypeId = 2) AS UpVotes,
+        SUM(V.VoteTypeId = 3) AS DownVotes
+    FROM
+        Tags T
+    LEFT JOIN
+        Posts P ON T.Id = ANY(string_to_array(P.Tags , ''><''))
+    LEFT JOIN
+        Posts A ON P.Id = A.ParentId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    GROUP BY
+        T.Id, T.TagName, T.Count
+),
+UserBadgeStats AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Users U
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId AND B.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY
+        U.Id
+),
+UserInteractions AS (
+    SELECT
+        AU.UserId,
+        AU.Reputation,
+        AU.DisplayName,
+        AU.TotalPostScore,
+        AU.TotalPosts,
+        AU.TotalCommentScore,
+        AU.TotalComments,
+        AU.TotalUpVotesReceived,
+        AU.TotalDownVotesReceived,
+        COALESCE(UBS.TotalBadges, 0) AS TotalBadges,
+        COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges
+    FROM
+        ActiveUsers AU
+    LEFT JOIN
+        UserBadgeStats UBS ON AU.UserId = UBS.UserId
+)
+SELECT
+    UI.UserId,
+    UI.Reputation,
+    UI.DisplayName,
+    UI.TotalPostScore,
+    UI.TotalPosts,
+    UI.TotalCommentScore,
+    UI.TotalComments,
+    UI.TotalUpVotesReceived,
+    UI.TotalDownVotesReceived,
+    UI.TotalBadges,
+    UI.GoldBadges,
+    UI.SilverBadges,
+    UI.BronzeBadges,
+    SUBSTRING(UI.DisplayName, 1, 1) || '***' AS MaskedDisplayName,
+    COALESCE(TS.TagId, 0) AS MostActiveTagId,
+    COALESCE(TS.TagName, 'Unknown') AS MostActiveTagName,
+    COALESCE(TS.Questions, 0) AS MostActiveTagQuestions,
+    COALESCE(TS.Answers, 0) AS MostActiveTagAnswers,
+    COALESCE(TS.UpVotes, 0) AS MostActiveTagUpVotes,
+    COALESCE(TS.DownVotes, 0) AS MostActiveTagDownVotes
+FROM
+    UserInteractions UI
+LEFT JOIN LATERAL (
+    SELECT
+        TS.TagId,
+        TS.TagName,
+        TS.Questions,
+        TS.Answers,
+        TS.UpVotes,
+        TS.DownVotes
+    FROM
+        TagStats TS
+    WHERE
+        TS.TagId = (
+            SELECT
+                TagId
+            FROM
+                TagStats
+            WHERE
+                TagId IN (SELECT DISTINCT ANY(string_to_array(P.Tags , ''><'')) FROM Posts P WHERE P.OwnerUserId = UI.UserId)
+            ORDER BY
+                Questions DESC, Answers DESC, UpVotes DESC
+            LIMIT 1
+        )
+) TS ON TRUE
+WHERE
+    UI.TotalPosts > 10 AND UI.TotalComments > 5
+ORDER BY
+    UI.Reputation DESC,
+    UI.TotalPostScore DESC,
+    UI.TotalComments DESC;

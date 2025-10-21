@@ -1,0 +1,87 @@
+WITH
+ -- Latest edit information per post
+ latest_edit AS (
+     SELECT ph.PostId,
+            MAX(ph.CreationDate) AS LastEdit,
+            STRING_AGG(DISTINCT ph.Comment, ', ') AS EditComments
+     FROM PostHistory ph
+     WHERE ph.PostHistoryTypeId IN (5,12,20)
+     GROUP BY ph.PostId
+ ),
+ -- Hierarchical duplicate tree (Make recursive to support all dialects)
+ duplicate_tree AS (
+     SELECT pl.PostId,
+            pl.RelatedPostId,
+            1 AS depth
+     FROM PostLinks pl
+     WHERE pl.LinkTypeId = 3
+     UNION ALL
+     SELECT d.PostId,
+            pl.RelatedPostId,
+            d.depth + 1
+     FROM duplicate_tree d
+     JOIN PostLinks pl ON pl.PostId = d.RelatedPostId AND pl.LinkTypeId = 3
+ ),
+ -- Badge aggregates per user
+ badge_stats AS (
+     SELECT b.UserId,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+            COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBadges
+     FROM Badges b
+     GROUP BY b.UserId
+ ),
+ -- Vote counts per post
+ vote_agg AS (
+     SELECT vs.PostId,
+            SUM(CASE WHEN vs.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vs.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            SUM(CASE WHEN vs.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+            SUM(CASE WHEN vs.VoteTypeId = 8 THEN vs.BountyAmount ELSE 0 END) AS BountyTotal
+     FROM Votes vs
+     GROUP BY vs.PostId
+ )
+SELECT
+    u.Id                AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.TagBadges,
+    COUNT(DISTINCT p.Id)         AS QuestionCount,
+    COUNT(DISTINCT a.Id)         AS AnswerCount,
+    ROUND(AVG(COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)), 2) AS AvgNetVotes,
+    MAX(p.CreationDate)          AS LastPost,
+    SUM(COALESCE(p.ViewCount,0))             AS TotalViews,
+    MAX(le.LastEdit)             AS LastEditDate,
+    STRING_AGG(DISTINCT COALESCE(le.EditComments, ''), ' | ') AS EditSnapshots,
+    MAX(d.depth)                 AS MaxDuplicateDepth
+FROM Users u
+LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+    AND p.PostTypeId = 1
+LEFT JOIN Posts a
+    ON a.ParentId = p.Id
+    AND a.PostTypeId = 2
+LEFT JOIN badge_stats b
+    ON b.UserId = u.Id
+LEFT JOIN vote_agg v
+    ON v.PostId = p.Id
+LEFT JOIN latest_edit le
+    ON le.PostId = p.Id
+LEFT JOIN duplicate_tree d
+    ON d.PostId = p.Id
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.TagBadges
+ORDER BY u.Reputation DESC, QuestionCount DESC
+LIMIT 100;

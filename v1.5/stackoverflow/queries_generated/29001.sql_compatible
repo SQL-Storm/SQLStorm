@@ -1,0 +1,225 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(DATE '1970-01-01', CAST(MAX(p.CreationDate) AS DATE)) as DaysSinceLastPost,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.AnswerCount), 0) as TotalAnswers,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+                CAST(SUM(p.AnswerCount) AS FLOAT) / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+            ELSE 0 
+        END as AvgAnswersPerQuestion,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopPerformers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        DaysSinceLastPost,
+        TotalScore,
+        TotalViews,
+        TotalAnswers,
+        AvgAnswersPerQuestion,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, Reputation DESC) as RankByPosts
+    FROM UserActivityStats
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.CreationDate,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN 
+                SUBSTRING(ph.Text, 1, 100) || '...'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 
+                SUBSTRING(ph.Text, 1, 100) || '...'
+            ELSE ph.Comment
+        END as ActivitySummary
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.CreationDate >= DATEADD(MONTH, -3, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as RelatedPosts,
+        CASE 
+            WHEN t.Count > 100 THEN 'High'
+            WHEN t.Count > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as PopularityLevel,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScore
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexPostAnalytics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            ELSE 'No'
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END as IsClosed,
+        CASE 
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Yes'
+            ELSE 'No'
+        END as IsCommunityOwned,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountActual,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) as NetVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        LENGTH(p.Body) as BodyLength,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        DATEDIFF(DATE '1970-01-01', CAST(p.CreationDate AS DATE)) as DaysOld,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) as DuplicateLinks,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 1) as LinkedFromCount,
+        COALESCE((SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%'), 0) as AvgTagScore,
+        NULL as TagName -- placeholder to keep column alignment if needed
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    CROSS JOIN (
+        SELECT TagName FROM Tags 
+        WHERE TagName IS NOT NULL 
+        ORDER BY Count DESC 
+        LIMIT 10
+    ) t
+    WHERE p.PostTypeId IN (1,2) 
+),
+CombinedAnalysis AS (
+    SELECT 
+        tp.UserId,
+        tp.DisplayName,
+        tp.Reputation,
+        tp.TotalPosts,
+        tp.Questions,
+        tp.Answers,
+        tp.Comments,
+        tp.Badges,
+        tp.LastPostDate,
+        tp.DaysSinceLastPost,
+        tp.TotalScore,
+        tp.TotalViews,
+        tp.TotalAnswers,
+        tp.AvgAnswersPerQuestion,
+        tp.AllTags,
+        tp.RankByScore,
+        tp.RankByPosts,
+        ra.PostId,
+        ra.PostType,
+        ra.ActivitySummary,
+        ra.CreationDate as ActivityDate,
+        ts.TagName,
+        ts.TagCount,
+        ts.RelatedPosts,
+        ts.PopularityLevel,
+        ts.AvgScore,
+        cpa.PostId as ComplexPostId,
+        cpa.Title as ComplexPostTitle,
+        cpa.Score as ComplexPostScore,
+        cpa.ViewCount as ComplexPostViewCount,
+        cpa.AnswerCount as ComplexPostAnswerCount,
+        cpa.HasAcceptedAnswer,
+        cpa.IsClosed,
+        cpa.IsCommunityOwned,
+        cpa.NetVoteCount,
+        cpa.ScoreCategory,
+        cpa.DaysOld,
+        cpa.AvgTagScore,
+        CASE
+            WHEN tp.TotalScore > 2000 AND tp.TotalPosts > 10 THEN 'Elite contributor'
+            WHEN tp.TotalScore > 1000 AND tp.TotalPosts > 5 THEN 'Active contributor'
+            WHEN tp.TotalScore > 500 THEN 'Regular contributor'
+            ELSE 'Casual contributor'
+        END as ContributionTier
+    FROM TopPerformers tp
+    LEFT JOIN RecentActivity ra ON tp.UserId = ra.UserId
+    LEFT JOIN TagStatistics ts ON EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = tp.UserId AND p.Tags LIKE '%' || ts.TagName || '%'
+    )
+    LEFT JOIN ComplexPostAnalytics cpa ON tp.UserId = cpa.OwnerUserId
+    WHERE tp.UserId IS NOT NULL
+)
+SELECT 
+    c.ContributionTier,
+    COUNT(DISTINCT c.UserId) as UserCount,
+    AVG(c.Reputation) as AvgReputation,
+    AVG(c.TotalScore) as AvgTotalScore,
+    AVG(c.TotalPosts) as AvgTotalPosts,
+    AVG(c.AvgAnswersPerQuestion) as AvgAvgAnswersPerQuestion,
+    SUM(CASE WHEN c.HasAcceptedAnswer = 'Yes' THEN 1 ELSE 0 END) as PostsWithAcceptedAnswers,
+    SUM(CASE WHEN c.IsClosed = 1 THEN 1 ELSE 0 END) as ClosedPosts,
+    SUM(CASE WHEN c.IsCommunityOwned = 'Yes' THEN 1 ELSE 0 END) as CommunityOwnedPosts,
+    STRING_AGG(DISTINCT CASE WHEN c.PopularityLevel = 'High' THEN c.TagName END, ', ') as HighPopularityTags,
+    STRING_AGG(DISTINCT CASE WHEN c.ScoreCategory = 'High' THEN c.ComplexPostTitle END, ', ') as HighScorePosts,
+    MIN(c.DaysSinceLastPost) as MinDaysSinceLastPost,
+    MAX(c.DaysSinceLastPost) as MaxDaysSinceLastPost,
+    AVG(c.DaysOld) as AvgDaysOld,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY c.NetVoteCount) as MedianNetVotes,
+    COUNT(DISTINCT c.ComplexPostId) as TotalComplexPosts,
+    COUNT(DISTINCT c.ActivitySummary) as UniqueActivityTypes,
+    COUNT(*) as TotalRecords
+FROM CombinedAnalysis c
+GROUP BY c.ContributionTier
+HAVING COUNT(*) > 10
+ORDER BY AVG(c.TotalScore) DESC
+LIMIT 50;

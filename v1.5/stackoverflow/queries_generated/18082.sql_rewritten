@@ -1,0 +1,110 @@
+-- {"query": "18082.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1029} 
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS Rank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEditCount,
+      AVG(DATEDIFF(day, p.CreationDate, ph.CreationDate)) AS AvgDaysToFirstEdit
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Posts AS p
+      ON ph.PostId = p.Id
+    WHERE
+      u.Id <> -1
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  HotQuestions AS (
+    SELECT
+      Id,
+      Title,
+      Score,
+      ViewCount,
+      AnswerCount,
+      FavoriteCount,
+      CreationDate,
+      ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC, FavoriteCount DESC, CreationDate DESC) AS HotRank
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND Score > 100 AND ViewCount > 1000 AND AnswerCount > 5
+  )
+SELECT
+  hq.Title AS QuestionTitle,
+  hq.Score AS QuestionScore,
+  hq.ViewCount AS QuestionViewCount,
+  hq.FavoriteCount AS QuestionFavoriteCount,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  ra.AnswerCreationDate AS BestAnswerCreationDate,
+  ra.Rank AS BestAnswerRank,
+  CASE WHEN p_closed.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+  COALESCE(ua.BodyEditCount, 0) AS OwnerBodyEdits,
+  COALESCE(ua.AvgDaysToFirstEdit, 0) AS AvgDaysToFirstEditByOwner,
+  p_tags.TagName AS PrimaryTag,
+  COUNT(c.Id) AS CommentCountOnQuestion
+FROM HotQuestions AS hq
+JOIN Users AS ua
+  ON hq.OwnerUserId = ua.Id
+LEFT JOIN RankedAnswers AS ra
+  ON hq.Id = ra.QuestionId AND ra.Rank = 1
+LEFT JOIN Posts AS p_closed
+  ON hq.Id = p_closed.Id
+LEFT JOIN Tags AS p_tags
+  ON hq.Id = p_tags.WikiPostId AND p_tags.TagName IN (
+    SELECT
+      SUBSTRING(value, 2, LEN(value) - 2)
+    FROM STRING_SPLIT(REPLACE(REPLACE(hq.Tags, '<', '>'), '><', '<'), '>')
+    WHERE
+      LEN(value) > 0
+  ) AND p_tags.Id = (
+    SELECT
+      MIN(t2.Id)
+    FROM Tags AS t2
+    WHERE
+      t2.TagName IN (
+        SELECT
+          SUBSTRING(value, 2, LEN(value) - 2)
+        FROM STRING_SPLIT(REPLACE(REPLACE(hq.Tags, '<', '>'), '><', '<'), '>')
+        WHERE
+          LEN(value) > 0
+      )
+  )
+LEFT JOIN Comments AS c
+  ON hq.Id = c.PostId
+WHERE
+  ua.Location IS NOT NULL AND ua.WebsiteUrl IS NOT NULL AND ua.AboutMe IS NOT NULL AND LEN(ua.AboutMe) > 100
+GROUP BY
+  hq.Title,
+  hq.Score,
+  hq.ViewCount,
+  hq.FavoriteCount,
+  ua.DisplayName,
+  ua.Reputation,
+  ra.AnswerCreationDate,
+  ra.Rank,
+  QuestionStatus,
+  OwnerBodyEdits,
+  AvgDaysToFirstEditByOwner,
+  p_tags.TagName
+HAVING
+  COUNT(c.Id) > 5
+ORDER BY
+  hq.HotRank,
+  OwnerReputation DESC;

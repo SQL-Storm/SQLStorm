@@ -1,0 +1,122 @@
+WITH RECURSIVE user_influence AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(p.Score) as total_score,
+        SUM(p.ViewCount) as total_views
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= DATE '2024-10-01' - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+top_answerers AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) as answer_count,
+        AVG(p.Score) as avg_score,
+        COUNT(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 END) as accepted_count,
+        ARRAY_AGG(DISTINCT string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag_arrays
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2 
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '3 years'
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(*) >= 20
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag,
+        COUNT(*) as tag_usage,
+        AVG(p.Score) as avg_tag_score,
+        SUM(p.ViewCount) as tag_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId, tag
+    HAVING COUNT(*) >= 5
+),
+engagement_metrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) as comments_received,
+        COUNT(DISTINCT v.Id) as votes_received,
+        COUNT(DISTINCT b.Id) as badges_earned,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as downvotes,
+        COUNT(DISTINCT pl.RelatedPostId) as linked_posts
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId 
+        AND b.Date >= p.CreationDate 
+        AND b.Date <= p.CreationDate + INTERVAL '30 days'
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.CreationDate >= DATE '2024-10-01' - INTERVAL '3 years'
+    GROUP BY p.OwnerUserId
+),
+quality_score AS (
+    SELECT 
+        ui.Id,
+        ui.DisplayName,
+        ui.Reputation,
+        ui.total_posts,
+        ui.questions,
+        ui.answers,
+        ta.answer_count,
+        ta.accepted_count,
+        CASE WHEN ta.accepted_count = 0 THEN 0.0
+             ELSE CAST(ta.accepted_count AS FLOAT) / CAST(ta.answer_count AS FLOAT)
+        END as acceptance_rate,
+        te.tag,
+        te.tag_usage,
+        te.avg_tag_score,
+        em.upvotes,
+        em.downvotes,
+        em.comments_received,
+        em.badges_earned,
+        (ui.total_score * 0.3 + 
+         COALESCE(ta.accepted_count * 15, 0) + 
+         COALESCE(em.upvotes * 2, 0) - 
+         COALESCE(em.downvotes * 5, 0) +
+         COALESCE(em.badges_earned * 10, 0)) as calculated_quality_score,
+        ROW_NUMBER() OVER (PARTITION BY ui.Id ORDER BY te.tag_usage DESC) as tag_rank
+    FROM user_influence ui
+    LEFT JOIN top_answerers ta ON ui.Id = ta.OwnerUserId
+    LEFT JOIN tag_expertise te ON ui.Id = te.OwnerUserId
+    LEFT JOIN engagement_metrics em ON ui.Id = em.OwnerUserId
+)
+SELECT 
+    qs.DisplayName,
+    qs.Reputation,
+    qs.total_posts,
+    qs.questions,
+    qs.answers,
+    qs.answer_count,
+    qs.accepted_count,
+    ROUND(qs.acceptance_rate, 2) as acceptance_rate,
+    qs.tag,
+    qs.tag_usage,
+    ROUND(qs.avg_tag_score, 2) as avg_tag_score,
+    qs.upvotes,
+    qs.downvotes,
+    qs.comments_received,
+    qs.badges_earned,
+    ROUND(qs.calculated_quality_score, 2) as quality_score,
+    DENSE_RANK() OVER (ORDER BY qs.calculated_quality_score DESC) as overall_rank,
+    /* Median of calculated_quality_score per tag using standard SQL */
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qs.calculated_quality_score) OVER (PARTITION BY qs.tag) as median_quality_by_tag,
+    COUNT(*) OVER (PARTITION BY qs.tag) as experts_in_tag
+FROM quality_score qs
+WHERE qs.tag_rank <= 3
+    AND qs.calculated_quality_score > 100
+ORDER BY qs.calculated_quality_score DESC, qs.acceptance_rate DESC, qs.tag_usage DESC
+LIMIT 500;

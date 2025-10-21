@@ -1,0 +1,335 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT ph.Id) as HistoryEntries,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(MAX(p.LastActivityDate), MAX(p.CreationDate)) as LastActivityDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        COALESCE(
+            AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END),
+            0
+        ) as AvgQuestionScore,
+        COALESCE(
+            AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END),
+            0
+        ) as AvgAnswerScore,
+        CAST(NULL AS DOUBLE PRECISION) as QuestionScoreStdDev,
+        CAST(NULL AS DOUBLE PRECISION) as AnswerScoreStdDev,
+        STRING_AGG(DISTINCT t.TagName, ', ') as TagInterests
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN (
+        SELECT DISTINCT PostId, unnest(string_to_array(Tags, '><')) as TagName
+        FROM Posts 
+        WHERE Tags IS NOT NULL AND Tags != ''
+    ) t ON p.Id = t.PostId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        Comments,
+        HistoryEntries,
+        LastPostDate,
+        LastActivityDate,
+        ReputationTier,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        QuestionScoreStdDev,
+        AnswerScoreStdDev,
+        TagInterests,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, Reputation DESC) as RankByActivity
+    FROM UserActivityStats
+),
+UserEngagementMetrics AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Badges,
+        tu.Comments,
+        tu.HistoryEntries,
+        tu.LastPostDate,
+        tu.LastActivityDate,
+        tu.ReputationTier,
+        tu.AvgQuestionScore,
+        tu.AvgAnswerScore,
+        tu.QuestionScoreStdDev,
+        tu.AnswerScoreStdDev,
+        tu.TagInterests,
+        tu.RankByReputation,
+        tu.RankByActivity,
+        CASE 
+            WHEN tu.Questions > 0 THEN (tu.Answers * 1.0 / tu.Questions) * 100
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN tu.HistoryEntries > 0 THEN (tu.Badges * 1.0 / tu.HistoryEntries) * 100
+            ELSE 0 
+        END as BadgesToHistoryRatio,
+        (tu.Views * 1.0 / NULLIF(tu.Reputation, 0)) * 100000 as ViewsPerReputation,
+        CASE 
+            WHEN tu.QuestionScoreStdDev IS NOT NULL AND tu.QuestionScoreStdDev > 0 THEN 
+                (tu.AvgQuestionScore - 0) / tu.QuestionScoreStdDev
+            ELSE 0 
+        END as QuestionScoreZScore,
+        CASE 
+            WHEN tu.AnswerScoreStdDev IS NOT NULL AND tu.AnswerScoreStdDev > 0 THEN 
+                (tu.AvgAnswerScore - 0) / tu.AnswerScoreStdDev
+            ELSE 0 
+        END as AnswerScoreZScore,
+        DATE_DIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), tu.LastPostDate, 'day') as DaysSinceLastPost,
+        DATE_DIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), tu.LastActivityDate, 'day') as DaysSinceLastActivity,
+        CASE 
+            WHEN DATE_DIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), tu.LastPostDate, 'day') > 365 THEN 'Inactive'
+            WHEN DATE_DIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), tu.LastPostDate, 'day') > 90 THEN 'Stale'
+            WHEN DATE_DIFF(CAST('2024-10-01 12:34:56' AS TIMESTAMP), tu.LastPostDate, 'day') > 30 THEN 'Active'
+            ELSE 'Very Active'
+        END as ActivityLevel,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1 AND p.Score >= 100),
+            0
+        ) as HighValueQuestions,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 2 AND p.Score >= 50),
+            0
+        ) as HighValueAnswers,
+        COALESCE(
+            (SELECT STRING_AGG(DISTINCT v.Name, ', ')
+             FROM Badges b 
+             JOIN (
+                 SELECT Id, Name FROM Badges 
+                 WHERE Name IN ('Nice Question', 'Good Question', 'Great Question', 'Popular Question',
+                              'Notable Question', 'Famous Question', 'Excellent Question')
+             ) v ON b.Name = v.Name
+             WHERE b.UserId = tu.UserId AND b.Class = 1),
+            'None'
+        ) as GoldBadges,
+        COALESCE(
+            (SELECT STRING_AGG(DISTINCT v.Name, ', ')
+             FROM Badges b 
+             JOIN (
+                 SELECT Id, Name FROM Badges 
+                 WHERE Name IN ('Nice Answer', 'Good Answer', 'Great Answer', 'Popular Answer',
+                              'Notable Answer', 'Famous Answer', 'Excellent Answer')
+             ) v ON b.Name = v.Name
+             WHERE b.UserId = tu.UserId AND b.Class = 1),
+            'None'
+        ) as GoldAnswers,
+        (COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             JOIN Posts p ON v.PostId = p.Id 
+             WHERE p.OwnerUserId = tu.UserId AND v.VoteTypeId IN (2,3)
+             GROUP BY p.OwnerUserId),
+            0
+        )) as TotalVotesReceived,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             JOIN Posts p ON ph.PostId = p.Id 
+             WHERE p.OwnerUserId = tu.UserId AND ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20)),
+            0
+        ) as ModerationActivities,
+        COALESCE(
+            (SELECT COUNT(DISTINCT p.Id) 
+             FROM Posts p 
+             JOIN PostHistory ph ON p.Id = ph.PostId 
+             WHERE p.OwnerUserId = tu.UserId 
+             AND ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9)),
+            0
+        ) as EditedPosts
+    FROM TopUsers tu
+),
+FinalUserAnalysis AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.Questions,
+        ue.Answers,
+        ue.Badges,
+        ue.Comments,
+        ue.HistoryEntries,
+        ue.LastPostDate,
+        ue.LastActivityDate,
+        ue.ReputationTier,
+        ue.AvgQuestionScore,
+        ue.AvgAnswerScore,
+        ue.QuestionScoreStdDev,
+        ue.AnswerScoreStdDev,
+        ue.TagInterests,
+        ue.RankByReputation,
+        ue.RankByActivity,
+        ue.AnswerToQuestionRatio,
+        ue.BadgesToHistoryRatio,
+        ue.ViewsPerReputation,
+        ue.QuestionScoreZScore,
+        ue.AnswerScoreZScore,
+        ue.DaysSinceLastPost,
+        ue.DaysSinceLastActivity,
+        ue.ActivityLevel,
+        ue.HighValueQuestions,
+        ue.HighValueAnswers,
+        ue.GoldBadges,
+        ue.GoldAnswers,
+        ue.TotalVotesReceived,
+        ue.ModerationActivities,
+        ue.EditedPosts,
+        CASE WHEN ue.HighValueQuestions > 0 THEN 1 ELSE 0 END as IsHighValueQuestioner,
+        CASE WHEN ue.HighValueAnswers > 0 THEN 1 ELSE 0 END as IsHighValueAnswerer,
+        CASE WHEN ue.ModerationActivities > 0 THEN 1 ELSE 0 END as HasModerationExperience,
+        CASE WHEN ue.TotalVotesReceived > 100 THEN 1 ELSE 0 END as HasHighVoteCount,
+        CASE WHEN ue.Badges >= 50 THEN 1 ELSE 0 END as HasManyBadges,
+        CASE WHEN LENGTH(ue.TagInterests) > 100 THEN 1 ELSE 0 END as HasDiverseTagInterests,
+        CASE WHEN ue.AnswerToQuestionRatio >= 50 THEN 1 ELSE 0 END as ActiveAnswerer,
+        CASE WHEN ue.BadgesToHistoryRatio >= 20 THEN 1 ELSE 0 END as EfficientBadgeCollector,
+        CASE WHEN ue.ViewsPerReputation >= 100 THEN 1 ELSE 0 END as HighVisibilityUser
+    FROM UserEngagementMetrics ue
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.Badges,
+    fa.Comments,
+    fa.HistoryEntries,
+    fa.LastPostDate,
+    fa.LastActivityDate,
+    fa.ReputationTier,
+    fa.AvgQuestionScore,
+    fa.AvgAnswerScore,
+    fa.QuestionScoreStdDev,
+    fa.AnswerScoreStdDev,
+    fa.TagInterests,
+    fa.RankByReputation,
+    fa.RankByActivity,
+    ROUND(fa.AnswerToQuestionRatio, 2) as AnswerToQuestionRatio,
+    ROUND(fa.BadgesToHistoryRatio, 2) as BadgesToHistoryRatio,
+    ROUND(fa.ViewsPerReputation, 2) as ViewsPerReputation,
+    ROUND(fa.QuestionScoreZScore, 2) as QuestionScoreZScore,
+    ROUND(fa.AnswerScoreZScore, 2) as AnswerScoreZScore,
+    fa.DaysSinceLastPost,
+    fa.DaysSinceLastActivity,
+    fa.ActivityLevel,
+    fa.HighValueQuestions,
+    fa.HighValueAnswers,
+    fa.GoldBadges,
+    fa.GoldAnswers,
+    fa.TotalVotesReceived,
+    fa.ModerationActivities,
+    fa.EditedPosts,
+    CASE 
+        WHEN fa.IsHighValueQuestioner + fa.IsHighValueAnswerer + fa.HasModerationExperience + 
+             fa.HasHighVoteCount + fa.HasManyBadges + fa.HasDiverseTagInterests + 
+             fa.ActiveAnswerer + fa.EfficientBadgeCollector + fa.HighVisibilityUser >= 6 
+        THEN 'Elite User'
+        WHEN fa.IsHighValueQuestioner + fa.IsHighValueAnswerer + fa.HasModerationExperience + 
+             fa.HasHighVoteCount + fa.HasManyBadges + fa.HasDiverseTagInterests + 
+             fa.ActiveAnswerer + fa.EfficientBadgeCollector + fa.HighVisibilityUser >= 4 
+        THEN 'Active Contributor'
+        WHEN fa.IsHighValueQuestioner + fa.IsHighValueAnswerer + fa.HasModerationExperience + 
+             fa.HasHighVoteCount + fa.HasManyBadges + fa.HasDiverseTagInterests + 
+             fa.ActiveAnswerer + fa.EfficientBadgeCollector + fa.HighVisibilityUser >= 2 
+        THEN 'Regular User'
+        ELSE 'Basic User'
+    END as UserCategory,
+    DENSE_RANK() OVER (ORDER BY fa.Reputation DESC, fa.TotalPosts DESC, fa.Badges DESC) as UserPerformanceIndex,
+    ROW_NUMBER() OVER (ORDER BY 
+        (fa.Reputation + fa.TotalPosts * 10 + fa.Badges * 5 + fa.Views + fa.TotalVotesReceived) DESC
+    ) as OverallRanking,
+    CASE 
+        WHEN fa.Reputation > (SELECT AVG(Reputation) FROM FinalUserAnalysis) * 1.5 THEN 'Above Average'
+        WHEN fa.Reputation > (SELECT AVG(Reputation) FROM FinalUserAnalysis) THEN 'Average'
+        ELSE 'Below Average'
+    END as RepPerformance,
+    STRING_AGG(
+        CASE 
+            WHEN fa.IsHighValueQuestioner = 1 THEN 'High Value Questioner'
+            WHEN fa.IsHighValueAnswerer = 1 THEN 'High Value Answerer'
+            WHEN fa.HasModerationExperience = 1 THEN 'Moderator'
+            WHEN fa.HasHighVoteCount = 1 THEN 'Popular'
+            WHEN fa.HasManyBadges = 1 THEN 'Badge Collector'
+            WHEN fa.HasDiverseTagInterests = 1 THEN 'Tag Explorer'
+            WHEN fa.ActiveAnswerer = 1 THEN 'Active Answerer'
+            WHEN fa.EfficientBadgeCollector = 1 THEN 'Efficient Collector'
+            WHEN fa.HighVisibilityUser = 1 THEN 'High Visibility'
+        END, 
+        ', '
+    ) as UserTraits,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         JOIN Comments c ON p.Id = c.PostId 
+         WHERE p.OwnerUserId = fa.UserId AND c.UserId IS NOT NULL),
+        0
+    ) as CommentInteractionCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostLinks pl 
+         JOIN Posts p ON pl.PostId = p.Id 
+         WHERE p.OwnerUserId = fa.UserId AND pl.LinkTypeId = 3),
+        0
+    ) as DuplicateLinkCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 1 AND p.Tags LIKE '%python%'),
+        0
+    ) as PythonRelatedQuestions,
+    CASE 
+        WHEN fa.HistoryEntries > 0 THEN CAST(fa.HistoryEntries AS FLOAT) / NULLIF(fa.TotalPosts, 0)
+        ELSE 0 
+    END as EditRatio,
+    CASE 
+        WHEN fa.Answers > 0 THEN CAST(fa.HistoryEntries AS FLOAT) / NULLIF(fa.Answers, 0)
+        ELSE 0 
+    END as HistoryPerAnswerRatio,
+    CASE 
+        WHEN fa.Reputation > 0 THEN (fa.Badges * 100.0) / NULLIF(fa.Reputation, 0)
+        ELSE 0 
+    END as BadgesPerReputationRatio,
+    MAX(fa.Reputation) OVER () as MaxReputation,
+    AVG(fa.Reputation) OVER () as AvgReputation
+FROM FinalUserAnalysis fa
+WHERE fa.Reputation > 0
+AND fa.TotalPosts > 0
+AND fa.DaysSinceLastActivity <= 365
+AND (fa.GoldBadges != 'None' OR fa.GoldAnswers != 'None')
+ORDER BY fa.Reputation DESC, fa.TotalPosts DESC, fa.Badges DESC
+LIMIT 250;

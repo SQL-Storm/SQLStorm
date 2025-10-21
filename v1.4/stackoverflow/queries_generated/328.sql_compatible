@@ -1,0 +1,114 @@
+WITH
+P AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    COALESCE(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), ARRAY[]::text[]) AS TagArray
+  FROM Posts p
+  WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+),
+CommentCounts AS (
+  SELECT p.Id AS PostId, COUNT(*) AS CommentCount
+  FROM P p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+VotesAgg AS (
+  SELECT p.Id AS PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM P p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+Activity AS (
+  SELECT p.Id AS PostId,
+         GREATEST(p.LastActivityDate,
+                  COALESCE(MAX(c.CreationDate), p.LastActivityDate),
+                  COALESCE(MAX(h.CreationDate), p.LastActivityDate)) AS LastActivity
+  FROM P p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN PostHistory h ON h.PostId = p.Id
+  GROUP BY p.Id
+),
+Q1 AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.TagArray,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    COALESCE(cc.CommentCount, 0) AS CommentCount,
+    COALESCE(va.UpVotes, 0) AS UpVotes,
+    COALESCE(va.DownVotes, 0) AS DownVotes,
+    COALESCE(a.LastActivity, p.LastActivityDate) AS LastActivityDate,
+    array_length(p.TagArray, 1) AS TagCount,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId AND p2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' AND p2.Id <> p.Id) AS OwnerRecentPosts,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId
+                       ORDER BY (ln(GREATEST(p.ViewCount, 0) + 1) * (COALESCE(va.UpVotes, 0) + 2)
+                                 - ln(COALESCE(va.DownVotes, 0) + 1)
+                                 + (p.Score * 0.5)
+                                 + (array_length(p.TagArray, 1) * 0.25)
+                       ) DESC, p.CreationDate DESC) AS TypeRank,
+    (ln(GREATEST(p.ViewCount, 0) + 1) * (COALESCE(va.UpVotes, 0) + 2)
+       - ln(COALESCE(va.DownVotes, 0) + 1)
+       + (p.Score * 0.5)
+       + (array_length(p.TagArray, 1) * 0.25)) AS HotScore
+  FROM P p
+  LEFT JOIN CommentCounts cc ON cc.PostId = p.Id
+  LEFT JOIN VotesAgg va ON va.PostId = p.Id
+  LEFT JOIN Activity a ON a.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+Q2 AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.TagArray,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    COALESCE(cc.CommentCount, 0) AS CommentCount,
+    COALESCE(va.UpVotes, 0) AS UpVotes,
+    COALESCE(va.DownVotes, 0) AS DownVotes,
+    COALESCE(a.LastActivity, p.LastActivityDate) AS LastActivityDate,
+    array_length(p.TagArray, 1) AS TagCount,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId AND p2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' AND p2.Id <> p.Id) AS OwnerRecentPosts,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId
+                       ORDER BY (ln(GREATEST(p.ViewCount, 0) + 1) * (COALESCE(va.UpVotes, 0) + 2)
+                                 - ln(COALESCE(va.DownVotes, 0) + 1)
+                                 + (p.Score * 0.5)
+                                 + (array_length(p.TagArray, 1) * 0.25)
+                       ) DESC, p.CreationDate DESC) AS TypeRank,
+    (ln(GREATEST(p.ViewCount, 0) + 1) * (COALESCE(va.UpVotes, 0) + 2)
+       - ln(COALESCE(va.DownVotes, 0) + 1)
+       + (p.Score * 0.5)
+       + (array_length(p.TagArray, 1) * 0.25)) AS HotScore
+  FROM P p
+  LEFT JOIN CommentCounts cc ON cc.PostId = p.Id
+  LEFT JOIN VotesAgg va ON va.PostId = p.Id
+  LEFT JOIN Activity a ON a.PostId = p.Id
+  WHERE p.PostTypeId = 2
+)
+SELECT * FROM Q1
+UNION ALL
+SELECT * FROM Q2
+ORDER BY HotScore DESC
+LIMIT 500;

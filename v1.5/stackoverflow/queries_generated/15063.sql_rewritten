@@ -1,0 +1,69 @@
+-- {"query": "15063.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 149440, "output_tokens": 44007} 
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+PostActivity AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        MAX(p.LastActivityDate) AS MostRecentActivity,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        FIRST_VALUE(t.TagName) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY COUNT(*) DESC
+        ) AS TopTag
+    FROM Posts p
+    CROSS JOIN LATERAL string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') tags
+    JOIN Tags t ON t.TagName = tags
+    GROUP BY p.OwnerUserId, t.TagName
+)
+
+SELECT 
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    pa.PostCount,
+    pa.QuestionCount,
+    pa.AnswerCount,
+    pa.TotalScore,
+    tt.TopTag,
+    CASE 
+        WHEN pa.PostCount > 0 THEN 
+            ROUND(pa.TotalScore * 1.0 / pa.PostCount, 2)
+        ELSE NULL 
+    END AS AvgPostScore,
+    RANK() OVER (
+        ORDER BY 
+            (ubc.GoldBadges * 3 + ubc.SilverBadges * 2 + ubc.BronzeBadges) DESC, 
+            pa.TotalScore DESC
+    ) AS UserRank
+FROM UserBadgeCounts ubc
+JOIN PostActivity pa ON ubc.UserId = pa.OwnerUserId
+LEFT JOIN TopTags tt ON ubc.UserId = tt.OwnerUserId
+WHERE 
+    ubc.BadgeRank <= 1000
+    AND pa.PostCount > 5
+    AND (pa.MostRecentActivity > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+ORDER BY UserRank
+LIMIT 100;

@@ -1,0 +1,195 @@
+WITH tag_list AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.Count >= 50
+),
+question_stats AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    regexp_split_to_table(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS TagName
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+    AND p.Score IS NOT NULL
+),
+tagged_questions AS (
+  SELECT
+    q.*,
+    tl.TagId
+  FROM question_stats q
+  JOIN tag_list tl ON tl.TagName = q.TagName
+),
+answers_agg AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.Score >= 0) AS AnswerCountPositiveScore,
+    COUNT(*) FILTER (WHERE a.Score < 0) AS AnswerCountNegativeScore,
+    AVG(a.Score) AS AvgAnswerScore,
+    MAX(a.Score) AS MaxAnswerScore,
+    MIN(a.Score) AS MinAnswerScore,
+    COUNT(*) AS TotalAnswers,
+    SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnswersWithOwner
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+  GROUP BY a.ParentId
+),
+votes_agg AS (
+  SELECT
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId IN (5,15) OR v.VoteTypeId = 16) AS SpecialVotes,
+    COUNT(*) AS TotalVotes,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comments_agg AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    AVG(c.Score) AS AvgCommentScore,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+user_badge_agg AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(*) AS TotalBadges,
+    BOOL_OR(b.TagBased) AS HasTagBadge
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreation,
+    u.LastAccessDate,
+    u.Views AS ProfileViews,
+    u.UpVotes AS UserUpVotes,
+    REPLACE(u.[Down Votes], ' ', '') AS UserDownVotes,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.TotalBadges,
+    uba.HasTagBadge
+  FROM Users u
+  LEFT JOIN user_badge_agg uba ON uba.UserId = u.Id
+),
+post_link_agg AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedOutCount,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+recent_edit_activity AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) AS RevisionCount,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS HelpfulEdits,
+    MAX(ph.CreationDate) AS LastEdited
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+  GROUP BY ph.PostId
+),
+ranked_questions AS (
+  SELECT
+    tq.TagId,
+    tq.TagName,
+    tq.QuestionId,
+    tq.Title,
+    tq.OwnerUserId,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.Tags,
+    COALESCE(a.TotalAnswers,0) AS TotalAnswersObserved,
+    COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+    COALESCE(v.TotalVotes,0) AS TotalVotes,
+    COALESCE(v.UpVotes,0) AS UpVotes,
+    COALESCE(v.DownVotes,0) AS DownVotes,
+    COALESCE(c.CommentCount,0) AS CommentCount,
+    COALESCE(pa.LinkedOutCount,0) AS LinkedOutCount,
+    COALESCE(pa.DuplicateCount,0) AS DuplicateCount,
+    COALESCE(re.RevisionCount,0) AS RevisionCount,
+    u.Reputation AS OwnerReputation,
+    u.TotalBadges,
+    ( (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) * 0.6
+      + GREATEST(LEAST(LOG(1 + COALESCE(tq.ViewCount,0)) , 10),0) * 0.2
+      + (LEAST(COALESCE(a.AvgAnswerScore,0),20) / 20.0) * 0.15
+      + (LEAST(COALESCE(u.Reputation,0),10000) / 10000.0) * 0.05
+    ) AS HotScore
+  FROM tagged_questions tq
+  LEFT JOIN answers_agg a ON a.QuestionId = tq.QuestionId
+  LEFT JOIN votes_agg v ON v.PostId = tq.QuestionId
+  LEFT JOIN comments_agg c ON c.PostId = tq.QuestionId
+  LEFT JOIN post_link_agg pa ON pa.PostId = tq.QuestionId
+  LEFT JOIN recent_edit_activity re ON re.PostId = tq.QuestionId
+  LEFT JOIN user_activity u ON u.UserId = tq.OwnerUserId
+),
+top_per_tag AS (
+  SELECT
+    TagId,
+    TagName,
+    COUNT(*) AS QuestionsInTag,
+    AVG(Score) AS AvgQuestionScore,
+    AVG(ViewCount) AS AvgViewCount,
+    AVG(TotalAnswersObserved) AS AvgObservedAnswers,
+    MAX(HotScore) AS MaxHotScore,
+    MIN(HotScore) AS MinHotScore,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY HotScore) AS MedianHotScore,
+    JSON_AGG(json_build_object(
+      'QuestionId', QuestionId,
+      'Title', Title,
+      'HotScore', round(HotScore::numeric,4),
+      'Score', Score,
+      'Views', ViewCount,
+      'Answers', TotalAnswersObserved,
+      'OwnerReputation', OwnerReputation,
+      'RevisionCount', RevisionCount
+    ) ORDER BY HotScore DESC NULLS LAST) FILTER (WHERE HotScore IS NOT NULL) AS QuestionsByHotScore
+  FROM ranked_questions
+  GROUP BY TagId, TagName
+),
+selected_tags AS (
+  SELECT *
+  FROM top_per_tag
+  ORDER BY MaxHotScore DESC
+  LIMIT 20
+)
+SELECT
+  st.TagId,
+  st.TagName,
+  st.QuestionsInTag,
+  round(st.AvgQuestionScore::numeric,3) AS AvgQuestionScore,
+  round(st.AvgViewCount::numeric,1) AS AvgViewCount,
+  round(st.AvgObservedAnswers::numeric,3) AS AvgObservedAnswers,
+  round(st.MaxHotScore::numeric,4) AS MaxHotScore,
+  round(st.MedianHotScore::numeric,4) AS MedianHotScore,
+  st.QuestionsByHotScore
+FROM selected_tags st
+ORDER BY st.MaxHotScore DESC, st.TagName;

@@ -1,0 +1,82 @@
+-- {"query": "118.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1460} 
+WITH LastYearPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS OutgoingLinks
+  FROM Posts p
+  WHERE p.LastActivityDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+PostUpvotes AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(*) AS UpvoteCount
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  WHERE v.VoteTypeId = 2
+  GROUP BY p.Id
+),
+UserBadgeStats AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(lp.PostId) AS PostsLastYear,
+    COALESCE(SUM(lp.Score), 0) AS SumScoreLastYear,
+    COALESCE(AVG(lp.ViewCount), 0) AS AvgViewsPerPost,
+    MAX(lp.LastActivityDate) AS LastActivityDate,
+    COALESCE(SUM(lp.OutgoingLinks), 0) AS TotalOutgoingLinks,
+    COALESCE(SUM(pu.UpvoteCount), 0) AS TotalUpvotes
+  FROM Users u
+  LEFT JOIN LastYearPosts lp ON lp.OwnerUserId = u.Id
+  LEFT JOIN PostUpvotes pu ON pu.PostId = lp.PostId
+  LEFT JOIN UserBadgeStats UBS ON UBS.UserId = u.Id
+  GROUP BY u.Id
+),
+TopContributors AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.AccountId,
+    ra.PostsLastYear,
+    ra.SumScoreLastYear,
+    ra.AvgViewsPerPost,
+    ra.LastActivityDate,
+    ra.TotalOutgoingLinks,
+    ra.TotalUpvotes,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    ROW_NUMBER() OVER (ORDER BY ra.TotalUpvotes DESC NULLS LAST, ra.SumScoreLastYear DESC NULLS LAST, u.Reputation DESC) AS rn
+  FROM Users u
+  LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+  LEFT JOIN UserBadgeStats UBS ON UBS.UserId = u.Id
+  ORDER BY ra.TotalUpvotes DESC NULLS LAST
+)
+SELECT
+  tc.UserId,
+  tc.DisplayName,
+  tc.Reputation,
+  tc.CreationDate,
+  tc.AccountId,
+  tc.PostsLastYear,
+  tc.SumScoreLastYear,
+  tc.AvgViewsPerPost,
+  tc.LastActivityDate,
+  tc.TotalOutgoingLinks,
+  tc.TotalUpvotes,
+  tc.GoldBadges,
+  tc.TotalBadges
+FROM TopContributors tc
+WHERE tc.rn <= 100
+ORDER BY tc.TotalUpvotes DESC NULLS LAST, tc.SumScoreLastYear DESC NULLS LAST, tc.Reputation DESC;

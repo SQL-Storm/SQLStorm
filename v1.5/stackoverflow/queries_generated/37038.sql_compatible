@@ -1,0 +1,139 @@
+WITH
+-- recent active questions with tag arrays and score deltas
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         p.AnswerCount, p.CommentCount,
+         regexp_split_to_array(substring(coalesce(p.Tags,''),2,length(coalesce(p.Tags,''))-2), '><') AS Tags,
+         EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/3600.0 AS HoursOld
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+),
+-- top answerer stats per question
+AnswerStats AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.Score > 0) AS PosAnswers,
+         COUNT(a.Id) FILTER (WHERE a.Score <= 0) AS NonPosAnswers,
+         COALESCE(MAX(a.Score),0) AS BestAnswerScore,
+         COALESCE(MIN(a.Score),0) AS WorstAnswerScore,
+         SUM(a.Score) AS SumAnswerScore,
+         -- top answer by score with tie-breaker most recent
+         (SELECT to_json(t) FROM (
+            SELECT a2.Id, a2.OwnerUserId, a2.Score, a2.CreationDate
+            FROM Posts a2
+            WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2
+            ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate DESC
+            LIMIT 1
+         ) t) AS TopAnswer
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY q.Id
+),
+-- voting dynamics: counts by type over last year and last 30 days
+VoteAggregates AS (
+  SELECT v.PostId,
+         COUNT(*) FILTER (WHERE v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')) AS VotesYear,
+         COUNT(*) FILTER (WHERE v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')) AS Votes30,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 2 AND v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')) AS UpVotesYear,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 3 AND v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')) AS DownVotesYear,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 2 AND v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')) AS UpVotes30,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 3 AND v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')) AS DownVotes30
+  FROM Votes v
+  GROUP BY v.PostId
+),
+-- comment sentiment proxies: average comment length and recent commenting users
+CommentStats AS (
+  SELECT c.PostId,
+         COUNT(*) AS CommentCountTotal,
+         AVG(char_length(c.Text)) AS AvgCommentLen,
+         COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+         MAX(c.CreationDate) AS LastComment
+  FROM Comments c
+  WHERE c.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  GROUP BY c.PostId
+),
+-- related links/dedupe graph metrics
+LinkGraph AS (
+  SELECT pl.PostId,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS OutgoingLinks,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateEdges,
+         COUNT(DISTINCT pl.RelatedPostId) AS DistinctRelated
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  GROUP BY pl.PostId
+),
+-- user summary for question askers
+AskerStats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName, u.Reputation,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS NumQuestions,
+         COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS NumAnswers,
+         u.CreationDate
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+-- assemble core metrics and compute composite score
+Core AS (
+  SELECT q.*,
+         a.PosAnswers, a.NonPosAnswers, a.BestAnswerScore, a.WorstAnswerScore, a.SumAnswerScore, a.TopAnswer,
+         COALESCE(v.VotesYear,0) AS VotesYear, COALESCE(v.Votes30,0) AS Votes30,
+         COALESCE(v.UpVotesYear,0) AS UpVotesYear, COALESCE(v.DownVotesYear,0) AS DownVotesYear,
+         COALESCE(c.CommentCountTotal,0) AS CommentCountYear, COALESCE(c.AvgCommentLen,0) AS AvgCommentLen,
+         COALESCE(l.OutgoingLinks,0) AS OutgoingLinks, COALESCE(l.DuplicateEdges,0) AS DuplicateEdges,
+         us.UserId, us.DisplayName AS AskerName, us.Reputation,
+         -- composite heuristics
+         -- recency weight (newer -> higher), attention weight (views and votes), answer quality weight
+         ( (1.0 / NULLIF(GREATEST(q.HoursOld,1),0)) * 10.0
+           + LEAST(1.0, GREATEST(CAST(q.ViewCount AS numeric) / NULLIF(NULLIF(q.AnswerCount,0),0)::numeric, 0)) * 5.0
+           + (CASE WHEN a.BestAnswerScore > 0 THEN 5 ELSE 0 END)
+           + (COALESCE(v.UpVotesYear,0) - COALESCE(v.DownVotesYear,0)) * 0.2
+           + GREATEST(COALESCE(c.UniqueCommenters,0),0) * 0.5
+         ) AS HotnessScore
+  FROM Questions q
+  LEFT JOIN AnswerStats a ON a.QuestionId = q.Id
+  LEFT JOIN VoteAggregates v ON v.PostId = q.Id
+  LEFT JOIN CommentStats c ON c.PostId = q.Id
+  LEFT JOIN LinkGraph l ON l.PostId = q.Id
+  LEFT JOIN AskerStats us ON us.UserId = q.OwnerUserId
+)
+SELECT
+  to_char(cast('2024-10-01 12:34:56' as timestamp), 'YYYY-MM-DD"T"HH24:MI:SS') AS BenchmarkRun,
+  core.Id AS QuestionId,
+  core.Title,
+  core.Tags,
+  core.CreationDate,
+  core.HoursOld,
+  core.ViewCount,
+  core.Score AS QuestionScore,
+  core.AnswerCount,
+  core.PosAnswers,
+  core.BestAnswerScore,
+  (core.TopAnswer->>'OwnerUserId')::int AS TopAnswerOwner,
+  (core.TopAnswer->>'Score')::int AS TopAnswerScore,
+  core.VotesYear, core.Votes30, core.UpVotesYear, core.DownVotesYear,
+  core.CommentCountYear, core.AvgCommentLen,
+  core.OutgoingLinks, core.DuplicateEdges,
+  core.AskerName AS AskerName,
+  core.Reputation AS AskerReputation,
+  core.GoldBadges, core.SilverBadges, core.BronzeBadges,
+  core.HotnessScore,
+  -- windowed ranks and percentiles for benchmarking
+  rank() OVER (ORDER BY core.HotnessScore DESC) AS HotRank,
+  dense_rank() OVER (ORDER BY core.SumAnswerScore DESC NULLS LAST) AS AnswerQualityRank,
+  ntile(100) OVER (ORDER BY core.HotnessScore DESC) AS HotnessPercentile,
+  -- choose problematic candidates: high view low answer ratio, many duplicates, many downvotes recently
+  CASE
+    WHEN core.ViewCount > 1000 AND core.AnswerCount = 0 THEN 'HighViewNoAnswers'
+    WHEN core.DuplicateEdges > 0 THEN 'PossibleDuplicateCluster'
+    WHEN core.DownVotesYear > core.UpVotesYear THEN 'NegativeReception'
+    ELSE 'Normal'
+  END AS IssueTag
+FROM Core core
+WHERE core.HotnessScore IS NOT NULL
+ORDER BY core.HotnessScore DESC
+LIMIT 500;

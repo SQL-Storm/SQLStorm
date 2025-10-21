@@ -1,0 +1,185 @@
+-- {"query": "3070.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1455} 
+WITH TagUsage AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.CreationDate DESC) AS TagPostRank
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.WikiPostId = p.Id
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+),
+RecentTopTags AS (
+    SELECT
+        TagName,
+        COUNT(*) FILTER (WHERE TagPostRank = 1) AS RecentEntries,
+        AVG(OwnerReputation) AS AvgReputation,
+        MAX(CreationDate) AS LastUpdate
+    FROM
+        TagUsage
+    WHERE
+        TagPostRank = 1
+    GROUP BY
+        TagName
+),
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastActive
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.LastAccessDate > NOW() - INTERVAL '90 days'
+        AND u.Reputation > 100
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+PostRevisions AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RevisionRank
+    FROM
+        PostHistory ph
+),
+LatestRevisions AS (
+    SELECT
+        pr.PostId,
+        pr.PostHistoryTypeId,
+        pr.CreationDate,
+        pr.UserId,
+        pr.Comment
+    FROM
+        PostRevisions pr
+    WHERE
+        pr.RevisionRank = 1
+),
+PostLinksCTE AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS LinkRank
+    FROM
+        PostLinks pl
+    LEFT JOIN
+        LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+RecentlyEditedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.LastEditDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName,
+        lr.CreationDate AS LastRevisionDate,
+        lr.Comment AS LastRevisionComment,
+        ARRAY_AGG(pl.RelatedPostId || ':' || pl.LinkType) FILTER (WHERE pl.LinkRank = 1) AS Links
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        LatestRevisions lr ON p.Id = lr.PostId
+    LEFT JOIN
+        PostLinksCTE pl ON p.Id = pl.PostId AND pl.LinkRank = 1
+    WHERE
+        p.LastEditDate > NOW() - INTERVAL '60 days'
+        AND p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.Title, p.CreationDate, p.LastEditDate, p.OwnerUserId, p.Score, p.ViewCount, p.Tags, u.DisplayName, lr.CreationDate, lr.Comment
+)
+SELECT
+    'Benchmark Dataset' AS Description,
+    COUNT(DISTINCT at.UserId) AS ActiveUserCount,
+    COUNT(DISTINCT ut.TagName) AS TagCount,
+    COUNT(DISTINCT ppe.Id) AS RecentlyEditedQuestions,
+    JSON_AGG(
+        JSON_BUILD_OBJECT(
+            'Tag', ut.TagName,
+            'RecentEntries', ut.RecentEntries,
+            'AverageReputation', ut.AvgReputation,
+            'LastUpdate', ut.LastUpdate
+        )
+    ) AS TagStatistics,
+    JSON_AGG(
+        JSON_BUILD_OBJECT(
+            'UserId', au.UserId,
+            'DisplayName', au.DisplayName,
+            'Reputation', au.Reputation,
+            'BadgeCount', au.BadgeCount,
+            'GoldBadges', au.GoldBadges,
+            'SilverBadges', au.SilverBadges,
+            'BronzeBadges', au.BronzeBadges,
+            'Questions', au.QuestionsCount,
+            'Answers', au.AnswersCount,
+            'AverageScore', ROUND(au.AvgPostScore, 2),
+            'LastActive', au.LastActive
+        )
+    ) AS ActiveUserDetails,
+    JSON_AGG(
+        JSON_BUILD_OBJECT(
+            'PostId', p.Id,
+            'Title', p.Title,
+            'Created', p.CreationDate,
+            'LastEdited', p.LastEditDate,
+            'Owner', u.DisplayName,
+            'Score', p.Score,
+            'Views', p.ViewCount,
+            'Tags', p.Tags,
+            'LastRevision', JSON_BUILD_OBJECT(
+                'Date', lr.CreationDate,
+                'Comment', lr.Comment
+            ),
+            'Links', pl.RelatedPostId
+        )
+    ) AS RecentlyEditedPosts
+FROM
+    ActiveUsers au
+CROSS JOIN
+    RecentTopTags ut
+LEFT JOIN
+    Posts p ON p.Id = (SELECT PostId FROM LatestRevisions WHERE PostId = p.Id LIMIT 1)
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    PostLinksCTE pl ON p.Id = pl.PostId AND pl.LinkRank = 1
+LEFT JOIN
+    PostHistory lr ON p.Id = lr.PostId
+LEFT JOIN
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    TagUsage ut ON ut.TagName = (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) LIMIT 1)
+WHERE
+    p.PostTypeId = 1
+GROUP BY
+    at.UserId
+LIMIT 1;

@@ -1,0 +1,83 @@
+-- {"query": "44054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 123876, "output_tokens": 43309} 
+
+WITH cte AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.CreationDate, 
+    p.OwnerUserId, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    u.Reputation, 
+    u.CreationDate AS UserCreationDate, 
+    u.LastAccessDate, 
+    u.Views AS UserViews, 
+    u.UpVotes AS UserUpVotes, 
+    u.DownVotes AS UserDownVotes, 
+    b.Name AS BadgeName, 
+    b.Date AS BadgeDate, 
+    b.Class AS BadgeClass, 
+    b.TagBased AS BadgeTagBased,
+    ph.Id AS PostHistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS PostHistoryCreationDate,
+    ph.UserId AS PostHistoryUserId,
+    ph.UserDisplayName AS PostHistoryUserDisplayName,
+    ph.Comment AS PostHistoryComment,
+    ph.Text AS PostHistoryText,
+    pl.Id AS PostLinkId,
+    pl.CreationDate AS PostLinkCreationDate,
+    pl.LinkTypeId,
+    v.Id AS VoteId,
+    v.VoteTypeId,
+    v.CreationDate AS VoteCreationDate,
+    v.BountyAmount
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  LEFT JOIN Votes v ON p.Id = v.PostId
+)
+SELECT 
+  Id, 
+  PostTypeId, 
+  CreationDate, 
+  OwnerUserId, 
+  Score, 
+  ViewCount, 
+  AnswerCount, 
+  CommentCount, 
+  FavoriteCount, 
+  ClosedDate, 
+  CommunityOwnedDate, 
+  Reputation, 
+  UserCreationDate, 
+  LastAccessDate, 
+  UserViews, 
+  UserUpVotes, 
+  UserDownVotes, 
+  BadgeName, 
+  BadgeDate, 
+  BadgeClass, 
+  BadgeTagBased,
+  PostHistoryId,
+  PostHistoryTypeId,
+  PostHistoryCreationDate,
+  PostHistoryUserId,
+  PostHistoryUserDisplayName,
+  PostHistoryComment,
+  PostHistoryText,
+  PostLinkId,
+  PostLinkCreationDate,
+  LinkTypeId,
+  VoteId,
+  VoteTypeId,
+  VoteCreationDate,
+  BountyAmount
+FROM cte

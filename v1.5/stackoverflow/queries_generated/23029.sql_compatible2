@@ -1,0 +1,114 @@
+WITH TagPopularity AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 1), 0) AS AvgQuestionScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING t.Count > 100
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        COALESCE(MAX(ph.CreationDate), u.CreationDate) AS LastEditDate,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(p.Tags, ''), 'No Tags'), ', ') AS AllTags
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    WHERE u.Reputation > 1000 AND (p.CreationDate > TIMESTAMP '2020-01-01' OR ph.CreationDate > TIMESTAMP '2020-01-01')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = TRUE
+    GROUP BY b.UserId
+),
+ComplexVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = v.PostId AND c.Score > 5) AS HighScoreComments
+    FROM Votes v
+    GROUP BY v.PostId
+    HAVING COUNT(*) > 10
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.TotalQuestionScore,
+    ua.LastEditDate,
+    ua.AllTags,
+    COALESCE(ub.BadgeCount, 0) AS BadgeCount,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    ub.LatestBadgeDate,
+    tp.TagName AS TopTag,
+    tp.TagRank,
+    tp.AvgQuestionScore,
+    cv.VoteCount,
+    cv.NetVotes,
+    cv.HighScoreComments,
+    ROW_NUMBER() OVER (PARTITION BY tp.TagId ORDER BY ua.Reputation DESC) AS UserRankInTag,
+    CASE 
+        WHEN ua.Reputation > 10000 THEN 'High Rep'
+        WHEN ua.Reputation BETWEEN 5000 AND 10000 THEN 'Medium Rep'
+        ELSE 'Low Rep'
+    END AS RepCategory,
+    COALESCE((SELECT MAX(pp.ViewCount) FROM Posts pp WHERE pp.OwnerUserId = ua.UserId AND pp.PostTypeId = 1), 0) AS MaxQuestionViews
+FROM UserActivity ua
+LEFT OUTER JOIN UserBadges ub ON ub.UserId = ua.UserId
+INNER JOIN (
+    SELECT DISTINCT p.OwnerUserId, t.TagName, tp.TagRank, tp.AvgQuestionScore, tp.TagId
+    FROM Posts p
+    CROSS JOIN Tags t
+    INNER JOIN TagPopularity tp ON tp.TagId = t.Id
+    WHERE p.Tags LIKE '%' || t.TagName || '%'
+      AND p.PostTypeId = 1
+      AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3))
+) AS UserTags ON UserTags.OwnerUserId = ua.UserId
+LEFT JOIN TagPopularity tp ON tp.TagId = UserTags.TagId
+LEFT JOIN ComplexVotes cv ON cv.PostId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId ORDER BY p.Score DESC LIMIT 1
+)
+WHERE ua.PostCount > 5 AND (ub.LatestBadgeDate IS NULL OR ub.LatestBadgeDate > TIMESTAMP '2022-01-01')
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Aggregate' AS DisplayName,
+    SUM(ua.Reputation) AS Reputation,
+    SUM(ua.PostCount) AS PostCount,
+    SUM(ua.TotalQuestionScore) AS TotalQuestionScore,
+    MAX(ua.LastEditDate) AS LastEditDate,
+    NULL AS AllTags,
+    SUM(COALESCE(ub.BadgeCount, 0)) AS BadgeCount,
+    SUM(COALESCE(ub.GoldBadges, 0)) AS GoldBadges,
+    MAX(ub.LatestBadgeDate) AS LatestBadgeDate,
+    NULL AS TopTag,
+    NULL AS TagRank,
+    AVG(tp.AvgQuestionScore) AS AvgQuestionScore,
+    SUM(cv.VoteCount) AS VoteCount,
+    SUM(cv.NetVotes) AS NetVotes,
+    SUM(cv.HighScoreComments) AS HighScoreComments,
+    NULL AS UserRankInTag,
+    NULL AS RepCategory,
+    MAX(GREATEST(0, 0)) AS MaxQuestionViews
+FROM UserActivity ua
+LEFT OUTER JOIN UserBadges ub ON ub.UserId = ua.UserId
+LEFT JOIN TagPopularity tp ON TRUE
+LEFT JOIN ComplexVotes cv ON TRUE
+ORDER BY Reputation DESC
+LIMIT 100;

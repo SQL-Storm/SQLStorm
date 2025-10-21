@@ -1,0 +1,90 @@
+-- {"query": "50086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1076} 
+
+WITH UserAnswerMetrics AS (
+    SELECT
+        p_ans.OwnerUserId,
+        p_ans.Score AS AnswerScore,
+        p_que.ViewCount AS QuestionViewCount,
+        p_que.Tags AS QuestionTags,
+        (CASE WHEN p_que.AcceptedAnswerId = p_ans.Id THEN 1 ELSE 0 END) AS IsAcceptedAnswer,
+        EXTRACT(EPOCH FROM (p_ans.CreationDate - p_que.CreationDate)) / 3600.0 AS HoursToAnswer
+    FROM Posts AS p_ans
+    INNER JOIN Posts AS p_que ON p_ans.ParentId = p_que.Id
+    WHERE p_ans.PostTypeId = 2 -- Answers
+      AND p_que.PostTypeId = 1 -- Questions
+      AND p_ans.OwnerUserId IS NOT NULL
+      AND p_ans.DeletionDate IS NULL
+      AND p_que.DeletionDate IS NULL
+),
+UserTagPerformance AS (
+    SELECT
+        uam.OwnerUserId,
+        tag,
+        SUM(uam.AnswerScore) AS TotalScoreInTag,
+        COUNT(*) AS AnswerCountInTag,
+        AVG(uam.QuestionViewCount) AS AvgViewCountInTag,
+        ROW_NUMBER() OVER(PARTITION BY uam.OwnerUserId ORDER BY SUM(uam.AnswerScore) DESC, COUNT(*) DESC) AS TagRank
+    FROM UserAnswerMetrics AS uam,
+         unnest(string_to_array(substring(uam.QuestionTags, 2, length(uam.QuestionTags) - 2), '><')) AS tag
+    WHERE uam.QuestionTags IS NOT NULL AND tag <> ''
+    GROUP BY uam.OwnerUserId, tag
+),
+AggregatedUserStats AS (
+    SELECT
+        uam.OwnerUserId AS UserId,
+        COUNT(*) AS TotalAnswers,
+        SUM(uam.AnswerScore) AS TotalAnswerScore,
+        SUM(uam.IsAcceptedAnswer) AS TotalAcceptedAnswers,
+        AVG(uam.AnswerScore) AS AverageAnswerScore,
+        AVG(uam.HoursToAnswer) FILTER (WHERE uam.HoursToAnswer > 0) AS AverageHoursToAnswer,
+        SUM(CAST(uam.QuestionViewCount AS BIGINT)) AS TotalQuestionViewCountReached
+    FROM UserAnswerMetrics AS uam
+    GROUP BY uam.OwnerUserId
+),
+UserBadgePivots AS (
+    SELECT
+        UserId,
+        COUNT(Id) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(Id) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(Id) FILTER (WHERE Class = 3) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    aus.TotalAnswers,
+    aus.TotalAnswerScore,
+    aus.TotalAcceptedAnswers,
+    aus.AverageHoursToAnswer,
+    aus.TotalQuestionViewCountReached,
+    ubp.GoldBadges,
+    ubp.SilverBadges,
+    utp.tag AS TopPerformingTag,
+    utp.TotalScoreInTag AS ScoreInTopTag,
+    (CAST(aus.TotalAcceptedAnswers AS DECIMAL) / aus.TotalAnswers) * 100 AS AcceptanceRate,
+    (aus.TotalAnswerScore / NULLIF(EXTRACT(EPOCH FROM (NOW() - u.CreationDate)) / 86400, 0)) AS ScoreVelocity,
+    (
+        SELECT AVG(c.Score)
+        FROM Comments c
+        JOIN Posts p ON c.PostId = p.Id
+        WHERE p.OwnerUserId = u.Id AND c.UserId != u.Id
+    ) AS AvgCommentScoreOnPosts
+FROM Users AS u
+JOIN AggregatedUserStats AS aus ON u.Id = aus.UserId
+LEFT JOIN UserBadgePivots AS ubp ON u.Id = ubp.UserId
+LEFT JOIN UserTagPerformance AS utp ON u.Id = utp.OwnerUserId AND utp.TagRank = 1
+WHERE
+    u.Reputation > 50000
+    AND aus.TotalAnswers > 100
+    AND u.Id IN (
+        SELECT DISTINCT v.UserId
+        FROM Votes v
+        WHERE v.VoteTypeId = 2 -- UpMod
+        GROUP BY v.UserId
+        HAVING COUNT(*) > 1000
+    )
+ORDER BY
+    (u.Reputation * 0.5) + (aus.TotalAnswerScore * 0.3) + (COALESCE(ubp.GoldBadges, 0) * 1000) DESC
+LIMIT 100;

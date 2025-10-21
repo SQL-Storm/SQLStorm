@@ -1,0 +1,27 @@
+SELECT 
+    tag, 
+    AVG(u.Reputation) AS avg_user_reputation, 
+    COUNT(DISTINCT pt.Id) AS question_count, 
+    COUNT(DISTINCT b.Id) AS total_badges, 
+    COUNT(DISTINCT v.Id) AS total_votes_on_questions, 
+    AVG(pt.Score) AS avg_question_score, 
+    COUNT(DISTINCT ph.Id) AS total_history_events
+FROM (
+    SELECT 
+        UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag, 
+        p.Id, 
+        p.OwnerUserId, 
+        p.Score
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 
+      AND p.Tags IS NOT NULL 
+      AND p.ClosedDate IS NULL
+) AS pt
+JOIN Users AS u ON pt.OwnerUserId = u.Id
+LEFT JOIN Badges AS b ON u.Id = b.UserId AND b.Class = 1
+LEFT JOIN Votes AS v ON pt.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN PostHistory AS ph ON pt.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+GROUP BY tag
+HAVING COUNT(DISTINCT pt.Id) > 20
+ORDER BY AVG(u.Reputation) DESC, COUNT(DISTINCT b.Id) DESC
+LIMIT 15;

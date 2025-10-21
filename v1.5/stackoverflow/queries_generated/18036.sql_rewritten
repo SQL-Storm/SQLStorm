@@ -1,0 +1,105 @@
+-- {"query": "18036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1232} 
+WITH PostEditFrequency AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        COUNT(ph.Id) AS EditCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(ph.Id) DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    LEFT JOIN PostHistory ph
+        ON p.Id = ph.PostId
+        AND ph.PostHistoryTypeId IN (4, 5, 7, 8) -- Edits and Rollbacks
+    WHERE p.PostTypeId = 1 -- Questions only
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostsCreated,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        AVG(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1.0 ELSE 0.0 END) AS AvgAcceptRate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0 -- Exclude the community user
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnswerRatio AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2 -- Join to get answers
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Score, p.ViewCount
+),
+HighActivityUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        ROW_NUMBER() OVER (PARTITION BY Reputation / 1000 ORDER BY PostsCreated DESC) AS RankWithinRepBucket
+    FROM UserEngagement
+    WHERE Reputation > 1000
+),
+TaggedQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(SPLIT_PART(TAGS, '><', 1)) AS FirstTag,
+        TRIM(SPLIT_PART(TAGS, '><', 2)) AS SecondTag,
+        CASE WHEN TAGS LIKE '%<sql>%' THEN 1 ELSE 0 END AS HasSqlTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+)
+SELECT
+    pef.PostId,
+    pef.OwnerUserId,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    pef.PostCreationDate,
+    pef.EditCount,
+    qar.AnswerCount,
+    qar.QuestionScore,
+    qar.QuestionViewCount,
+    CASE
+        WHEN qar.QuestionViewCount > 10000 AND qar.AnswerCount > 10 THEN 'Popular'
+        WHEN qar.QuestionViewCount > 5000 AND qar.AnswerCount BETWEEN 5 AND 10 THEN 'Engaged'
+        ELSE 'Standard'
+    END AS PopularityCategory,
+    tq.FirstTag,
+    tq.SecondTag,
+    tq.HasSqlTag,
+    COALESCE(u_last_editor.DisplayName, pef.OwnerDisplayName) AS LastEditorDisplayName,
+    CASE
+        WHEN pef.EditCount > (SELECT AVG(EditCount) FROM PostEditFrequency) THEN 'Above Average Editor'
+        WHEN pef.EditCount < (SELECT AVG(EditCount) FROM PostEditFrequency) THEN 'Below Average Editor'
+        ELSE 'Average Editor'
+    END AS EditorBenchmark,
+    ue.CommentsMade,
+    ue.UpvotesGiven,
+    ue.DownvotesGiven,
+    ue.AvgAcceptRate,
+    CASE
+        WHEN ue.AvgAcceptRate IS NULL THEN 'N/A'
+        WHEN ue.AvgAcceptRate > 0.8 THEN 'High'
+        WHEN ue.AvgAcceptRate > 0.5 THEN 'Medium'
+        ELSE 'Low'
+    END AS AcceptRateTier
+FROM PostEditFrequency pef
+INNER JOIN UserEngagement ue ON pef.OwnerUserId = ue.UserId
+INNER JOIN QuestionAnswerRatio qar ON pef.PostId = qar.QuestionId
+LEFT JOIN TaggedQuestions tq ON pef.PostId = tq.PostId
+LEFT JOIN Users u_last_editor ON (SELECT LastEditorUserId FROM Posts WHERE Id = pef.PostId) = u_last_editor.Id
+WHERE pef.rn <= 100 -- Top 100 most edited questions
+AND ue.Reputation BETWEEN 500 AND 5000 -- Focus on mid-tier users
+AND COALESCE(tq.HasSqlTag, 0) = 1 -- Questions related to SQL
+ORDER BY pef.EditCount DESC, qar.QuestionScore DESC;

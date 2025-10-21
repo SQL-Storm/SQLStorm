@@ -1,0 +1,82 @@
+WITH
+user_base AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.LastAccessDate AS LastLogin
+  FROM Users u
+),
+posts_stats AS (
+  SELECT ub.UserId,
+         COUNT(p.Id) AS PostCount365,
+         AVG(p.Score) AS AvgPostScore,
+         MAX(p.LastActivityDate) AS LastPostActivity
+  FROM user_base ub
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = ub.UserId
+   AND p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '365' DAY
+  GROUP BY ub.UserId
+),
+comment_stats AS (
+  SELECT c.UserId,
+         COUNT(*) AS CommentCount365
+  FROM Comments c
+  WHERE c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '365' DAY
+  GROUP BY c.UserId
+),
+badge_latest AS (
+  SELECT DISTINCT ON (b.UserId)
+         b.UserId,
+         b.Name AS BadgeName,
+         b.Date AS BadgeDate
+  FROM Badges b
+  ORDER BY b.UserId, b.Date DESC
+),
+combined AS (
+  SELECT u.UserId,
+         u.DisplayName,
+         u.Reputation,
+         COALESCE(ps.PostCount365, 0) AS PostCount365,
+         COALESCE(cs.CommentCount365, 0) AS CommentCount365,
+         ps.LastPostActivity AS LastActivity,
+         bl.BadgeName
+  FROM user_base u
+  LEFT JOIN posts_stats ps  ON ps.UserId = u.UserId
+  LEFT JOIN comment_stats cs ON cs.UserId = u.UserId
+  LEFT JOIN badge_latest bl  ON bl.UserId = u.UserId
+),
+active AS (
+  SELECT *
+  FROM combined
+  WHERE LastActivity IS NOT NULL
+),
+inactive AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         0 AS PostCount365,
+         0 AS CommentCount365,
+         NULL AS LastActivity,
+         NULL AS BadgeName
+  FROM Users u
+  WHERE NOT EXISTS (SELECT 1 FROM active a WHERE a.UserId = u.Id)
+)
+SELECT
+  t.UserId,
+  t.DisplayName,
+  t.Reputation,
+  t.PostCount365,
+  t.CommentCount365,
+  t.LastActivity,
+  t.BadgeName,
+  (SELECT COUNT(*) FROM Votes v JOIN Posts p ON p.Id = v.PostId
+     WHERE p.OwnerUserId = t.UserId AND v.VoteTypeId = 2) AS UpvotesReceived,
+  (t.DisplayName || ' (' || t.Reputation || ')') AS ProfileSummary,
+  ROW_NUMBER() OVER (ORDER BY t.Reputation DESC, t.LastActivity DESC NULLS LAST) AS rn
+FROM (
+  SELECT * FROM active
+  UNION
+  SELECT * FROM inactive
+) AS t
+ORDER BY rn
+LIMIT 200;

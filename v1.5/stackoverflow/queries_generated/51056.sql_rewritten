@@ -1,0 +1,100 @@
+-- {"query": "51056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1208} 
+WITH 
+monthly_posts AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        u.Id AS user_id,
+        COUNT(*) AS post_count,
+        SUM(COALESCE(p.Score, 0)) AS total_score,
+        SUM(COALESCE(p.ViewCount, 0)) AS total_views,
+        AVG(COALESCE(p.Score, 0)) AS avg_score,
+        COUNT(DISTINCT p.AcceptedAnswerId) AS accepted_answers_count
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+      AND p.DeletionDate IS NULL -- Assuming there's a deletion flag or use Posts that are not deleted
+    GROUP BY DATE_TRUNC('month', p.CreationDate), u.Id
+),
+user_badges AS (
+    SELECT 
+        u.Id AS user_id,
+        COUNT(b.Id) AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+monthly_engagement AS (
+    SELECT 
+        mp.month,
+        mp.user_id,
+        mp.post_count,
+        mp.total_score,
+        mp.total_views,
+        mp.avg_score,
+        mp.accepted_answers_count,
+        COALESCE(ub.total_badges, 0) AS total_badges,
+        COALESCE(ub.gold_badges, 0) AS gold_badges,
+        COALESCE(ub.silver_badges, 0) AS silver_badges,
+        COALESCE(ub.bronze_badges, 0) AS bronze_badges,
+        -- Calculate engagement score
+        (mp.post_count * 10 + 
+         mp.total_score * 2 + 
+         mp.total_views / 1000 + 
+         mp.accepted_answers_count * 50) AS engagement_score
+    FROM monthly_posts mp
+    LEFT JOIN user_badges ub ON mp.user_id = ub.user_id
+),
+tag_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '<>') AS tag_name,
+        COUNT(*) AS tag_usage_count,
+        SUM(p.ViewCount) AS total_tag_views,
+        AVG(p.Score) AS avg_tag_score
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.Tags IS NOT NULL 
+      AND LENGTH(p.Tags) > 2
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), 
+             REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '<>')
+    HAVING COUNT(*) >= 5 -- Only tags with reasonable activity
+)
+SELECT 
+    me.month,
+    t.tag_name,
+    COUNT(DISTINCT me.user_id) AS active_users,
+    SUM(me.post_count) AS total_posts,
+    SUM(me.total_score) AS total_score_all_users,
+    SUM(me.total_views) AS total_views_all_users,
+    SUM(me.engagement_score) AS total_engagement,
+    AVG(me.engagement_score) AS avg_engagement_per_user,
+    SUM(me.gold_badges) AS total_gold_badges,
+    -- Top performing users for each tag-month combination
+    COUNT(CASE WHEN me.engagement_score > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY engagement_score) FROM monthly_engagement me2 WHERE me2.month = me.month) THEN 1 END) AS top_performers,
+    -- Most popular tags for this month
+    RANK() OVER (PARTITION BY me.month ORDER BY ta.tag_usage_count DESC, ta.total_tag_views DESC) AS tag_popularity_rank,
+    -- Calculate growth metrics
+    CASE 
+        WHEN LAG(SUM(me.post_count)) OVER (PARTITION BY t.tag_name ORDER BY me.month) IS NULL THEN NULL
+        ELSE (SUM(me.post_count) - LAG(SUM(me.post_count)) OVER (PARTITION BY t.tag_name ORDER BY me.month)) * 100.0 / 
+             NULLIF(LAG(SUM(me.post_count)) OVER (PARTITION BY t.tag_name ORDER BY me.month), 0)
+    END AS month_over_month_growth_pct
+FROM monthly_engagement me
+CROSS JOIN tag_activity ta ON me.month = ta.month
+INNER JOIN Posts p ON p.OwnerUserId = me.user_id 
+    AND p.CreationDate >= me.month 
+    AND p.CreationDate < me.month + INTERVAL '1 month'
+    AND p.PostTypeId = 1 -- Questions only for tag analysis
+    AND POSITION(ta.tag_name IN SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2)) > 0 -- User posted about this tag
+INNER JOIN Users u ON me.user_id = u.Id
+WHERE u.Reputation >= 100 -- Only established users
+  AND me.post_count >= 1
+GROUP BY me.month, t.tag_name, ta.tag_usage_count, ta.total_tag_views, ta.avg_tag_score
+HAVING SUM(me.post_count) >= 10 -- Only months with sufficient activity
+ORDER BY me.month DESC, total_engagement DESC, tag_popularity_rank
+LIMIT 1000;

@@ -1,0 +1,148 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+QuestionAnalytics AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Unanswered'
+        END AS Status,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate))/3600 AS HoursToResolution,
+        CARDINALITY(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagCount,
+        FIRST_VALUE(t.TagName) OVER (
+            PARTITION BY p.Id 
+            ORDER BY t.Count DESC
+        ) AS MostPopularTag,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST
+        ) AS UserQuestionRank
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name
+    ) AS tag_split ON TRUE
+    LEFT JOIN Tags t ON t.TagName = tag_split.tag_name
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+AnswerPerformance AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerUserId,
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionUserId,
+        a.Score AS AnswerScore,
+        q.Score AS QuestionScore,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAnswer,
+        LENGTH(a.Body) - LENGTH(REPLACE(REPLACE(LOWER(a.Body), '<code>', ''), '</code>', '')) AS CodeBlockChars,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = a.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+        AND a.Score >= 0
+),
+UserActivity AS (
+    SELECT 
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        pht.Name AS ActionType,
+        COUNT(*) AS ActionCount,
+        MAX(ph.CreationDate) AS LastActionDate
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (2, 5, 8, 10, 11, 12, 13)
+    GROUP BY ph.UserId, ph.PostHistoryTypeId, pht.Name
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.Reputation,
+    um.YearsActive,
+    um.PostCount,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.TotalPostScore / NULLIF(um.PostCount, 0) , 2) AS ScorePerPost,
+    um.GoldBadges || '/' || um.SilverBadges || '/' || um.BronzeBadges AS BadgeDistribution,
+    LEFT(COALESCE(um.GoldBadgeNames, 'None'), 100) AS TopGoldBadges,
+    COUNT(DISTINCT qa.QuestionId) FILTER (WHERE qa.UserQuestionRank = 1) AS TopQuestions,
+    AVG(qa.ViewCount) FILTER (WHERE qa.UserQuestionRank <= 3) AS AvgViewsTopQuestions,
+    COUNT(DISTINCT ap.AnswerId) AS TotalAnswers,
+    COUNT(DISTINCT ap.AnswerId) FILTER (WHERE ap.IsAccepted = 1) AS AcceptedAnswers,
+    ROUND(100.0 * COUNT(DISTINCT ap.AnswerId) FILTER (WHERE ap.IsAccepted = 1) / 
+          NULLIF(COUNT(DISTINCT ap.AnswerId), 0), 1) AS AcceptanceRate,
+    ROUND(AVG(ap.HoursToAnswer) FILTER (WHERE ap.AnswerRank = 1), 1) AS AvgHoursToTopAnswer,
+    STRING_AGG(DISTINCT ua.ActionType || ':' || CAST(ua.ActionCount AS VARCHAR), ', ' 
+               ORDER BY ua.ActionCount DESC) AS EditingActivity,
+    CASE 
+        WHEN um.Reputation > 20000 AND um.GoldBadges > 5 THEN 'Elite Contributor'
+        WHEN um.Reputation > 10000 OR um.GoldBadges > 2 THEN 'Expert'
+        WHEN um.Reputation > 5000 OR (um.SilverBadges > 10 AND um.AnswerCount > 50) THEN 'Advanced'
+        WHEN um.PostCount > 20 THEN 'Active'
+        ELSE 'Regular'
+    END AS UserTier,
+    COALESCE(
+        (SELECT STRING_AGG(SUBSTRING(p2.Title, 1, 50), ' | ' ORDER BY p2.Score DESC)
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = um.Id 
+            AND p2.PostTypeId = 1
+            AND p2.Score > 10
+         LIMIT 3), 
+        'No high-scoring questions'
+    ) AS TopQuestionTitles
+FROM UserMetrics um
+LEFT JOIN QuestionAnalytics qa ON um.Id = qa.OwnerUserId
+LEFT JOIN AnswerPerformance ap ON um.Id = ap.AnswerUserId
+LEFT JOIN UserActivity ua ON um.Id = ua.UserId
+WHERE um.PostCount > 10
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.UserId = um.Id 
+            AND v.VoteTypeId IN (4, 12)
+            AND v.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months'
+    )
+GROUP BY 
+    um.Id, um.DisplayName, um.Location, um.Reputation, 
+    um.YearsActive, um.PostCount, um.QuestionCount, 
+    um.AnswerCount, um.TotalPostScore, um.GoldBadges, 
+    um.SilverBadges, um.BronzeBadges, um.GoldBadgeNames
+HAVING COUNT(DISTINCT qa.QuestionId) > 0 OR COUNT(DISTINCT ap.AnswerId) > 0
+ORDER BY 
+    um.Reputation DESC,
+    COALESCE(COUNT(DISTINCT ap.AnswerId) FILTER (WHERE ap.IsAccepted = 1), 0) DESC,
+    um.TotalPostScore DESC
+LIMIT 100;

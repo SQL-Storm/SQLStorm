@@ -1,0 +1,68 @@
+-- {"query": "13054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 716} 
+
+WITH ActiveQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.CreationDate,
+        COUNT(DISTINCT ph.UserId) AS EditorCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY p.Id
+), UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+), RankedQuestions AS (
+    SELECT 
+        aq.Id,
+        aq.Title,
+        aq.Score,
+        aq.ViewCount,
+        aq.OwnerUserId,
+        aq.Tags,
+        aq.CreationDate,
+        aq.EditorCount,
+        aq.LastEditDate,
+        ROW_NUMBER() OVER (PARTITION BY aq.OwnerUserId ORDER BY aq.Score DESC) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY aq.ViewCount DESC) AS GlobalRank
+    FROM ActiveQuestions aq
+)
+SELECT 
+    rq.Id,
+    rq.Title,
+    rq.Score,
+    rq.ViewCount,
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    rq.Tags,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS ParsedTags,
+    rq.CreationDate,
+    rq.EditorCount,
+    rq.LastEditDate,
+    rq.UserRank,
+    rq.GlobalRank,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rq.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rq.Id AND v.VoteTypeId = 2) AS UpvoteCount
+FROM RankedQuestions rq
+JOIN Users u ON rq.OwnerUserId = u.Id
+LEFT JOIN UserBadges ub ON rq.OwnerUserId = ub.UserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(rq.Tags, 2, LENGTH(rq.Tags) - 2), '><')) AS TagName
+) t ON TRUE
+WHERE rq.UserRank <= 5 AND LENGTH(COALESCE(u.AboutMe, '')) > 0
+GROUP BY rq.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+ORDER BY rq.GlobalRank
+LIMIT 100;

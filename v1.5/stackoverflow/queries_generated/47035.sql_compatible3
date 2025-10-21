@@ -1,0 +1,149 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as depth,
+        CAST(t.TagName AS VARCHAR(1000)) as tag_path
+    FROM Tags t
+    WHERE t.Count > 1000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        th.depth + 1,
+        CAST(th.tag_path || ' -> ' || t2.TagName AS VARCHAR(1000))
+    FROM Tags t2
+    INNER JOIN tag_hierarchy th ON th.Id <> t2.Id
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%' 
+    INNER JOIN Posts p2 ON p2.Id = p1.Id AND p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%' 
+    WHERE th.depth < 3
+    HAVING COUNT(DISTINCT p1.Id) > 100
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        COUNT(DISTINCT b.Id) as tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    INNER JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+    ) tag_split ON true
+    INNER JOIN Tags t ON t.TagName = tag_split.tag
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.TagBased = true AND b.Name = t.TagName
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('quarter', p.CreationDate) as quarter,
+        pt.Name as post_type,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT p.OwnerUserId) as unique_authors,
+        AVG(p.Score) as avg_score,
+        STDDEV(p.Score) as score_stddev,
+        AVG(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) as avg_views,
+        AVG(p.AnswerCount) FILTER (WHERE p.PostTypeId = 1) as avg_answers,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.ClosedDate IS NOT NULL) as closed_posts,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.CommunityOwnedDate IS NOT NULL) as community_owned,
+        LAG(COUNT(DISTINCT p.Id), 1) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('quarter', p.CreationDate)) as prev_quarter_count,
+        LAG(COUNT(DISTINCT p.Id), 4) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('quarter', p.CreationDate)) as year_ago_count
+    FROM Posts p
+    INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+    GROUP BY DATE_TRUNC('quarter', p.CreationDate), pt.Name
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        p.PostTypeId,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        COUNT(DISTINCT ph.UserId) as unique_editors,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as content_edits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) as rollbacks,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))/3600) as avg_hours_between_edits,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) as edit_timespan,
+        ARRAY_AGG(DISTINCT pht.Name ORDER BY pht.Name) as edit_types
+    FROM PostHistory ph
+    INNER JOIN Posts p ON p.Id = ph.PostId
+    INNER JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9,24)
+    GROUP BY ph.PostId, p.PostTypeId
+    HAVING COUNT(DISTINCT ph.Id) >= 3
+),
+vote_dynamics AS (
+    SELECT 
+        v.PostId,
+        p.PostTypeId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as downvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as favorites,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) as bounties,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as total_bounty,
+        STDDEV(EXTRACT(EPOCH FROM (v.CreationDate - p.CreationDate))/86400) as vote_timing_stddev_days,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY v.CreationDate - p.CreationDate) as p90_vote_delay
+    FROM Votes v
+    INNER JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId IN (2,3,5,8)
+    GROUP BY v.PostId, p.PostTypeId
+)
+SELECT 
+    th.tag_path,
+    th.Count as tag_frequency,
+    ue.DisplayName as expert_user,
+    ue.tag_rank,
+    ue.total_score as expert_score,
+    ue.accepted_answers,
+    tp.quarter,
+    tp.post_count as quarterly_posts,
+    ROUND(100.0 * (tp.post_count - COALESCE(tp.prev_quarter_count, 0)) / NULLIF(tp.prev_quarter_count, 0), 2) as quarter_growth_pct,
+    ROUND(100.0 * (tp.post_count - COALESCE(tp.year_ago_count, 0)) / NULLIF(tp.year_ago_count, 0), 2) as yoy_growth_pct,
+    tp.avg_score as quarterly_avg_score,
+    tp.score_stddev,
+    ep.edit_count,
+    ep.unique_editors,
+    ep.rollbacks,
+    ROUND(EXTRACT(EPOCH FROM ep.edit_timespan)/86400, 2) as edit_span_days,
+    vd.upvotes,
+    vd.downvotes,
+    ROUND(100.0 * vd.upvotes / NULLIF(vd.upvotes + vd.downvotes, 0), 2) as upvote_ratio,
+    vd.total_bounty,
+    ROUND(EXTRACT(EPOCH FROM vd.p90_vote_delay)/86400, 2) as p90_vote_delay_days,
+    CASE 
+        WHEN ue.tag_rank = 1 THEN 'Top Expert'
+        WHEN ue.tag_rank <= 5 THEN 'Expert'
+        WHEN ue.tag_rank <= 20 THEN 'Contributor'
+        ELSE 'Active User'
+    END as expertise_level,
+    CASE
+        WHEN ep.rollbacks > 0 THEN 'Controversial'
+        WHEN ep.edit_count > 10 THEN 'Heavily Edited'
+        WHEN ep.unique_editors > 5 THEN 'Community Effort'
+        ELSE 'Standard'
+    END as edit_classification
+FROM tag_hierarchy th
+CROSS JOIN temporal_patterns tp
+LEFT JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.tag_rank <= 10
+LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || th.TagName || '>' || '%' 
+    AND DATE_TRUNC('quarter', p.CreationDate) = tp.quarter
+    AND p.PostTypeId = 1
+LEFT JOIN edit_patterns ep ON ep.PostId = p.Id
+LEFT JOIN vote_dynamics vd ON vd.PostId = p.Id
+WHERE th.depth <= 2
+    AND tp.post_count > 100
+    AND tp.quarter >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+ORDER BY th.Count DESC, tp.quarter DESC, ue.tag_rank ASC
+LIMIT 5000;

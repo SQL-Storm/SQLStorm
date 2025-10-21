@@ -1,0 +1,58 @@
+WITH UserPostStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN 1 END) AS TotalQuestions,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalScore
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+TopTags AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.Id = ANY(STRING_TO_ARRAY(P.Tags, '><'))
+    GROUP BY 
+        T.TagName
+    HAVING 
+        COUNT(P.Id) > 10
+),
+CombinedStats AS (
+    SELECT 
+        UPS.UserId,
+        UPS.DisplayName,
+        UPS.TotalPosts,
+        UPS.TotalQuestions,
+        UPS.TotalAnswers,
+        UPS.TotalScore,
+        TT.TagName,
+        ROW_NUMBER() OVER (PARTITION BY UPS.UserId ORDER BY UPS.TotalScore DESC) AS TagRank
+    FROM 
+        UserPostStats UPS
+    LEFT JOIN 
+        TopTags TT ON TT.TagName = ANY(STRING_TO_ARRAY((SELECT STRING_AGG(P.Tags, ',') FROM Posts P WHERE P.OwnerUserId = UPS.UserId), ','))
+)
+SELECT 
+    C.UserId,
+    C.DisplayName,
+    COALESCE(C.TotalPosts, 0) AS TotalPosts,
+    COALESCE(C.TotalQuestions, 0) AS TotalQuestions,
+    COALESCE(C.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(C.TotalScore, 0) AS TotalScore,
+    C.TagName,
+    C.TagRank
+FROM 
+    CombinedStats C
+WHERE 
+    C.TagRank = 1
+ORDER BY 
+    C.TotalScore DESC, C.DisplayName;

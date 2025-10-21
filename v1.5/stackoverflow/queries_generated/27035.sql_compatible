@@ -1,0 +1,236 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName, u.CreationDate
+), ActiveUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        UserCreationDate,
+        TotalPosts,
+        TotalAnswers,
+        LastPostActivity,
+        LastCommentDate,
+        TotalUpvotes,
+        TotalDownvotes,
+        ROW_NUMBER() OVER (PARTITION BY Reputation ORDER BY TotalUpvotes DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC) AS PostRank,
+        ROW_NUMBER() OVER (ORDER BY TotalAnswers DESC) AS AnswerRank
+    FROM
+        UserActivity
+    WHERE
+        LastPostActivity > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+        OR LastCommentDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+), HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        UserCreationDate,
+        TotalPosts,
+        TotalAnswers,
+        LastPostActivity,
+        LastCommentDate,
+        TotalUpvotes,
+        TotalDownvotes,
+        ReputationRank,
+        PostRank,
+        AnswerRank
+    FROM
+        ActiveUsers
+    WHERE
+        Reputation > 1000
+), TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS TypeScoreRank
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.OwnerUserId, u.DisplayName
+), HighEngagementPosts AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        PostCreationDate,
+        Score,
+        ViewCount,
+        Title,
+        Tags,
+        OwnerUserId,
+        OwnerDisplayName,
+        CommentCount,
+        VoteCount,
+        UpvoteCount,
+        DownvoteCount,
+        ScoreRank,
+        ViewRank,
+        TypeScoreRank
+    FROM
+        TopPosts
+    WHERE
+        ScoreRank <= 100 AND ViewRank <= 100
+), UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) AS TagBasedBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+), ComprehensiveUserStats AS (
+    SELECT
+        h.UserId,
+        h.Reputation,
+        h.DisplayName,
+        h.UserCreationDate,
+        h.TotalPosts,
+        h.TotalAnswers,
+        h.LastPostActivity,
+        h.LastCommentDate,
+        h.TotalUpvotes,
+        h.TotalDownvotes,
+        h.ReputationRank,
+        h.PostRank,
+        h.AnswerRank,
+        s.TotalBadges,
+        s.GoldBadges,
+        s.SilverBadges,
+        s.BronzeBadges,
+        s.TagBasedBadges
+    FROM
+        HighReputationUsers h
+    LEFT JOIN
+        UserBadgeStats s ON h.UserId = s.UserId
+), PostEngagementMetrics AS (
+    SELECT
+        hep.PostId,
+        hep.PostTypeId,
+        hep.PostCreationDate,
+        hep.Score,
+        hep.ViewCount,
+        hep.Title,
+        hep.Tags,
+        hep.OwnerUserId,
+        hep.OwnerDisplayName,
+        hep.CommentCount,
+        hep.VoteCount,
+        hep.UpvoteCount,
+        hep.DownvoteCount,
+        hep.ScoreRank,
+        hep.ViewRank,
+        hep.TypeScoreRank,
+        COALESCE(Cuba.TotalPosts, -1) AS TotalPosts,
+        COALESCE(Cuba.TotalAnswers, -1) AS TotalAnswers,
+        COALESCE(Cuba.TotalPosts, -1) + COALESCE(Cuba.TotalAnswers, -1) AS All,
+        CASE
+            WHEN COALESCE(Cuba.TotalPosts, -1) + COALESCE(Cuba.TotalAnswers, -1) = -2 THEN
+                COALESCE(Cuba.TotalUpvotes, -1) + COALESCE(Cuba.TotalDownvotes, -1)
+            ELSE
+                COALESCE(Cuba.TotalUpvotes, -1)
+        END AS UserUpAction,
+        0 AS Threshold,
+        1 AS Undefined,
+        CASE
+            WHEN COALESCE(Cuba.TotalPosts, -1) + COALESCE(Cuba.TotalAnswers, -1) = -2 THEN
+                COALESCE(Cuba.TotalUpvotes, -1) + COALESCE(Cuba.TotalDownvotes, -1)
+            ELSE
+                COALESCE(Cuba.TotalUpvotes, -1)
+        END AS PROFILEUPVOTES,
+        CASE
+            WHEN COALESCE(Cuba.TotalPosts, -1) + COALESCE(Cuba.TotalAnswers, -1) = -2 THEN
+                COALESCE(Cuba.TotalBadges, 0)
+            ELSE
+                COALESCE(Cuba.GoldBadges, 0) + COALESCE(Cuba.SilverBadges, 0) + COALESCE(Cuba.BronzeBadges, 0)
+        END AS SUMBADGES,
+        Cuba.UserId AS UserId
+    FROM
+        HighEngagementPosts hep
+    LEFT JOIN
+        ComprehensiveUserStats cuba ON hep.OwnerUserId = cuba.UserId
+    LEFT JOIN
+        UserBadgeStats s ON hep.OwnerUserId = s.UserId
+)
+SELECT
+    pem.PostId,
+    pem.PostTypeId,
+    pem.PostCreationDate,
+    pem.Score,
+    pem.ViewCount,
+    pem.Title,
+    pem.Tags,
+    pem.OwnerUserId,
+    pem.OwnerDisplayName,
+    pem.CommentCount,
+    pem.VoteCount,
+    pem.UpvoteCount,
+    pem.DownvoteCount,
+    pem.ScoreRank,
+    pem.ViewRank,
+    pem.TypeScoreRank,
+    pem.UserId,
+    (pem.Profileupvotes + pem.UpvoteCount) AS PersonTotalUpVotes,
+    pem.All AS UserTotalPostsQuestionsAndAnswers,
+    pem.PROFILEUPVOTES,
+    pem.USERUPACTION,
+    CASE
+        WHEN pem.Threshold > pem.USERUPACTION - 1 THEN 'OVER SITUATION'
+        WHEN pem.Undefined = 0 THEN 'THE USER IS BALANCED'
+        WHEN pem.TotalPosts = -1 AND pem.TotalAnswers = -1 THEN 'INACTIVE'
+        ELSE ' radial-gradient(circle, rgba(204,187,133,1) 0%,  rgba(204,187,133,0.3847457627118644) 78%,  rgba(0,0,0,0.41234265734265735) 100%)'
+    END AS DESCRIPTION,
+    CASE
+        WHEN pem.Score <> COALESCE(Cuba.TotalUpvotes, -1) + pem.SUMBADGES THEN COALESCE(Cuba.GoldBadges, -1) ELSE pem.Score END AS GOLD,
+        pem.Score <> COALESCE(pem.PROFILEUPVOTES, 0) AND pem.Score <> COALESCE(pem.UpvoteCount, 0) AS PROFILE,
+        (pem.PROFILEUPVOTES / pem.USERUPACTION) * 1 AS TiationIndex
+FROM
+    PostEngagementMetrics pem
+ORDER BY
+    pem.PostId;

@@ -1,0 +1,105 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS HighestBounty,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        PostLinks pl ON p.Id = pl.PostId
+    WHERE 
+        p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS PostCount, 
+        AVG(Score) AS AvgScore, 
+        SUM(ViewCount) AS TotalViews
+    FROM 
+        Posts
+    WHERE 
+        CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 5
+),
+BadgeSummary AS (
+    SELECT 
+        UserId, 
+        COUNT(Id) AS BadgeCount, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    rp.VoteCount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount, 
+    rp.HighestBounty, 
+    rp.CommentCount, 
+    rp.LinkCount, 
+    COALESCE(tu.PostCount, 0) AS UserPostCount, 
+    COALESCE(tu.AvgScore, 0) AS UserAvgScore, 
+    COALESCE(tu.TotalViews, 0) AS UserTotalViews, 
+    COALESCE(bs.BadgeCount, 0) AS UserBadgeCount, 
+    COALESCE(bs.GoldBadges, 0) AS UserGoldBadges, 
+    COALESCE(bs.SilverBadges, 0) AS UserSilverBadges, 
+    COALESCE(bs.BronzeBadges, 0) AS UserBronzeBadges
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    TopUsers tu ON rp.OwnerDisplayName = (
+        SELECT u.DisplayName
+        FROM Users u 
+        WHERE u.Id = (
+            SELECT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.Id = rp.Id
+        )
+    )
+LEFT JOIN 
+    BadgeSummary bs ON rp.OwnerDisplayName = (
+        SELECT u.DisplayName
+        FROM Users u 
+        WHERE u.Id = (
+            SELECT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.Id = rp.Id
+        )
+    )
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.CreationDate DESC
+LIMIT 10;

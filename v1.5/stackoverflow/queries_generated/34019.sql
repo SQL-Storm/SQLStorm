@@ -1,0 +1,142 @@
+-- {"query": "34019.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1249} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        1 AS Level,
+        t.Count
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        r.Level + 1,
+        t2.Count
+    FROM Tags t2
+    INNER JOIN RecursiveTagHierarchy r ON t2.ExcerptPostId = r.Id
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalPostViews
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(b.Id) > 5
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.Score > 10 THEN 1 ELSE 0 END) AS HighScoreAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > current_date - interval '1 year'
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount
+    HAVING COUNT(a.Id) > 2
+),
+TopPostsWithEngagement AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        u.DisplayName,
+        p.Score,
+        p.ViewCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        (COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0))::float / NULLIF(p.ViewCount, 0) AS VoteViewRatio,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) AS LinkCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1 -- questions only
+      AND p.CreationDate > current_date - interval '6 months'
+      AND p.ViewCount > 1000
+),
+UserActivityPeriods AS (
+    SELECT 
+        UserId,
+        MIN(CreationDate) AS FirstPostDate,
+        MAX(CreationDate) AS LastPostDate,
+        COUNT(*) AS TotalPosts
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY UserId
+),
+TopActiveUsersPosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        ua.FirstPostDate,
+        ua.LastPostDate,
+        ua.TotalPosts,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    JOIN UserActivityPeriods ua ON ua.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE ua.TotalPosts > 50
+    GROUP BY u.Id, u.DisplayName, ua.FirstPostDate, ua.LastPostDate, ua.TotalPosts
+)
+SELECT 
+    tas.QuestionId,
+    tas.Title AS QuestionTitle,
+    tas.QuestionScore,
+    tas.QuestionViews,
+    tas.AnswerCount,
+    tas.AvgAnswerScore,
+    tas.MaxAnswerScore,
+    tas.HighScoreAnswers,
+    ubs.DisplayName AS QuestionOwner,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.AvgPostScore AS OwnerAvgPostScore,
+    ta.Tags,
+    ta.UpVotes,
+    ta.DownVotes,
+    ta.VoteViewRatio,
+    ta.CommentCount,
+    ta.LinkCount,
+    uap.DisplayName AS TopActiveUser,
+    uap.TotalPosts AS ActiveUserTotalPosts,
+    uap.QuestionsCount AS ActiveUserQuestions,
+    uap.AnswersCount AS ActiveUserAnswers,
+    uap.AvgPostScore AS ActiveUserAvgScore
+FROM PostAnswerStats tas
+JOIN UserBadgeStats ubs ON ubs.UserId = tas.OwnerUserId
+JOIN TopPostsWithEngagement ta ON ta.Id = tas.QuestionId
+LEFT JOIN TopActiveUsersPosts uap ON uap.UserId = tas.OwnerUserId
+WHERE tas.QuestionScore > 5
+  AND ta.VoteViewRatio > 0.01
+ORDER BY (tas.AnswerCount * tas.AvgAnswerScore) DESC
+LIMIT 100;

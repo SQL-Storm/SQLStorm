@@ -1,0 +1,77 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        u.Reputation,
+        (u.UpVotes * 1.0 / NULLIF(u.UpVotes + u.DownVotes, 0)) * 100 AS UpvoteRatio,
+        RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostScore
+    FROM Users u
+), PostAnalysis AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        CAST(REGEXP_REPLACE(p.Tags, '<|>', ',', 'g') AS TEXT) AS TagArrayRaw,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT SUM(v.VoteTypeId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS VoteImpact
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+)
+SELECT 
+    us.DisplayName,
+    us.Location,
+    us.Reputation,
+    pa.Score,
+    pa.ViewCount,
+    pa.CommentCount,
+    CARDINALITY(CAST(string_to_array(replace(coalesce(pa.TagArrayRaw, ''), ',', ''), ',') AS TEXT[])) AS TagCount,
+    (SELECT COUNT(DISTINCT t.TagName) FROM Tags t WHERE t.TagName = ANY(string_to_array(coalesce(pa.TagArrayRaw, ''), ','))) AS ValidTags,
+    (SELECT STRING_AGG(phType.Name, ', ') 
+     FROM PostHistory ph 
+     JOIN PostHistoryTypes phType ON ph.PostHistoryTypeId = phType.Id
+     WHERE ph.PostId = pa.Id AND phType.Id IN (10,11,12)) AS PostHistoryEvents,
+    CASE 
+        WHEN us.UpvoteRatio > 80 THEN 'High Quality'
+        WHEN us.UpvoteRatio BETWEEN 60 AND 80 THEN 'Medium Quality'
+        ELSE 'Low Quality'
+    END AS ContributorQuality,
+    (SELECT SUM(BountyAmount) FROM Votes v WHERE v.UserId = us.Id AND v.VoteTypeId = 8) AS TotalBountyOffered
+FROM UserStats us
+LEFT JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+WHERE us.GoldBadges > 0
+  AND us.AvgPostScore > (SELECT AVG(Score) FROM Posts)
+  AND EXISTS (
+    SELECT 1 
+    FROM Votes v 
+    WHERE v.UserId = us.Id 
+      AND v.VoteTypeId = 2 
+      AND v.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') AND TIMESTAMP '2024-10-01 12:34:56'
+  )
+UNION ALL
+SELECT 
+    'Community Wiki' AS DisplayName,
+    'N/A' AS Location,
+    0 AS Reputation,
+    p.Score,
+    p.ViewCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagCount,
+    NULL AS ValidTags,
+    (SELECT STRING_AGG(phType.Name, ', ') 
+     FROM PostHistory ph 
+     JOIN PostHistoryTypes phType ON ph.PostHistoryTypeId = phType.Id
+     WHERE ph.PostId = p.Id) AS PostHistoryEvents,
+    'System' AS ContributorQuality,
+    NULL AS TotalBountyOffered
+FROM Posts p
+WHERE p.CommunityOwnedDate IS NOT NULL
+  AND p.Id NOT IN (SELECT COALESCE(AcceptedAnswerId, 0) FROM Posts WHERE AcceptedAnswerId IS NOT NULL)
+ORDER BY Score DESC NULLS LAST, Reputation DESC
+LIMIT 100;

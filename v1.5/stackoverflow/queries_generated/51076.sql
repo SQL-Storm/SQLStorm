@@ -1,0 +1,78 @@
+-- {"query": "51076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 902} 
+
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        u.CreationDate AS user_creation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        SUM(p.ViewCount) AS total_views,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.Score >= 0
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3) -- Upvotes/Downvotes only
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class IN (1, 2) -- Gold and Silver badges only
+    WHERE u.Reputation >= 100 
+      AND u.CreationDate >= '2010-01-01'
+      AND u.Location IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+tag_stats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_usage_count,
+        COUNT(DISTINCT p.OwnerUserId) AS distinct_users,
+        AVG(ua.reputation_rank) AS avg_user_rank,
+        COUNT(DISTINCT ph.Id) AS history_events
+    FROM Tags t
+    JOIN Posts p ON position(t.TagName IN p.Tags) > 0 AND p.PostTypeId = 1 AND p.DeletionDate IS NULL
+    JOIN user_activity ua ON p.OwnerUserId = ua.user_id
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1,4,6,9) -- Title/Tag related edits
+    WHERE t.Count >= 100
+    GROUP BY t.TagName, t.Count
+),
+top_users_with_tags AS (
+    SELECT 
+        ua.*,
+        STRING_AGG(ts.TagName, ', ' ORDER BY ts.tag_usage_count DESC) AS top_tags,
+        COUNT(ts.TagName) AS tag_diversity
+    FROM user_activity ua
+    JOIN Posts p ON ua.user_id = p.OwnerUserId AND p.PostTypeId = 1 AND p.DeletionDate IS NULL
+    JOIN tag_stats ts ON position(ts.TagName IN p.Tags) > 0
+    GROUP BY ua.user_id, ua.Reputation, ua.user_creation, ua.post_count, ua.question_count, 
+             ua.answer_count, ua.avg_post_score, ua.total_views, ua.comment_count, 
+             ua.vote_count, ua.badge_count, ua.reputation_rank
+    HAVING COUNT(DISTINCT ts.TagName) >= 3
+)
+SELECT 
+    tu.reputation_rank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.post_count,
+    tu.question_count,
+    tu.answer_count,
+    ROUND(tu.avg_post_score, 2) AS avg_score,
+    tu.total_views,
+    tu.comment_count,
+    tu.badge_count,
+    tu.top_tags,
+    tu.tag_diversity,
+    -- Derived metrics for benchmarking
+    (tu.question_count * 1.0 / NULLIF(tu.post_count, 0)) AS question_ratio,
+    (tu.total_views / NULLIF(tu.post_count, 0)) AS views_per_post,
+    DENSE_RANK() OVER (ORDER BY tu.total_views DESC) AS view_rank,
+    PERCENT_RANK() OVER (ORDER BY tu.Reputation) AS reputation_percentile
+FROM top_users_with_tags tu
+JOIN Users u ON tu.user_id = u.Id
+WHERE tu.reputation_rank <= 1000  -- Top 1000 users for performance testing
+  AND tu.total_views > 10000
+ORDER BY tu.total_views DESC, tu.reputation_rank ASC
+LIMIT 500;

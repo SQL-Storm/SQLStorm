@@ -1,0 +1,220 @@
+WITH ActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.DisplayName,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM
+        Users U
+    WHERE
+        U.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+),
+PopularPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.CreationDate,
+        P.OwnerUserId,
+        P.OwnerDisplayName,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        COALESCE(P.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS ScoreRank
+    FROM
+        Posts P
+    WHERE
+       P.PostTypeId IN (1, 2)
+       AND P.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+),
+TagMetrics AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count,
+        T.ExcerptPostId,
+        COALESCE(T.WikiPostId, 0) AS WikiPostId,
+        T.IsModeratorOnly,
+        T.IsRequired,
+        RANK() OVER (ORDER BY T.Count DESC) AS TagRank
+    FROM
+        Tags T
+),
+UserActivity AS (
+    SELECT
+        AU.UserId,
+        AU.Reputation,
+        AU.DisplayName,
+        AU.ReputationRank,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        COUNT(DISTINCT V.Id) AS VoteCount
+    FROM
+        ActiveUsers AU
+    LEFT JOIN
+        Posts P ON AU.UserId = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON AU.UserId = C.UserId
+    LEFT JOIN
+        Votes V ON AU.UserId = V.UserId
+    GROUP BY
+        AU.UserId, AU.Reputation, AU.DisplayName, AU.ReputationRank
+),
+PopularTags AS (
+    SELECT
+        TM.TagId,
+        TM.TagName,
+        TM.TagRank,
+        COUNT(PP.PostId) AS PostCount,
+        SUM(PP.Score) AS TotalScore
+    FROM
+        TagMetrics TM
+    LEFT JOIN
+        PopularPosts PP ON PP.Tags LIKE CONCAT('%<', TM.TagName, '>%')
+    GROUP BY
+        TM.TagId, TM.TagName, TM.TagRank
+),
+PostHistoryMetrics AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.UserId,
+        PH.CreationDate,
+        PH.Comment,
+        COUNT(PH.Id) AS EditCount,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS LastEditRank
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId IN (2, 5, 6)
+    GROUP BY
+        PH.PostId, PH.PostHistoryTypeId, PH.UserId, PH.CreationDate, PH.Comment
+),
+CorrelatedTagMetrics AS (
+    SELECT
+        PP.PostId,
+        PT.TagId,
+        PT.TagName,
+        PT.TagRank,
+        (SELECT COUNT(*)
+         FROM Posts P2
+         WHERE P2.Tags LIKE CONCAT('%<', PT.TagName, '>%')
+           AND P2.Id <> PP.PostId) AS RelatedPostCount
+    FROM
+        PopularPosts PP
+    JOIN
+        PopularTags PT ON PP.Tags LIKE CONCAT('%<', PT.TagName, '>%')
+),
+HighActivityUsers AS (
+    SELECT
+        UA.UserId,
+        UA.Reputation,
+        UA.DisplayName,
+        UA.ReputationRank,
+        UA.PostCount,
+        UA.TotalScore,
+        UA.LastPostDate,
+        UA.CommentCount,
+        UA.VoteCount,
+        PHM.EditCount,
+        PHM.LastEditRank
+    FROM
+        UserActivity UA
+    LEFT JOIN
+        PostHistoryMetrics PHM ON UA.UserId = PHM.UserId
+),
+ComplexJoinResults AS (
+    SELECT
+        HAU.UserId,
+        HAU.Reputation,
+        HAU.DisplayName,
+        HAU.ReputationRank,
+        HAU.PostCount,
+        PP.PostId,
+        PP.PostTypeId,
+        PP.Score,
+        PP.ViewCount,
+        PP.Title,
+        PP.CreationDate,
+        PP.OwnerUserId,
+        PP.OwnerDisplayName,
+        PP.Tags,
+        PP.AnswerCount,
+        PP.CommentCount,
+        PP.ScoreRank,
+        PT.TagId,
+        PT.TagName,
+        PT.TagRank,
+        CTM.RelatedPostCount,
+        PHM.EditCount,
+        PHM.LastEditRank
+    FROM
+        HighActivityUsers HAU
+    JOIN
+        PopularPosts PP ON HAU.UserId = PP.OwnerUserId
+    JOIN
+        PopularTags PT ON PP.Tags LIKE CONCAT('%<', PT.TagName, '>%')
+    LEFT JOIN
+        CorrelatedTagMetrics CTM ON PP.PostId = CTM.PostId AND PT.TagId = CTM.TagId
+    LEFT JOIN
+        PostHistoryMetrics PHM ON PP.PostId = PHM.PostId
+)
+SELECT
+    CJR.UserId,
+    CJR.Reputation,
+    CJR.DisplayName,
+    CJR.ReputationRank,
+    CJR.PostCount,
+    CJR.PostId,
+    CJR.PostTypeId,
+    CJR.Score,
+    CJR.ViewCount,
+    CJR.Title,
+    CJR.CreationDate,
+    CJR.OwnerUserId,
+    CJR.OwnerDisplayName,
+    CJR.Tags,
+    CJR.AnswerCount,
+    CJR.CommentCount,
+    CJR.ScoreRank,
+    CJR.TagId,
+    CJR.TagName,
+    CJR.TagRank,
+    CJR.RelatedPostCount,
+    CJR.EditCount,
+    CJR.LastEditRank,
+    U.LastAccessDate,
+    U.Views AS UserViews,
+    U.UpVotes,
+    U.DownVotes,
+    COALESCE(U.WebsiteUrl, 'N/A') AS WebsiteUrl,
+    COALESCE(U.Location, 'N/A') AS Location,
+    CASE
+        WHEN U.AboutMe IS NULL THEN 'No Bio'
+        WHEN LENGTH(U.AboutMe) = 0 THEN 'Empty Bio'
+        ELSE U.AboutMe
+    END AS AboutMe,
+    U.ProfileImageUrl,
+    U.EmailHash
+FROM
+    ComplexJoinResults CJR
+JOIN
+    Users U ON CJR.UserId = U.Id
+WHERE
+    CJR.ScoreRank <= 100
+    AND CJR.TagRank <= 50
+    AND CJR.LastEditRank <= 10
+    AND U.Reputation > 1000
+    AND CJR.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+ORDER BY
+    CJR.Score DESC,
+    CJR.ViewCount DESC,
+    CJR.EditCount DESC;

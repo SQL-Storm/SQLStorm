@@ -1,0 +1,154 @@
+-- {"query": "47044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 100936, "output_tokens": 89830} 
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as question_count,
+        SUM(p.Score) as total_score,
+        1 as level
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND p.Score >= 100
+        AND t.Count >= 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th.question_count,
+        th.total_score,
+        th.level + 1
+    FROM tag_hierarchy th
+    JOIN Posts p ON p.Tags LIKE '%<' || th.TagName || '>%'
+    JOIN Tags t2 ON p.Tags LIKE '%<' || t2.TagName || '>%'
+        AND t2.Id != th.Id
+    WHERE th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers_in_tag,
+        AVG(p.Score) as avg_answer_score,
+        SUM(p.Score) as total_answer_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        STDDEV(p.Score) as score_stddev,
+        COUNT(DISTINCT DATE_TRUNC('month', p.CreationDate)) as active_months,
+        MAX(p.CreationDate) as last_answer_date,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as rank_in_tag
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON q.Id = p.ParentId
+    JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND u.Reputation >= 10000
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+question_quality AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.ViewCount, 0) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400, 0) as views_per_day,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN p.Score::FLOAT / p.AnswerCount 
+            ELSE p.Score 
+        END as score_per_answer,
+        COUNT(DISTINCT c.UserId) as unique_commenters,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) as editor_count,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) as upvoters,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) as downvoters,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) as linked_posts,
+        BOOL_OR(ph.PostHistoryTypeId = 52) as was_hot_network,
+        MIN(a.CreationDate) FILTER (WHERE a.Score > 0) as first_good_answer_time
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND p.Score >= 10
+    GROUP BY p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.AnswerCount, 
+             p.FavoriteCount, p.CreationDate, p.OwnerUserId
+),
+badge_patterns AS (
+    SELECT 
+        b.UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Name) as times_earned,
+        FIRST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date) as first_earned,
+        LAST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as last_earned,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as prev_badge_date,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as next_badge_date,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) as class_count,
+        DENSE_RANK() OVER (PARTITION BY b.Name ORDER BY b.Date) as global_rank_for_badge
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+    WHERE b.TagBased = 0
+        AND u.Reputation >= 5000
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.Reputation,
+    ue.answers_in_tag,
+    ue.avg_answer_score,
+    ue.total_answer_score,
+    ue.accepted_answers,
+    ROUND(ue.accepted_answers::NUMERIC / NULLIF(ue.answers_in_tag, 0) * 100, 2) as acceptance_rate,
+    ue.median_score,
+    ue.score_stddev,
+    ue.active_months,
+    ue.last_answer_date,
+    ue.rank_in_tag,
+    COUNT(DISTINCT qq.Id) as high_quality_questions_answered,
+    AVG(qq.score_per_answer) as avg_question_quality,
+    SUM(qq.ViewCount) as total_views_on_answered_questions,
+    COUNT(DISTINCT bp.BadgeName) FILTER (WHERE bp.Class = 1) as gold_badges,
+    COUNT(DISTINCT bp.BadgeName) FILTER (WHERE bp.Class = 2) as silver_badges,
+    COUNT(DISTINCT bp.BadgeName) FILTER (WHERE bp.Class = 3) as bronze_badges,
+    MAX(bp.times_earned) as max_badge_repetitions,
+    COUNT(DISTINCT th.TagName) as related_tag_expertise,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY qq.views_per_day) as q75_views_per_day,
+    BOOL_OR(qq.was_hot_network) as answered_hot_network_question,
+    AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600) as avg_response_time_hours
+FROM user_expertise ue
+LEFT JOIN Posts a ON a.OwnerUserId = ue.UserId AND a.PostTypeId = 2
+LEFT JOIN Posts q ON q.Id = a.ParentId
+LEFT JOIN question_quality qq ON qq.Id = q.Id
+LEFT JOIN badge_patterns bp ON bp.UserId = ue.UserId
+LEFT JOIN tag_hierarchy th ON th.TagName = ue.TagName
+WHERE ue.rank_in_tag <= 100
+    AND ue.last_answer_date >= cast('2024-10-01' as date) - INTERVAL '6 months'
+GROUP BY 
+    ue.DisplayName, ue.TagName, ue.Reputation, ue.answers_in_tag,
+    ue.avg_answer_score, ue.total_answer_score, ue.accepted_answers,
+    ue.median_score, ue.score_stddev, ue.active_months,
+    ue.last_answer_date, ue.rank_in_tag
+HAVING COUNT(DISTINCT qq.Id) >= 5
+ORDER BY 
+    ue.TagName, 
+    ue.total_answer_score DESC,
+    ue.acceptance_rate DESC
+LIMIT 1000;

@@ -1,0 +1,196 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS PositiveScore,
+        AVG(NULLIF(p.Score, 0)) AS AvgPostScore,
+        MAX(CASE WHEN b.Class = 1 THEN b.Name END) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors,
+        AVG(p.Score) AS AvgQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        MAX(p.Score) - MIN(NULLIF(p.Score, 0)) AS ScoreRange,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'High Activity'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Medium Activity'
+            ELSE 'Low Activity'
+        END AS ActivityLevel
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION(LOWER('<' || LOWER(t.TagName) || '>') IN LOWER(p.Tags)) > 0
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY t.TagName, t.Count
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryType,
+        ph.CreationDate AS ActivityDate,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextActivityDate,
+        LAG(ph.Comment, 1, 'Initial') OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousComment,
+        CASE 
+            WHEN ph.Text LIKE '%duplicate%' THEN 'Duplicate Related'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Moderation Action'
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Content Edit'
+            ELSE 'Other'
+        END AS ActionCategory
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+),
+ComplexScoring AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        SUBSTRING(p.Body FROM 1 FOR 100) || '...' AS BodyPreview,
+        p.Score,
+        p.ViewCount,
+        (p.Score * 1.5 + COALESCE(p.ViewCount, 0) * 0.001 + p.AnswerCount * 2) AS CompositeScore,
+        EXISTS (
+            SELECT 1 
+            FROM Comments c 
+            WHERE c.PostId = p.Id 
+                AND c.Score > (SELECT AVG(Score) FROM Comments WHERE Score > 0)
+        ) AS HasHighScoredComments,
+        (
+            SELECT COUNT(DISTINCT v.UserId)
+            FROM Votes v
+            WHERE v.PostId = p.Id 
+                AND v.VoteTypeId = 2
+                AND v.UserId IN (
+                    SELECT Id FROM Users WHERE Reputation > 10000
+                )
+        ) AS ExpertUpvotes,
+        COALESCE(
+            (SELECT STRING_AGG(u2.DisplayName, ', ' ORDER BY u2.Reputation DESC)
+             FROM Posts p2
+             INNER JOIN Users u2 ON p2.OwnerUserId = u2.Id
+             WHERE p2.ParentId = p.Id
+                AND p2.Score > 5
+             LIMIT 3),
+            'No high-scoring answers'
+        ) AS TopAnswerers
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.Score > 0
+        AND p.ClosedDate IS NULL
+)
+SELECT 
+    um.DisplayName,
+    um.UserLocation,
+    um.Reputation,
+    um.JoinYear,
+    um.YearlyRank,
+    um.TotalPosts,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.AvgPostScore,
+    COALESCE(um.GoldBadges, 'None') AS GoldBadges,
+    ta.TagName AS MostActiveTag,
+    ta.TagUsageCount,
+    ta.AvgQuestionScore AS TagAvgScore,
+    ta.ActivityLevel,
+    cs.Title AS RecentHighScorePost,
+    cs.CompositeScore,
+    cs.ExpertUpvotes,
+    cs.TopAnswerers,
+    ra.ActionCategory AS RecentAction,
+    ra.ActivityDate,
+    CASE 
+        WHEN um.Reputation > 50000 AND um.YearlyRank <= 10 THEN 'Elite Contributor'
+        WHEN um.AvgPostScore > 10 AND um.TotalPosts > 100 THEN 'Quality Focused'
+        WHEN um.AnswerCount > um.QuestionCount * 3 THEN 'Answer Specialist'
+        WHEN um.QuestionCount > um.AnswerCount * 2 THEN 'Question Specialist'
+        WHEN um.TotalPosts > 500 THEN 'Prolific Contributor'
+        ELSE 'Active Member'
+    END AS UserCategory,
+    COALESCE(
+        NULLIF(
+            CASE 
+                WHEN um.PositiveScore > 1000 THEN '🏆'
+                WHEN um.PositiveScore > 500 THEN '⭐'
+                WHEN um.PositiveScore > 100 THEN '✨'
+                ELSE ''
+            END || 
+            CASE 
+                WHEN um.GoldBadges IS NOT NULL THEN '🥇'
+                ELSE ''
+            END,
+            ''
+        ),
+        '📝'
+    ) AS AchievementIcons
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT ta.*
+    FROM TagAnalysis ta
+    INNER JOIN Posts p ON POSITION(LOWER('<' || ta.TagName || '>') IN LOWER(p.Tags)) > 0
+    WHERE p.OwnerUserId = um.Id
+    ORDER BY ta.TagUsageCount DESC
+    LIMIT 1
+) ta ON TRUE
+LEFT JOIN LATERAL (
+    SELECT cs.*
+    FROM ComplexScoring cs
+    INNER JOIN Posts p ON cs.PostId = p.Id
+    WHERE p.OwnerUserId = um.Id
+    ORDER BY cs.CompositeScore DESC
+    LIMIT 1
+) cs ON TRUE
+LEFT JOIN LATERAL (
+    SELECT ra.*
+    FROM RecentActivity ra
+    WHERE ra.UserId = um.Id
+    ORDER BY ra.ActivityDate DESC
+    LIMIT 1
+) ra ON TRUE
+WHERE um.YearlyRank <= 100
+    AND (um.TotalPosts > 10 OR um.Reputation > 5000)
+    AND (ta.TagName IS NOT NULL OR um.GoldBadges IS NOT NULL)
+UNION ALL
+SELECT 
+    'System Average' AS DisplayName,
+    'Global' AS UserLocation,
+    AVG(Reputation) AS Reputation,
+    NULL AS JoinYear,
+    NULL AS YearlyRank,
+    AVG(TotalPosts) AS TotalPosts,
+    AVG(QuestionCount) AS QuestionCount,
+    AVG(AnswerCount) AS AnswerCount,
+    AVG(AvgPostScore) AS AvgPostScore,
+    'Various' AS GoldBadges,
+    NULL AS MostActiveTag,
+    NULL AS TagUsageCount,
+    NULL AS TagAvgScore,
+    'Aggregate' AS ActivityLevel,
+    NULL AS RecentHighScorePost,
+    NULL AS CompositeScore,
+    NULL AS ExpertUpvotes,
+    NULL AS TopAnswerers,
+    'Summary' AS RecentAction,
+    CAST('2024-10-01' AS date) AS ActivityDate,
+    'Benchmark Baseline' AS UserCategory,
+    '📊' AS AchievementIcons
+FROM UserMetrics
+WHERE YearlyRank <= 100
+ORDER BY UserCategory, Reputation DESC NULLS LAST, TotalPosts DESC
+LIMIT 100;

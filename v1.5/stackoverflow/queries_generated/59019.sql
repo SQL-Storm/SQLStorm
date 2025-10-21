@@ -1,0 +1,45 @@
+-- {"query": "59019.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 609} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as HighScoringAnswers,
+    SUM(p.Score) as TotalScore,
+    AVG(p.Score) as AverageScore,
+    MAX(p.ViewCount) as MaxViews,
+    COUNT(DISTINCT b.Id) as BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    COUNT(DISTINCT CASE WHEN c.Score > 0 THEN c.Id END) as HighScoringComments,
+    COUNT(DISTINCT ph.Id) as EditHistoryEntries,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) as PostStatusChanges,
+    COUNT(DISTINCT pl.Id) as PostLinks,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) as DuplicateLinks,
+    STRING_AGG(DISTINCT t.TagName, ', ') as TagsUsed
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+LEFT JOIN (
+    SELECT 
+        PostId,
+        UNNEST(string_to_array(Tags, '><')) as TagName
+    FROM Posts 
+    WHERE Tags IS NOT NULL AND Tags != ''
+) t ON p.Id = t.PostId
+WHERE u.CreationDate >= DATEADD(year, -2, CURRENT_DATE)
+    AND u.Reputation > 100
+    AND (p.Id IS NULL OR p.DeletedDate IS NULL OR p.DeletedDate > CURRENT_DATE)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 5
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+ORDER BY TotalScore DESC, Reputation DESC
+LIMIT 10000;

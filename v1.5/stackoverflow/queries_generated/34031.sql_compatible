@@ -1,0 +1,107 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        MAX(u.Reputation) AS MaxReputation
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1,2) -- Questions and Answers
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+PostTagExploded AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        TRIM(tag) AS TagName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount
+    FROM Posts p
+    CROSS JOIN (
+        SELECT REGEXP_REPLACE(x, '^<|>$', '') AS tag
+        FROM (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS x
+        ) AS t
+    ) AS tag_table(tag)
+    WHERE p.PostTypeId = 1 -- Questions only
+),
+TopTags AS (
+    SELECT 
+        TagName,
+        COUNT(*) AS QuestionCount,
+        AVG(Score) AS AvgScore,
+        AVG(ViewCount) AS AvgViewCount
+    FROM PostTagExploded
+    GROUP BY TagName
+    HAVING COUNT(*) > 100
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(p.LastActivityDate) AS LastActivity,
+        COUNT(DISTINCT CASE WHEN p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days' THEN p.Id END) AS PostsLastMonth,
+        COUNT(DISTINCT CASE WHEN c.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days' THEN c.Id END) AS CommentsLastMonth,
+        COUNT(DISTINCT CASE WHEN v.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days' THEN v.Id END) AS VotesLastMonth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id
+),
+TopActiveUsers AS (
+    SELECT 
+        ura.UserId,
+        ura.LastActivity,
+        ura.PostsLastMonth,
+        ura.CommentsLastMonth,
+        ura.VotesLastMonth,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.AvgPostScore,
+        bs.TotalPosts,
+        bs.MaxReputation,
+        u.DisplayName,
+        COUNT(DISTINCT pl.Id) AS LinkedPostsCount
+    FROM UserRecentActivity ura
+    JOIN Users u ON u.Id = ura.UserId
+    LEFT JOIN UserBadgeStats bs ON bs.UserId = ura.UserId
+    LEFT JOIN Posts p ON p.OwnerUserId = ura.UserId
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    WHERE ura.PostsLastMonth > 5 AND ura.LastActivity IS NOT NULL
+    GROUP BY ura.UserId, ura.LastActivity, ura.PostsLastMonth, ura.CommentsLastMonth, ura.VotesLastMonth,
+             bs.TotalBadges, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, bs.AvgPostScore, bs.TotalPosts, bs.MaxReputation, u.DisplayName
+    ORDER BY bs.MaxReputation DESC
+    LIMIT 20
+)
+SELECT 
+    tau.DisplayName,
+    tau.MaxReputation,
+    tau.TotalPosts,
+    tau.TotalBadges,
+    tau.GoldBadges,
+    tau.SilverBadges,
+    tau.BronzeBadges,
+    tau.AvgPostScore,
+    tau.PostsLastMonth,
+    tau.CommentsLastMonth,
+    tau.VotesLastMonth,
+    tau.LinkedPostsCount,
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.AvgViewCount
+FROM TopActiveUsers tau
+CROSS JOIN TopTags tt
+ORDER BY tau.MaxReputation DESC, tt.QuestionCount DESC;

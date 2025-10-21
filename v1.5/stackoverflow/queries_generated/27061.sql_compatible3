@@ -1,0 +1,140 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        LISTAGG(DISTINCT t.TagName, ', ') WITHIN GROUP (ORDER BY t.TagName) AS FavoriteTags
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Posts pt ON pt.Id = p.Id AND pt.PostTypeId = 1
+    LEFT JOIN
+        Tags t ON pt.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostAnalytics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        COUNT(DISTINCT v.Id) AS TotalVotesOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesOnPost,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost,
+        MAX(ph.CreationDate) AS LastEditDate,
+        STRING_AGG(DISTINCT tr.Name, ', ') AS RelatedPostTypes
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN
+        Posts rp ON pl.RelatedPostId = rp.Id
+    LEFT JOIN
+        LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN
+        CloseReasonTypes crt ON ph.Comment = crt.Id
+    LEFT JOIN
+        Votes crv ON ph.Comment = crv.Id
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.OwnerUserId
+),
+TagStatistics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        SUM(p.ViewCount) AS TotalViewsForTag,
+        AVG(p.Score) AS AverageScoreForTag,
+        MAX(p.Score) AS MaxScoreForTag,
+        MIN(p.Score) AS MinScoreForTag
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%' )
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.LastAccessDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.FavoriteTags,
+    pa.PostId,
+    pt.Name AS PostTypeName,
+    pa.PostCreationDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.TotalVotesOnPost,
+    pa.TotalUpvotesOnPost,
+    pa.TotalDownvotesOnPost,
+    pa.TotalCommentsOnPost,
+    pa.LastEditDate,
+    pa.RelatedPostTypes,
+    ts.TagId,
+    ts.TagName,
+    ts.TagCount,
+    ts.PostsWithTag,
+    ts.TotalViewsForTag,
+    ts.AverageScoreForTag,
+    ts.MaxScoreForTag,
+    ts.MinScoreForTag,
+    vt.Name AS VoteTypeName,
+    v.BountyAmount
+FROM
+    UserActivity ua
+LEFT JOIN
+    PostAnalytics pa ON ua.UserId = pa.OwnerUserId
+LEFT JOIN
+    PostTypes pt ON pa.PostTypeId = pt.Id
+LEFT JOIN
+    TagStatistics ts ON pa.PostId = ts.TagId
+LEFT JOIN
+    Votes v ON pa.PostId = v.PostId
+LEFT JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+WHERE
+    ua.TotalPosts > 0
+    AND pa.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    AND pa.PostCreationDate <= TIMESTAMP '2024-10-01 12:34:56'
+    AND (pa.TotalUpvotesOnPost > 10 OR pa.TotalDownvotesOnPost > 5)
+    AND ts.TagCount > 1000
+ORDER BY
+    ua.Reputation DESC,
+    pa.Score DESC,
+    ts.TotalViewsForTag DESC
+LIMIT 100;

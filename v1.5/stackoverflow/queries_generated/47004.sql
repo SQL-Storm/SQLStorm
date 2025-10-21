@@ -1,0 +1,176 @@
+-- {"query": "47004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 9176, "output_tokens": 7873} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.PostId) as direct_posts,
+        t.TagName as root_tag,
+        0 as level
+    FROM Tags t
+    INNER JOIN (
+        SELECT p.Id as PostId, unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) pt ON t.TagName = pt.TagName
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COUNT(DISTINCT pt2.PostId),
+        th.root_tag,
+        th.level + 1
+    FROM tag_hierarchy th
+    INNER JOIN Tags t2 ON t2.Id != th.Id
+    INNER JOIN (
+        SELECT p.Id as PostId, unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) pt2 ON t2.TagName = pt2.TagName
+    WHERE th.level < 2
+    GROUP BY t2.Id, t2.TagName, th.root_tag, th.level
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        MAX(p.Score) as max_score,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = p.Id THEN p.Id END) as accepted_answers,
+        COUNT(DISTINCT b.Id) as tag_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as silver_badges,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    INNER JOIN (
+        SELECT q2.Id as PostId, unnest(string_to_array(substring(q2.Tags, 2, length(q2.Tags)-2), '><')) as TagName
+        FROM Posts q2
+        WHERE q2.PostTypeId = 1 AND q2.Tags IS NOT NULL
+    ) qt ON q.Id = qt.PostId
+    INNER JOIN Tags t ON qt.TagName = t.TagName
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Name = t.TagName AND b.TagBased = '1'
+    WHERE p.PostTypeId = 2 
+        AND p.Score > 0
+        AND u.Reputation > 5000
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+question_quality AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Score as question_score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        q.ClosedDate,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'answered'
+            WHEN q.AnswerCount > 0 THEN 'has_answers'
+            ELSE 'unanswered'
+        END as status,
+        COUNT(DISTINCT c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        MIN(a.CreationDate) - q.CreationDate as time_to_first_answer,
+        COUNT(DISTINCT CASE WHEN a.Score > 5 THEN a.Id END) as high_quality_answers,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) as upvoters,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) as downvoters,
+        DENSE_RANK() OVER (ORDER BY q.Score DESC) as overall_rank,
+        DENSE_RANK() OVER (PARTITION BY DATE_TRUNC('month', q.CreationDate) ORDER BY q.Score DESC) as monthly_rank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    LEFT JOIN PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN Votes v ON q.Id = v.PostId
+    WHERE q.PostTypeId = 1
+        AND q.Score > 10
+        AND q.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY q.Id, q.OwnerUserId, q.Title, q.Score, q.ViewCount, q.AnswerCount, 
+             q.FavoriteCount, q.CreationDate, q.ClosedDate, q.AcceptedAnswerId
+),
+network_analysis AS (
+    SELECT 
+        pl.PostId as source_post,
+        pl.RelatedPostId as target_post,
+        lt.Name as link_type,
+        p1.OwnerUserId as source_user,
+        p2.OwnerUserId as target_user,
+        p1.Score as source_score,
+        p2.Score as target_score,
+        COUNT(*) OVER (PARTITION BY pl.PostId) as outbound_links,
+        COUNT(*) OVER (PARTITION BY pl.RelatedPostId) as inbound_links,
+        CASE 
+            WHEN p1.OwnerUserId = p2.OwnerUserId THEN 'self_reference'
+            WHEN EXISTS (
+                SELECT 1 FROM PostLinks pl2 
+                WHERE pl2.PostId = pl.RelatedPostId 
+                AND pl2.RelatedPostId = pl.PostId
+            ) THEN 'bidirectional'
+            ELSE 'unidirectional'
+        END as link_direction
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    INNER JOIN Posts p1 ON pl.PostId = p1.Id
+    INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE p1.PostTypeId = 1 AND p2.PostTypeId = 1
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.tag_rank,
+    ue.answer_count,
+    ue.total_score,
+    ue.avg_score,
+    ue.median_score,
+    ue.accepted_answers,
+    ue.gold_badges,
+    ue.silver_badges,
+    qq.question_score,
+    qq.ViewCount,
+    qq.status,
+    qq.comment_count,
+    qq.edit_count,
+    qq.time_to_first_answer,
+    qq.high_quality_answers,
+    qq.overall_rank,
+    qq.monthly_rank,
+    na.link_type,
+    na.source_score,
+    na.target_score,
+    na.outbound_links,
+    na.inbound_links,
+    na.link_direction,
+    th.root_tag,
+    th.level as tag_hierarchy_level,
+    DENSE_RANK() OVER (
+        ORDER BY 
+            ue.total_score * 0.4 + 
+            ue.accepted_answers * 50 + 
+            ue.gold_badges * 100 + 
+            ue.silver_badges * 25 + 
+            COALESCE(qq.question_score, 0) * 0.2 + 
+            COALESCE(qq.ViewCount / 1000.0, 0) DESC
+    ) as composite_rank
+FROM user_expertise ue
+LEFT JOIN question_quality qq ON ue.UserId = qq.OwnerUserId
+LEFT JOIN network_analysis na ON qq.QuestionId = na.source_post OR qq.QuestionId = na.target_post
+LEFT JOIN tag_hierarchy th ON ue.TagName = th.TagName
+WHERE ue.tag_rank <= 50
+ORDER BY composite_rank, ue.TagName, ue.tag_rank
+LIMIT 5000;

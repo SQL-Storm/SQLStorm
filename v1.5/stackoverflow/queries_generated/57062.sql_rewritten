@@ -1,0 +1,119 @@
+-- {"query": "57062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1066} 
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        BadgeCount
+    FROM
+        ActiveUsers
+    WHERE
+        Reputation > 1000
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.Id = ANY (string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ''><''))
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        PostCount DESC
+    LIMIT 10
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        u.DisplayName AS AuthorName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    CROSS JOIN LATERAL
+         UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ''><'')) AS t(TagName)
+    WHERE
+        p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, u.DisplayName
+    ORDER BY
+        p.CreationDate DESC
+    LIMIT 50
+)
+SELECT
+    h.UserId,
+    h.DisplayName AS HighRepUser,
+    h.Reputation,
+    h.PostCount AS HighRepPostCount,
+    h.CommentCount AS HighRepCommentCount,
+    h.VoteCount AS HighRepVoteCount,
+    h.BadgeCount AS HighRepBadgeCount,
+    t.TagName,
+    t.Count AS TagCount,
+    t.AvgPostScore,
+    t.PostCount AS TagPostCount,
+    t.UniqueAuthors,
+    r.PostId,
+    r.PostTypeId,
+    r.CreationDate AS RecentPostDate,
+    r.Score AS RecentPostScore,
+    r.ViewCount AS RecentPostViewCount,
+    r.Title AS RecentPostTitle,
+    r.AuthorName,
+    r.VoteCount AS RecentPostVoteCount,
+    r.CommentCount AS RecentPostCommentCount,
+    r.Tags AS RecentPostTags
+FROM
+    HighReputationUsers h
+CROSS JOIN
+    TopTags t
+CROSS JOIN
+    RecentPosts r
+ORDER BY
+    h.Reputation DESC,
+    t.PostCount DESC,
+    r.CreationDate DESC;

@@ -1,0 +1,131 @@
+-- {"query": "16016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 39695, "output_tokens": 36957} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(SUBSTRING(u.Location, 1, POSITION(',' IN u.Location || ',') - 1), 'Unknown') ORDER BY u.Reputation DESC) AS LocationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 5)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2020-01-01'
+        AND (u.Reputation > 1000 OR u.UpVotes > 50)
+        AND u.DisplayName IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+PostPerformanceAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        STRING_AGG(DISTINCT COALESCE(t.TagName, 'untagged'), ', ' ORDER BY t.TagName) AS TagList,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+        COALESCE(p.ViewCount, 0) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / 86400.0, 0) AS ViewsPerDay,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgScore,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            WHEN p.AnswerCount = 0 AND p.PostTypeId = 1 THEN 'Unanswered'
+            ELSE 'Not Applicable'
+        END AS AnswerStatus,
+        EXISTS(
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId IN (10, 102, 103, 104, 105)
+        ) AS WasClosed
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag_name
+    ) pt ON TRUE
+    LEFT JOIN Tags t ON t.TagName = pt.tag_name
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= '2019-01-01'
+        AND (p.Score >= 5 OR p.ViewCount > 1000 OR p.AnswerCount > 3)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.OwnerUserId, p.AcceptedAnswerId, p.CreationDate, p.Tags
+),
+BadgeAchievementPatterns AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        STRING_AGG(DISTINCT b.Name, '; ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        MIN(b.Date) AS FirstBadgeDate,
+        EXTRACT(EPOCH FROM (MAX(b.Date) - MIN(b.Date))) / 86400.0 AS DaysSpanBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date)))) AS MedianDaysBetweenBadges
+    FROM Badges b
+    WHERE b.Date >= '2018-01-01'
+    GROUP BY b.UserId, b.Class
+)
+SELECT 
+    uem.DisplayName,
+    COALESCE(SUBSTRING(uem.Location FROM 1 FOR 50), 'Location Unknown') AS TruncatedLocation,
+    uem.Reputation,
+    uem.PostCount,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(uem.AvgPostScore::numeric, 2) AS AvgScore,
+    uem.LocationRank,
+    ppa.TagList,
+    ppa.ViewsPerDay,
+    ppa.LinkedPostCount,
+    ppa.UpVotes - ppa.DownVotes AS NetVotes,
+    ppa.AnswerStatus,
+    CASE 
+        WHEN ppa.WasClosed THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    bap.BadgeCount,
+    bap.GoldBadges,
+    bap.DaysSpanBadges,
+    COALESCE(bap.MedianDaysBetweenBadges / 86400.0, 0) AS MedianDaysBetweenBadges,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = ppa.PostId AND c2.Score > 5) AS HighScoreComments,
+    (SELECT AVG(Score) FROM Posts p2 WHERE p2.OwnerUserId = uem.UserId AND p2.PostTypeId = 1) AS UserAvgQuestionScore,
+    CASE 
+        WHEN uem.Reputation > (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Reputation) FROM Users) THEN 'Top 10%'
+        WHEN uem.Reputation > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Reputation) FROM Users) THEN 'Top 25%'
+        WHEN uem.Reputation > (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Reputation) FROM Users) THEN 'Top 50%'
+        ELSE 'Bottom 50%'
+    END AS ReputationTier,
+    ppa.MovingAvgScore
+FROM UserEngagementMetrics uem
+INNER JOIN PostPerformanceAnalysis ppa ON uem.UserId = ppa.OwnerUserId
+LEFT OUTER JOIN BadgeAchievementPatterns bap ON uem.UserId = bap.UserId AND bap.Class = 1
+WHERE uem.LocationRank <= 5
+    AND ppa.ViewsPerDay IS NOT NULL
+    AND (ppa.UpVotes > ppa.DownVotes * 2 OR ppa.DownVotes = 0)
+    AND LENGTH(COALESCE(ppa.TagList, '')) > 0
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v2 
+        WHERE v2.PostId = ppa.PostId 
+            AND v2.VoteTypeId IN (4, 12)
+    )
+ORDER BY 
+    uem.Reputation DESC,
+    ppa.ViewsPerDay DESC NULLS LAST,
+    uem.PostCount DESC
+LIMIT 500;

@@ -1,0 +1,122 @@
+-- {"query": "6089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 875} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.ContentLicense,
+    p.Title IS NOT NULL AS HasTitle,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        (CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) DESC,
+        p.Score DESC,
+        p.CreationDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS ll ON true
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+TopActive AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.OwnerUserId,
+    rp.Tags,
+    rp.LastActivityDate,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.Body,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.LastEditDate,
+    rp.LastEditorUserId,
+    rp.LastEditorDisplayName,
+    rp.ContentLicense
+  FROM RankedPosts rp
+  WHERE rp.rn <= 5
+),
+TaggedSummary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostsWithTag,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore
+  FROM Posts p
+  CROSS APPLY STRING_SPLIT(p.Tags, '><') AS tag
+  LEFT JOIN Tags t ON t.TagName = tag.value
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 1
+),
+RecentActivity AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.LastActivityDate IS NOT NULL
+    AND p.LastActivityDate > CURRENT_DATE - INTERVAL '30 days'
+),
+CorrelatedStats AS (
+  SELECT
+    t.TagName,
+    COUNT(1) AS TotalPosts,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+  FROM Posts p
+  LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%' OR t.TagName = ANY(string_to_array(p.Tags, '<>'))
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+)
+SELECT
+  ta.TagName,
+  ta.TotalPosts,
+  ta.PositivePosts,
+  ta.Upvotes,
+  ta.Downvotes,
+  ra.Id AS TopPostId,
+  ra.Title AS TopPostTitle,
+  ra.CreationDate AS TopPostDate,
+  ra.ViewCount AS TopPostViews,
+  ra.Score AS TopPostScore,
+  ra.OwnerUserId AS TopPostOwner
+FROM CorrelatedStats ta
+JOIN TopActive ra ON ra.Id IN (
+  SELECT p.Id
+  FROM Posts p
+  WHERE p.Tags LIKE '%' || ta.TagName || '%' OR p.Tags LIKE '%' || ra.Tags || '%'
+  ORDER BY p.LastActivityDate DESC
+  LIMIT 1
+)
+ORDER BY ta.TotalPosts DESC, ta.Upvotes DESC
+LIMIT 100;

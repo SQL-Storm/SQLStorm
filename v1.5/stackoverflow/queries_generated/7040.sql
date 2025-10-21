@@ -1,0 +1,191 @@
+-- {"query": "7040.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1984} 
+with
+-- Compute per-question aggregates and tag arrays
+question_base as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score as QuestionScore,
+         coalesce(p.ViewCount,0) as ViewCount,
+         coalesce(p.AnswerCount,0) as AnswerCount,
+         coalesce(p.FavoriteCount,0) as FavoriteCount,
+         regexp_split_to_array(substring(p.Tags,2,case when p.Tags is null then 0 else length(p.Tags)-2 end), '><') as TagArray,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- Best answer metrics per question (including accepted, highest score, most recent)
+answer_metrics as (
+  select q.QuestionId,
+         q.AcceptedAnswerId,
+         count(a.Id) filter (where a.Score >= 0) as PosAnswerCount,
+         count(a.Id) filter (where a.Score < 0) as NegAnswerCount,
+         max(a.Score) as MaxAnswerScore,
+         min(a.Score) as MinAnswerScore,
+         max(a.CreationDate) as LastAnswerDate,
+         -- correlated subquery to find the Id of highest scoring answer (tie-breaker: earliest creation)
+         (select aa.Id
+          from Posts aa
+          where aa.ParentId = q.QuestionId
+          order by aa.Score desc nulls last, aa.CreationDate asc nulls last
+          limit 1) as TopAnswerId
+  from question_base q
+  left join Posts a on a.ParentId = q.QuestionId and a.PostTypeId = 2
+  group by q.QuestionId, q.AcceptedAnswerId
+),
+-- User reputation and activity windowed stats
+user_stats as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         coalesce(u.Views,0) as ProfileViews,
+         coalesce(u.UpVotes,0) as UpVotes,
+         coalesce(u.DownVotes,0) as DownVotes,
+         dense_rank() over (order by u.Reputation desc) as ReputationRank,
+         row_number() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearlyTopUserRank
+  from Users u
+),
+-- Per-question heavy text/NULL analysis from PostHistory and Comments
+text_activity as (
+  select ph.PostId,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6,24)) as EditCount,
+         count(*) filter (where ph.PostHistoryTypeId in (10,11,12,13,14)) as ModerationEventCount,
+         max(ph.CreationDate) as LastHistoryDate,
+         bool_or(ph.Text is null) as AnyHistoryTextNull,
+         sum(char_length(coalesce(ph.Text,''))) as TotalHistoryTextChars,
+         coalesce((select count(*) from Comments c where c.PostId = ph.PostId),0) as CommentCount
+  from PostHistory ph
+  group by ph.PostId
+),
+-- Votes breakdown per post with windowed percentiles
+vote_breakdown as (
+  select v.PostId,
+         count(*) as TotalVotes,
+         count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+         count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+         count(*) filter (where v.VoteTypeId = 5) as FavoriteVotes,
+         coalesce(sum(v.BountyAmount),0) as TotalBounty,
+         percent_rank() over (partition by v.PostId order by v.CreationDate) as VoteTimePercentile_example -- silly window to exercise planner
+  from Votes v
+  group by v.PostId
+),
+-- Tag popularity across questions (explode tags)
+exploded_tags as (
+  select q.QuestionId,
+         lower(trim(t)) as Tag
+  from question_base q
+  cross join lateral unnest(coalesce(q.TagArray,array[]::text[])) t
+  where t is not null and t <> ''
+),
+tag_popularity as (
+  select et.Tag,
+         count(distinct et.QuestionId) as QuestionCount,
+         dense_rank() over (order by count(distinct et.QuestionId) desc) as PopularityRank
+  from exploded_tags et
+  group by et.Tag
+),
+-- Combine many different stats and join related posts via complex predicates and outer joins
+combined as (
+  select q.QuestionId,
+         q.Title,
+         q.CreationDate as QuestionCreated,
+         q.QuestionScore,
+         qm.PosAnswerCount,
+         qm.NegAnswerCount,
+         qm.MaxAnswerScore,
+         qm.TopAnswerId,
+         a.Score as TopAnswerScore,
+         a.OwnerUserId as TopAnswerOwner,
+         a.CreationDate as TopAnswerCreated,
+         us.DisplayName as QuestionOwnerName,
+         us.Reputation as QuestionOwnerRep,
+         us.ReputationRank,
+         ta.Tag,
+         tp.PopularityRank as TagRank,
+         ph.EditCount,
+         ph.ModerationEventCount,
+         ph.LastHistoryDate,
+         vb.TotalVotes,
+         vb.UpVotes,
+         vb.DownVotes,
+         vb.TotalBounty,
+         -- compute an attention score combining views, answers, votes, and edits with null-safe math
+         (coalesce(q.ViewCount,0)::numeric / nullif(greatest(coalesce(qm.PosAnswerCount,0),1),0)
+          + coalesce(q.QuestionScore,0) * 2
+          + coalesce(vb.UpVotes,0) * 1.5
+          - coalesce(vb.DownVotes,0) * 1.2
+          + coalesce(ph.EditCount,0) * 0.5
+          + log(1 + coalesce(vb.TotalBounty,0))
+         ) as AttentionScore,
+         -- string expression: shortened title with fallback and null handling
+         coalesce(nullif(substring(q.Title for 120),''), '[no-title]') || ' (' || coalesce(tp.Tag,'[no-tag]') || ')' as ShortTitleTag,
+         -- flag controversial: many opposing votes and high edit churn
+         (case when coalesce(vb.UpVotes,0) >= 10 and coalesce(vb.DownVotes,0) >= 5 and ph.EditCount > 3 then true else false end) as IsControversial
+  from question_base q
+  left join answer_metrics qm on qm.QuestionId = q.QuestionId
+  left join Posts a on a.Id = qm.TopAnswerId
+  left join Users us on us.Id = q.OwnerUserId
+  left join exploded_tags et on et.QuestionId = q.QuestionId
+  left join tag_popularity tp on tp.Tag = et.Tag
+  left join text_activity ph on ph.PostId = q.QuestionId
+  left join vote_breakdown vb on vb.PostId = q.QuestionId
+),
+-- Final ranking with window functions and set operations to produce a complex result set
+ranked as (
+  select *,
+         rank() over (partition by coalesce(Tag,'[untagged]') order by AttentionScore desc nulls last) as TagAttentionRank,
+         row_number() over (order by AttentionScore desc nulls last) as GlobalAttentionRank
+  from combined
+),
+-- A small set operator to union top-n per tag with global top
+per_tag_top as (
+  select * from ranked where TagAttentionRank <= 3
+  union
+  select * from ranked where GlobalAttentionRank <= 50
+)
+-- Final projection with correlated subquery pulling recent comment text, plus conditional NULL-centric expressions
+select
+  p.GlobalAttentionRank,
+  p.TagAttentionRank,
+  p.QuestionId,
+  p.ShortTitleTag,
+  p.Tag,
+  p.PopularityRank,
+  p.QuestionOwnerName,
+  p.QuestionOwnerRep,
+  p.QuestionCreated,
+  p.AttentionScore,
+  p.IsControversial,
+  p.PosAnswerCount,
+  p.NegAnswerCount,
+  p.MaxAnswerScore,
+  p.TopAnswerId,
+  p.TopAnswerOwner,
+  p.TopAnswerScore,
+  p.TopAnswerCreated,
+  p.EditCount,
+  p.ModerationEventCount,
+  p.LastHistoryDate,
+  p.TotalVotes,
+  p.UpVotes,
+  p.DownVotes,
+  p.TotalBounty,
+  -- correlated subquery: most recent non-empty comment text on the question with NULL trimming
+  (select c.Text
+   from Comments c
+   where c.PostId = p.QuestionId and coalesce(trim(c.Text),'') <> ''
+   order by c.CreationDate desc
+   limit 1) as MostRecentComment,
+  -- correlated subquery: number of distinct editors excluding the owner
+  (select count(distinct ph.UserId)
+   from PostHistory ph
+   where ph.PostId = p.QuestionId and ph.UserId is not null and ph.UserId <> p.QuestionOwnerRep
+  ) as DistinctEditorCount,
+  -- computed normalized attention percentile over the per_tag_top set using window
+  round(100.0 * (rank() over (order by p.AttentionScore) - 1) / nullif(count(*) over (),0),2) as PercentileWithinResult
+from per_tag_top p
+order by p.AttentionScore desc nulls last, p.QuestionCreated desc
+limit 200;

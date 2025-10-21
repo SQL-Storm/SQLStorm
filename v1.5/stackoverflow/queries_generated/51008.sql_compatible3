@@ -1,0 +1,149 @@
+WITH user_activity AS (
+    SELECT 
+        u.id as user_id,
+        u.reputation,
+        u.upvotes,
+        u.downvotes,
+        COUNT(DISTINCT p.id) as post_count,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(p.score) as avg_post_score,
+        MAX(p.creationdate) as last_post_date,
+        COUNT(DISTINCT c.id) as comment_count
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id AND p.owneruserid IS NOT NULL
+    LEFT JOIN comments c ON c.userid = u.id
+    GROUP BY u.id, u.reputation, u.upvotes, u.downvotes
+),
+top_users AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.reputation DESC) as rep_rank,
+        ROW_NUMBER() OVER (ORDER BY (ua.question_count + ua.answer_count) DESC) as activity_rank
+    FROM user_activity ua
+    WHERE ua.reputation > 1000
+),
+influential_users AS (
+    SELECT 
+        tu.user_id,
+        tu.reputation,
+        tu.post_count,
+        tu.question_count,
+        tu.answer_count,
+        tu.avg_post_score,
+        tu.last_post_date,
+        tu.comment_count,
+        b.name as badge_name,
+        b.class as badge_class,
+        COUNT(DISTINCT b.id) as badge_count
+    FROM top_users tu
+    LEFT JOIN badges b ON b.userid = tu.user_id
+    WHERE tu.rep_rank <= 1000
+    GROUP BY tu.user_id, tu.reputation, tu.post_count, tu.question_count, 
+             tu.answer_count, tu.avg_post_score, tu.last_post_date, 
+             tu.comment_count, b.name, b.class
+),
+post_performance AS (
+    SELECT 
+        p.id as post_id,
+        p.title,
+        p.posttypeid,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.commentcount,
+        p.creationdate,
+        p.lastactivitydate,
+        p.tags,
+        iu.user_id as author_id,
+        iu.reputation as author_rep,
+        iu.question_count as author_questions,
+        iu.answer_count as author_answers,
+        CAST(v.vote_typeid AS integer) as vote_typeid,
+        COUNT(v.id) as vote_count,
+        SUM(CASE WHEN v.vote_typeid = 2 THEN 1 ELSE 0 END) as upvotes,
+        SUM(CASE WHEN v.vote_typeid = 3 THEN 1 ELSE 0 END) as downvotes
+    FROM posts p
+    INNER JOIN influential_users iu ON p.owneruserid = iu.user_id
+    LEFT JOIN votes v ON v.postid = p.id
+        -- Upvotes and Downvotes only
+        AND v.vote_typeid IN (2, 3)
+    WHERE p.posttypeid IN (1, 2) -- Questions and Answers only
+        AND p.deletiondate IS NULL
+        AND p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    GROUP BY p.id, p.title, p.posttypeid, p.score, p.viewcount, 
+             p.favoritecount, p.commentcount, p.creationdate, 
+             p.lastactivitydate, p.tags, iu.user_id, iu.reputation, 
+             iu.question_count, iu.answer_count
+),
+top_posts AS (
+    SELECT 
+        pp.*,
+        RANK() OVER (PARTITION BY pp.posttypeid ORDER BY pp.viewcount DESC) as view_rank,
+        RANK() OVER (ORDER BY pp.score DESC) as score_rank,
+        pp.upvotes - pp.downvotes as net_votes
+    FROM post_performance pp
+    WHERE pp.viewcount > 100
+),
+linked_posts AS (
+    SELECT 
+        tp.post_id,
+        tp.title,
+        tp.posttypeid,
+        tp.score,
+        tp.viewcount,
+        tp.favoritecount,
+        tp.upvotes,
+        tp.downvotes,
+        tp.net_votes,
+        tp.view_rank,
+        pl.relatedpostid as linked_post_id,
+        COUNT(DISTINCT pl.id) as link_count,
+        STRING_AGG(DISTINCT t.tagname, ',') as linked_tags
+    FROM top_posts tp
+    LEFT JOIN postlinks pl ON pl.postid = tp.post_id AND pl.linktypeid = 1
+    LEFT JOIN posts linked_p ON linked_p.id = pl.relatedpostid
+    LEFT JOIN (
+        SELECT 
+            pt.id,
+            STRING_AGG(
+                REGEXP_REPLACE(tp.tags, '<[^>]+>', '', 'g'), 
+                ','
+            ) as tagname
+        FROM posts pt
+        INNER JOIN tags t ON POSITION(t.tagname IN pt.tags) > 0
+        WHERE pt.posttypeid = 1
+        GROUP BY pt.id
+    ) tag_extract ON linked_p.id = tag_extract.id
+    WHERE tp.view_rank <= 50
+    GROUP BY tp.post_id, tp.title, tp.posttypeid, tp.score, 
+             tp.viewcount, tp.favoritecount, tp.upvotes, 
+             tp.downvotes, tp.net_votes, tp.view_rank, pl.relatedpostid
+)
+SELECT 
+    lp.post_id,
+    lp.title,
+    CASE lp.posttypeid 
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+    END as post_type,
+    lp.score,
+    lp.viewcount,
+    lp.favoritecount,
+    lp.upvotes,
+    lp.downvotes,
+    lp.net_votes,
+    lp.link_count,
+    lp.linked_tags,
+    lp.author_rep,
+    lp.author_questions + lp.author_answers as author_total_posts,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - lp.creationdate)) as days_since_creation,
+    ROUND((CAST(lp.viewcount AS FLOAT) / GREATEST(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - lp.creationdate)), 1)), 2) as views_per_day,
+    ROUND((CAST(lp.score AS FLOAT) / GREATEST(lp.upvotes, 1)), 2) as score_per_upvote,
+    ROW_NUMBER() OVER (ORDER BY lp.viewcount DESC, lp.score DESC) as overall_rank,
+    DENSE_RANK() OVER (PARTITION BY lp.posttypeid ORDER BY lp.net_votes DESC) as type_rank
+FROM linked_posts lp
+WHERE lp.viewcount > 1000
+    AND (lp.upvotes > lp.downvotes OR lp.posttypeid = 1)
+ORDER BY lp.viewcount DESC, lp.score DESC
+LIMIT 100;

@@ -1,0 +1,54 @@
+WITH RecentUsers AS (
+    SELECT U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    FROM Users U
+    WHERE U.CreationDate >= TIMESTAMP '2024-10-01 12:34:56'
+        - INTERVAL '1 year'
+),
+HighReputationUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM RecentUsers
+    WHERE Reputation > 1000
+),
+TopVotedAnswers AS (
+    SELECT P.Id, P.Title, MAX(V.VoteCount) AS MaxVotes
+    FROM Posts P
+    JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) V ON P.Id = V.PostId
+    WHERE P.PostTypeId = 2
+    GROUP BY P.Id, P.Title
+),
+TopQuestions AS (
+    SELECT P.Id, P.Title, P.Score, U.DisplayName
+    FROM Posts P
+    LEFT JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE P.PostTypeId = 1 AND P.Score > 10
+),
+UserBadgeCounts AS (
+    SELECT B.UserId, COUNT(*) AS BadgeCount
+    FROM Badges B
+    GROUP BY B.UserId
+),
+ComplexQuery AS (
+    SELECT H.DisplayName AS UserName,
+           H.Reputation,
+           T.Title AS QuestionTitle,
+           T.Score AS QuestionScore,
+           COALESCE(BC.BadgeCount, 0) AS NumBadges,
+           LEVENSHTEIN(LOWER(T.Title), LOWER(A.Title)) AS TitleSimilarity
+    FROM HighReputationUsers H
+    JOIN TopQuestions T ON H.Id = T.Id
+    LEFT JOIN UserBadgeCounts BC ON H.Id = BC.UserId
+    CROSS JOIN TopVotedAnswers A
+    WHERE T.Id IN (SELECT Id FROM RecentUsers)
+      AND H.Reputation > CAST(1.5 * (SELECT AVG(Reputation) FROM Users) AS DOUBLE PRECISION)
+)
+SELECT UserName, QuestionTitle, QuestionScore, NumBadges, TitleSimilarity
+FROM ComplexQuery
+WHERE NumBadges > 5
+  AND TitleSimilarity < 10
+ORDER BY QuestionScore DESC, NumBadges ASC
+LIMIT 50;

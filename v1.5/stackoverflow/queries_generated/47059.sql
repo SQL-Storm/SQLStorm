@@ -1,0 +1,131 @@
+-- {"query": "47059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 135346, "output_tokens": 119784} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as question_count,
+        SUM(p.ViewCount) as total_views,
+        1 as depth
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COUNT(DISTINCT p2.Id),
+        SUM(p2.ViewCount),
+        th.depth + 1
+    FROM tag_hierarchy th
+    JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    JOIN Posts p2 ON p2.Tags LIKE '%<' || th.TagName || '>%'
+        AND p2.Id != p1.Id
+    JOIN Tags t2 ON p2.Tags LIKE '%<' || t2.TagName || '>%'
+        AND t2.Id != th.Id
+    WHERE p1.PostTypeId = 1 
+        AND p2.PostTypeId = 1
+        AND th.depth < 3
+    GROUP BY t2.Id, t2.TagName, th.depth
+),
+user_expertise AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) as accepted_answers,
+        COUNT(DISTINCT b.Id) as tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY 
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 0.3 +
+            AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) * 0.4 +
+            SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) * 0.3 DESC
+        ) as expertise_rank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1
+    JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Badges b ON u.Id = b.UserId 
+        AND b.TagBased = true 
+        AND b.Name = t.TagName
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as month,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as posts,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        COUNT(DISTINCT p.OwnerUserId) as unique_authors,
+        SUM(p.AnswerCount) as total_answers,
+        AVG(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate))/3600) as avg_lifetime_hours
+    FROM Posts p
+    JOIN Tags t ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= NOW() - INTERVAL '5 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), t.TagName
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) as rollback_count,
+        COUNT(DISTINCT ph.UserId) as unique_editors,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) as edit_timespan,
+        ARRAY_AGG(DISTINCT ph.PostHistoryTypeId ORDER BY ph.PostHistoryTypeId) as history_types
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId NOT IN (25, 31, 50, 52, 53)
+    GROUP BY ph.PostId
+)
+SELECT 
+    th.TagName as primary_tag,
+    th.question_count,
+    th.total_views,
+    ue.DisplayName as top_expert,
+    ue.answers as expert_answers,
+    ue.avg_answer_score as expert_avg_score,
+    ue.accepted_answers as expert_accepted,
+    tp.month as trending_month,
+    tp.posts as monthly_posts,
+    tp.avg_score as monthly_avg_score,
+    tp.median_views as monthly_median_views,
+    tp.unique_authors as monthly_authors,
+    ep.edit_count as heavily_edited_posts,
+    ep.rollback_count as contentious_edits,
+    ep.unique_editors as collaborative_editors,
+    COUNT(DISTINCT pl.RelatedPostId) as linked_posts,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) as duplicate_targets,
+    AVG(c.Score) as avg_comment_score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as total_upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as total_downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as total_bounty_amount
+FROM tag_hierarchy th
+JOIN user_expertise ue ON th.TagName = ue.TagName AND ue.expertise_rank = 1
+JOIN temporal_patterns tp ON th.TagName = tp.TagName
+JOIN Posts p ON p.Tags LIKE '%<' || th.TagName || '>%' AND p.PostTypeId = 1
+LEFT JOIN edit_patterns ep ON p.Id = ep.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE th.depth = 1
+    AND tp.posts > 100
+    AND ep.edit_count > 5
+GROUP BY 
+    th.TagName, th.question_count, th.total_views,
+    ue.DisplayName, ue.answers, ue.avg_answer_score, ue.accepted_answers,
+    tp.month, tp.posts, tp.avg_score, tp.median_views, tp.unique_authors,
+    ep.edit_count, ep.rollback_count, ep.unique_editors
+ORDER BY 
+    th.total_views DESC,
+    ue.avg_answer_score DESC,
+    tp.posts DESC
+LIMIT 100;

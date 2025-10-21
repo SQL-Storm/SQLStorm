@@ -1,0 +1,108 @@
+-- {"query": "1017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 745} 
+
+WITH UserStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views,
+        COALESCE(SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END), 0) AS AcceptedAnswers,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS CommentCount,
+        COALESCE(SUM(P.Score), 0) AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS Rank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        U.Reputation > 100
+    GROUP BY 
+        U.Id
+), TopUsers AS (
+    SELECT 
+        UserId, 
+        DisplayName, 
+        Reputation, 
+        Views, 
+        AcceptedAnswers, 
+        CommentCount, 
+        TotalScore, 
+        Rank
+    FROM 
+        UserStats
+    WHERE 
+        Rank <= 10
+), PostSummary AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.Score,
+        U.DisplayName AS Owner,
+        COALESCE(V.UpVotes, 0) AS UpVoteCount,
+        COALESCE(V.DownVotes, 0) AS DownVoteCount,
+        COUNT(C.Id) AS TotalComments
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3)  -- Upvotes and Downvotes
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        P.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        P.Id, U.DisplayName, V.UpVotes, V.DownVotes
+), UserPosts AS (
+    SELECT 
+        U.Id AS UserId,
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.Score,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY P.CreationDate DESC) AS UserPostRank
+    FROM 
+        Users U
+    JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.Score > 0
+), FinalReport AS (
+    SELECT 
+        TU.DisplayName AS TopUserName,
+        TU.Reputation AS Reputation,
+        TU.Views AS Views,
+        PS.Title AS PostTitle,
+        PS.CreationDate AS PostDate,
+        PS.Score AS PostScore,
+        PS.UpVoteCount,
+        PS.DownVoteCount,
+        PU.PostId AS UserPostId,
+        PU.Title AS UserPostTitle,
+        PU.CreationDate AS UserPostDate
+    FROM 
+        TopUsers TU
+    LEFT JOIN 
+        PostSummary PS ON 1=1  -- CROSS JOIN to include each post summary
+    LEFT JOIN 
+        UserPosts PU ON TU.UserId = PU.UserId AND PU.UserPostRank <= 5  -- Limit to top 5 posts per user
+)
+SELECT 
+    TopUserName,
+    Reputation,
+    Views,
+    PostTitle,
+    PostDate,
+    PostScore,
+    UpVoteCount,
+    DownVoteCount,
+    UserPostId,
+    UserPostTitle,
+    UserPostDate 
+FROM 
+    FinalReport
+ORDER BY 
+    Reputation DESC, PostDate DESC;

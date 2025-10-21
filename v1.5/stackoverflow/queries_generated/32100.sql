@@ -1,0 +1,36 @@
+-- {"query": "32100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 370} 
+
+SELECT 
+    U.DisplayName AS UserDisplayName,
+    U.Reputation,
+    P.Title,
+    P.CreationDate AS PostCreationDate,
+    COUNT(DISTINCT C.Id) AS CommentCount,
+    COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END), 0) AS VoteScore,
+    SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+    COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+    STRING_AGG(DISTINCT T.TagName, ', ') AS TagList
+FROM 
+    Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN (
+        SELECT P.Id, STRING_AGG(T.TagName, ',') AS TagName
+        FROM Posts P
+        JOIN (
+            SELECT Id, 
+                   UNNEST(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS TagName
+            FROM Posts
+            WHERE PostTypeId = 1
+        ) T ON P.Id = T.Id
+        GROUP BY P.Id
+    ) AS TagsList ON P.Id = TagsList.Id
+WHERE 
+    P.PostTypeId = 1
+GROUP BY 
+    U.Id, P.Id
+ORDER BY 
+    Reputation DESC, VoteScore DESC, CommentCount DESC
+LIMIT 100;

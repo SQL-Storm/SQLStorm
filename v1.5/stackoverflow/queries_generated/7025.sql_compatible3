@@ -1,0 +1,180 @@
+WITH
+recent_activity AS (
+  SELECT u.Id, u.DisplayName,
+         u.Reputation,
+         GREATEST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate))::bigint, 1) AS secs_since_access,
+         COALESCE(u.Location,'') AS location,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 0
+),
+questions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(p.Tags,'') AS raw_tags,
+         regexp_split_to_array(trim(BOTH '<>' FROM COALESCE(p.Tags,'')), '><') AS tag_array,
+         p.AnswerCount, p.FavoriteCount, p.CommentCount,
+         ROW_NUMBER() OVER (PARTITION BY COALESCE(p.OwnerUserId,-1) ORDER BY p.Score DESC, p.ViewCount DESC) AS owner_q_rank
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.OwnerUserId, a.CreationDate AS AnswerDate, a.Score AS AnswerScore,
+         a.CommentCount AS AnswerComments,
+         EXISTS(SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND q.AcceptedAnswerId = a.Id) AS IsAccepted,
+         LAG(a.CreationDate) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS prev_answer_date,
+         LEAD(a.CreationDate) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS next_answer_date
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+q_aggregates AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         q.raw_tags,
+         CARDINALITY(q.tag_array) AS tag_count,
+         COALESCE(SUM(a.AnswerScore),0) AS total_answer_score,
+         COUNT(DISTINCT a.Id) FILTER (WHERE a.Id IS NOT NULL) AS actual_answer_count,
+         COUNT(DISTINCT c.Id) FILTER (WHERE c.Id IS NOT NULL) AS comment_count,
+         COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS outgoing_links,
+         COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_links,
+         MAX(CAST(a.IsAccepted AS integer)) AS has_accepted,
+         (SELECT EXTRACT(EPOCH FROM MIN(a2.CreationDate) - q.CreationDate)
+          FROM Posts a2
+          WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2 AND a2.CreationDate > q.CreationDate
+         ) AS sec_to_first_answer
+  FROM questions q
+  LEFT JOIN answers a ON a.QuestionId = q.Id
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+  GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.raw_tags, q.tag_array
+),
+user_influence AS (
+  SELECT u.Id AS UserId,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END),0) AS badge_score,
+         COALESCE(SUM(vt_cnt.upvotes),0) AS total_upvotes_received,
+         COALESCE(SUM(vt_cnt.downvotes),0) AS total_downvotes_received
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId AS OwnerId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ) vt_cnt ON vt_cnt.OwnerId = u.Id
+  GROUP BY u.Id
+),
+tag_pairs AS (
+  SELECT qa.QuestionId,
+         LOWER(trim(t1)) AS tag1,
+         LOWER(trim(t2)) AS tag2,
+         CONCAT(LOWER(trim(t1)), '::', LOWER(trim(t2))) AS tag_pair
+  FROM q_aggregates qa,
+       LATERAL (
+         SELECT unnest(regexp_split_to_array(trim(BOTH '<>' FROM COALESCE(raw_tags,'')), '><')) AS t
+       ) t1vals(t1)
+       LEFT JOIN LATERAL (
+         SELECT unnest(regexp_split_to_array(trim(BOTH '<>' FROM COALESCE(raw_tags,'')), '><')) AS t2
+       ) t2vals(t2) ON t2vals.t2 IS NOT NULL
+  WHERE t1vals.t1 IS NOT NULL AND t2vals.t2 IS NOT NULL AND t1vals.t1 < t2vals.t2
+),
+question_scores AS (
+  SELECT qa.QuestionId,
+         qa.Title,
+         qa.OwnerUserId,
+         qa.CreationDate,
+         qa.QuestionScore,
+         qa.ViewCount,
+         qa.actual_answer_count,
+         qa.total_answer_score,
+         qa.tag_count,
+         COALESCE(qa.sec_to_first_answer, 1e9) AS sec_to_first_answer,
+         COALESCE(ui.badge_score,0) AS owner_badge_score,
+         COALESCE(ui.total_upvotes_received,0) AS owner_upvotes,
+         COALESCE(ui.total_downvotes_received,0) AS owner_downvotes,
+         (
+           (LEAST(CAST(qa.ViewCount AS numeric), 100000) / NULLIF(GREATEST(DATE(q.CreationDate) - DATE '2008-01-01', 1),0))
+           * (1 + CAST(qa.QuestionScore AS numeric)/10)
+           + (COALESCE(qa.total_answer_score,0) AS numeric * 2)
+           + (COALESCE(ui.badge_score,0) AS numeric * 1.5)
+           - (CAST(LEAST(qa.sec_to_first_answer, 30*24*3600) AS numeric) / (24*3600))
+           - (qa.duplicate_links AS numeric * 50)
+         ) AS raw_composite_score
+  FROM q_aggregates qa
+  LEFT JOIN user_influence ui ON ui.UserId = qa.OwnerUserId
+),
+ranked_questions AS (
+  SELECT qs.*,
+         RANK() OVER (ORDER BY qs.raw_composite_score DESC NULLS LAST) AS global_rank,
+         RANK() OVER (PARTITION BY qs.tag_count ORDER BY qs.raw_composite_score DESC NULLS LAST) AS rank_by_tagcount,
+         NTILE(10) OVER (ORDER BY qs.raw_composite_score DESC NULLS LAST) AS decile
+  FROM question_scores qs
+),
+top_questions AS (
+  SELECT * FROM ranked_questions
+  WHERE global_rank <= 200
+)
+SELECT
+  tq.QuestionId,
+  LEFT(tq.Title, 200) AS ShortTitle,
+  COALESCE(u.DisplayName, '[deleted]') AS OwnerName,
+  COALESCE(u.Reputation,0) AS OwnerReputation,
+  tq.QuestionScore,
+  tq.ViewCount,
+  tq.actual_answer_count,
+  tq.total_answer_score,
+  tq.tag_count,
+  CASE WHEN tq.sec_to_first_answer >= 1e8 THEN NULL ELSE tq.sec_to_first_answer END AS SecondsToFirstAnswer,
+  tq.owner_badge_score,
+  tq.owner_upvotes - tq.owner_downvotes AS OwnerNetVotes,
+  tq.raw_composite_score,
+  tq.global_rank,
+  tq.decile,
+  (SELECT COALESCE(SUM(length(distinct_words) - length(replace(distinct_words,' ',''))),0)
+   FROM (
+     SELECT DISTINCT regexp_replace(lower(word),'[^a-z0-9]','','g') AS distinct_words
+     FROM Comments c2
+     CROSS JOIN LATERAL regexp_split_to_table(COALESCE(c2.Text,''),'\\s+') AS word
+     WHERE c2.PostId = tq.QuestionId
+     LIMIT 100
+   ) tsub
+  ) AS CommentLexicalDiversity,
+  (SELECT AVG(a2.Score)::numeric
+   FROM Posts a2
+   WHERE a2.ParentId = tq.QuestionId AND a2.PostTypeId = 2 AND a2.Score IS NOT NULL
+  ) AS AvgAnswerScore,
+  CONCAT('q/', tq.QuestionId, '/u/', COALESCE(CAST(u.Id AS text),'-1'), '/t/', COALESCE(CAST(tq.tag_count AS text),'0')) AS PrefixedLink,
+  CASE WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.AcceptedAnswerId IS NOT NULL AND p2.Id = tq.QuestionId) THEN TRUE ELSE FALSE END AS HasAcceptedByIndicator,
+  ph.LastEditorName,
+  ph.LastEditDate,
+  (SELECT string_agg(tp.tag_pair, ', ' ORDER BY tp.tag_pair)
+   FROM tag_pairs tp
+   WHERE tp.QuestionId = tq.QuestionId
+  ) AS TagPairUnion,
+  PERCENT_RANK() OVER (ORDER BY tq.raw_composite_score) AS CompositePercentRank
+FROM top_questions tq
+LEFT JOIN Users u ON u.Id = tq.OwnerUserId
+LEFT JOIN (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastEditDate,
+         MAX(ph.UserDisplayName) AS LastEditorName
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,24)
+  GROUP BY ph.PostId
+) ph ON ph.PostId = tq.QuestionId
+WHERE NOT EXISTS (
+  SELECT 1 FROM Posts p_other
+  WHERE p_other.Id = tq.QuestionId
+    AND p_other.LastActivityDate IS NOT NULL
+    AND p_other.LastActivityDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    AND (tq.ViewCount < 10 OR tq.actual_answer_count = 0)
+)
+ORDER BY tq.raw_composite_score DESC NULLS LAST, tq.QuestionId
+LIMIT 200;

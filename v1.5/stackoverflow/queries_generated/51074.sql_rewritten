@@ -1,0 +1,113 @@
+-- {"query": "51074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 989} 
+WITH popular_tags AS (
+    SELECT t.TagName,
+           COUNT(pt.PostId) as usage_count
+    FROM Tags t
+    JOIN Posts pt ON position('<' || t.TagName || '>' IN pt.Tags) > 0
+    WHERE pt.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(pt.PostId) > 1000
+),
+user_activity AS (
+    SELECT u.Id as user_id,
+           COUNT(p.Id) as post_count,
+           AVG(p.Score) as avg_score,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) as total_answers
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY u.Id
+    HAVING COUNT(p.Id) >= 10
+),
+question_stats AS (
+    SELECT p.Id as question_id,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           p.FavoriteCount,
+           COALESCE(v.up_votes, 0) as up_votes,
+           COALESCE(v.down_votes, 0) as down_votes,
+           CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as is_closed,
+           ac.accepted_score
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as up_votes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as down_votes
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT ParentId,
+               AVG(pa.Score) as accepted_score
+        FROM Posts pa
+        WHERE pa.PostTypeId = 2 AND pa.Id = p.AcceptedAnswerId
+        GROUP BY ParentId
+    ) ac ON p.Id = ac.ParentId
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+)
+SELECT 
+    qs.Title,
+    qs.CreationDate,
+    qs.Score as question_score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.accepted_score,
+    qs.up_votes,
+    qs.down_votes,
+    qs.is_closed,
+    pt.Name as post_type,
+    u.DisplayName as author_name,
+    ua.post_count as author_total_posts,
+    ua.avg_score as author_avg_score,
+    ua.total_answers as author_total_answers,
+    ARRAY(
+        SELECT DISTINCT t.TagName
+        FROM popular_tags t
+        WHERE position('<' || t.TagName || '>' IN qs.Tags) > 0
+    ) as tags,
+    COALESCE(c.comment_count, 0) as recent_comments,
+    COALESCE(vh.history_count, 0) as edit_history_count,
+    COALESCE(pl.link_count, 0) as external_links,
+    b.badge_count,
+    ROW_NUMBER() OVER (
+        PARTITION BY EXTRACT(YEAR FROM qs.CreationDate)
+        ORDER BY (qs.up_votes + qs.ViewCount * 0.1 + qs.AnswerCount * 5) DESC
+    ) as yearly_rank
+FROM question_stats qs
+JOIN PostTypes pt ON qs.PostTypeId = pt.Id
+JOIN Users u ON qs.OwnerUserId = u.Id
+JOIN user_activity ua ON u.Id = ua.user_id
+LEFT JOIN (
+    SELECT PostId, COUNT(*) as comment_count
+    FROM Comments
+    WHERE CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY PostId
+) c ON qs.question_id = c.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) as history_count
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6)  -- Edits
+    GROUP BY PostId
+) vh ON qs.question_id = vh.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(DISTINCT RelatedPostId) as link_count
+    FROM PostLinks
+    WHERE LinkTypeId = 1
+    GROUP BY PostId
+) pl ON qs.question_id = pl.PostId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) as badge_count
+    FROM Badges
+    WHERE Class = 1  -- Gold badges only
+    GROUP BY UserId
+) b ON u.Id = b.UserId
+WHERE qs.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+  AND position('[sql]' IN LOWER(qs.Body)) > 0  -- SQL related questions
+ORDER BY yearly_rank ASC
+LIMIT 100;

@@ -1,0 +1,269 @@
+-- {"query": "19046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3952} 
+WITH UserInfluence AS (
+    -- CTE 1: Calculates an influence score for users based on reputation, vote ratio, and badge count.
+    -- Includes aggregate user statistics and conditional sums for badge classes.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsByOwner,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        -- Complex calculation: User's upvote-to-downvote ratio, handling division by zero.
+        CAST(COALESCE(u.UpVotes, 0) AS NUMERIC) / NULLIF(COALESCE(u.UpVotes, 0) + COALESCE(u.DownVotes, 0), 0) AS UserVoteRatio,
+        -- Weighted influence score: higher reputation, gold badges, and posts contribute more.
+        (u.Reputation * 0.1
+         + (SUM(CASE WHEN b.Class = 1 THEN 10 ELSE CASE WHEN b.Class = 2 THEN 5 ELSE 1 END END)) * 0.5
+         + COUNT(DISTINCT p.Id) * 0.05
+         - COALESCE(u.DownVotes, 0) * 0.01 -- Penalize downvotes
+        ) AS InfluenceScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) -- Only questions and answers for post count
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 500 -- Filter for users with a minimum reputation
+      AND u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Active users
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+QuestionEditHistory AS (
+    -- CTE 2: Analyzes the edit history of posts, focusing on questions.
+    -- Counts various history events, unique editors, and calculates average time between edits using a window function.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS UniqueEditors, -- PostgreSQL-specific FILTER clause
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS BodyTitleTagEdits, -- Total edits (body, title, tags)
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 19 THEN 1 ELSE 0 END) AS ProtectionEvents, -- Question protected
+        MAX(ph.CreationDate) AS LastEditHistoryDate,
+        MIN(ph.CreationDate) AS FirstEditHistoryDate,
+        -- Window function: Calculates average time difference (in seconds) between consecutive edits by the same user on the same post.
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate)))) AS AvgTimeBetweenUserEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13,16,19,20,35,36) -- Relevant history types for questions
+    GROUP BY ph.PostId
+    HAVING COUNT(DISTINCT ph.Id) > 3 -- Only posts with significant history interactions
+),
+QuestionVoteSummary AS (
+    -- CTE 3: Summarizes different types of votes received by a post.
+    -- Includes counts for upvotes, downvotes, accepted answers, and favorites.
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1,2,3,5) -- Accepted, UpMod, DownMod, Favorite
+    GROUP BY v.PostId
+    HAVING SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 0 -- Must have received at least one upvote
+),
+PostTagAnalysis AS (
+    -- CTE 4: Extracts and processes tags for questions.
+    -- Determines the primary tag and counts the total number of tags.
+    SELECT
+        p.Id AS PostId,
+        p.Tags,
+        -- String expression: Extracts the first tag from the `Tags` string, cleans it, and converts to lowercase.
+        LOWER(TRIM(REPLACE(REPLACE(SPLIT_PART(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><', 1), '>', ''), '<', ''))) AS PrimaryTag,
+        -- String expression: Counts the number of tags using array length (PostgreSQL specific).
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'), 1) AS NumberOfTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+QuestionLinkSummary AS (
+    -- CTE 5: Summarizes links related to questions (linked, duplicate).
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalUniqueLinkedPosts
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+HighlyInteractedQuestions AS (
+    -- CTE 6: Combines data from previous CTEs to identify "highly interacted" questions.
+    -- Applies various filters and includes a correlated subquery for recent comments.
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.OwnerUserId,
+        ui.DisplayName AS OwnerDisplayName,
+        ui.Reputation AS OwnerReputation,
+        ui.InfluenceScore,
+        qe.BodyTitleTagEdits,
+        qe.UniqueEditors,
+        qe.CloseEvents,
+        qe.ReopenEvents,
+        qe.ProtectionEvents,
+        qvs.UpVotesReceived,
+        qvs.DownVotesReceived,
+        pta.PrimaryTag,
+        pta.NumberOfTags,
+        qls.LinkedPostCount,
+        qls.DuplicateLinkCount,
+        qls.TotalUniqueLinkedPosts,
+        -- Correlated subquery: Counts meaningful comments posted within the last 14 days.
+        (SELECT COUNT(DISTINCT c.Id)
+         FROM Comments c
+         WHERE c.PostId = p.Id
+           AND c.UserId IS NOT NULL
+           AND c.CreationDate > p.LastActivityDate - INTERVAL '14 days'
+           AND LENGTH(c.Text) > 20 -- Filter for comments with a minimum length
+        ) AS RecentMeaningfulComments,
+        -- Complex calculation: Question longevity in days.
+        EXTRACT(DAY FROM (p.LastActivityDate - p.CreationDate)) AS DaysOpen,
+        -- Case expression: Determines if a question is considered "hot" based on views and age.
+        CASE
+            WHEN p.ViewCount > 25000 AND EXTRACT(DAY FROM (p.LastActivityDate - p.CreationDate)) BETWEEN 30 AND 365 THEN TRUE
+            ELSE FALSE
+        END AS IsHotQuestion
+    FROM Posts p
+    INNER JOIN UserInfluence ui ON p.OwnerUserId = ui.UserId
+    INNER JOIN QuestionEditHistory qe ON p.Id = qe.PostId
+    INNER JOIN QuestionVoteSummary qvs ON p.Id = qvs.PostId
+    LEFT JOIN PostTagAnalysis pta ON p.Id = pta.PostId
+    LEFT JOIN QuestionLinkSummary qls ON p.Id = qls.PostId
+    WHERE p.PostTypeId = 1 -- Only consider questions
+      AND p.AcceptedAnswerId IS NOT NULL -- Must have an accepted answer
+      AND p.AnswerCount >= 2 -- At least two answers
+      AND p.Score > 5 -- Minimum score for the question
+      AND qe.BodyTitleTagEdits >= 2 -- At least two significant edits
+      AND qvs.UpVotesReceived > qvs.DownVotesReceived -- More upvotes than downvotes
+      AND p.CreationDate BETWEEN '2018-01-01' AND cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' -- Created within a specific recent window
+),
+QuestionEngagementRank AS (
+    -- CTE 7: Ranks highly interacted questions using various window functions.
+    SELECT
+        hiq.*,
+        -- Window function: Ranks questions by score within their primary tag.
+        DENSE_RANK() OVER (PARTITION BY hiq.PrimaryTag ORDER BY hiq.Score DESC, hiq.ViewCount DESC) AS TagScoreRank,
+        -- Window function: Calculates the average score of all questions by the same owner.
+        AVG(hiq.Score) OVER (PARTITION BY hiq.OwnerUserId) AS OwnerAvgQuestionScore,
+        -- Window function: Counts total questions from users whose influence score is within a 10% range of the current user's influence.
+        COUNT(hiq.QuestionId) OVER (ORDER BY hiq.InfluenceScore RANGE BETWEEN CURRENT ROW - (hiq.InfluenceScore * 0.1) AND CURRENT ROW + (hiq.InfluenceScore * 0.1)
+                                    ) AS SimilarInfluenceUserQuestionCount,
+        -- Window function: Calculates the cumulative sum of views for questions by the same owner, ordered by creation date.
+        SUM(hiq.ViewCount) OVER (PARTITION BY hiq.OwnerUserId ORDER BY hiq.QuestionCreationDate) AS CumulativeOwnerViews
+    FROM HighlyInteractedQuestions hiq
+    WHERE hiq.RecentMeaningfulComments > 0 OR hiq.IsHotQuestion = TRUE
+),
+FinalResultCombined AS (
+    -- CTE 8: Combines two different sets of "impactful" questions using a UNION ALL set operator.
+    -- Perspective 1: Top-ranked questions from influential users with extensive edits and a defined primary tag.
+    SELECT
+        qer.QuestionId,
+        qer.Title,
+        qer.OwnerDisplayName,
+        qer.OwnerReputation,
+        qer.InfluenceScore,
+        qer.QuestionCreationDate,
+        qer.LastActivityDate,
+        qer.Score,
+        qer.ViewCount,
+        qer.AnswerCount,
+        qer.BodyTitleTagEdits,
+        qer.UpVotesReceived,
+        qer.DownVotesReceived,
+        qer.PrimaryTag,
+        qer.TagScoreRank,
+        qer.OwnerAvgQuestionScore,
+        'HighImpact_Ranked' AS Category,
+        -- Correlated subquery: Retrieves the latest close date for a question, if closed by a user.
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = qer.QuestionId AND ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL) AS LatestCloseDate
+    FROM QuestionEngagementRank qer
+    WHERE qer.TagScoreRank <= 5 -- Top 5 questions within their primary tag
+      AND qer.InfluenceScore > 500 -- High influence threshold
+      AND qer.BodyTitleTagEdits >= 3 -- At least three significant edits
+      AND qer.ProtectionEvents > 0 -- Was protected
+    UNION ALL
+    -- Perspective 2: Questions with very high community engagement (views, comments) and complex close/reopen cycles,
+    -- or those marked as duplicates, regardless of specific rank.
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        ui.DisplayName AS OwnerDisplayName,
+        ui.Reputation AS OwnerReputation,
+        ui.InfluenceScore,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        qe.BodyTitleTagEdits,
+        qvs.UpVotesReceived,
+        qvs.DownVotesReceived,
+        pta.PrimaryTag,
+        NULL AS TagScoreRank, -- Not applicable for this branch of the union
+        NULL AS OwnerAvgQuestionScore, -- Not applicable for this branch
+        'Community_Engagement_Complex' AS Category,
+        -- Correlated subquery: Retrieves the latest close date, if any.
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) AS LatestCloseDate
+    FROM Posts p
+    INNER JOIN UserInfluence ui ON p.OwnerUserId = ui.UserId
+    INNER JOIN QuestionEditHistory qe ON p.Id = qe.PostId
+    INNER JOIN QuestionVoteSummary qvs ON p.Id = qvs.PostId
+    LEFT JOIN PostTagAnalysis pta ON p.Id = pta.PostId
+    LEFT JOIN QuestionLinkSummary qls ON p.Id = qls.PostId
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 75000 -- Very high view count
+      AND p.CommentCount >= 15 -- Many comments
+      AND qe.CloseEvents > 0 AND qe.ReopenEvents > 0 -- Has been closed and subsequently reopened
+      AND qls.DuplicateLinkCount > 0 -- Has been marked as a duplicate
+      AND p.CreationDate >= '2021-01-01' -- Focus on more recent, highly active posts
+)
+-- Final SELECT statement: Filters, orders, and calculates a final weighted engagement score.
+SELECT
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.OwnerReputation,
+    fr.InfluenceScore,
+    fr.Category,
+    fr.QuestionCreationDate,
+    fr.LastActivityDate,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.BodyTitleTagEdits,
+    fr.UpVotesReceived,
+    fr.DownVotesReceived,
+    -- NULL logic: Default to 'untagged' if PrimaryTag is NULL.
+    COALESCE(fr.PrimaryTag, 'untagged') AS DisplayTag,
+    fr.TagScoreRank,
+    fr.OwnerAvgQuestionScore,
+    fr.LatestCloseDate,
+    -- Elaborate calculation: Weighted engagement score based on multiple factors.
+    (fr.Score * 0.5
+     + fr.ViewCount * 0.0005
+     + fr.AnswerCount * 3
+     + fr.BodyTitleTagEdits * 1.5
+     + fr.UpVotesReceived * 0.75
+     - fr.DownVotesReceived * 0.25
+     + (CASE WHEN fr.LatestCloseDate IS NOT NULL THEN -10 ELSE 0 END) -- Penalty for being closed
+    ) AS WeightedEngagementScore,
+    -- Case statement: Categorizes the question's lifecycle status based on various attributes.
+    CASE
+        WHEN fr.LatestCloseDate IS NOT NULL AND fr.LatestCloseDate > fr.LastActivityDate - INTERVAL '30 days' THEN 'Recently_Closed_Or_Reopened'
+        WHEN fr.AnswerCount = 0 AND fr.LastActivityDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' THEN 'Stale_Unanswered'
+        WHEN fr.BodyTitleTagEdits > 5 AND fr.UpVotesReceived > 50 THEN 'Highly_Curated_Valuable'
+        WHEN fr.ProtectionEvents > 0 THEN 'Protected_Question'
+        ELSE 'Standard_Engaged'
+    END AS QuestionLifecycleStatus
+FROM FinalResultCombined fr
+WHERE fr.WeightedEngagementScore > 150 -- Final filter on the calculated score
+  AND fr.QuestionCreationDate >= '2019-01-01' -- Overall creation date filter
+ORDER BY fr.WeightedEngagementScore DESC, fr.LastActivityDate DESC
+LIMIT 500;

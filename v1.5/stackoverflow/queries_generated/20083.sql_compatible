@@ -1,0 +1,122 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS TotalAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS TotalQuestionViewCount,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        (
+            SELECT MIN(ph.CreationDate)
+            FROM PostHistory ph
+            WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId = 16
+        ) AS FirstCommunityOwnedPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > '2018-01-01' AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.Tags,
+        p.CreationDate,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM UNNEST(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><'))) AS TagCount,
+        EXTRACT(EPOCH FROM (pa.CreationDate - p.CreationDate)) / 3600.0 AS HoursToAcceptedAnswer,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserCumulativeScore,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC) AS RankInTag
+    FROM Posts p
+    LEFT JOIN Posts pa ON p.AcceptedAnswerId = pa.Id
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CommunityOwnedDate IS NULL
+      AND p.ClosedDate IS NULL
+),
+UserRanking AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.UserCreationDate,
+        ua.QuestionsAsked,
+        ua.AnswersPosted,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        AVG(pd.Score) AS AvgPostScore,
+        AVG(pd.HoursToAcceptedAnswer) AS AvgHoursToAcceptedAnswer,
+        (LOG(ua.Reputation + 1) * (ua.AnswersPosted + 1) * (ua.GoldBadges * 10 + ua.SilverBadges * 5 + ua.BronzeBadges)) / (EXTRACT(EPOCH FROM (CAST(TIMESTAMP '2024-10-01 12:34:56' AS timestamp) - ua.UserCreationDate)) / 86400.0) AS InfluenceScore,
+        NTILE(100) OVER (ORDER BY (LOG(ua.Reputation + 1) * (ua.AnswersPosted + 1)) DESC) AS ReputationPercentile,
+        LAG(ua.DisplayName, 1, 'N/A') OVER (ORDER BY ua.Reputation DESC) AS UserWithHigherRep,
+        LEAD(ua.DisplayName, 1, 'N/A') OVER (ORDER BY ua.Reputation DESC) AS UserWithLowerRep
+    FROM UserActivity ua
+    JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+    WHERE pd.TagCount > 2 OR pd.FavoriteCount > 10
+    GROUP BY
+        ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.QuestionsAsked,
+        ua.AnswersPosted, ua.TotalAnswerScore, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges
+)
+(
+    SELECT
+        ur.UserId,
+        ur.DisplayName,
+        ur.Reputation,
+        'Influential User' AS UserCategory,
+        ur.InfluenceScore,
+        ur.ReputationPercentile,
+        ur.AvgHoursToAcceptedAnswer,
+        CONCAT(
+            'User ''', ur.DisplayName, ''' (Rep: ', ur.Reputation, ') has asked ', ur.QuestionsAsked,
+            ' questions and posted ', ur.AnswersPosted, ' answers. ',
+            'Belongs to Rep Percentile: ', ur.ReputationPercentile
+        ) AS ProfileSummary,
+        (
+            SELECT STRING_AGG(b.Name, ', ')
+            FROM (SELECT Name FROM Badges WHERE UserId = ur.UserId AND Class = 1 ORDER BY Date DESC LIMIT 3) b
+        ) AS RecentGoldBadges
+    FROM UserRanking ur
+    WHERE ur.Reputation > (SELECT AVG(Reputation) FROM Users) AND ur.InfluenceScore > 0.1
+    ORDER BY ur.InfluenceScore DESC
+    LIMIT 100
+)
+UNION ALL
+(
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        'Tag Specialist' AS UserCategory,
+        pd.Score * 1.0 AS InfluenceScore,
+        NULL AS ReputationPercentile,
+        pd.HoursToAcceptedAnswer,
+        CONCAT(
+            'Specialist in tag ''', t.TagName, ''' with top post (ID: ', pd.PostId,
+            ') scoring ', pd.Score
+        ) AS ProfileSummary,
+        NULL AS RecentGoldBadges
+    FROM PostDetails pd
+    JOIN Users u ON pd.OwnerUserId = u.Id
+    JOIN Tags t ON pd.Tags LIKE '%' || t.TagName || '%'
+    WHERE pd.RankInTag <= 3
+      AND t.Count < (SELECT AVG(Count) FROM Tags)
+      AND t.TagName NOT IN ('discussion', 'feature-request', 'bug')
+      AND NOT EXISTS (
+          SELECT 1
+          FROM UserRanking ur_inner
+          WHERE ur_inner.UserId = u.Id
+            AND ur_inner.InfluenceScore > 0.1
+      )
+    ORDER BY pd.Score DESC
+    LIMIT 50
+);

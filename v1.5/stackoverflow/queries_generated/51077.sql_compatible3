@@ -1,0 +1,76 @@
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(p.Score) AS total_post_score,
+        AVG(p.Score) AS avg_post_score,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_given,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        SUM(b.Class) AS total_badge_class
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Votes AS v ON v.UserId = u.Id AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges AS b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_usage,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_users,
+        AVG(p.Score) AS avg_question_score
+    FROM Tags AS t
+    JOIN Posts AS p ON p.Tags LIKE '%' || t.TagName || '%'
+        AND p.PostTypeId = 1
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.OwnerUserId) > 10
+),
+user_tag_interactions AS (
+    SELECT 
+        ua.user_id,
+        tt.TagName,
+        COUNT(DISTINCT p.Id) AS questions_asked,
+        AVG(p.Score) AS avg_score_for_tag,
+        SUM(p.ViewCount) AS total_views_for_tag
+    FROM user_activity AS ua
+    JOIN Posts AS p ON p.OwnerUserId = ua.user_id AND p.PostTypeId = 1
+    JOIN top_tags AS tt ON p.Tags LIKE '%' || tt.TagName || '%'
+    GROUP BY ua.user_id, tt.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 2
+)
+SELECT 
+    ua.DisplayName AS user_name,
+    ua.Reputation,
+    ua.post_count,
+    ua.avg_post_score,
+    tt.tag_usage,
+    uti.questions_asked,
+    uti.avg_score_for_tag,
+    uti.total_views_for_tag,
+    (CASE WHEN ua.vote_count = 0 THEN NULL ELSE CAST(ua.upvotes_given AS DECIMAL(20, 6)) / NULLIF(ua.vote_count, 0) END) AS upvote_ratio,
+    RANK() OVER (
+        PARTITION BY tt.TagName 
+        ORDER BY uti.avg_score_for_tag DESC NULLS LAST, uti.questions_asked DESC NULLS LAST
+    ) AS rank_in_tag,
+    DENSE_RANK() OVER (
+        ORDER BY (COALESCE(ua.total_post_score, 0) + ua.Reputation * 0.1) DESC
+    ) AS overall_user_rank
+FROM user_activity AS ua
+JOIN user_tag_interactions AS uti ON uti.user_id = ua.user_id
+JOIN top_tags AS tt ON tt.TagName = uti.TagName
+LEFT JOIN Comments AS c ON c.UserId = ua.user_id 
+    AND c.PostId IN (
+        SELECT Id FROM Posts 
+        WHERE PostTypeId = 1 AND Posts.Tags LIKE '%' || uti.TagName || '%'
+    )
+WHERE ua.post_count > 5
+    AND ua.Reputation > 100
+    AND tt.tag_usage > 0
+    AND uti.total_views_for_tag > 1000
+ORDER BY tt.TagName, uti.avg_score_for_tag DESC NULLS LAST, ua.Reputation DESC
+LIMIT 1000;

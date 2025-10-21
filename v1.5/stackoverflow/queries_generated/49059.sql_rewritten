@@ -1,0 +1,159 @@
+-- {"query": "49059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2094} 
+WITH UserActivitySummary AS (
+    -- Summarize user activity, reputation, and badge achievements
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(U.LastAccessDate) AS LastSeenDate
+    FROM Users AS U
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views
+    HAVING U.Reputation > 5000 AND COUNT(DISTINCT B.Id) >= 5 -- Filter for users with significant activity and reputation
+),
+TopQuestionTags AS (
+    -- Identify the most frequently used and viewed tags on questions
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        COUNT(P.Id) AS QuestionCount,
+        SUM(P.ViewCount) AS TotalViewCount
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY TagName
+    HAVING COUNT(P.Id) > 2000 AND SUM(P.ViewCount) > 1000000 -- Filter for significant and popular tags
+    ORDER BY COUNT(P.Id) DESC, SUM(P.ViewCount) DESC
+    LIMIT 200 -- Focus on the top 200 most active and viewed tags
+),
+AnswerDetailsExtended AS (
+    -- Gather extensive details for answers, linking them to parent questions, their tags, and initial user comments
+    SELECT
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        Q.Id AS QuestionId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Title AS QuestionTitle,
+        Q.Tags AS QuestionTags,
+        Q.ViewCount AS QuestionViewCount,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        (CASE WHEN Q.AcceptedAnswerId = A.Id THEN TRUE ELSE FALSE END) AS IsAcceptedAnswer,
+        COUNT(DISTINCT C.Id) AS CommentCountOnAnswer,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesOnAnswer
+    FROM Posts AS A -- Answers
+    INNER JOIN Posts AS Q ON A.ParentId = Q.Id -- Parent Questions
+    LEFT JOIN Comments AS C ON A.Id = C.PostId
+    LEFT JOIN Votes AS V ON A.Id = V.PostId AND V.VoteTypeId = 2 -- Only upvotes
+    WHERE A.PostTypeId = 2 AND Q.PostTypeId = 1
+    GROUP BY A.Id, A.OwnerUserId, A.CreationDate, A.Score, Q.Id, Q.CreationDate, Q.Title, Q.Tags, Q.ViewCount, Q.FavoriteCount, Q.AnswerCount, Q.AcceptedAnswerId
+),
+AnswerTagContributions AS (
+    -- Link answers to specific top tags and aggregate their core performance metrics
+    SELECT
+        ADE.AnswerOwnerId AS UserId,
+        TQT.TagName,
+        ADE.AnswerId,
+        ADE.AnswerScore,
+        ADE.IsAcceptedAnswer,
+        ADE.QuestionViewCount,
+        ADE.QuestionFavoriteCount,
+        ADE.CommentCountOnAnswer,
+        ADE.UpvotesOnAnswer,
+        DATE_TRUNC('quarter', ADE.AnswerCreationDate) AS AnswerQuarter
+    FROM AnswerDetailsExtended AS ADE
+    INNER JOIN TopQuestionTags AS TQT ON EXISTS (
+        SELECT 1
+        FROM UNNEST(string_to_array(SUBSTRING(ADE.QuestionTags FROM 2 FOR LENGTH(ADE.QuestionTags) - 2), '><')) AS PostTag
+        WHERE PostTag = TQT.TagName
+    )
+    WHERE ADE.AnswerScore >= 10 -- Filter for high-quality answers
+    AND ADE.AnswerCreationDate >= '2021-01-01' -- Focus on recent activity within the last few years
+),
+UserQuarterlyTagPerformance AS (
+    -- Aggregate performance of users per tag on a quarterly basis
+    SELECT
+        UserId,
+        TagName,
+        AnswerQuarter,
+        COUNT(AnswerId) AS TotalAnswersInTagQuarter,
+        SUM(AnswerScore) AS TotalScoreInTagQuarter,
+        AVG(AnswerScore) AS AvgScoreInTagQuarter,
+        SUM(CASE WHEN IsAcceptedAnswer THEN 1 ELSE 0 END) AS AcceptedAnswersInTagQuarter,
+        AVG(QuestionViewCount) AS AvgParentQuestionViewCount,
+        SUM(QuestionFavoriteCount) AS TotalParentQuestionFavoriteCount,
+        SUM(CommentCountOnAnswer) AS TotalCommentsReceived,
+        SUM(UpvotesOnAnswer) AS TotalUpvotesReceived
+    FROM AnswerTagContributions
+    GROUP BY UserId, TagName, AnswerQuarter
+    HAVING COUNT(AnswerId) >= 3 -- At least 3 high-quality answers in the tag for this quarter
+),
+PostEditActivitySummary AS (
+    -- Count significant edits made by users on their own answers, aggregated by user, tag, and quarter
+    SELECT
+        ATC.UserId,
+        ATC.TagName,
+        ATC.AnswerQuarter AS EditQuarter,
+        COUNT(PH.Id) AS TotalEdits
+    FROM PostHistory AS PH
+    INNER JOIN AnswerTagContributions AS ATC ON PH.PostId = ATC.AnswerId AND PH.UserId = ATC.UserId
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    GROUP BY ATC.UserId, ATC.TagName, ATC.AnswerQuarter
+    HAVING COUNT(PH.Id) >= 2 -- Consider only quarters where user made at least 2 edits
+),
+UserOverallInfluence AS (
+    -- Calculate an overall influence score for users based on their activity in relevant tags
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UQTP.TagName,
+        UQTP.AnswerQuarter,
+        UQTP.TotalAnswersInTagQuarter,
+        UQTP.TotalScoreInTagQuarter,
+        UQTP.AvgScoreInTagQuarter,
+        UQTP.AcceptedAnswersInTagQuarter,
+        UQTP.AvgParentQuestionViewCount,
+        UQTP.TotalCommentsReceived,
+        UQTP.TotalUpvotesReceived,
+        COALESCE(PEAS.TotalEdits, 0) AS TotalEditsInTagQuarter,
+        CAST(COALESCE(PEAS.TotalEdits, 0) AS DECIMAL) / UQTP.TotalAnswersInTagQuarter AS AvgEditsPerAnswerQuarter,
+        (UQTP.TotalScoreInTagQuarter * 0.4) + (UQTP.AcceptedAnswersInTagQuarter * 50) + (UQTP.TotalCommentsReceived * 2) + (UQTP.TotalUpvotesReceived * 1) AS QuarterlyInfluenceScore
+    FROM UserQuarterlyTagPerformance AS UQTP
+    INNER JOIN UserActivitySummary AS UAS ON UQTP.UserId = UAS.UserId
+    LEFT JOIN PostEditActivitySummary AS PEAS ON UQTP.UserId = PEAS.UserId AND UQTP.TagName = PEAS.TagName AND UQTP.AnswerQuarter = PEAS.EditQuarter
+)
+-- Final Query: Rank users by their consistent influence across multiple tags and quarters
+SELECT
+    UOI.UserId,
+    UOI.DisplayName,
+    UOI.Reputation,
+    UOI.GoldBadges,
+    UOI.SilverBadges,
+    UOI.TagName,
+    UOI.AnswerQuarter,
+    UOI.TotalAnswersInTagQuarter,
+    UOI.TotalScoreInTagQuarter,
+    UOI.AvgScoreInTagQuarter,
+    UOI.AcceptedAnswersInTagQuarter,
+    UOI.AvgParentQuestionViewCount,
+    UOI.TotalCommentsReceived,
+    UOI.TotalUpvotesReceived,
+    UOI.TotalEditsInTagQuarter,
+    UOI.AvgEditsPerAnswerQuarter,
+    UOI.QuarterlyInfluenceScore,
+    RANK() OVER (PARTITION BY UOI.TagName, UOI.AnswerQuarter ORDER BY UOI.QuarterlyInfluenceScore DESC, UOI.Reputation DESC) AS RankInTagByQuarter,
+    SUM(UOI.QuarterlyInfluenceScore) OVER (PARTITION BY UOI.UserId ORDER BY UOI.AnswerQuarter) AS RunningTotalInfluenceScore
+FROM UserOverallInfluence AS UOI
+WHERE UOI.QuarterlyInfluenceScore >= 100 -- Minimum influence threshold for a quarter
+ORDER BY
+    UOI.TagName, UOI.AnswerQuarter DESC, RankInTagByQuarter ASC
+LIMIT 5000;

@@ -1,0 +1,135 @@
+WITH
+    -- Aggregate post statistics per user
+    user_post_agg AS (
+        SELECT
+            u.id                                      AS user_id,
+            u.displayname,
+            u.reputation,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1)                AS question_count,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2)                AS answer_count,
+            AVG(p.score) FILTER (WHERE p.posttypeid = 1)               AS avg_question_score,
+            AVG(p.score) FILTER (WHERE p.posttypeid = 2)               AS avg_answer_score,
+            SUM(p.score) FILTER (WHERE p.posttypeid = 2
+                                 AND p.creationdate >= CAST('2024-10-01' AS date) - INTERVAL '30 days') AS recent_answer_score_sum
+        FROM users u
+        LEFT JOIN posts p ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    -- Aggregate badge information per user
+    user_badge_agg AS (
+        SELECT
+            b.userid                      AS user_id,
+            COUNT(*)                      AS badge_count,
+            COUNT(*) FILTER (WHERE b.class = 1) AS gold_badge_count,
+            STRING_AGG(DISTINCT b.name, ',')   AS badge_names
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    -- Compute per‑user tag contribution (only for questions)
+    user_tag_contrib AS (
+        SELECT
+            upa.user_id,
+            t.tagname,
+            COUNT(*)                                 AS tag_post_count,
+            ROW_NUMBER() OVER (PARTITION BY upa.user_id ORDER BY COUNT(*) DESC) AS rn
+        FROM user_post_agg upa
+        JOIN posts p ON p.owneruserid = upa.user_id AND p.posttypeid = 1
+        CROSS JOIN LATERAL (
+            SELECT trim(both '<>' FROM UNNEST(string_to_array(p.tags, '><'))) AS tagname
+        ) AS taglist
+        JOIN tags t ON t.tagname = taglist.tagname
+        GROUP BY upa.user_id, t.tagname
+    ),
+
+    -- Aggregate vote information per user (votes received on their posts)
+    user_vote_agg AS (
+        SELECT
+            p.owneruserid                     AS user_id,
+            COUNT(v.id)                       AS total_votes_received,
+            COUNT(v.id) FILTER (WHERE v.votetypeid = 2) AS up_votes_received,
+            COUNT(v.id) FILTER (WHERE v.votetypeid = 3) AS down_votes_received,
+            COALESCE((
+                SELECT COUNT(DISTINCT v2.userid)
+                FROM votes v2
+                WHERE v2.postid = p.id AND v2.votetypeid = 2
+            ),0)                               AS distinct_upvoters_per_post
+        FROM posts p
+        LEFT JOIN votes v ON v.postid = p.id
+        WHERE p.owneruserid IS NOT NULL
+        GROUP BY p.owneruserid
+    ),
+
+    -- Combine all the aggregates together
+    combined AS (
+        SELECT
+            upa.user_id,
+            upa.displayname,
+            upa.reputation,
+            upa.question_count,
+            upa.answer_count,
+            upa.avg_question_score,
+            upa.avg_answer_score,
+            upa.recent_answer_score_sum,
+            COALESCE(uba.badge_count,0)          AS badge_count,
+            COALESCE(uba.gold_badge_count,0)    AS gold_badge_count,
+            uba.badge_names,
+            COALESCE(uva.total_votes_received,0) AS total_votes_received,
+            COALESCE(uva.up_votes_received,0)    AS up_votes_received,
+            COALESCE(uva.down_votes_received,0)  AS down_votes_received,
+            (SELECT tagname
+               FROM user_tag_contrib utc
+              WHERE utc.user_id = upa.user_id AND utc.rn = 1) AS top_tag
+        FROM user_post_agg upa
+        LEFT JOIN user_badge_agg uba ON uba.user_id = upa.user_id
+        LEFT JOIN user_vote_agg uva  ON uva.user_id = upa.user_id
+    )
+
+SELECT
+    c.user_id,
+    c.displayname,
+    c.reputation,
+    c.question_count,
+    c.answer_count,
+    ROUND(CAST(c.avg_question_score AS numeric), 2) AS avg_question_score,
+    ROUND(CAST(c.avg_answer_score AS numeric), 2)  AS avg_answer_score,
+    c.recent_answer_score_sum,
+    c.badge_count,
+    c.gold_badge_count,
+    c.badge_names,
+    c.total_votes_received,
+    c.up_votes_received,
+    c.down_votes_received,
+    c.top_tag,
+    RANK() OVER (ORDER BY c.reputation DESC)                AS reputation_rank,
+    RANK() OVER (ORDER BY (c.question_count + c.answer_count) DESC) AS activity_rank,
+    CASE
+        WHEN c.reputation > 20000 THEN 'Veteran'
+        WHEN c.reputation BETWEEN 10000 AND 20000 THEN 'Expert'
+        WHEN c.reputation BETWEEN 5000  AND 9999  THEN 'Seasoned'
+        ELSE 'Newcomer'
+    END                                          AS reputation_tier
+FROM combined c
+WHERE c.reputation > 1000
+  AND (c.badge_count > 5 OR c.gold_badge_count > 0)
+  AND c.top_tag IS NOT NULL
+
+UNION ALL
+
+SELECT
+    u.id,
+    u.displayname,
+    u.reputation,
+    0,0,NULL,NULL,NULL,
+    0,0,NULL,
+    0,0,0,
+    NULL,
+    NULL,NULL,
+    NULL
+FROM users u
+WHERE u.reputation > 1000
+  AND NOT EXISTS (SELECT 1 FROM combined cc WHERE cc.user_id = u.id)
+
+ORDER BY reputation_rank NULLS LAST, activity_rank NULLS LAST
+LIMIT 100;

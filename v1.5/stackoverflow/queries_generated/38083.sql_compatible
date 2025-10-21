@@ -1,0 +1,270 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+hot_questions as (
+  select p.id as question_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.owneruserid,
+         p.tags,
+         p.title,
+         p.answercount
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+answerers as (
+  select a.parentid as question_id,
+         a.id as answer_id,
+         a.owneruserid as answer_user_id,
+         a.score as answer_score,
+         a.creationdate as answer_date
+  from posts a
+  where a.posttypeid = 2
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comment_count,
+         sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+q_votes as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+         count(*) as total_votes,
+         max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+dup_links as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as normal_links
+  from postlinks pl
+  group by pl.postid
+),
+ph_events as (
+  select ph.postid as question_id,
+         count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36,37,38)) as mod_events,
+         count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits_applied,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9)) as edits,
+         max(ph.creationdate) as last_event_date
+  from posthistory ph
+  group by ph.postid
+),
+tag_counts as (
+  select p.id as question_id,
+         t.tagname,
+         tg.count as tag_global_count
+  from posts p
+  join lateral (
+    select unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+  ) t on true
+  left join tags tg on tg.tagname = t.tagname
+  where p.posttypeid = 1
+),
+tag_density as (
+  select question_id,
+         count(*) as tag_count,
+         avg(coalesce(tag_global_count,0)) as avg_tag_popularity,
+         sum(case when coalesce(tag_global_count,0) = 0 then 1 else 0 end) as unknown_tags
+  from tag_counts
+  group by question_id
+),
+accepted_latency as (
+  select q.id as question_id,
+         q.creationdate as q_date,
+         a.creationdate as accepted_date,
+         extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1 and q.acceptedanswerid is not null
+),
+answer_stats as (
+  select an.question_id,
+         count(*) as answers,
+         avg(an.answer_score) as avg_answer_score,
+         max(an.answer_score) as max_answer_score,
+         min(an.answer_score) as min_answer_score,
+         count(*) filter (where an.answer_score > 0) as pos_answers,
+         count(distinct an.answer_user_id) as distinct_answerers,
+         max(an.answer_date) as last_answer_date
+  from answerers an
+  group by an.question_id
+),
+power_users as (
+  select u.id as user_id
+  from users u
+  where u.reputation >= (select percentile_cont(0.99) within group (order by reputation) from users)
+),
+engagement_windows as (
+  select q.id as question_id,
+         q.creationdate,
+         q.title,
+         q.owneruserid,
+         sum(case when v.votetypeid = 2 and v.creationdate <= q.creationdate + interval '24 hours' then 1 else 0 end) as up_24h,
+         sum(case when v.votetypeid = 3 and v.creationdate <= q.creationdate + interval '24 hours' then 1 else 0 end) as down_24h,
+         sum(case when v.votetypeid = 2 and v.creationdate <= q.creationdate + interval '7 days' then 1 else 0 end) as up_7d,
+         sum(case when v.votetypeid = 3 and v.creationdate <= q.creationdate + interval '7 days' then 1 else 0 end) as down_7d,
+         sum(case when v.votetypeid = 5 and v.creationdate <= q.creationdate + interval '7 days' then 1 else 0 end) as fav_7d
+  from posts q
+  left join votes v on v.postid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+  group by q.id, q.creationdate, q.title, q.owneruserid
+),
+owner_profile as (
+  select u.id as user_id,
+         u.reputation,
+         u.views,
+         u.upvotes,
+         u.downvotes,
+         u.creationdate as user_created,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate))/86400.0 as user_age_days
+  from users u
+),
+badge_summary as (
+  select b.userid,
+         count(*) as total_badges,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+question_base as (
+  select hq.question_id,
+         hq.creationdate,
+         hq.score,
+         hq.viewcount,
+         hq.owneruserid,
+         hq.title,
+         hq.answercount
+  from hot_questions hq
+),
+final_agg as (
+  select qb.question_id,
+         qb.creationdate,
+         qb.score,
+         qb.viewcount,
+         qb.title,
+         qb.answercount,
+         coalesce(asx.answers, 0) as answers,
+         coalesce(asx.avg_answer_score, 0) as avg_answer_score,
+         coalesce(asx.max_answer_score, 0) as max_answer_score,
+         coalesce(asx.min_answer_score, 0) as min_answer_score,
+         coalesce(asx.pos_answers, 0) as pos_answers,
+         coalesce(asx.distinct_answerers, 0) as distinct_answerers,
+         qv.upvotes,
+         qv.downvotes,
+         qv.total_votes,
+         qv.bounty_started,
+         qv.bounty_awarded,
+         qv.last_vote_date,
+         ca.comment_count,
+         ca.pos_comment_count,
+         ca.last_comment_date,
+         dl.duplicate_links,
+         dl.normal_links,
+         ph.mod_events,
+         ph.suggested_edits_applied,
+         ph.edits,
+         ph.last_event_date,
+         td.tag_count,
+         td.avg_tag_popularity,
+         td.unknown_tags,
+         al.hours_to_accept,
+         ew.up_24h,
+         ew.down_24h,
+         ew.up_7d,
+         ew.down_7d,
+         ew.fav_7d,
+         op.reputation as owner_reputation,
+         op.views as owner_profile_views,
+         op.upvotes as owner_upvotes_cast,
+         op.downvotes as owner_downvotes_cast,
+         op.user_age_days,
+         bs.total_badges,
+         bs.gold_badges,
+         bs.silver_badges,
+         bs.bronze_badges,
+         bs.tag_badges,
+         percentile_disc(0.5) within group (order by coalesce(fa.viewcount,0)) over () as p50_views_all,
+         percentile_disc(0.9) within group (order by coalesce(fa.viewcount,0)) over () as p90_views_all,
+         percentile_disc(0.99) within group (order by coalesce(fa.viewcount,0)) over () as p99_views_all,
+         row_number() over (order by coalesce(fa.viewcount,0) desc, fa.score desc, fa.creationdate desc) as rn_views_desc,
+         row_number() over (order by coalesce(fa.total_votes,0) desc, fa.creationdate desc) as rn_votes_desc
+  from question_base qb
+  left join answer_stats asx on asx.question_id = qb.question_id
+  left join q_votes qv on qv.postid = qb.question_id
+  left join comment_activity ca on ca.postid = qb.question_id
+  left join dup_links dl on dl.question_id = qb.question_id
+  left join ph_events ph on ph.question_id = qb.question_id
+  left join tag_density td on td.question_id = qb.question_id
+  left join accepted_latency al on al.question_id = qb.question_id
+  left join engagement_windows ew on ew.question_id = qb.question_id
+  left join owner_profile op on op.user_id = qb.owneruserid
+  left join badge_summary bs on bs.userid = qb.owneruserid
+)
+select
+  fa.question_id,
+  fa.creationdate,
+  fa.title,
+  fa.score,
+  fa.viewcount,
+  fa.answercount,
+  fa.answers,
+  fa.avg_answer_score,
+  fa.max_answer_score,
+  fa.min_answer_score,
+  fa.pos_answers,
+  fa.distinct_answerers,
+  fa.upvotes,
+  fa.downvotes,
+  fa.total_votes,
+  fa.bounty_started,
+  fa.bounty_awarded,
+  fa.comment_count,
+  fa.pos_comment_count,
+  fa.duplicate_links,
+  fa.normal_links,
+  fa.mod_events,
+  fa.suggested_edits_applied,
+  fa.edits,
+  fa.tag_count,
+  round(coalesce(fa.avg_tag_popularity,0),2) as avg_tag_popularity,
+  fa.unknown_tags,
+  round(coalesce(fa.hours_to_accept,0),2) as hours_to_accept,
+  fa.up_24h,
+  fa.down_24h,
+  fa.up_7d,
+  fa.down_7d,
+  fa.fav_7d,
+  fa.owner_reputation,
+  fa.owner_profile_views,
+  fa.owner_upvotes_cast,
+  fa.owner_downvotes_cast,
+  round(coalesce(fa.user_age_days,0),2) as owner_age_days,
+  fa.total_badges,
+  fa.gold_badges,
+  fa.silver_badges,
+  fa.bronze_badges,
+  fa.tag_badges,
+  percentile_disc(0.5) within group (order by coalesce(fa.viewcount,0)) over () as p50_views_all,
+  percentile_disc(0.9) within group (order by coalesce(fa.viewcount,0)) over () as p90_views_all,
+  percentile_disc(0.99) within group (order by coalesce(fa.viewcount,0)) over () as p99_views_all,
+  row_number() over (order by coalesce(fa.viewcount,0) desc, fa.score desc, fa.creationdate desc) as rn_views_desc,
+  row_number() over (order by coalesce(fa.total_votes,0) desc, fa.creationdate desc) as rn_votes_desc
+from final_agg fa
+where coalesce(fa.up_7d,0) + coalesce(fa.down_7d,0) + coalesce(fa.fav_7d,0) > 0
+order by fa.viewcount desc nulls last, fa.score desc, fa.creationdate desc
+limit 500;

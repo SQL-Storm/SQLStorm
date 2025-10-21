@@ -1,0 +1,116 @@
+-- {"query": "46010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 22940, "output_tokens": 17652} 
+
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        AVG(p.Score) as AvgScore,
+        SUM(p.ViewCount) as TotalViews,
+        MAX(p.CreationDate) as LastQuestionDate
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+        AND p.Score >= 5
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerQualityMetrics AS (
+    SELECT 
+        a.OwnerUserId,
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        q.CreationDate as QuestionDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        COUNT(DISTINCT c.Id) as AnswerComments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownVotes
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY a.OwnerUserId, a.ParentId, a.Id, a.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId
+),
+UserEngagementStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) as GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) as TagBasedBadges,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotesGiven,
+        COUNT(DISTINCT ph.Id) as EditCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as QuestionsInTag,
+        AVG(p.Score) as AvgTagScore,
+        SUM(p.ViewCount) as TagViews,
+        COUNT(DISTINCT pl.Id) as LinkedPosts
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1
+        AND t.Count >= 100
+    GROUP BY t.TagName, p.OwnerUserId
+)
+SELECT 
+    tqa.DisplayName,
+    tqa.QuestionCount,
+    ROUND(tqa.AvgScore::numeric, 2) as AvgQuestionScore,
+    tqa.TotalViews,
+    COUNT(DISTINCT aqm.AnswerId) as AnswersGiven,
+    ROUND(AVG(aqm.AnswerScore)::numeric, 2) as AvgAnswerScore,
+    SUM(aqm.IsAccepted) as AcceptedAnswers,
+    ROUND(AVG(aqm.HoursToAnswer)::numeric, 2) as AvgHoursToAnswer,
+    ues.Reputation,
+    ues.BadgeCount,
+    ues.GoldBadges,
+    ues.SilverBadges,
+    ues.CommentCount,
+    ues.EditCount,
+    COUNT(DISTINCT tp.TagName) as UniqueTagsUsed,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName) FILTER (WHERE tp.QuestionsInTag >= 3) as TopTags,
+    MAX(tp.AvgTagScore) as BestTagPerformance,
+    ROUND((SUM(aqm.UpVotes)::numeric / NULLIF(SUM(aqm.UpVotes) + SUM(aqm.DownVotes), 0) * 100)::numeric, 2) as AnswerUpvoteRate
+FROM TopQuestionAuthors tqa
+INNER JOIN UserEngagementStats ues ON tqa.OwnerUserId = ues.UserId
+LEFT JOIN AnswerQualityMetrics aqm ON tqa.OwnerUserId = aqm.OwnerUserId
+LEFT JOIN TagPerformance tp ON tqa.OwnerUserId = tp.OwnerUserId
+WHERE ues.Reputation >= 1000
+GROUP BY 
+    tqa.DisplayName, 
+    tqa.QuestionCount, 
+    tqa.AvgScore, 
+    tqa.TotalViews,
+    ues.Reputation,
+    ues.BadgeCount,
+    ues.GoldBadges,
+    ues.SilverBadges,
+    ues.CommentCount,
+    ues.EditCount
+HAVING COUNT(DISTINCT aqm.AnswerId) >= 5
+ORDER BY 
+    (tqa.QuestionCount * 0.3 + 
+     COUNT(DISTINCT aqm.AnswerId) * 0.3 + 
+     ues.BadgeCount * 0.2 + 
+     ues.Reputation / 1000.0 * 0.2) DESC
+LIMIT 100;

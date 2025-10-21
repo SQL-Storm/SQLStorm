@@ -1,0 +1,26 @@
+-- {"query": "58098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1543} 
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsAsked,
+    (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT COUNT(DISTINCT b.Name) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesGiven,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND v2.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT MAX(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate,
+    (SELECT STRING_AGG(Tags, '><') FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 5) AS RecentTags,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > NOW() - INTERVAL '1 YEAR') AS RecentEdits,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+    DENSE_RANK() OVER (PARTITION BY (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) ORDER BY u.Reputation DESC) AS RankByGoldBadges
+FROM 
+    Users u
+WHERE 
+    u.Reputation > 10000
+    AND EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CreationDate > NOW() - INTERVAL '2 YEARS')
+    AND (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) > 50
+ORDER BY 
+    u.Reputation DESC,
+    GoldBadges DESC
+LIMIT 100;

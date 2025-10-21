@@ -1,0 +1,88 @@
+-- {"query": "22045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 856} 
+WITH RankedUsers AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COALESCE(U.WebsiteUrl, 'No Website') AS WebsiteUrl,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY U.Id) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY U.Id) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY U.Id) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, COUNT(B.Id) DESC) AS Rank
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.WebsiteUrl
+),
+PostStats AS (
+    SELECT 
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.OwnerUserId,
+        SUM(V.VoteTypeId) AS VoteSum,
+        STRING_AGG(TS.TagName, ', ') AS TagList
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN (
+        SELECT P.Id, UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS TagName
+        FROM Posts P WHERE P.Tags IS NOT NULL
+    ) TS ON P.Id = TS.Id
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, P.Title, P.Tags, P.Score, P.ViewCount, P.AnswerCount, P.OwnerUserId
+),
+AcceptedAnswers AS (
+    SELECT 
+        A.ParentId AS QuestionId,
+        A.Score AS AnswerScore,
+        RANK() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC) AS ScoreRank
+    FROM Posts A
+    WHERE A.PostTypeId = 2 AND A.Id IN (
+        SELECT DISTINCT AcceptedAnswerId FROM Posts WHERE AcceptedAnswerId IS NOT NULL
+    )
+),
+LinkedPosts AS (
+    SELECT 
+        PL.PostId,
+        PL.RelatedPostId,
+        LT.Name AS LinkType,
+        P.Score AS RelatedScore
+    FROM PostLinks PL
+    JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    JOIN Posts P ON PL.RelatedPostId = P.Id
+)
+SELECT 
+    RU.UserId,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.WebsiteUrl,
+    RU.GoldBadges,
+    RU.SilverBadges,
+    RU.BronzeBadges,
+    RU.Rank AS UserRank,
+    PS.Title,
+    PS.Score AS QuestionScore,
+    PS.ViewCount,
+    PS.AnswerCount,
+    PS.VoteSum,
+    PS.TagList,
+    CASE 
+        WHEN PS.AnswerCount > 0 THEN AVG(AA.AnswerScore) 
+        ELSE NULL 
+    END AS AvgAcceptedAnswerScore,
+    LP.LinkType,
+    LP.RelatedScore,
+    CONCAT(RU.DisplayName, ' - ', COALESCE(SUBSTRING(PS.Title, 1, 50), 'No Title')) AS UserTitleSnippet,
+    (PS.Score + COALESCE(PS.ViewCount, 0) / 100) * COALESCE(PS.AnswerCount, 0) AS ComplexScore,
+    EXISTS (
+        SELECT 1 FROM Comments C WHERE C.PostId = PS.PostId AND C.Score > 5
+    ) AS HasHighScoreComment
+FROM RankedUsers RU
+FULL OUTER JOIN PostStats PS ON RU.UserId = PS.OwnerUserId
+LEFT JOIN AcceptedAnswers AA ON PS.PostId = AA.QuestionId AND AA.ScoreRank = 1
+LEFT JOIN LinkedPosts LP ON PS.PostId = LP.PostId
+WHERE RU.Reputation > 100 OR PS.Score > 10
+ORDER BY RU.Rank, PS.Score DESC, LP.RelatedScore;

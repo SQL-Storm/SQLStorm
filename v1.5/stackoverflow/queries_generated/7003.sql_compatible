@@ -1,0 +1,219 @@
+with
+-- users with activity footprint and derived reputation bands
+user_metrics as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    case
+      when u.reputation >= 100000 then '>=100k'
+      when u.reputation >= 10000 then '10k-99k'
+      when u.reputation >= 1000 then '1k-9k'
+      when u.reputation >= 100 then '100-999'
+      when u.reputation >= 1 then '1-99'
+      else '0'
+    end as rep_band,
+    coalesce(u.views,0) as profile_views,
+    u.creationdate,
+    u.lastaccessdate,
+    greatest(0, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate)) as days_since_last_access,
+    -- activity density: posts per year since account creation
+    case when date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)) < 1
+      then (select count(*) from posts p where p.owneruserid = u.id) * 365.0 / nullif(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.creationdate),0)
+      else (select count(*) from posts p where p.owneruserid = u.id) / nullif(date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)),0)
+    end as posts_per_year
+  from users u
+),
+-- questions with computed tag arrays and useful aggregates
+question_base as (
+  select
+    p.id,
+    p.owneruserid,
+    p.title,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.tags,
+    -- split tags string like '<tag1><tag2>' into array
+    case when p.tags is null then array[]::varchar[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+    -- heuristics: title length, body length approximation
+    char_length(coalesce(p.title,'')) as title_len,
+    -- count of words in title (simple)
+    cardinality(regexp_split_to_array(coalesce(p.title,''), '\s+')) as title_word_count
+  from posts p
+  where p.posttypeid = 1
+),
+-- for each question, compute top answer stats and link/duplicate relationships
+question_enriched as (
+  select
+    q.*,
+    -- best answer (highest score, tiebreaker earliest creation)
+    (select a.id from posts a where a.parentid = q.id order by a.score desc nulls last, a.creationdate asc nulls last limit 1) as top_answer_id,
+    (select a.score from posts a where a.parentid = q.id order by a.score desc nulls last, a.creationdate asc nulls last limit 1) as top_answer_score,
+    -- number of distinct answerers
+    (select count(distinct a.owneruserid) from posts a where a.parentid = q.id and a.owneruserid is not null) as distinct_answerers,
+    -- whether question is linked to or duplicated by others (outer links)
+    exists(select 1 from postlinks pl where pl.relatedpostid = q.id and pl.linktypeid = 3) as has_duplicates_pointing_here,
+    exists(select 1 from postlinks pl where pl.postid = q.id and pl.linktypeid = 1) as has_outgoing_links,
+    -- last edit metadata from posthistory (correlated subquery)
+    (select ph.creationdate from posthistory ph where ph.postid = q.id order by ph.creationdate desc limit 1) as last_revision_date,
+    (select ph.posthistorytypeid from posthistory ph where ph.postid = q.id order by ph.creationdate desc limit 1) as last_revision_type
+  from question_base q
+),
+-- windowed ranking across tags to find tag-specific hot questions
+tag_question_exploded as (
+  select
+    qe.*,
+    tag,
+    row_number() over (partition by tag order by qe.viewcount desc nulls last, qe.score desc nulls last, qe.creationdate desc nulls last) as tag_rank_by_views,
+    dense_rank() over (partition by tag order by qe.score desc nulls last) as tag_rank_by_score
+  from question_enriched qe
+  cross join lateral unnest(qe.tag_array) as t(tag)
+),
+-- aggregate votes by type for posts (complex aggregation + pivot via filter)
+post_votes_agg as (
+  select
+    p.id as postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    count(*) filter (where v.votetypeid = 8) as bounty_starts,
+    sum(v.bountyamount) filter (where v.bountyamount is not null) as total_bounty_amount,
+    count(*) as total_votes
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.id
+),
+-- compute user-level badge sentiment: tag-based vs named badges and recency
+user_badge_summary as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    count(*) filter (where b.tagbased = 1) as tag_badges,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    max(b.date) as last_badge_date,
+    -- sample most recent badge names concatenated (string aggregation)
+    string_agg(b.name, ', ' order by b.date desc) filter (where b.name is not null) as recent_badges_list
+  from badges b
+  group by b.userid
+),
+-- join questions to votes, owner metrics, and badge summaries; include some complex predicates and computed flags
+question_final as (
+  select
+    tq.*,
+    pva.upvotes,
+    pva.downvotes,
+    pva.favorites,
+    pva.total_bounty_amount,
+    um.displayname as owner_name,
+    um.reputation as owner_reputation,
+    ub.total_badges,
+    ub.tag_badges,
+    -- signal: controversial if similar up and down counts and many comments
+    case when pva.upvotes >= 10 and pva.downvotes >= 5 and abs(pva.upvotes - pva.downvotes) < greatest(1, pva.total_votes/5) then true else false end as controversial,
+    -- freshness score: weighted recency of last activity, last revision, and top answer recency
+    (
+      coalesce( (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(lastactivitydate, creationdate)))/86400), 365000) * -0.5
+      + coalesce( (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - last_revision_date))/86400), 365000) * -0.3
+      + coalesce( (select min(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - a.creationdate))/86400 from posts a where a.parentid = tq.id), 365000) * -0.2
+    ) * -1 as freshness_index,
+    -- complexity metric: title length + answercount*10 + tag count*5 + commentcount*2
+    (tq.title_len + coalesce(tq.answercount,0)*10 + coalesce(cardinality(tq.tag_array),0)*5 + coalesce(tq.commentcount,0)*2) as complexity_score
+  from tag_question_exploded tq
+  left join post_votes_agg pva on pva.postid = tq.id
+  left join users um on um.id = tq.owneruserid
+  left join user_badge_summary ub on ub.userid = tq.owneruserid
+  left join posts p on p.id = tq.id -- to access lastactivitydate if present
+),
+-- identify problematic posts via left join to posthistory close events and recent deletions
+problem_signals as (
+  select
+    qf.*,
+    phc.count_close_votes,
+    phd.count_deletions
+  from question_final qf
+  left join lateral (
+    select count(*) filter (where ph.posthistorytypeid in (10,35)) as count_close_votes
+    from posthistory ph
+    where ph.postid = qf.id and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+  ) phc on true
+  left join lateral (
+    select count(*) filter (where ph.posthistorytypeid in (12,13)) as count_deletions
+    from posthistory ph
+    where ph.postid = qf.id and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  ) phd on true
+)
+select
+  ps.tag,
+  ps.id as question_id,
+  ps.title,
+  ps.owner_name,
+  ps.owner_reputation,
+  ps.rep_band,
+  ps.viewcount,
+  ps.score,
+  ps.upvotes,
+  ps.downvotes,
+  ps.favorites,
+  ps.total_bounty_amount,
+  ps.answercount,
+  ps.distinct_answerers,
+  ps.top_answer_id,
+  ps.top_answer_score,
+  ps.tag_rank_by_views,
+  ps.tag_rank_by_score,
+  ps.has_duplicates_pointing_here,
+  ps.has_outgoing_links,
+  ps.controversial,
+  ps.complexity_score,
+  round(ps.freshness_index,3) as freshness_index,
+  ps.total_badges,
+  ps.tag_badges,
+  ps.recent_badges_list,
+  ps.days_since_last_access,
+  ps.posts_per_year,
+  ps.count_close_votes,
+  ps.count_deletions,
+  -- heavy expression mixing null logic, coalesce, conditional and string operations
+  (
+    case
+      when ps.upvotes is null and ps.downvotes is null then 'no votes'
+      when ps.upvotes is null then 'downvoted-only'
+      when ps.downvotes is null then 'upvoted-only'
+      when ps.upvotes >= ps.downvotes * 3 then 'mostly-positive'
+      when ps.downvotes >= ps.upvotes * 2 then 'mostly-negative'
+      else 'mixed'
+    end
+    || ' | tags: ' || coalesce(array_to_string(array_agg(distinct ps.tag) over (partition by ps.id order by ps.tag), ','), '(none)')
+    || ' | last_badge: ' || coalesce(ps.recent_badges_list,'(none)')
+  ) as human_label,
+  -- sample correlated subquery for median answer score (using percentile_disc)
+  (select percentile_disc(0.5) within group (order by a.score) from posts a where a.parentid = ps.id) as median_answer_score,
+  -- set operator: union-derived metric of similar questions in same tag with equal complexity (top 3)
+  (
+    select json_agg(row_to_json(t))
+    from (
+      select q2.id,q2.title,q2.viewcount,q2.score
+      from question_final q2
+      where q2.tag = ps.tag and q2.id != ps.id and abs(q2.complexity_score - ps.complexity_score) <= 20
+      order by q2.viewcount desc
+      limit 3
+    ) t
+  ) as similar_questions_preview
+from problem_signals ps
+where
+  -- complex predicate combining recency, popularity, and signals
+  (
+    (ps.viewcount >= 1000 and ps.score >= 5)
+    or (ps.upvotes >= 50)
+    or (ps.answercount >= 5 and ps.distinct_answerers >= 3)
+  )
+  and (ps.freshness_index > -120 or ps.count_close_votes > 0 or ps.count_deletions > 0)
+  and (ps.tag_rank_by_views <= 100 or ps.tag_rank_by_score <= 50)
+order by ps.tag, ps.tag_rank_by_views, ps.freshness_index desc
+limit 200;

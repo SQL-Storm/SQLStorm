@@ -1,0 +1,150 @@
+WITH user_engagement_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+        EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS tenure_months,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate >= TIMESTAMP '2015-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+question_answer_stats AS (
+    SELECT 
+        q.Id AS question_id,
+        q.OwnerUserId AS question_owner_id,
+        q.Score AS question_score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate AS question_date,
+        q.Title,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS has_accepted_answer,
+        a.Id AS answer_id,
+        a.OwnerUserId AS answer_owner_id,
+        a.Score AS answer_score,
+        a.CreationDate AS answer_date,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS hours_to_answer,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rank,
+        AVG(a.Score) OVER (PARTITION BY q.Id) AS avg_answer_score,
+        STRING_AGG(DISTINCT COALESCE(c.Text, ''), ' | ') OVER (PARTITION BY a.Id) AS concatenated_comments
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE q.PostTypeId = 1
+        AND q.Score >= 5
+        AND q.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2023-12-31'
+        AND q.ClosedDate IS NULL
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvote_count,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvote_count,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS favorite_count,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS bounty_start_count,
+        SUM(COALESCE(v.BountyAmount, 0)) AS total_bounty_amount,
+        MAX(v.CreationDate) AS last_vote_date,
+        COUNT(DISTINCT v.UserId) AS unique_voters
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5, 8, 9)
+    GROUP BY v.PostId
+),
+tag_performance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_usage_count,
+        AVG(p.Score) AS avg_post_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS median_views,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_contributors
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+        AND t.Count > 100
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING AVG(p.Score) IS NOT NULL
+),
+complex_edit_history AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS edit_count,
+        COUNT(DISTINCT ph.UserId) AS unique_editors,
+        MAX(ph.CreationDate) AS last_edit_date,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) > 0 THEN 'Closed'
+            WHEN COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 12) > 0 THEN 'Deleted'
+            ELSE 'Active'
+        END AS post_lifecycle_status
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= TIMESTAMP '2018-01-01'
+    GROUP BY ph.PostId
+)
+SELECT 
+    uem.DisplayName AS user_name,
+    uem.Reputation,
+    uem.reputation_rank,
+    uem.tenure_months,
+    CONCAT(COALESCE(uem.gold_badges, 0), 'G/', 
+           COALESCE(uem.silver_badges, 0), 'S/', 
+           COALESCE(uem.bronze_badges, 0), 'B') AS badge_summary,
+    COUNT(DISTINCT qas.question_id) AS questions_asked,
+    COUNT(DISTINCT qas.answer_id) AS answers_provided,
+    ROUND(AVG(CASE WHEN qas.answer_rank = 1 THEN qas.answer_score ELSE NULL END), 2) AS avg_top_answer_score,
+    ROUND(AVG(qas.hours_to_answer), 2) AS avg_hours_to_answer,
+    SUM(CASE WHEN qas.answer_id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = qas.question_id) THEN 1 ELSE 0 END) AS accepted_answers,
+    COALESCE(MAX(vp.upvote_count), 0) AS max_upvotes_on_single_post,
+    COALESCE(SUM(vp.total_bounty_amount), 0) AS total_bounties_earned,
+    STRING_AGG(DISTINCT SUBSTRING(qas.Title, 1, 30), ' || ') AS sample_question_titles,
+    MAX(ceh.edit_count) AS max_edits_on_post,
+    ROUND(AVG(COALESCE(qas.ViewCount, 0)), 0) AS avg_question_views,
+    CASE 
+        WHEN uem.net_votes > 10000 AND uem.reputation > 50000 THEN 'Elite'
+        WHEN uem.net_votes > 5000 OR uem.reputation > 20000 THEN 'Expert'
+        WHEN uem.net_votes > 1000 OR uem.reputation > 5000 THEN 'Advanced'
+        ELSE 'Intermediate'
+    END AS user_tier,
+    CAST(
+        EXISTS(
+            SELECT 1 
+            FROM Posts p2 
+            INNER JOIN PostLinks pl ON p2.Id = pl.PostId 
+            WHERE p2.OwnerUserId = uem.Id 
+                AND pl.LinkTypeId = 3
+        ) AS INTEGER
+    ) AS has_duplicate_posts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT t.TagName) 
+         FROM Posts p3 
+         CROSS JOIN LATERAL (
+             SELECT UNNEST(string_to_array(SUBSTRING(p3.Tags, 2, LENGTH(p3.Tags)-2), '><')) AS TagName
+         ) t
+         WHERE p3.OwnerUserId = uem.Id 
+             AND p3.PostTypeId IN (1, 2)
+        ), 0
+    ) AS unique_tags_used
+FROM user_engagement_metrics uem
+LEFT JOIN question_answer_stats qas ON (uem.Id = qas.question_owner_id OR uem.Id = qas.answer_owner_id)
+LEFT JOIN vote_patterns vp ON qas.answer_id = vp.PostId
+LEFT JOIN complex_edit_history ceh ON qas.question_id = ceh.PostId
+WHERE uem.reputation_rank <= 5000
+    AND (qas.question_score >= 3 OR qas.answer_score >= 3 OR qas.question_score IS NULL)
+GROUP BY 
+    uem.Id, uem.DisplayName, uem.Reputation, uem.reputation_rank, 
+    uem.tenure_months, uem.gold_badges, uem.silver_badges, 
+    uem.bronze_badges, uem.net_votes
+HAVING COUNT(DISTINCT COALESCE(qas.question_id, qas.answer_id)) >= 1
+ORDER BY 
+    uem.Reputation DESC,
+    COUNT(DISTINCT qas.answer_id) DESC,
+    avg_top_answer_score DESC NULLS LAST
+LIMIT 500;

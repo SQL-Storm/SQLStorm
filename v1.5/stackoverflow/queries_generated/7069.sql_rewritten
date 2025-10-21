@@ -1,0 +1,253 @@
+-- {"query": "7069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2432} 
+with
+-- base: questions with tag arrays and derived metrics
+QuestionBase as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as Views,
+    p.AnswerCount,
+    p.FavoriteCount,
+    -- tags parsed to array (Postgres style) and normalized to lower-case for comparisons
+    case when p.Tags is null then array[]::text[] else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- latest answer per question with scoring and activity gaps
+LatestAnswer as (
+  select distinct on (a.ParentId)
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerUserId,
+    a.CreationDate as AnswerCreationDate,
+    a.Score as AnswerScore,
+    a.LastActivityDate as AnswerLastActivityDate,
+    a.Body as AnswerBody
+  from Posts a
+  where a.PostTypeId = 2
+  order by a.ParentId, a.LastActivityDate desc, a.Score desc, a.CreationDate desc
+),
+-- aggregated votes distribution per post (pivot-like but as jsonb)
+PostVoteAgg as (
+  select
+    v.PostId,
+    jsonb_object_agg(vt.Name, cnt) filter (where vt.Name is not null) as VoteCounts
+  from (
+    select PostId, VoteTypeId, count(*) as cnt
+    from Votes
+    group by PostId, VoteTypeId
+  ) vv
+  join VoteTypes vt on vv.VoteTypeId = vt.Id
+  group by v.PostId
+  -- alias v not used; keep compatibility
+),
+-- user summary: activity windows, badge counts and reputation trends
+UserSummary as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(badge_counts.badges, jsonb_build_object()) as BadgeCountsJson,
+    -- daily active span in days between creation and last access
+    greatest(1, cast((u.LastAccessDate - u.CreationDate) as int)) as ActiveDays,
+    -- recent activity score: number of posts + comments in last year
+    coalesce(posts_last_year.cnt,0) + coalesce(comments_last_year.cnt,0) as RecentActivity
+  from Users u
+  left join (
+    select UserId, jsonb_object_agg(Name, cnt) as badges
+    from (
+      select UserId, Name, count(*) as cnt
+      from Badges
+      group by UserId, Name
+    ) t
+    group by UserId
+  ) badge_counts on badge_counts.UserId = u.Id
+  left join (
+    select OwnerUserId, count(*) as cnt
+    from Posts
+    where CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by OwnerUserId
+  ) posts_last_year on posts_last_year.OwnerUserId = u.Id
+  left join (
+    select UserId, count(*) as cnt
+    from Comments
+    where CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by UserId
+  ) comments_last_year on comments_last_year.UserId = u.Id
+),
+-- close reason counts per question (via PostHistory)
+CloseStats as (
+  select
+    ph.PostId as QuestionId,
+    count(*) filter (where ph.PostHistoryTypeId in (10,35)) as CloseEvents,
+    count(*) filter (where ph.PostHistoryTypeId in (11)) as ReopenEvents,
+    max(ph.CreationDate) as LastCloseDate
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11,35)
+  group by ph.PostId
+),
+-- link graph metrics: in-degree/out-degree and duplicates
+LinkMetrics as (
+  select
+    p.Id as QuestionId,
+    coalesce(outdeg.out_links,0) as OutLinks,
+    coalesce(indeg.in_links,0) as InLinks,
+    coalesce(dups.duplicate_count,0) as DuplicateCount
+  from Posts p
+  left join (
+    select PostId, count(*) as out_links from PostLinks group by PostId
+  ) outdeg on outdeg.PostId = p.Id
+  left join (
+    select RelatedPostId, count(*) as in_links from PostLinks group by RelatedPostId
+  ) indeg on indeg.RelatedPostId = p.Id
+  left join (
+    select RelatedPostId, count(*) filter (where LinkTypeId = 3) as duplicate_count from PostLinks group by RelatedPostId
+  ) dups on dups.RelatedPostId = p.Id
+  where p.PostTypeId = 1
+),
+-- heavy text heuristics for answers: readability-like metrics and token entropy approximations
+AnswerTextHeuristics as (
+  select
+    a.Id as AnswerId,
+    length(coalesce(a.Body,'')) as BodyLength,
+    (length(coalesce(a.Body,'')) - length(replace(coalesce(a.Body,''), '<code>', ''))) / greatest(1, (length('<code>'))) as CodeTagCount,
+    -- approximation of distinct word share
+    (
+      select count(distinct lower(word))
+      from regexp_split_to_table(regexp_replace(a.Body, '<[^>]+>', ' ', 'g'), '\s+') as word
+      where length(word) > 0
+    ) as DistinctWordCount,
+    -- crude avg word length
+    case when regexp_split_to_table(regexp_replace(a.Body, '<[^>]+>', ' ', 'g'), '\s+') is null then 0 else
+      (
+        select coalesce(avg(length(word)::numeric),0)
+        from regexp_split_to_table(regexp_replace(a.Body, '<[^>]+>', ' ', 'g'), '\s+') as word
+        where length(word) > 0
+      )
+    end as AvgWordLen
+  from Posts a
+  where a.PostTypeId = 2
+),
+-- combine and rank candidate questions for complex filtering
+CandidateQuestions as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.Views,
+    q.AnswerCount,
+    q.FavoriteCount,
+    qm.OutLinks,
+    qm.InLinks,
+    qm.DuplicateCount,
+    coalesce(cs.CloseEvents,0) as CloseEvents,
+    coalesce(cs.ReopenEvents,0) as ReopenEvents,
+    cs.LastCloseDate,
+    la.AnswerId,
+    la.AnswerOwnerUserId,
+    la.AnswerCreationDate,
+    la.AnswerScore,
+    pva.VoteCounts,
+    us.OwnerReputation,
+    us.RecentActivity as OwnerRecentActivity,
+    uth.BodyLength,
+    uth.CodeTagCount,
+    uth.DistinctWordCount,
+    uth.AvgWordLen,
+    -- computed complex scoring:
+    (
+      -- base: normalized popularity
+      (greatest(q.Score,0)::numeric + ln(greatest(q.Views,1)) ) * (1 + least(10, greatest(q.FavoriteCount,0)) / 100.0)
+      -- penalize duplicates/close events
+      - (coalesce(qm.DuplicateCount,0) * 2)
+      - (coalesce(cs.CloseEvents,0) * 3)
+      + (coalesce(la.AnswerScore,0) * 1.5)
+      + (coalesce(uth.DistinctWordCount,0) / greatest(1, uth.BodyLength) * 50)
+    ) as HeuristicScore
+  from QuestionBase q
+  left join LinkMetrics qm on qm.QuestionId = q.QuestionId
+  left join CloseStats cs on cs.QuestionId = q.QuestionId
+  left join LatestAnswer la on la.QuestionId = q.QuestionId
+  left join PostVoteAgg pva on pva.PostId = q.QuestionId
+  left join Users u on u.Id = q.OwnerUserId
+  left join UserSummary us on us.UserId = q.OwnerUserId
+  left join AnswerTextHeuristics uth on uth.AnswerId = la.AnswerId
+),
+-- rank over window with ties, partitioned by month and by top tag (if any)
+RankedCandidates as (
+  select
+    c.*,
+    -- pick primary tag (first in array) normalized, else 'none'
+    coalesce(lower((c_tag).tag), 'none') as PrimaryTag,
+    row_number() over (
+      partition by date_trunc('month', c.CreationDate), coalesce(lower((c_tag).tag), 'none')
+      order by c.HeuristicScore desc nulls last, c.Views desc nulls last, c.Score desc nulls last
+    ) as MonthTagRank,
+    rank() over (
+      partition by date_trunc('month', c.CreationDate)
+      order by c.HeuristicScore desc nulls last
+    ) as MonthRank
+  from CandidateQuestions c
+  left join lateral (
+    select case when array_length(q_tagarr,1) >= 1 then q_tagarr[1] end as tag
+    from (select case when TagArray is null then array[]::text[] else TagArray end as q_tagarr) s
+  ) c_tag on true
+),
+-- final aggregation: top N per month-tag and anomalies
+FinalSelection as (
+  select
+    rc.*,
+    -- flag questions with inconsistent metadata
+    case
+      when rc.AnswerCount = 0 and rc.AnswerId is not null then 'stale_answer_link'
+      when rc.InLinks > 5 and rc.Views < 50 then 'high_in_low_view'
+      when rc.DuplicateCount > 0 and rc.CloseEvents > 0 then 'dup_closed'
+      else null
+    end as AnomalyTag
+  from RankedCandidates rc
+  where rc.MonthTagRank <= 25 -- limit to top 25 per month per tag
+)
+select
+  fs.QuestionId,
+  fs.Title,
+  fs.CreationDate,
+  to_char(fs.CreationDate,'YYYY-MM') as Month,
+  fs.PrimaryTag,
+  fs.Score,
+  fs.Views,
+  fs.AnswerCount,
+  fs.FavoriteCount,
+  fs.OutLinks,
+  fs.InLinks,
+  fs.DuplicateCount,
+  fs.CloseEvents,
+  fs.ReopenEvents,
+  fs.LastCloseDate,
+  fs.AnswerId,
+  fs.AnswerOwnerUserId,
+  fs.AnswerCreationDate,
+  fs.AnswerScore,
+  -- stringified vote counts sorted by key for deterministic output
+  coalesce(
+    (
+      select string_agg(k||':'||v::text, ';' order by k)
+      from jsonb_each_text(coalesce(fs.VoteCounts, '{}'::jsonb)) t(k,v)
+    ), '') as VoteCountsFlat,
+  fs.OwnerRecentActivity,
+  fs.BodyLength,
+  fs.CodeTagCount,
+  fs.DistinctWordCount,
+  round(fs.AvgWordLen::numeric,2) as AvgWordLen,
+  round(fs.HeuristicScore::numeric,4) as HeuristicScore,
+  fs.MonthTagRank,
+  fs.MonthRank,
+  fs.AnomalyTag
+from FinalSelection fs
+order by fs.CreationDate desc, fs.HeuristicScore desc
+limit 100;

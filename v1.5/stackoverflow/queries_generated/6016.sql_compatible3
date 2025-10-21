@@ -1,0 +1,111 @@
+WITH TopActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS MostRecentActivity
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT CAST(value AS VARCHAR) AS TagName
+    FROM STRING_SPLIT(p.Tags, '>') AS value
+  ) AS t
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+  GROUP BY t.TagName
+),
+QualifiedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ViewCount > 100
+    AND p.Score > 0
+),
+ExpandedLinks AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked', 'Duplicate')
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    vt.Name AS VoteTypeName
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= DATEADD(day, -30, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+Combined AS (
+  SELECT
+    cu.UserId,
+    cu.DisplayName AS UserName,
+    cu.Reputation,
+    tp.Id AS PostId,
+    tp.Title,
+    tp.Tags,
+    tp.CreationDate AS PostDate,
+    tp.LastActivityDate AS LastActivity,
+    tp.Score,
+    tp.ViewCount,
+    tp.AnswerCount,
+    tp.CommentCount,
+    ar.ScoreSum AS AggregateScore,
+    ar.PostCount AS UserPostsInBenchmark
+  FROM QualifiedPosts tp
+  JOIN Posts p ON p.Id = tp.Id
+  LEFT JOIN TopActiveUsers cu ON cu.UserId = p.OwnerUserId
+  LEFT JOIN LATERAL (
+    SELECT SUM(p2.Score) AS ScoreSum, COUNT(*) AS PostCount
+    FROM Posts p2
+    WHERE p2.OwnerUserId = p.OwnerUserId
+  ) ar ON TRUE
+  WHERE p.OwnerUserId IS NOT NULL
+)
+SELECT
+  c.UserId,
+  c.UserName,
+  c.Reputation,
+  c.PostId,
+  c.Title,
+  c.Tags,
+  c.PostDate,
+  c.LastActivity,
+  c.Score,
+  c.ViewCount,
+  c.AnswerCount,
+  c.CommentCount,
+  c.AggregateScore,
+  c.UserPostsInBenchmark,
+  ROW_NUMBER() OVER (PARTITION BY c.UserId ORDER BY c.PostDate DESC) AS rn
+FROM Combined c
+WHERE c.rn <= 5
+ORDER BY c.UserId, c.rn;

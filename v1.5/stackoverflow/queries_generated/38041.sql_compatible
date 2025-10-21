@@ -1,0 +1,234 @@
+with recent_users as (
+  select u.id,
+         u.reputation,
+         u.creationdate,
+         date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+),
+cohort_activity as (
+  select ru.id as user_id,
+         ru.cohort_month,
+         date_trunc('month', p.creationdate) as activity_month,
+         count(*) filter (where p.posttypeid = 1) as q_count,
+         count(*) filter (where p.posttypeid = 2) as a_count,
+         coalesce(sum(p.score), 0) as post_score_sum
+  from recent_users ru
+  join posts p on p.owneruserid = ru.id
+  where p.creationdate >= ru.creationdate
+  group by ru.id, ru.cohort_month, date_trunc('month', p.creationdate)
+),
+votes_agg as (
+  select p.owneruserid as user_id,
+         date_trunc('month', v.creationdate) as vote_month,
+         count(*) filter (where v.votetypeid = 2) as upvotes_rcvd,
+         count(*) filter (where v.votetypeid = 3) as downvotes_rcvd,
+         count(*) filter (where v.votetypeid = 5) as favorites_rcvd
+  from votes v
+  join posts p on p.id = v.postid
+  where p.owneruserid is not null
+    and v.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by p.owneruserid, date_trunc('month', v.creationdate)
+),
+badges_agg as (
+  select b.userid as user_id,
+         date_trunc('month', b.date) as badge_month,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges
+  from badges b
+  where b.date >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by b.userid, date_trunc('month', b.date)
+),
+comments_agg as (
+  select c.userid as user_id,
+         date_trunc('month', c.creationdate) as comment_month,
+         count(*) as comments_count,
+         sum(c.score) as comment_score_sum
+  from comments c
+  where c.userid is not null
+    and c.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by c.userid, date_trunc('month', c.creationdate)
+),
+question_quality as (
+  select q.owneruserid as user_id,
+         date_trunc('month', q.creationdate) as q_month,
+         avg(nullif(q.viewcount,0)) as avg_views,
+         avg(nullif(q.score,0)) as avg_q_score,
+         percentile_cont(0.9) within group (order by coalesce(q.viewcount,0)) as p90_views
+  from posts q
+  where q.posttypeid = 1
+    and q.owneruserid is not null
+    and q.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by q.owneruserid, date_trunc('month', q.creationdate)
+),
+answer_accepts as (
+  select a.owneruserid as user_id,
+         date_trunc('month', a.creationdate) as a_month,
+         count(*) filter (where q.acceptedanswerid = a.id) as accepts_won,
+         count(*) as answers_posted
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+    and a.owneruserid is not null
+    and a.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by a.owneruserid, date_trunc('month', a.creationdate)
+),
+edit_events as (
+  select ph.userid as user_id,
+         date_trunc('month', ph.creationdate) as edit_month,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_count,
+         count(*) filter (where ph.posthistorytypeid = 10) as closes,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopens
+  from posthistory ph
+  where ph.userid is not null
+    and ph.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by ph.userid, date_trunc('month', ph.creationdate)
+),
+linking as (
+  select p.owneruserid as user_id,
+         date_trunc('month', pl.creationdate) as link_month,
+         count(*) filter (where pl.linktypeid = 1) as links,
+         count(*) filter (where pl.linktypeid = 3) as duplicates
+  from postlinks pl
+  join posts p on p.id = pl.postid
+  where p.owneruserid is not null
+    and pl.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by p.owneruserid, date_trunc('month', pl.creationdate)
+),
+tag_expertise as (
+  select p.owneruserid as user_id,
+         date_trunc('month', p.creationdate) as t_month,
+         unnest(string_to_array(substring(p.tags from 2 for length(p.tags) - 2), '><')) as tag,
+         count(*) as posts_in_tag,
+         sum(p.score) as tag_score_sum
+  from posts p
+  where p.owneruserid is not null
+    and p.tags is not null
+    and p.posttypeid in (1,2)
+    and p.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  group by p.owneruserid, date_trunc('month', p.creationdate), unnest(string_to_array(substring(p.tags from 2 for length(p.tags) - 2), '><'))
+),
+top_tag_per_user_month as (
+  select user_id,
+         t_month,
+         tag,
+         posts_in_tag,
+         tag_score_sum,
+         row_number() over (partition by user_id, t_month order by tag_score_sum desc, posts_in_tag desc, tag) as rn
+  from tag_expertise
+),
+calendar as (
+  select generate_series(date_trunc('month', cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'), date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)), interval '1 month') as month_start
+),
+user_month_grid as (
+  select ru.id as user_id, c.month_start as month_start
+  from recent_users ru
+  cross join calendar c
+  where c.month_start >= date_trunc('month', ru.creationdate)
+),
+merged as (
+  select g.user_id,
+         g.month_start,
+         coalesce(ca.q_count, 0) as q_count,
+         coalesce(ca.a_count, 0) as a_count,
+         coalesce(ca.post_score_sum, 0) as post_score_sum,
+         coalesce(va.upvotes_rcvd, 0) as upvotes_rcvd,
+         coalesce(va.downvotes_rcvd, 0) as downvotes_rcvd,
+         coalesce(va.favorites_rcvd, 0) as favorites_rcvd,
+         coalesce(ba.gold_badges, 0) as gold_badges,
+         coalesce(ba.silver_badges, 0) as silver_badges,
+         coalesce(ba.bronze_badges, 0) as bronze_badges,
+         coalesce(cm.comments_count, 0) as comments_count,
+         coalesce(cm.comment_score_sum, 0) as comment_score_sum,
+         coalesce(qq.avg_views, 0) as avg_q_views,
+         coalesce(qq.avg_q_score, 0) as avg_q_score,
+         coalesce(qq.p90_views, 0) as p90_q_views,
+         coalesce(aa.accepts_won, 0) as accepts_won,
+         coalesce(aa.answers_posted, 0) as answers_posted,
+         coalesce(ee.edits_count, 0) as edits_count,
+         coalesce(ee.closes, 0) as closes,
+         coalesce(ee.reopens, 0) as reopens,
+         coalesce(lk.links, 0) as links,
+         coalesce(lk.duplicates, 0) as duplicates,
+         ttp.tag as top_tag,
+         ttp.posts_in_tag as top_tag_posts,
+         ttp.tag_score_sum as top_tag_score
+  from user_month_grid g
+  left join cohort_activity ca on ca.user_id = g.user_id and ca.activity_month = g.month_start
+  left join votes_agg va on va.user_id = g.user_id and va.vote_month = g.month_start
+  left join badges_agg ba on ba.user_id = g.user_id and ba.badge_month = g.month_start
+  left join comments_agg cm on cm.user_id = g.user_id and cm.comment_month = g.month_start
+  left join question_quality qq on qq.user_id = g.user_id and qq.q_month = g.month_start
+  left join answer_accepts aa on aa.user_id = g.user_id and aa.a_month = g.month_start
+  left join edit_events ee on ee.user_id = g.user_id and ee.edit_month = g.month_start
+  left join linking lk on lk.user_id = g.user_id and lk.link_month = g.month_start
+  left join top_tag_per_user_month ttp on ttp.user_id = g.user_id and ttp.t_month = g.month_start and ttp.rn = 1
+),
+rolling as (
+  select m.*,
+         sum(q_count) over w as roll_q_count_12m,
+         sum(a_count) over w as roll_a_count_12m,
+         sum(post_score_sum) over w as roll_post_score_12m,
+         sum(upvotes_rcvd - downvotes_rcvd) over w as roll_net_votes_12m,
+         sum(accepts_won) over w as roll_accepts_12m,
+         sum(answers_posted) over w as roll_answers_12m,
+         sum(comments_count) over w as roll_comments_12m,
+         avg(avg_q_score) over w as roll_avg_q_score_12m
+  from merged m
+  window w as (
+    partition by m.user_id
+    order by m.month_start
+    rows between 11 preceding and current row
+  )
+),
+ranked as (
+  select r.*,
+         case when roll_answers_12m > 0 then roll_accepts_12m::decimal / roll_answers_12m else null end as accept_rate_12m,
+         row_number() over (partition by r.month_start order by coalesce(roll_post_score_12m,0) desc, coalesce(roll_net_votes_12m,0) desc, coalesce(roll_q_count_12m + roll_a_count_12m,0) desc, r.user_id) as month_rank
+  from rolling r
+)
+select
+  u.id as user_id,
+  u.displayname,
+  u.reputation,
+  r.month_start as month,
+  r.q_count,
+  r.a_count,
+  r.post_score_sum,
+  r.upvotes_rcvd,
+  r.downvotes_rcvd,
+  r.favorites_rcvd,
+  r.gold_badges,
+  r.silver_badges,
+  r.bronze_badges,
+  r.comments_count,
+  r.comment_score_sum,
+  r.avg_q_views,
+  r.avg_q_score,
+  r.p90_q_views,
+  r.accepts_won,
+  r.answers_posted,
+  r.edits_count,
+  r.closes,
+  r.reopens,
+  r.links,
+  r.duplicates,
+  r.top_tag,
+  r.top_tag_posts,
+  r.top_tag_score,
+  r.roll_q_count_12m,
+  r.roll_a_count_12m,
+  r.roll_post_score_12m,
+  r.roll_net_votes_12m,
+  r.roll_accepts_12m,
+  r.roll_answers_12m,
+  r.roll_comments_12m,
+  r.roll_avg_q_score_12m,
+  r.accept_rate_12m,
+  r.month_rank
+from ranked r
+join users u on u.id = r.user_id
+where r.month_start >= date_trunc('month', (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'))
+  and r.month_rank <= 100
+order by r.month_start desc, r.month_rank asc, u.id asc;

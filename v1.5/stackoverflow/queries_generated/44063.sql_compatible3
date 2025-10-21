@@ -1,0 +1,54 @@
+WITH posts_by_month AS (
+  SELECT 
+    DATE_TRUNC('month', CreationDate) AS month_date,
+    COUNT(*) AS post_count
+  FROM Posts
+  WHERE CreationDate >= DATE '2020-01-01'
+  GROUP BY DATE_TRUNC('month', CreationDate)
+),
+user_rep_changes AS (
+  SELECT
+    CAST(COALESCE(UserId, 0) AS VARCHAR) AS UserId,
+    MAX(Reputation) AS max_reputation,
+    MIN(Reputation) AS min_reputation,
+    MAX(Reputation) - MIN(Reputation) AS reputation_change
+  FROM Users
+  GROUP BY CAST(COALESCE(UserId, 0) AS VARCHAR)
+),
+popular_tags AS (
+  SELECT
+    TagName,
+    COUNT(*) AS post_count
+  FROM Posts
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(Tags, 2, char_length(Tags) - 2), '><')) AS tag
+  ) AS tag_table
+  WHERE CreationDate >= DATE '2020-01-01'
+  GROUP BY TagName
+  ORDER BY post_count DESC
+  LIMIT 10
+),
+active_users AS (
+  SELECT
+    CAST(COALESCE(OwnerUserId, 0) AS VARCHAR) AS OwnerUserId,
+    COUNT(*) AS post_count
+  FROM Posts
+  WHERE CreationDate >= DATE '2020-01-01'
+  GROUP BY CAST(COALESCE(OwnerUserId, 0) AS VARCHAR)
+  ORDER BY post_count DESC
+  LIMIT 10
+)
+SELECT
+  p.month_date,
+  p.post_count AS new_posts_per_month,
+  r.max_reputation,
+  r.min_reputation,
+  r.reputation_change,
+  t.TagName,
+  t.post_count AS posts_with_popular_tag,
+  u.post_count AS posts_by_active_users
+FROM posts_by_month p
+CROSS JOIN user_rep_changes r
+CROSS JOIN popular_tags t
+CROSS JOIN active_users u
+ORDER BY p.month_date;

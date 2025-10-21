@@ -1,0 +1,302 @@
+with
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    case
+      when u.reputation >= 100000 then 'legend'
+      when u.reputation >= 50000 then 'elite'
+      when u.reputation >= 10000 then 'veteran'
+      when u.reputation >= 1000 then 'regular'
+      when u.reputation is null then 'unknown'
+      else 'newcomer'
+    end as rep_tier
+  from users u
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+q_and_a as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount,
+    q.title,
+    q.tags,
+    q.acceptedanswerid,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score
+  from posts q
+  left join posts a
+    on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+post_vote_stats as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid not in (2,3)) as other_votes,
+    coalesce(sum(case when v.votetypeid = 8 then v.bountyamount end),0) as total_bounty_started,
+    coalesce(sum(case when v.votetypeid = 9 then v.bountyamount end),0) as total_bounty_awarded,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at,
+    count(*) as total_votes,
+    (percent_rank() over (order by count(*) desc)) as vote_load_pr
+  from votes v
+  group by v.postid
+),
+comment_metrics as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    coalesce(sum(c.score),0) as comment_score_sum,
+    max(length(c.text)) as longest_comment_len,
+    max(c.creationdate) as last_commented_at
+  from comments c
+  group by c.postid
+),
+question_tag_expanded as (
+  select
+    p.id as question_id,
+    unnest(string_to_array(substring(p.tags from 2 for greatest(length(p.tags)-2,0)), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+),
+tag_popularity as (
+  select
+    qte.tag,
+    count(distinct qte.question_id) as questions_with_tag,
+    sum(p.score) as total_tag_score
+  from question_tag_expanded qte
+  join posts p on p.id = qte.question_id
+  group by qte.tag
+),
+user_posting as (
+  select
+    u.id as user_id,
+    count(*) filter (where p.posttypeid = 1) as questions_asked,
+    count(*) filter (where p.posttypeid = 2) as answers_posted,
+    coalesce(sum(case when p.posttypeid = 1 then p.score end),0) as q_score_sum,
+    coalesce(sum(case when p.posttypeid = 2 then p.score end),0) as a_score_sum,
+    max(p.lastactivitydate) as last_post_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+post_history_signals as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as closed_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopened_events,
+    count(*) filter (where ph.posthistorytypeid = 14) as locked_events,
+    count(*) filter (where ph.posthistorytypeid = 15) as unlocked_events,
+    count(*) filter (where ph.posthistorytypeid in (35,36)) as migration_events,
+    max(ph.creationdate) as last_history_at,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as int) end) as last_close_reason_id
+  from posthistory ph
+  group by ph.postid
+),
+linkage as (
+  select
+    p.postid,
+    count(*) filter (where p.linktypeid = 1) as linked_refs,
+    count(*) filter (where p.linktypeid = 3) as duplicate_refs,
+    max(p.creationdate) as last_link_at
+  from postlinks p
+  group by p.postid
+),
+question_signal as (
+  select
+    q.question_id,
+    q.q_score,
+    q.viewcount,
+    coalesce(pvs.total_votes,0) as total_votes,
+    coalesce(pvs.upvotes,0) as upvotes,
+    coalesce(pvs.downvotes,0) as downvotes,
+    coalesce(cm.comment_count,0) as comment_count,
+    coalesce(cm.comment_score_sum,0) as comment_score_sum,
+    coalesce(cm.longest_comment_len,0) as longest_comment_len,
+    coalesce(phs.closed_events,0) as closed_events,
+    coalesce(phs.reopened_events,0) as reopened_events,
+    coalesce(phs.locked_events,0) as locked_events,
+    coalesce(phs.migration_events,0) as migration_events,
+    coalesce(lk.duplicate_refs,0) as duplicate_refs,
+    coalesce(lk.linked_refs,0) as linked_refs,
+    (coalesce(pvs.upvotes,0) * 2 - coalesce(pvs.downvotes,0))
+      + greatest(coalesce(cm.comment_count,0) - 5, 0)
+      + least(coalesce(q.viewcount,0) / nullif(100,0), 500)
+      + case when coalesce(phs.closed_events,0) > 0 then -50 else 0 end
+      + least(coalesce(cm.longest_comment_len,0)/50, 20)
+      + coalesce(lk.linked_refs,0) * 1
+      - coalesce(lk.duplicate_refs,0) * 5
+      + coalesce(pvs.vote_load_pr,0) * 10
+    as complexity_score
+  from q_and_a q
+  left join post_vote_stats pvs on pvs.postid = q.question_id
+  left join comment_metrics cm on cm.postid = q.question_id
+  left join post_history_signals phs on phs.postid = q.question_id
+  left join linkage lk on lk.postid = q.question_id
+),
+cohort_questions as (
+  select
+    qs.question_id,
+    qs.complexity_score,
+    tpe.tag,
+    tp.questions_with_tag,
+    tp.total_tag_score
+  from question_signal qs
+  join question_tag_expanded tpe on tpe.question_id = qs.question_id
+  join tag_popularity tp on tp.tag = tpe.tag
+  where tp.questions_with_tag between 100 and 5000
+),
+ranked_per_tag as (
+  select
+    cq.*,
+    p.creationdate as q_created,
+    p.title,
+    row_number() over (partition by cq.tag order by cq.complexity_score desc, p.creationdate desc) as rn,
+    rank() over (partition by cq.tag order by p.viewcount desc) as view_rank_within_tag
+  from cohort_questions cq
+  join posts p on p.id = cq.question_id
+),
+user_influence as (
+  select
+    r.tag,
+    ask.id as user_id,
+    'asker' as role,
+    count(*) as cnt,
+    sum(q.score) as contributed_score
+  from ranked_per_tag r
+  join posts q on q.id = r.question_id
+  left join users ask on ask.id = q.owneruserid
+  group by r.tag, ask.id
+  union all
+  select
+    r.tag,
+    ans.id as user_id,
+    'answerer' as role,
+    count(*) as cnt,
+    sum(a.score) as contributed_score
+  from ranked_per_tag r
+  join posts q on q.id = r.question_id
+  join posts a on a.id = q.acceptedanswerid
+  left join users ans on ans.id = a.owneruserid
+  group by r.tag, ans.id
+),
+user_influence_agg as (
+  select
+    ui.tag,
+    ui.user_id,
+    sum(ui.cnt) as appearances,
+    coalesce(sum(ui.contributed_score),0) as total_contrib_score
+  from user_influence ui
+  where ui.user_id is not null
+  group by ui.tag, ui.user_id
+),
+top_contributors as (
+  select
+    uia.*,
+    ru.displayname,
+    ru.rep_tier,
+    up.answers_posted,
+    up.questions_asked,
+    row_number() over (partition by uia.tag order by uia.appearances desc, uia.total_contrib_score desc) as tag_contrib_rank
+  from user_influence_agg uia
+  left join recent_users ru on ru.user_id = uia.user_id
+  left join user_posting up on up.user_id = uia.user_id
+),
+topn_per_tag as (
+  select
+    r.tag,
+    r.question_id,
+    r.complexity_score,
+    r.title,
+    r.q_created,
+    r.view_rank_within_tag
+  from ranked_per_tag r
+  where r.rn <= 20
+  union all
+  select
+    qt.tag,
+    qs.question_id,
+    qs.complexity_score,
+    p.title,
+    p.creationdate,
+    9999
+  from question_signal qs
+  join question_tag_expanded qt on qt.question_id = qs.question_id
+  join posts p on p.id = qs.question_id
+  where qs.longest_comment_len >= (
+    select percentile_disc(0.99) within group (order by coalesce(cm.longest_comment_len,0))
+    from comment_metrics cm
+  )
+)
+select
+  tpt.tag,
+  tp.questions_with_tag,
+  tp.total_tag_score,
+  tpt.question_id,
+  tpt.title,
+  tpt.q_created,
+  round(tpt.complexity_score::numeric, 2) as complexity_score,
+  coalesce(pvs.total_votes,0) as total_votes,
+  coalesce(pvs.upvotes,0) as upvotes,
+  coalesce(pvs.downvotes,0) as downvotes,
+  coalesce(cm.comment_count,0) as comment_count,
+  coalesce(cm.longest_comment_len,0) as longest_comment_len,
+  phs.closed_events,
+  phs.reopened_events,
+  phs.locked_events,
+  phs.migration_events,
+  coalesce(lk.duplicate_refs,0) as duplicate_refs,
+  coalesce(lk.linked_refs,0) as linked_refs,
+  concat(
+    '[',
+    coalesce(replace(replace(p.title, chr(10), ' '), chr(13), ' '), 'Untitled'),
+    '] by ',
+    coalesce(u.displayname, '(deleted)'),
+    ' @ ',
+    to_char(p.creationdate, 'YYYY-MM-DD')
+  ) as pretty_label,
+  tc.displayname as top_contributor,
+  tc.rep_tier as contributor_tier,
+  tc.appearances as contributor_appearances,
+  tc.total_contrib_score as contributor_score
+from topn_per_tag tpt
+join tag_popularity tp on tp.tag = tpt.tag
+join posts p on p.id = tpt.question_id
+left join post_vote_stats pvs on pvs.postid = tpt.question_id
+left join comment_metrics cm on cm.postid = tpt.question_id
+left join post_history_signals phs on phs.postid = tpt.question_id
+left join linkage lk on lk.postid = tpt.question_id
+left join users u on u.id = p.owneruserid
+left join lateral (
+  select tc.displayname, tc.rep_tier, tc.appearances, tc.total_contrib_score
+  from top_contributors tc
+  where tc.tag = tpt.tag
+  order by tc.tag_contrib_rank
+  limit 1
+) tc on true
+where
+  (
+    (coalesce(pvs.upvotes,0) >= 5 and coalesce(cm.comment_count,0) >= 2)
+    or
+    (phs.closed_events is not null and phs.closed_events > 0 and coalesce(pvs.downvotes,0) >= 1)
+    or
+    (tpt.view_rank_within_tag <= 10 and tpt.complexity_score > 0)
+  )
+  and not (p.owneruserid is null and p.ownerdisplayname is null)
+  and coalesce(tp.questions_with_tag, 0) > 0
+order by
+  tp.questions_with_tag desc,
+  tpt.tag asc,
+  tpt.complexity_score desc,
+  tpt.q_created desc
+limit 500;

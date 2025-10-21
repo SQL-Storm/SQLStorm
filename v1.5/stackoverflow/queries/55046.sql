@@ -1,0 +1,102 @@
+WITH TagPosts AS (
+    SELECT 
+        t.Id                AS TagId,
+        t.TagName,
+        p.Id                AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.AnswerCount,
+        p.FavoriteCount
+    FROM Tags t
+    JOIN Posts p 
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+   WHERE p.PostTypeId IN (1, 2)
+),
+UserAgg AS (
+    SELECT 
+        tp.TagId,
+        tp.TagName,
+        tp.OwnerUserId      AS UserId,
+        SUM(tp.Score)       AS TotalScore,
+        COUNT(*)            AS PostsCount,
+        SUM(CASE WHEN tp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerPosts,
+        SUM(CASE WHEN tp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionPosts
+    FROM TagPosts tp
+    GROUP BY tp.TagId, tp.TagName, tp.OwnerUserId
+),
+UserRanked AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (PARTITION BY ua.TagId ORDER BY ua.TotalScore DESC) AS Rank
+    FROM UserAgg ua
+),
+BadgeCounts AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                               AS BadgeTotal,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)          AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)          AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)          AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAgg AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END)                                         AS NetVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+PostVoteAgg AS (
+    SELECT 
+        tp.TagId,
+        SUM(COALESCE(va.NetVotes, 0)) AS TagNetVotes
+    FROM TagPosts tp
+    LEFT JOIN VoteAgg va ON tp.PostId = va.PostId
+    GROUP BY tp.TagId
+),
+DuplicateCounts AS (
+    SELECT 
+        pl.PostId               AS OriginalPostId,
+        COUNT(*)                AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+TopUserPosts AS (
+    SELECT 
+        tp.TagId,
+        tp.OwnerUserId,
+        MAX(tp.PostId)          AS TopPostId
+    FROM TagPosts tp
+    GROUP BY tp.TagId, tp.OwnerUserId
+)
+
+SELECT 
+    ur.TagName,
+    u.Id                      AS UserId,
+    u.DisplayName,
+    ur.TotalScore,
+    ur.PostsCount,
+    ur.AnswerPosts,
+    ur.QuestionPosts,
+    bc.BadgeTotal,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    pva.TagNetVotes,
+    COALESCE(dc.DuplicateCount, 0) AS DuplicatesOfUserTopPost
+FROM UserRanked ur
+JOIN Users u                ON ur.UserId = u.Id
+JOIN BadgeCounts bc        ON u.Id = bc.UserId
+JOIN PostVoteAgg pva       ON ur.TagId = pva.TagId
+LEFT JOIN TopUserPosts tup ON tup.TagId = ur.TagId AND tup.OwnerUserId = ur.UserId
+LEFT JOIN DuplicateCounts dc ON tup.TopPostId = dc.OriginalPostId
+WHERE ur.Rank <= 5
+ORDER BY ur.TagName, ur.Rank;

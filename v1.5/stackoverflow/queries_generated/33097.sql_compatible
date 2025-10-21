@@ -1,0 +1,79 @@
+SELECT
+    p1.Id AS QuestionId,
+    p1.Title AS QuestionTitle,
+    p1.CreationDate AS QuestionCreationDate,
+    p1.Score AS QuestionScore,
+    p1.ViewCount AS QuestionViewCount,
+    array_length(string_to_array(substr(p1.Tags, 2, char_length(p1.Tags) - 2), '><'), 1) AS NumberOfTags,
+    COALESCE(acceptableAnswer.AnswerId, -1) AS AcceptedAnswerId,
+    acceptableAnswer.CreationDate AS AnswerCreationDate,
+    acceptableAnswer.Score AS AnswerScore,
+    totalAnswers.AnswerCount,
+    totalComments.CommentCount AS QuestionComments,
+    totalVotes.UpVotes AS TotalUpVotes,
+    totalVotes.DownVotes AS TotalDownVotes,
+    totalTags.TotalTagRevisions,
+    badge_summary.BadgeCount,
+    user_reputation.Reputation AS QuestionOwnerReputation
+FROM
+    Posts p1
+LEFT JOIN LATERAL (
+    SELECT
+        a.Id AS AnswerId,
+        a.CreationDate,
+        a.Score
+    FROM Posts a
+WHERE
+    a.ParentId = p1.Id
+    AND a.PostTypeId = 2
+    AND a.CreationDate = (
+        SELECT MAX(a2.CreationDate)
+        FROM Posts a2
+        WHERE a2.ParentId = p1.Id
+          AND a2.PostTypeId = 2
+    )
+    LIMIT 1
+) AS acceptableAnswer ON TRUE
+LEFT JOIN (
+    SELECT
+        COUNT(*) AS AnswerCount
+    FROM Posts a
+    WHERE
+        a.ParentId = p1.Id
+        AND a.PostTypeId = 2
+) AS totalAnswers ON TRUE
+LEFT JOIN (
+    SELECT
+        COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE c.PostId = p1.Id
+) AS totalComments ON TRUE
+LEFT JOIN (
+    SELECT
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    WHERE v.PostId = p1.Id
+) AS totalVotes ON TRUE
+LEFT JOIN (
+    SELECT
+        COUNT(*) AS TotalTagRevisions
+    FROM PostHistory ph
+    WHERE ph.PostId = p1.Id
+      AND ph.PostHistoryTypeId IN (4, 6)
+) AS totalTags ON TRUE
+LEFT JOIN (
+    SELECT
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.UserId = p1.OwnerUserId
+) AS badge_summary ON TRUE
+LEFT JOIN (
+    SELECT
+        u.Reputation
+    FROM Users u
+    WHERE u.Id = p1.OwnerUserId
+) AS user_reputation ON TRUE
+WHERE p1.PostTypeId = 1
+ORDER BY p1.CreationDate DESC
+LIMIT 10;

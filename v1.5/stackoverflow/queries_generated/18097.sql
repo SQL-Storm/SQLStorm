@@ -1,0 +1,252 @@
+-- {"query": "18097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2403} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+  ),
+  UserPostEngagement AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS total_posts_owned,
+      SUM(p.Score) AS total_score_on_posts,
+      SUM(p.ViewCount) AS total_views_on_posts,
+      COUNT(DISTINCT c.Id) AS total_comments_made,
+      SUM(c.Score) AS total_comment_score,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.UserId = p.OwnerUserId AND v.VoteTypeId = 2 /* UpMod */
+      ) AS upvotes_given,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.UserId = p.OwnerUserId AND v.VoteTypeId = 3 /* DownMod */
+      ) AS downvotes_given
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId AND p.OwnerUserId = c.UserId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  PostAnalysis AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM PostLinks AS pl
+          WHERE
+            pl.PostId = p.Id AND pl.LinkTypeId = 3 /* Duplicate */
+        ),
+        0
+      ) AS duplicate_link_count,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM PostLinks AS pl
+          WHERE
+            pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3 /* Duplicate */
+        ),
+        0
+      ) AS linked_as_duplicate_count,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM Comments AS c
+          WHERE
+            c.PostId = p.Id AND c.UserId = p.OwnerUserId
+        ),
+        0
+      ) AS comments_by_owner,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM Votes AS v
+          WHERE
+            v.PostId = p.Id AND v.VoteTypeId = 2 /* UpMod */
+        ),
+        0
+      ) AS upvotes_received,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM Votes AS v
+          WHERE
+            v.PostId = p.Id AND v.VoteTypeId = 3 /* DownMod */
+        ),
+        0
+      ) AS downvotes_received,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM Votes AS v
+          WHERE
+            v.PostId = p.Id AND v.VoteTypeId = 5 /* Favorite */
+        ),
+        0
+      ) AS favorites_received,
+      DATEDIFF(
+        day,
+        p.CreationDate,
+        p.LastActivityDate
+      ) AS days_since_last_activity,
+      SUBSTRING(
+        p.Tags,
+        2,
+        CHARINDEX('>', p.Tags + '>', 2) - 2
+      ) AS first_tag
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+  )
+SELECT
+  pa.PostId,
+  pa.PostTypeName,
+  pa.Title,
+  pa.Tags,
+  pa.PostStatus,
+  pa.Score,
+  pa.ViewCount,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.CreationDate,
+  pa.days_since_last_activity,
+  pa.first_tag,
+  pa.upvotes_received,
+  pa.downvotes_received,
+  pa.favorites_received,
+  pa.duplicate_link_count,
+  pa.linked_as_duplicate_count,
+  pa.comments_by_owner,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.Views AS UserViews,
+  u.UpVotes AS UserUpVotes,
+  u.DownVotes AS UserDownVotes,
+  COALESCE(rpe.rn, 0) AS edit_count_by_user_desc,
+  COALESCE(upe.total_posts_owned, 0) AS user_total_posts_owned,
+  COALESCE(upe.total_score_on_posts, 0) AS user_total_score_on_posts,
+  COALESCE(upe.total_views_on_posts, 0) AS user_total_views_on_posts,
+  COALESCE(upe.total_comments_made, 0) AS user_total_comments_made,
+  COALESCE(upe.total_comment_score, 0) AS user_total_comment_score,
+  COALESCE(upe.upvotes_given, 0) AS user_upvotes_given,
+  COALESCE(upe.downvotes_given, 0) AS user_downvotes_given,
+  CASE
+    WHEN pa.Score > 50 AND pa.ViewCount > 1000 THEN 'High Impact'
+    WHEN pa.Score < 0 OR pa.CommentCount > 10 THEN 'Needs Attention'
+    ELSE 'Standard'
+  END AS post_impact_category,
+  UPPER(SUBSTRING(pa.Title, 1, 3)) AS title_prefix,
+  CASE
+    WHEN pa.Tags LIKE '%<sql>%' THEN 'SQL Related'
+    WHEN pa.Tags LIKE '%<javascript>%' THEN 'JavaScript Related'
+    ELSE 'Other Technology'
+  END AS technology_category
+FROM PostAnalysis AS pa
+LEFT JOIN Users AS u
+  ON pa.OwnerUserId = u.Id
+LEFT JOIN RankedPostEdits AS rpe
+  ON pa.PostId = rpe.PostId AND pa.OwnerUserId = rpe.UserId AND rpe.rn = 1
+LEFT JOIN UserPostEngagement AS upe
+  ON pa.OwnerUserId = upe.OwnerUserId
+WHERE
+  pa.Score > 0
+  AND pa.ViewCount > 100
+  AND pa.OwnerUserId IS NOT NULL
+  AND u.Id IS NOT NULL
+  AND pa.PostTypeName NOT IN ('TagWikiExcerpt', 'TagWiki')
+UNION
+SELECT
+  pa.PostId,
+  pa.PostTypeName,
+  pa.Title,
+  pa.Tags,
+  pa.PostStatus,
+  pa.Score,
+  pa.ViewCount,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.CreationDate,
+  pa.days_since_last_activity,
+  pa.first_tag,
+  pa.upvotes_received,
+  pa.downvotes_received,
+  pa.favorites_received,
+  pa.duplicate_link_count,
+  pa.linked_as_duplicate_count,
+  pa.comments_by_owner,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.Views AS UserViews,
+  u.UpVotes AS UserUpVotes,
+  u.DownVotes AS UserDownVotes,
+  COALESCE(rpe.rn, 0) AS edit_count_by_user_desc,
+  COALESCE(upe.total_posts_owned, 0) AS user_total_posts_owned,
+  COALESCE(upe.total_score_on_posts, 0) AS user_total_score_on_posts,
+  COALESCE(upe.total_views_on_posts, 0) AS user_total_views_on_posts,
+  COALESCE(upe.total_comments_made, 0) AS user_total_comments_made,
+  COALESCE(upe.total_comment_score, 0) AS user_total_comment_score,
+  COALESCE(upe.upvotes_given, 0) AS user_upvotes_given,
+  COALESCE(upe.downvotes_given, 0) AS user_downvotes_given,
+  CASE
+    WHEN pa.Score > 50 AND pa.ViewCount > 1000 THEN 'High Impact'
+    WHEN pa.Score < 0 OR pa.CommentCount > 10 THEN 'Needs Attention'
+    ELSE 'Standard'
+  END AS post_impact_category,
+  UPPER(SUBSTRING(pa.Title, 1, 3)) AS title_prefix,
+  CASE
+    WHEN pa.Tags LIKE '%<sql>%' THEN 'SQL Related'
+    WHEN pa.Tags LIKE '%<javascript>%' THEN 'JavaScript Related'
+    ELSE 'Other Technology'
+  END AS technology_category
+FROM PostAnalysis AS pa
+LEFT JOIN Users AS u
+  ON pa.OwnerUserId = u.Id
+LEFT JOIN RankedPostEdits AS rpe
+  ON pa.PostId = rpe.PostId AND pa.OwnerUserId = rpe.UserId AND rpe.rn = 1
+LEFT JOIN UserPostEngagement AS upe
+  ON pa.OwnerUserId = upe.OwnerUserId
+WHERE
+  pa.Score <= 0
+  AND pa.ViewCount <= 100
+  AND pa.OwnerUserId IS NOT NULL
+  AND u.Id IS NOT NULL
+  AND pa.PostTypeName NOT IN ('TagWikiExcerpt', 'TagWiki');

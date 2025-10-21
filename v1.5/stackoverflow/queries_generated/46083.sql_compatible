@@ -1,0 +1,113 @@
+WITH RECURSIVE user_influence AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT p.Id) as question_count,
+    COUNT(DISTINCT a.Id) as answer_count,
+    AVG(p.Score) as avg_question_score,
+    AVG(a.Score) as avg_answer_score
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+  LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+  WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+  HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT a.Id) > 5
+),
+tag_expertise AS (
+  SELECT 
+    p.OwnerUserId,
+    t.TagName,
+    COUNT(DISTINCT p.Id) as posts_in_tag,
+    AVG(p.Score) as avg_score_in_tag,
+    SUM(p.ViewCount) as total_views,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+    RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(DISTINCT p.Id) DESC) as tag_rank
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, t.TagName
+),
+answer_quality AS (
+  SELECT 
+    a.OwnerUserId,
+    a.Id as answer_id,
+    a.Score as answer_score,
+    q.Score as question_score,
+    a.CreationDate as answer_date,
+    q.CreationDate as question_date,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as hours_to_answer,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as is_accepted,
+    COUNT(DISTINCT c.Id) as comment_count,
+    q.ViewCount as question_views
+  FROM Posts a
+  JOIN Posts q ON a.ParentId = q.Id
+  LEFT JOIN Comments c ON a.Id = c.PostId
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId, a.Id, a.Score, q.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId, q.ViewCount
+),
+badge_achievements AS (
+  SELECT 
+    b.UserId,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as silver_badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as bronze_badges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) as tag_based_badges,
+    MAX(b.Date) as last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+editing_activity AS (
+  SELECT 
+    ph.UserId as editor_id,
+    COUNT(DISTINCT ph.PostId) as edited_posts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as substantial_edits,
+    AVG(LENGTH(ph.Text)) as avg_edit_length,
+    COUNT(DISTINCT p.OwnerUserId) as unique_authors_helped
+  FROM PostHistory ph
+  JOIN Posts p ON ph.PostId = p.Id
+  WHERE ph.PostHistoryTypeId IN (4,5,6,24) 
+    AND ph.UserId IS NOT NULL 
+    AND ph.UserId != p.OwnerUserId
+  GROUP BY ph.UserId
+)
+SELECT 
+  ui.DisplayName,
+  ui.Reputation,
+  ui.question_count,
+  ui.answer_count,
+  ROUND(CAST(ui.avg_question_score AS numeric), 2) as avg_question_score,
+  ROUND(CAST(ui.avg_answer_score AS numeric), 2) as avg_answer_score,
+  STRING_AGG(DISTINCT te.TagName, ', ' ORDER BY te.TagName) FILTER (WHERE te.tag_rank <= 5) as top_5_tags,
+  ROUND(CAST(AVG(aq.answer_score) AS numeric), 2) as overall_answer_quality,
+  ROUND(CAST(AVG(aq.hours_to_answer) AS numeric), 2) as avg_hours_to_answer,
+  SUM(aq.is_accepted)::int as accepted_answers,
+  COALESCE(ba.gold_badges, 0) as gold_badges,
+  COALESCE(ba.silver_badges, 0) as silver_badges,
+  COALESCE(ba.bronze_badges, 0) as bronze_badges,
+  COALESCE(ea.edited_posts, 0) as community_edits,
+  COALESCE(ea.unique_authors_helped, 0) as authors_helped,
+  ROUND((ui.Reputation::numeric / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01' as date) - ui.CreationDate))/86400, 0))::numeric, 2) as reputation_per_day,
+  COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) as linked_posts_created
+FROM user_influence ui
+LEFT JOIN tag_expertise te ON ui.Id = te.OwnerUserId
+LEFT JOIN answer_quality aq ON ui.Id = aq.OwnerUserId
+LEFT JOIN badge_achievements ba ON ui.Id = ba.UserId
+LEFT JOIN editing_activity ea ON ui.Id = ea.editor_id
+LEFT JOIN Posts p ON ui.Id = p.OwnerUserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+GROUP BY 
+  ui.Id, ui.DisplayName, ui.Reputation, ui.question_count, ui.answer_count,
+  ui.avg_question_score, ui.avg_answer_score, ui.CreationDate,
+  ba.gold_badges, ba.silver_badges, ba.bronze_badges,
+  ea.edited_posts, ea.unique_authors_helped
+HAVING SUM(aq.is_accepted) >= 1
+ORDER BY 
+  (ui.Reputation * 0.3 + 
+   COALESCE(AVG(aq.answer_score), 0) * 100 * 0.2 + 
+   COALESCE(ba.gold_badges, 0) * 500 * 0.2 +
+   SUM(aq.is_accepted) * 50 * 0.15 +
+   COALESCE(ea.edited_posts, 0) * 10 * 0.15) DESC
+LIMIT 100;

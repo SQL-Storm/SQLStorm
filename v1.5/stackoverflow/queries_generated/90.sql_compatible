@@ -1,0 +1,17 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT Id, Name
+    FROM PostTypes
+    UNION ALL
+    SELECT RT.Id, RT.Name
+    FROM RecursiveCTE AS R
+    JOIN PostHistoryTypes AS RT ON R.Id = RT.Id
+)
+SELECT
+    PHT.Id,
+    PHT.Name,
+    LT.Name AS LinkTypeName
+FROM RecursiveCTE
+LEFT JOIN PostHistoryTypes AS PHT ON RecursiveCTE.Id = PHT.Id
+LEFT JOIN LinkTypes AS LT ON RecursiveCTE.Id = LT.Id
+WHERE PHT.Id IS NOT NULL OR LT.Id IS NOT NULL
+ORDER BY PHT.Id DESC, LT.Id ASC;

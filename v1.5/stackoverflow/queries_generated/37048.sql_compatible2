@@ -1,0 +1,172 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         COALESCE(array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1), 0) AS TagCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+TopAnswerPerQuestion AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwnerId,
+         a.CreationDate AS AnswerCreation,
+         a.Score AS AnswerScore,
+         a.CommentCount AS AnswerCommentCount,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+TopAnswers AS (
+  SELECT *
+  FROM TopAnswerPerQuestion
+  WHERE rn = 1
+),
+VoteAgg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FILTER (WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS UpVotesYear,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) FILTER (WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS DownVotesYear,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) FILTER (WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS FavoritesYear,
+         SUM(1) FILTER (WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS TotalVotesYear
+  FROM Votes v
+  GROUP BY v.PostId
+),
+CommentAgg AS (
+  SELECT c.PostId,
+         COUNT(*) FILTER (WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') AS Comments180,
+         COUNT(*) FILTER (WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') AS Comments30
+  FROM Comments c
+  GROUP BY c.PostId
+),
+UserSignals AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / 86400 AS UserAgeDays,
+         u.UpVotes,
+         u.DownVotes,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS GoldLastYear,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS SilverLastYear,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS BronzeLastYear
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+PostLinkAgg AS (
+  SELECT pl.PostId,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedOut,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS MarkedDuplicateOut,
+         SUM(1) AS TotalLinksOut
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+ExplodedTags AS (
+  SELECT q.QuestionId,
+         TRIM(tn) AS Tag
+  FROM RecentQuestions q
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) AS tn
+  ) s
+),
+TagStats AS (
+  SELECT et.Tag,
+         COUNT(*) AS QuestionsWithTag_recent180,
+         AVG(q.Score) AS AvgQuestionScoreWithTag
+  FROM ExplodedTags et
+  JOIN RecentQuestions q ON q.QuestionId = et.QuestionId
+  GROUP BY et.Tag
+),
+Combined AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.CommentCount,
+         q.FavoriteCount,
+         q.TagCount,
+         ta.AnswerId,
+         ta.AnswerScore,
+         ta.AnswerCreation,
+         va.UpVotesYear,
+         va.DownVotesYear,
+         va.FavoritesYear,
+         ca.Comments180,
+         ca.Comments30,
+         pla.LinkedOut,
+         pla.MarkedDuplicateOut,
+         us.Reputation,
+         us.GoldLastYear,
+         us.SilverLastYear,
+         us.BronzeLastYear,
+         ( 
+           (COALESCE(q.Score,0)*1.5)
+           + (LOG(1 + COALESCE(q.ViewCount,0)) * 1.2)
+           + (COALESCE(ta.AnswerScore,0) * 2.0)
+           + (CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 5.0 ELSE 0 END)
+           + (COALESCE(va.UpVotesYear,0) * 0.8)
+           - (COALESCE(va.DownVotesYear,0) * 1.0)
+           + (COALESCE(va.FavoritesYear,0) * 1.5)
+           + (COALESCE(ca.Comments30,0) * 1.0)
+           + (COALESCE(ca.Comments180,0) * 0.4)
+           + (LOG(1 + COALESCE(us.Reputation,0)) * 1.8)
+           + (COALESCE(us.GoldLastYear,0) * 3.0)
+           + (COALESCE(us.SilverLastYear,0) * 1.5)
+           - (COALESCE(pla.MarkedDuplicateOut,0) * 2.5)
+           - (COALESCE(pla.TotalLinksOut,0) * 0.3)
+           + (q.TagCount * 0.6)
+         ) AS CompositeScore
+  FROM RecentQuestions q
+  LEFT JOIN TopAnswers ta ON ta.QuestionId = q.QuestionId
+  LEFT JOIN VoteAgg va ON va.PostId = q.QuestionId
+  LEFT JOIN CommentAgg ca ON ca.PostId = q.QuestionId
+  LEFT JOIN PostLinkAgg pla ON pla.PostId = q.QuestionId
+  LEFT JOIN UserSignals us ON us.UserId = q.OwnerUserId
+)
+SELECT c.QuestionId,
+       c.Title,
+       c.OwnerUserId,
+       c.CreationDate,
+       ROUND(c.CompositeScore, 4) AS CompositeScore,
+       c.QuestionScore,
+       c.ViewCount,
+       c.AnswerCount,
+       c.TagCount,
+       c.AnswerId,
+       c.AnswerScore,
+       c.UpVotesYear,
+       c.DownVotesYear,
+       c.FavoritesYear,
+       c.Comments30,
+       c.Comments180,
+       c.Reputation AS OwnerReputation,
+       c.GoldLastYear,
+       c.SilverLastYear,
+       c.BronzeLastYear,
+       ts.TagsSummary
+FROM (
+  SELECT c.*,
+         ROW_NUMBER() OVER (ORDER BY c.CompositeScore DESC) AS rn
+  FROM Combined c
+) c
+LEFT JOIN LATERAL (
+  SELECT STRING_AGG(t.Tag || ':' || ts.QuestionsWithTag_recent180::text, ', ') AS TagsSummary
+  FROM ExplodedTags t
+  JOIN TagStats ts ON ts.Tag = t.Tag
+  WHERE t.QuestionId = c.QuestionId
+  GROUP BY t.QuestionId
+) ts ON true
+WHERE c.rn <= 100
+ORDER BY c.CompositeScore DESC;

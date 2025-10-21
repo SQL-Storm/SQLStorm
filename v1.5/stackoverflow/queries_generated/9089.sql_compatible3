@@ -1,0 +1,123 @@
+WITH
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.CreationDate >= DATE '2024-10-01' - INTERVAL '30 days') AS VotesLast30,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS DownVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt
+      ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+TopActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS RN,
+        COUNT(p.Id) AS PostCount
+    FROM Users u
+    LEFT JOIN Posts p
+      ON p.OwnerUserId = u.Id
+    WHERE u.Reputation >= COALESCE((SELECT AVG(Reputation) FROM Users), 0)
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 0
+),
+
+TagQuestionCount AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS QuestionCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY 1
+),
+
+BadgeRanking AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        DENSE_RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+)
+
+SELECT
+    u.Id                             AS UserId,
+    u.DisplayName,
+    ta.PostCount,
+    rv.VotesLast30,
+    COALESCE(tqc.QuestionCount, 0)   AS QuestionsTagSQL,
+    CASE
+        WHEN br.BadgeRank = 1 THEN 'TopBadge'
+        WHEN br.BadgeRank BETWEEN 2 AND 3 THEN 'MidBadge'
+        ELSE 'OtherBadge'
+    END                               AS BadgeTier,
+    CONCAT_WS(' / ',
+        CAST(rv.UpVotes   AS VARCHAR),
+        CAST(rv.DownVotes AS VARCHAR)
+    )                                  AS VoteRatio,
+    CAST(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) AS INTEGER) AS DaysSinceJoin,
+    pv.TotalComments,
+    pv.AvgCommentLength
+FROM TopActiveUsers ta
+JOIN Users u
+  ON u.Id = ta.Id
+LEFT JOIN RecentVotes rv
+  ON rv.PostId = (
+         SELECT p2.AcceptedAnswerId
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+         ORDER BY p2.Score DESC
+         LIMIT 1
+     )
+LEFT JOIN TagQuestionCount tqc
+  ON tqc.Tag = 'sql'
+LEFT JOIN BadgeRanking br
+  ON br.UserId = u.Id AND br.BadgeRank <= 3
+FULL OUTER JOIN (
+    SELECT
+        c.UserId,
+        COUNT(*)         AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength
+    FROM Comments c
+    GROUP BY c.UserId
+) pv
+  ON pv.UserId = u.Id
+WHERE
+    rv.VotesLast30 IS NOT NULL
+    AND ta.RN <= 100
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = (
+                  SELECT p3.Id
+                  FROM Posts p3
+                  WHERE p3.OwnerUserId = u.Id
+                  ORDER BY p3.ViewCount DESC
+                  LIMIT 1
+              )
+          AND pl.LinkTypeId = 3
+    )
+
+UNION
+SELECT
+    u2.Id,
+    u2.DisplayName,
+    NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL
+FROM Users u2
+WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p4 WHERE p4.OwnerUserId = u2.Id
+)
+
+EXCEPT
+
+SELECT
+    u3.Id,
+    u3.DisplayName,
+    NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL
+FROM Users u3
+WHERE u3.Reputation < 1000
+
+ORDER BY PostCount DESC, UserId
+LIMIT 50;

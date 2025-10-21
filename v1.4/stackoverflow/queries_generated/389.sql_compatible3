@@ -1,0 +1,81 @@
+WITH
+DateSeries AS (
+  SELECT generate_series(date '2024-10-01' - INTERVAL '29 days', date '2024-10-01', INTERVAL '1 day') AS Day
+),
+DailyMetrics AS (
+  SELECT
+    ds.Day,
+    'Metrics' AS Type,
+    NULL AS PostId,
+    NULL AS Title,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS LastActivityDate,
+    NULL AS TopTagName,
+    NULL AS OwnerUserId,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.Score) AS TotalScore
+  FROM DateSeries ds
+  LEFT JOIN Posts p ON DATE(p.CreationDate) = ds.Day AND p.PostTypeId IN (1, 2)
+  GROUP BY ds.Day, 'Metrics', NULL, NULL, NULL, NULL, NULL, NULL
+),
+TopPosts AS (
+  SELECT
+    ds.Day,
+    'TopPost' AS Type,
+    CAST(p.Id AS bigint) AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    CASE WHEN p.Tags IS NULL THEN NULL
+         ELSE (SELECT t.TagName
+               FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS t(TagName)
+               LIMIT 1)
+    END AS TopTagName,
+    p.OwnerUserId AS OwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY ds.Day
+      ORDER BY p.Score DESC NULLS LAST,
+               p.ViewCount DESC NULLS LAST,
+               p.LastActivityDate DESC NULLS LAST
+    ) AS rn
+  FROM DateSeries ds
+  LEFT JOIN Posts p ON DATE(p.CreationDate) = ds.Day AND p.PostTypeId IN (1, 2)
+),
+TopPostsLimited AS (
+  SELECT Day, Type, PostId, Title, Score, ViewCount, LastActivityDate, TopTagName, OwnerUserId
+  FROM TopPosts
+  WHERE rn <= 3
+)
+SELECT
+  Day,
+  Type,
+  PostId,
+  Title,
+  Score,
+  ViewCount,
+  LastActivityDate,
+  TopTagName,
+  OwnerUserId,
+  NULL AS PostCount,
+  NULL AS TotalViews,
+  NULL AS TotalScore
+FROM TopPostsLimited
+UNION ALL
+SELECT
+  Day,
+  Type,
+  NULL AS PostId,
+  NULL AS Title,
+  NULL AS Score,
+  NULL AS ViewCount,
+  NULL AS LastActivityDate,
+  NULL AS TopTagName,
+  NULL AS OwnerUserId,
+  PostCount,
+  TotalViews,
+  TotalScore
+FROM DailyMetrics
+ORDER BY Day ASC, Type ASC;

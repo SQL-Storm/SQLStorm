@@ -1,0 +1,136 @@
+-- {"query": "9079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3474} 
+
+WITH RecentActivities AS (
+    SELECT 
+        u.Id                         AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate >= NOW() - INTERVAL '30 days') AS RecentPosts,
+        COALESCE(SUM(CASE b.Class WHEN 1 THEN 3 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END), 0) AS BadgeScore,
+        RANK() OVER (ORDER BY COALESCE(SUM(b.Class), 0) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b   ON b.UserId      = u.Id
+    WHERE u.CreationDate BETWEEN NOW() - INTERVAL '1 year' AND NOW()
+    GROUP BY u.Id, u.DisplayName
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TagUsage,
+        AVG(EXTRACT(EPOCH FROM NOW() - p.CreationDate) / 3600) AS AvgHoursOld
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+),
+Duplicates AS (
+    SELECT
+        l.PostId,
+        COUNT(*) AS DuplicateCount
+    FROM PostLinks l
+    WHERE l.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+    GROUP BY l.PostId
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*)  AS AnswerCount,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(
+          CASE 
+            WHEN EXISTS (
+              SELECT 1 
+                FROM Comments c 
+               WHERE c.PostId = p.Id 
+                 AND c.Score > 0
+            )
+            THEN 1 
+            ELSE 0 
+          END
+        ) AS AnswersWithComments
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+)
+SELECT
+    ra.UserId,
+    ra.DisplayName,
+    ra.RecentPosts,
+    ra.BadgeScore,
+    ra.BadgeRank,
+    ts.TagName,
+    ts.TagUsage,
+    ROUND(ts.AvgHoursOld, 2) AS AvgHoursOld,
+    COALESCE(d.DuplicateCount, 0) AS DuplicateCount,
+    a.AnswerCount,
+    a.MaxAnswerScore,
+    a.AnswersWithComments,
+    (
+      SELECT COUNT(*) 
+        FROM Comments c 
+       WHERE c.UserId = ra.UserId
+    ) AS UserCommentCount
+FROM RecentActivities ra
+FULL OUTER JOIN TagStats ts
+    ON ts.TagUsage > ra.RecentPosts
+LEFT JOIN Duplicates d
+    ON d.PostId = (
+         SELECT p2.Id
+           FROM Posts p2
+          WHERE p2.OwnerUserId = ra.UserId
+          ORDER BY p2.CreationDate DESC
+          LIMIT 1
+       )
+INNER JOIN AnswerStats a
+    ON a.QuestionId = COALESCE(
+         (SELECT q.ParentId 
+            FROM Posts q 
+           WHERE q.OwnerUserId = ra.UserId 
+           LIMIT 1),
+         0
+       )
+WHERE ra.BadgeScore > (SELECT AVG(BadgeScore) FROM RecentActivities)
+  AND ts.TagName NOT IN ('sql', 'performance')
+
+UNION ALL
+
+SELECT
+    ra.UserId,
+    ra.DisplayName,
+    ra.RecentPosts,
+    ra.BadgeScore,
+    ra.BadgeRank,
+    'ALL_TAGS'          AS TagName,
+    SUM(ts.TagUsage)    AS TagUsage,
+    MIN(ts.AvgHoursOld) AS AvgHoursOld,
+    SUM(COALESCE(d.DuplicateCount, 0)),
+    SUM(a.AnswerCount),
+    MAX(a.MaxAnswerScore),
+    SUM(a.AnswersWithComments),
+    0                   AS UserCommentCount
+FROM RecentActivities ra
+CROSS JOIN TagStats ts
+LEFT JOIN Duplicates d
+    ON d.PostId = ra.UserId
+LEFT JOIN AnswerStats a
+    ON a.QuestionId = ra.UserId
+GROUP BY ra.UserId, ra.DisplayName, ra.RecentPosts, ra.BadgeScore, ra.BadgeRank
+
+EXCEPT
+
+SELECT
+    UserId,
+    DisplayName,
+    RecentPosts,
+    BadgeScore,
+    BadgeRank,
+    TagName,
+    TagUsage,
+    AvgHoursOld,
+    DuplicateCount,
+    AnswerCount,
+    MaxAnswerScore,
+    AnswersWithComments,
+    UserCommentCount
+FROM RecentActivities
+ORDER BY BadgeRank NULLS LAST, TagUsage DESC;

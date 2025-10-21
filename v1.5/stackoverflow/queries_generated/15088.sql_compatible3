@@ -1,0 +1,94 @@
+WITH PostMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(u.Reputation, 0) AS UserReputation,
+        EXTRACT(YEAR FROM p.CreationDate) AS PostYear,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC) AS YearlyScoreRank,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) AS TotalUpvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentFrequency
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+),
+TagPopularity AS (
+    SELECT 
+        t.Tag AS Tag,
+        AVG(pm.Score) AS AvgTagScore,
+        COUNT(*) AS TagCount
+    FROM (
+        SELECT
+            p.Id AS PostId,
+            CAST(value AS VARCHAR) AS Tag
+        FROM
+            Posts p
+        CROSS APPLY
+            (
+                SELECT CAST(x.value AS VARCHAR)
+                FROM (
+                    SELECT
+                        ROW_NUMBER() OVER () AS rn,
+                        x.value
+                    FROM
+                        (
+                            SELECT TRIM(value) AS value
+                            FROM
+                                (VALUES
+                                    (REPLACE(REPLACE(p.Tags, '><', '|'), '>', '|'), 1)
+                                ) AS t(tmp, dummy)
+                        ) AS x
+                    WHERE TRUE
+                ) AS y
+            ) AS t
+    ) AS t2
+    JOIN 
+        PostMetrics pm ON t2.PostId = pm.PostId
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        Tag
+)
+SELECT 
+    pm.PostId,
+    pm.PostYear,
+    pm.UserReputation,
+    pm.Score,
+    pm.ViewCount,
+    pm.YearlyScoreRank,
+    pm.TotalUpvotes,
+    pm.CommentFrequency,
+    tp.Tag,
+    tp.AvgTagScore,
+    tp.TagCount,
+    CASE 
+        WHEN pm.Score > tp.AvgTagScore * 1.5 THEN 'High Impact'
+        WHEN pm.Score < tp.AvgTagScore * 0.5 THEN 'Low Impact'
+        ELSE 'Average Impact'
+    END AS PostImpactCategory,
+    ROUND(pm.Score * LOG(pm.ViewCount + 1), 2) AS ScoreViewProduct
+FROM 
+    PostMetrics pm
+JOIN 
+    TagPopularity tp ON tp.Tag IN (
+        SELECT Tag
+        FROM (
+            SELECT
+                Tag
+            FROM
+                TagPopularity
+        ) AS sub
+    )
+WHERE 
+    pm.PostTypeId = 1 
+    AND pm.PostYear BETWEEN 2010 AND 2020
+    AND pm.UserReputation > 100
+    AND pm.ViewCount > 50
+ORDER BY 
+    ScoreViewProduct DESC
+LIMIT 1000;

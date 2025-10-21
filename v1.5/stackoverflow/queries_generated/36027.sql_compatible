@@ -1,0 +1,21 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(*) OVER () AS TotalPosts,
+  COUNT(DISTINCT v.UserId) OVER () AS DistinctVoters,
+  AVG(v.BountyAmount) OVER (PARTITION BY NULL) AS AvgBounty
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+WHERE
+  p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+  AND p.PostTypeId IN (1, 2)
+ORDER BY p.CreationDate DESC
+LIMIT 100
+OFFSET 0;

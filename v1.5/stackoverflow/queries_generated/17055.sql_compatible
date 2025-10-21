@@ -1,0 +1,149 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_TRUNC('month', u.CreationDate) AS JoinMonth,
+        EXTRACT(YEAR FROM AGE(DATE '2024-10-01', u.CreationDate)) * 12 + 
+        EXTRACT(MONTH FROM AGE(DATE '2024-10-01', u.CreationDate)) AS MonthsActive,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagUsageCount,
+        SUM(p.Score) AS TagScore,
+        AVG(p.ViewCount) AS AvgTagViews
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, Tag
+),
+RankedTags AS (
+    SELECT 
+        OwnerUserId,
+        Tag,
+        TagUsageCount,
+        TagScore,
+        AvgTagViews,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagScore DESC NULLS LAST, TagUsageCount DESC) AS TagRank,
+        DENSE_RANK() OVER (ORDER BY TagScore DESC NULLS LAST) AS GlobalTagRank
+    FROM TopTags
+),
+UserActivity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS Edits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN ph.Id END) AS Rollbacks,
+        MAX(ph.CreationDate) AS LastEditDate,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY LENGTH(COALESCE(ph.Text, ''))) AS MedianEditSize
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+ComplexScores AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN p.Score * 1.0 / NULLIF(LOG(p.ViewCount + 1), 0)
+            ELSE p.Score * 1.0
+        END AS NormalizedScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+        FIRST_VALUE(c.Text) OVER (
+            PARTITION BY p.Id 
+            ORDER BY c.Score DESC NULLS LAST, c.CreationDate DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS TopComment
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, c.Text, c.Score, c.CreationDate
+)
+SELECT DISTINCT
+    um.DisplayName,
+    um.Reputation,
+    UPPER(SUBSTRING(um.Location FROM 1 FOR 3)) ||
+        CASE WHEN LENGTH(um.Location) > 3 THEN '...' ELSE '' END AS LocationAbbr,
+    um.MonthsActive,
+    um.TotalPosts,
+    um.Questions,
+    um.Answers,
+    ROUND(um.AvgScore::numeric, 2) AS AvgPostScore,
+    um.GoldBadges,
+    COALESCE(LEFT(um.GoldBadgeNames, 50) || 
+        CASE WHEN LENGTH(um.GoldBadgeNames) > 50 THEN '...' ELSE '' END, 
+        'None') AS GoldBadgesSample,
+    COALESCE(rt.Tag, 'No Tags') AS TopTag,
+    COALESCE(rt.TagUsageCount, 0) AS TopTagUsage,
+    COALESCE(rt.TagScore, 0) AS TopTagScore,
+    ROUND(COALESCE(rt.AvgTagViews, 0)::numeric, 0) AS TopTagAvgViews,
+    rt.GlobalTagRank,
+    COALESCE(ua.Edits, 0) AS TotalEdits,
+    COALESCE(ua.Rollbacks, 0) AS TotalRollbacks,
+    COALESCE(ua.MedianEditSize, 0) AS MedianEditSize,
+    COALESCE(DATE_PART('day', date '2024-10-01') - ua.LastEditDate, 9999) AS DaysSinceLastEdit,
+    COUNT(DISTINCT cs.PostId) AS ScoredPosts,
+    ROUND(AVG(cs.NormalizedScore)::numeric, 3) AS AvgNormalizedScore,
+    SUM(cs.Upvotes) - SUM(cs.Downvotes) AS NetVotes,
+    ROUND(AVG(COALESCE(cs.AvgCommentScore, 0))::numeric, 2) AS OverallAvgCommentScore,
+    MAX(CASE 
+        WHEN cs.TopComment IS NOT NULL AND LENGTH(cs.TopComment) > 0 
+        THEN LEFT(REGEXP_REPLACE(cs.TopComment, '<[^>]+>', '', 'g'), 100)
+        ELSE NULL 
+    END) AS SampleTopComment,
+    CASE 
+        WHEN um.Reputation >= 100000 THEN 'Legendary'
+        WHEN um.Reputation >= 50000 THEN 'Epic'
+        WHEN um.Reputation >= 20000 THEN 'Trusted'
+        WHEN um.Reputation >= 10000 THEN 'Established'
+        WHEN um.Reputation >= 5000 THEN 'Active'
+        ELSE 'Rising'
+    END AS UserTier,
+    RANK() OVER (
+        ORDER BY 
+            um.Reputation * 0.3 + 
+            COALESCE(um.TotalScore, 0) * 0.3 + 
+            um.GoldBadges * 1000 * 0.2 +
+            COALESCE(ua.Edits, 0) * 10 * 0.1 +
+            um.TotalPosts * 0.1 DESC
+    ) AS OverallRank
+FROM UserMetrics um
+LEFT JOIN RankedTags rt ON um.Id = rt.OwnerUserId AND rt.TagRank = 1
+LEFT JOIN UserActivity ua ON um.Id = ua.UserId
+LEFT JOIN ComplexScores cs ON um.Id = cs.OwnerUserId
+WHERE um.TotalPosts > 0
+    OR um.BadgeCount > 0
+    OR ua.Edits IS NOT NULL
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.Location, um.MonthsActive,
+    um.TotalPosts, um.Questions, um.Answers, um.AvgScore, um.TotalScore,
+    um.GoldBadges, um.GoldBadgeNames, rt.Tag, rt.TagUsageCount, 
+    rt.TagScore, rt.AvgTagViews, rt.GlobalTagRank,
+    ua.Edits, ua.Rollbacks, ua.MedianEditSize, ua.LastEditDate
+HAVING COUNT(DISTINCT cs.PostId) > 0 
+    OR um.BadgeCount > 5
+ORDER BY OverallRank, um.Reputation DESC, um.TotalScore DESC NULLS LAST
+LIMIT 100;

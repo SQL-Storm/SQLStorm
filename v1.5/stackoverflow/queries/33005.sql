@@ -1,0 +1,27 @@
+SELECT
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.CreationDate,
+    COUNT(p.Id) AS TotalPosts,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.ViewCount) * 1.0 / NULLIF(COUNT(p.Id), 0) AS AvgViewsPerPost,
+    COUNT(DISTINCT u.Id) AS UniqueAuthors,
+    COUNT(c.Id) AS TotalComments,
+    AVG(c.Score) AS AvgCommentScore,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownVotes,
+    COUNT(DISTINCT bl.RelatedPostId) AS TotalLinkedPosts,
+    COUNT(DISTINCT t.TagName) AS DistinctTags,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostLinks bl ON bl.PostId = p.Id
+LEFT JOIN Tags t ON t.TagName = ANY(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><'))
+WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+GROUP BY p.PostTypeId, pt.Name, p.CreationDate
+ORDER BY p.PostTypeId, FirstPostDate;

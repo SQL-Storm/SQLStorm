@@ -1,0 +1,186 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS UserAvgScore,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        COALESCE(p.Title, 'No Title') AS CleanTitle,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN
+                ARRAY_LENGTH(string_to_array(trim(trim(p.Tags, '<>'), '><'), '><'), 1)
+            ELSE 0
+        END AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    WHERE t.Count > 50
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS UniqueActionTypes,
+        MAX(ph.CreationDate) AS LastActionDate,
+        STRING_AGG(ph.Comment, ' | ') AS AllComments,
+        STRING_AGG(CAST(ph.PostHistoryTypeId AS VARCHAR), ', ') AS ActionTypes
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATE '2023-01-01'
+    GROUP BY ph.PostId
+)
+SELECT 
+    'Performance Benchmark Report' AS ReportTitle,
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT rp.PostId) AS DistinctPosts,
+    COUNT(DISTINCT uas.UserId) AS ActiveUsers,
+    COUNT(DISTINCT ta.TagName) AS PopularTags,
+    COUNT(DISTINCT phs.PostId) AS PostsWithHistory,
+    COUNT(*) FILTER (WHERE rp.ScoreCategory = 'High') AS HighScorePosts,
+    COUNT(*) FILTER (WHERE rp.UserPostRank = 1) AS LatestPosts,
+    AVG(uas.TotalScore) AS AvgTotalScore,
+    AVG(rp.ViewCount) AS AvgViewCount,
+    AVG(rp.AnswerCount) AS AvgAnswerCount,
+    AVG(rp.CommentCount) AS AvgCommentCount,
+    (
+        SELECT STRING_AGG(
+            CONCAT('User:', uas.UserId, '|Reputation:', uas.Reputation, '|Posts:', uas.TotalPosts),
+            '; '
+        )
+        FROM UserActivityStats uas
+        WHERE uas.TotalPosts > 100
+        LIMIT 10
+    ) AS HighActivityUsers,
+    (
+        SELECT STRING_AGG(
+            CONCAT('Tag:', ta.TagName, '|Popularity:', ta.PopularityLevel, '|Count:', ta.TagCount),
+            '; '
+        )
+        FROM TagAnalysis ta
+        WHERE ta.PopularityLevel = 'Popular'
+        LIMIT 5
+    ) AS PopularTagsList,
+    (
+        SELECT STRING_AGG(
+            CONCAT('Post:', phs.PostId, '|Actions:', phs.HistoryCount, '|Last:', phs.LastActionDate),
+            '; '
+        )
+        FROM PostHistorySummary phs
+        WHERE phs.HistoryCount > 50
+        LIMIT 3
+    ) AS HighActivityPosts,
+    (
+        SELECT COUNT(DISTINCT ph.PostId)
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+        AND ph.CreationDate >= DATE '2023-06-01'
+    ) AS RecentVotingActions,
+    (
+        SELECT AVG(rp.UserAvgScore)
+        FROM RankedPosts rp
+        WHERE rp.UserPostRank <= 5
+    ) AS AvgScoreOfTop5Posts,
+    (
+        SELECT STRING_AGG(
+            CONCAT('Post:', rp.PostId, '|Title:', rp.CleanTitle, '|Score:', rp.Score),
+            '; '
+        )
+        FROM RankedPosts rp
+        WHERE rp.Score > 1000
+        AND rp.ScoreCategory = 'High'
+        LIMIT 5
+    ) AS HighScoringPosts,
+    (
+        SELECT COUNT(DISTINCT ph.PostId)
+        FROM PostHistory ph
+        JOIN Users u ON ph.UserId = u.Id
+        WHERE u.Reputation > 10000
+        AND ph.CreationDate >= DATE '2023-01-01'
+    ) AS HighRepUserActions,
+    (
+        SELECT COUNT(DISTINCT p.Id)
+        FROM Posts p
+        JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE u.Reputation > 10000
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2023-01-01'
+    ) AS HighRepUserQuestions,
+    (
+        SELECT 
+            (COUNT(*) - COUNT(CASE WHEN rp.PrevScore IS NULL THEN 1 END))
+        FROM RankedPosts rp
+        WHERE rp.PostTypeId = 1
+    ) AS PostsWithScoreHistory,
+    (
+        SELECT COUNT(DISTINCT u.Id)
+        FROM Users u
+        JOIN PostHistory ph ON u.Id = ph.UserId
+        WHERE ph.PostHistoryTypeId IN (1, 2, 3)
+        AND ph.CreationDate >= DATE '2023-01-01'
+    ) AS UsersWithPostHistory,
+    (
+        SELECT 
+            STRING_AGG(CONCAT('User:', uas.UserId, '|AvgScore:', ROUND(uas.AvgScore, 2)), '; ')
+        FROM UserActivityStats uas
+        WHERE uas.AvgScore > 100
+        LIMIT 5
+    ) AS HighScoringUsers
+FROM RankedPosts rp
+FULL OUTER JOIN UserActivityStats uas ON TRUE
+FULL OUTER JOIN TagAnalysis ta ON TRUE
+FULL OUTER JOIN PostHistorySummary phs ON TRUE
+WHERE 
+    rp.OwnerUserId IS NOT NULL 
+    AND uas.UserId IS NOT NULL 
+    AND ta.TagName IS NOT NULL
+    AND phs.PostId IS NOT NULL;

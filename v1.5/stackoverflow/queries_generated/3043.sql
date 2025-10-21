@@ -1,0 +1,79 @@
+-- {"query": "3043.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 676} 
+WITH UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COUNT(*) OVER () AS TotalUsers
+    FROM Users u
+    WHERE u.LastAccessDate > NOW() - INTERVAL '1 year'
+), RecentQuestions AS (
+    SELECT
+        p1.Id AS QuestionId,
+        p1.OwnerUserId,
+        p1.Title,
+        p1.CreationDate,
+        p1.Tags,
+        p1.Score
+    FROM Posts p1
+    WHERE p1.PostTypeId = 1
+      AND p1.CreationDate >= (SELECT MAX(CreationDate) FROM Posts WHERE PostTypeId=1) - INTERVAL '1 month'
+), AnswerCounts AS (
+    SELECT
+        p2.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount
+    FROM Posts p2
+    WHERE p2.PostTypeId = 2
+    GROUP BY p2.ParentId
+), TagSummaries AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY Tag
+), UserBadged AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    CASE WHEN u.Reputation >= 1000 THEN 'Top Contributor' ELSE 'Contributor' END AS Role,
+    rs.ReputationRank,
+    rs.TotalUsers,
+    COALESCE(qs.QuestionId, 0) AS RecentQuestionId,
+    qs.Title AS QuestionTitle,
+    ac.AnswerCount,
+    COALESCE(tb.Tag, 'unknown') AS Tag,
+    ts.TagCount,
+    ub.BadgeCount,
+    ub.BadgeNames,
+    -- Combine answer count with votes of type 'AcceptedByOriginator' (1) and 'UpMod' (2) for user's posts
+    (
+        SELECT
+            SUM(vs1.VoteCount)
+        FROM (
+            SELECT
+                COUNT(*) AS VoteCount
+            FROM Votes v
+            WHERE v.PostId = p.Id
+              AND v.VoteTypeId IN (1,2)
+        ) vs1
+    ) AS TotalVotesOnPosts
+FROM Users u
+LEFT JOIN UserReputationStats rs ON u.Id = rs.UserId
+LEFT JOIN RecentQuestions qs ON u.Id = qs.OwnerUserId
+LEFT JOIN AnswerCounts ac ON qs.QuestionId = ac.ParentId
+LEFT JOIN TagSummaries ts ON ts.Tag = ANY(string_to_array(substring(qs.Tags, 2, length(qs.Tags)-2), '><'))
+LEFT JOIN UserBadged ub ON u.Id = ub.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+WHERE u.LastAccessDate > NOW() - INTERVAL '1 year'
+ORDER BY u.Reputation DESC, rs.ReputationRank ASC
+LIMIT 100;

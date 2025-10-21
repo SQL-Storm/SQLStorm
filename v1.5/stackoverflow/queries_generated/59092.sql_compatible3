@@ -1,0 +1,94 @@
+SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName AS OwnerDisplayName, 
+    u.Reputation, 
+    COUNT(DISTINCT c.Id) AS CommentCount, 
+    COUNT(DISTINCT v.Id) AS VoteCount, 
+    COUNT(DISTINCT ph.Id) AS HistoryCount, 
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+        ELSE 'Open'
+    END AS PostStatus,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE ParentId = p.Id 
+          AND PostTypeId = 2
+    ) AS AnswerCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes 
+        WHERE PostId = p.Id 
+          AND VoteTypeId IN (2, 3)
+    ) AS UpDownVoteDifference,
+    (
+        SELECT AVG(Score) 
+        FROM Posts 
+        WHERE OwnerUserId = p.OwnerUserId 
+          AND PostTypeId IN (1, 2)
+    ) AS UserAvgScore,
+    (
+        SELECT COUNT(*) 
+        FROM Badges 
+        WHERE UserId = p.OwnerUserId 
+          AND Class = 1
+    ) AS GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges 
+        WHERE UserId = p.OwnerUserId 
+          AND Class = 2
+    ) AS SilverBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges 
+        WHERE UserId = p.OwnerUserId 
+          AND Class = 3
+    ) AS BronzeBadges,
+    (
+        SELECT MIN(CreationDate) 
+        FROM PostHistory 
+        WHERE PostId = p.Id 
+          AND PostHistoryTypeId IN (1, 2, 3)
+    ) AS FirstEditDate,
+    (
+        SELECT MAX(CreationDate) 
+        FROM PostHistory 
+        WHERE PostId = p.Id 
+          AND PostHistoryTypeId IN (10, 11, 12, 13)
+    ) AS LastStatusChangeDate
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT Id, TagName 
+    FROM Tags
+    WHERE Count > 100
+) t ON (
+    TRUE
+)
+WHERE p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= DATE '2010-01-01'
+  AND p.Score > 0
+  AND (p.ViewCount > 100 OR p.Score > 100)
+GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName, u.Reputation, p.PostTypeId, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId, p.OwnerUserId
+HAVING COUNT(DISTINCT v.Id) > 5
+   AND COUNT(DISTINCT ph.Id) > 3
+   AND STRING_AGG(DISTINCT t.TagName, ', ') IS NOT NULL
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 1000;

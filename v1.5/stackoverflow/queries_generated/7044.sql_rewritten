@@ -1,0 +1,251 @@
+-- {"query": "7044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2455} 
+with
+-- recent activity per post including last comment and last history
+post_activity as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.tags,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    greatest(coalesce(p.lastactivitydate, p.lasteditdate, p.creationdate), coalesce(c.max_comment_date, ph.max_history_date)) as last_known_activity,
+    c.max_comment_date,
+    ph.max_history_date,
+    -- snippet of body for string operations
+    left(coalesce(p.body, ''), 1024) as body_snippet
+  from posts p
+  left join (
+    select postid, max(creationdate) as max_comment_date
+    from comments
+    group by postid
+  ) c on c.postid = p.id
+  left join (
+    select postid, max(creationdate) as max_history_date
+    from posthistory
+    group by postid
+  ) ph on ph.postid = p.id
+),
+
+-- enrich users with derived metrics and windowed ranks
+user_metrics as (
+  select
+    u.*,
+    coalesce(b.badge_count,0) as total_badges,
+    coalesce(b.gold_badges,0) as gold_badges,
+    coalesce(b.silver_badges,0) as silver_badges,
+    coalesce(b.bronze_badges,0) as bronze_badges,
+    coalesce(q.question_count,0) as question_count,
+    coalesce(a.answer_count,0) as answer_count,
+    coalesce(v.vote_count,0) as vote_count,
+    -- score balance: upvotes minus downvotes approximation (using VoteTypes)
+    coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as vote_balance,
+    row_number() over (order by u.reputation desc, coalesce(b.gold_badges,0) desc) as global_rank,
+    dense_rank() over (partition by date_trunc('year', u.creationdate) order by u.reputation desc) as cohort_rank_by_year
+  from users u
+  left join (
+    select userid,
+      count(*) as badge_count,
+      sum(case when class=1 then 1 else 0 end) as gold_badges,
+      sum(case when class=2 then 1 else 0 end) as silver_badges,
+      sum(case when class=3 then 1 else 0 end) as bronze_badges
+    from badges
+    group by userid
+  ) b on b.userid = u.id
+  left join (
+    select owneruserid, count(*) as question_count
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) q on q.owneruserid = u.id
+  left join (
+    select owneruserid, count(*) as answer_count
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) a on a.owneruserid = u.id
+  left join (
+    select userid,
+      count(*) as vote_count,
+      sum(case when votetypeid = 2 then 1 else 0 end) as upvotes,
+      sum(case when votetypeid = 3 then 1 else 0 end) as downvotes
+    from votes
+    group by userid
+  ) v on v.userid = u.id
+),
+
+-- Top tags exploded with tag-level aggregates
+tag_exploded as (
+  select
+    t.tagname,
+    t.id as tagid,
+    t.count as usage_count,
+    t.excerptpostid,
+    t.wikipostid,
+    -- tag-related posts: parse tags and join via LIKE (benchmarks string ops)
+    p.id as postid,
+    p.posttypeid,
+    p.score as postscore,
+    p.creationdate as post_creation
+  from tags t
+  left join posts p on p.tags is not null and p.tags <> ''
+    and ( '<' || t.tagname || '>' ) = any(string_to_array(substring(p.tags,2,length(p.tags)-2), '><'))
+),
+
+-- tag level aggregates with window functions and correlated subqueries
+tag_stats as (
+  select
+    te.tagname,
+    te.tagid,
+    te.usage_count,
+    count(distinct te.postid) filter (where te.posttypeid = 1) as questions_with_tag,
+    count(distinct te.postid) filter (where te.posttypeid = 2) as answers_with_tag,
+    coalesce(avg(te.postscore) filter (where te.posttypeid in (1,2)),0) as avg_score,
+    max(te.postscore) filter (where te.posttypeid in (1,2)) as max_score,
+    min(te.postscore) filter (where te.posttypeid in (1,2)) as min_score,
+    -- correlated subquery: most active user for this tag (by answers)
+    (
+      select u.displayname || ' (uid:' || u.id || ')'
+      from users u
+      where u.id = (
+        select owneruserid
+        from posts p2
+        where p2.posttypeid = 2
+          and p2.owneruserid is not null
+          and p2.tags is not null
+          and ( '<' || te.tagname || '>' ) = any(string_to_array(substring(p2.tags,2,length(p2.tags)-2), '><'))
+        group by owneruserid
+        order by count(*) desc nulls last
+        limit 1
+      )
+    ) as top_answerer,
+    -- windowed popularity rank among tags
+    rank() over (order by coalesce(avg(te.postscore) filter (where te.posttypeid in (1,2)),0) desc, te.usage_count desc) as popularity_rank
+  from tag_exploded te
+  group by te.tagname, te.tagid, te.usage_count
+),
+
+-- complicated join graph: posts with accepted answer, parent question, linked posts and link types
+post_graph as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    pa.postid as accepted_answer_id,
+    parent.title as parent_title,
+    parent.owneruserid as parent_owner,
+    lt.Name as linktype_name,
+    pl.relatedpostid,
+    rp.posttypeid as related_post_type,
+    rp.score as related_post_score,
+    -- boolean-ish expressions and null logic
+    case
+      when p.acceptedanswerid is not null then true
+      when p.posttypeid = 2 and p.parentid is not null then exists (select 1 from posts q where q.id = p.parentid and q.acceptedanswerid = p.id)
+      else false
+    end as is_accepted_by_question,
+    -- computed complexity score mixing many metrics
+    (
+      coalesce(p.score,0) * 2
+      + coalesce(p.viewcount,0) / nullif(coalesce(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - p.creationdate),0),0)
+      + coalesce(pa_score.avg_accepted_score,0) * 5
+      - coalesce(tag_related.tag_influence,0)
+      + coalesce(u.reputation,0) / 1000.0
+    ) as complexity_score
+  from posts p
+  left join posts parent on parent.id = p.parentid
+  left join posts pa on pa.id = p.acceptedanswerid
+  left join (
+    select postid, avg(score) as avg_accepted_score
+    from posts
+    where id in (select acceptedanswerid from posts where acceptedanswerid is not null)
+    group by postid
+  ) pa_score on pa_score.postid = p.id
+  left join postlinks pl on pl.postid = p.id
+  left join linktypes lt on lt.id = pl.linktypeid
+  left join posts rp on rp.id = pl.relatedpostid
+  left join lateral (
+    select coalesce(sum(case when t.count is null then 0 else t.count end),0) as tag_influence
+    from tags t
+    where exists (
+      select 1 from posts p2
+      where p2.id = p.id
+        and p2.tags is not null
+        and ( '<' || t.tagname || '>' ) = any(string_to_array(substring(p2.tags,2,length(p2.tags)-2), '><'))
+    )
+  ) tag_related on true
+  left join users u on u.id = p.owneruserid
+),
+
+-- final aggregation combining many constructs: set operators, unions, and CTE consumption
+top_bench as (
+  -- union: top questions by complexity_score and top tags by popularity
+  select
+    'post' as entity_type,
+    pg.post_id::text as entity_id,
+    coalesce(pg.title, left(pg.post_id::text,50)) as label,
+    pg.complexity_score as metric,
+    pg.creationdate as created_at,
+    pg.owneruserid as owner_id,
+    array_remove(array_agg(distinct lt.name) filter (where lt.name is not null), NULL) as link_types
+  from post_graph pg
+  left join postlinks pl on pl.postid = pg.post_id
+  left join linktypes lt on lt.id = pl.linktypeid
+  group by pg.post_id, pg.title, pg.complexity_score, pg.creationdate, pg.owneruserid
+
+  union
+
+  select
+    'tag' as entity_type,
+    ts.tagid::text as entity_id,
+    ts.tagname as label,
+    ts.popularity_rank * -1.0 as metric, -- negative so higher popularity sorts first when ordering asc
+    null::timestamp as created_at,
+    null::int as owner_id,
+    null::text[] as link_types
+  from tag_stats ts
+  where ts.questions_with_tag > 10
+)
+
+select
+  tb.entity_type,
+  tb.entity_id,
+  tb.label,
+  tb.metric,
+  tb.created_at,
+  tb.owner_id,
+  tb.link_types,
+  -- enrich with owner details and user metrics via left join (NULL-aware)
+  um.displayname,
+  um.reputation,
+  um.total_badges,
+  um.gold_badges,
+  um.question_count,
+  -- windowed percentile of metric within its entity type
+  percentile_disc(0.5) within group (order by tb.metric) over (partition by tb.entity_type) as median_metric_by_type,
+  ntile(10) over (partition by tb.entity_type order by tb.metric) as decile_by_type,
+  -- correlated existence checks and subqueries to stress optimizer
+  exists (
+    select 1 from votes v
+    where v.postid = case when tb.entity_type = 'post' then tb.entity_id::int else null end
+      and v.votetypeid in (2,3)
+      and v.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  ) as has_recent_votes,
+  -- string concat and NULL coalescing to produce a synthetic summary
+  coalesce(tb.label, 'N/A') || ' :: ' || coalesce(um.displayname, 'unknown') ||
+    ' [' || tb.entity_type || ']' ||
+    case when tb.link_types is not null then ' links:' || array_to_string(tb.link_types,',') else '' end
+    as synthetic_summary
+from top_bench tb
+left join users um on um.id = tb.owner_id
+order by tb.entity_type asc, tb.metric desc
+limit 200;

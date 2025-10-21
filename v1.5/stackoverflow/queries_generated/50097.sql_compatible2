@@ -1,0 +1,78 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Tags,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS QuestionCommentCount,
+        (SELECT MAX(Score) FROM Posts WHERE ParentId = p.Id) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.ClosedDate IS NULL
+      AND p.DeletionDate IS NULL
+      AND p.Score > 10
+      AND p.AnswerCount > 2
+),
+UserContributions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        SUM(a.Score) AS TotalAnswerScore,
+        SUM(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges
+    FROM Users u
+    JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2 -- Answers
+    JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 5000 
+      AND u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT a.Id) > 20
+)
+SELECT
+    uc.DisplayName,
+    uc.Reputation,
+    qs.Tags,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.MaxAnswerScore,
+    uc.TotalAnswers,
+    uc.TotalAnswerScore,
+    uc.AcceptedAnswers,
+    uc.AvgAnswerScore,
+    uc.GoldBadges,
+    uc.SilverBadges,
+    (uc.Reputation / (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0 + 1)) AS ReputationPerDay,
+    (
+        (qs.QuestionScore * 0.4) +
+        (qs.ViewCount * 0.1) +
+        (qs.FavoriteCount * 0.3) +
+        (uc.TotalAnswerScore * 0.2) +
+        (uc.AcceptedAnswers * 50) +
+        (uc.GoldBadges * 100)
+    ) AS OverallInfluenceScore
+FROM QuestionStats qs
+JOIN UserContributions uc ON qs.OwnerUserId = uc.UserId
+JOIN Users u ON uc.UserId = u.Id
+WHERE
+    qs.QuestionId IN (
+        SELECT pl.PostId
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+        WHERE lt.Name = 'Linked'
+        GROUP BY pl.PostId
+        HAVING COUNT(*) > 3
+    )
+ORDER BY OverallInfluenceScore DESC, uc.Reputation DESC
+LIMIT 200;

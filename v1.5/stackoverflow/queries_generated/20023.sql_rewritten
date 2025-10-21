@@ -1,0 +1,213 @@
+-- {"query": "20023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1659} 
+WITH UserActivity AS (
+  -- Calculate core statistics for users with significant reputation and post count.
+  -- Includes a correlated subquery to find the last edit date for each user.
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    (
+      SELECT
+        COUNT(*)
+      FROM
+        Comments c
+      WHERE
+        c.UserId = u.Id
+    ) AS TotalComments,
+    (
+      SELECT
+        MAX(ph.CreationDate)
+      FROM
+        PostHistory ph
+      WHERE
+        ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, or Tags
+    ) AS LastEditDate
+  FROM
+    Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE
+    u.CreationDate < '2020-01-01'
+    AND u.Reputation > 1000
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+  HAVING
+    COUNT(p.Id) > 20
+), TaggedActivity AS (
+  -- Unnest tags and join with post details to analyze user activity per tag.
+  -- Identifies activity in tags that are considered "popular" (top 5%).
+  SELECT
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    t.tag_name,
+    CASE WHEN t.tag_name IN (
+      SELECT
+        TagName
+      FROM
+        Tags
+      ORDER BY
+        Count DESC
+      LIMIT (
+        SELECT
+          CAST(COUNT(*) * 0.05 AS INT)
+        FROM
+          Tags
+      )
+    ) THEN TRUE ELSE FALSE END AS IsPopularTag
+  FROM
+    Posts p,
+    LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><') AS t(tag_name)
+  WHERE
+    p.PostTypeId = 1 -- Questions
+    AND p.OwnerUserId IS NOT NULL
+    AND p.Tags IS NOT NULL
+), UserRanking AS (
+  -- Use window functions to rank users based on their activity and calculate posting lifespan.
+  SELECT
+    ua.UserId,
+    ua.TotalScore,
+    ua.TotalPosts,
+    ua.Reputation,
+    CAST(ua.UpVotes AS DECIMAL) / NULLIF(ua.DownVotes, 0) AS UpDownRatio,
+    ua.LastEditDate,
+    COUNT(DISTINCT CASE WHEN ta.IsPopularTag THEN ta.tag_name END) AS PopularTagCount,
+    AVG(CASE WHEN ta.IsPopularTag THEN ta.Score END) AS AvgScoreInPopularTags,
+    RANK() OVER (
+      PARTITION BY (
+        CASE
+          WHEN ua.Reputation > 100000 THEN 'Elite'
+          WHEN ua.Reputation > 25000 THEN 'Pro'
+          ELSE 'Regular'
+        END
+      )
+      ORDER BY
+        ua.TotalScore DESC,
+        ua.TotalPosts DESC
+    ) AS EngagementRank,
+    MAX(p.CreationDate) - MIN(p.CreationDate) AS PostingLifespan
+  FROM
+    UserActivity ua
+    LEFT JOIN TaggedActivity ta ON ua.UserId = ta.OwnerUserId
+    LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+  GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalScore,
+    ua.TotalPosts,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.LastEditDate
+)
+-- Main query combining "Power Posters" and "Gold Badge Specialists"
+SELECT
+  u.Id,
+  u.DisplayName,
+  'Power Poster' AS UserType,
+  ur.Reputation,
+  ur.EngagementRank,
+  ur.PopularTagCount,
+  ur.PostingLifespan,
+  -- Complex scoring formula combining various metrics
+  (
+    ur.TotalScore * 0.4
+  ) + (
+    ur.Reputation * 0.2
+  ) + (
+    COALESCE(ur.AvgScoreInPopularTags, 0) * 10
+  ) - (
+    EXTRACT(
+      EPOCH
+      FROM
+        (cast('2024-10-01 12:34:56' as timestamp) - ur.LastEditDate)
+    ) / 86400 * 0.1
+  ) AS WeightedImpactScore,
+  -- Complicated string expression with NULL logic
+  CONCAT(
+    'Location: ',
+    UPPER(
+      COALESCE(
+        SUBSTRING(u.Location, 1, 15),
+        'N/A'
+      )
+    ),
+    ' | Ratio: ',
+    ROUND(ur.UpDownRatio, 2)
+  ) AS UserSummary
+FROM
+  UserRanking ur
+  JOIN Users u ON ur.UserId = u.Id
+WHERE
+  ur.UpDownRatio > 10.0
+  AND ur.EngagementRank <= 50
+  AND ur.PopularTagCount > (
+    SELECT
+      AVG(PopularTagCount)
+    FROM
+      UserRanking
+    WHERE
+      PopularTagCount > 0
+  )
+UNION
+ALL
+-- Find users who are not necessarily prolific posters but have earned prestigious, non-tag-based gold badges.
+SELECT
+  u.Id,
+  u.DisplayName,
+  'Gold Specialist' AS UserType,
+  u.Reputation,
+  NULL AS EngagementRank,
+  NULL AS PopularTagCount,
+  NULL AS PostingLifespan,
+  (u.Reputation * 0.8) + (b.GoldBadgeCount * 2000) AS WeightedImpactScore,
+  CONCAT(
+    'Location: ',
+    UPPER(
+      COALESCE(
+        SUBSTRING(u.Location, 1, 15),
+        'N/A'
+      )
+    ),
+    ' | Gold Badges: ',
+    b.GoldBadgeCount
+  ) AS UserSummary
+FROM
+  Users u
+  JOIN (
+    SELECT
+      UserId,
+      COUNT(*) AS GoldBadgeCount
+    FROM
+      Badges
+    WHERE
+      Class = 1 -- Gold
+      AND TagBased = B'0'
+      AND Name IN (
+        'Great Answer',
+        'Famous Question',
+        'Strunk & White',
+        'Copy Editor'
+      )
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(*) >= 2
+  ) b ON u.Id = b.UserId
+WHERE
+  u.Reputation > 10000
+ORDER BY
+  WeightedImpactScore DESC,
+  Reputation DESC
+LIMIT
+  200;

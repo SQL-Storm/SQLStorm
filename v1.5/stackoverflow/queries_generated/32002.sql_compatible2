@@ -1,0 +1,31 @@
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName AS UserName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+    SUM(COALESCE(v.Score, 0)) AS TotalScore,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    COALESCE(SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+    COALESCE(SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+    COALESCE(SUM(CASE WHEN vt.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS FavoritesReceived
+FROM 
+    Users AS u
+LEFT JOIN 
+    Posts AS p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes AS v ON p.Id = v.PostId AND (v.VoteTypeId = 2 OR v.VoteTypeId = 3)
+LEFT JOIN 
+    Badges AS b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes AS vt ON p.Id = vt.PostId
+GROUP BY 
+    u.Id, u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) >= 5 
+ORDER BY 
+    TotalScore DESC, TotalBadges DESC
+LIMIT 100;

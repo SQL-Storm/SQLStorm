@@ -1,0 +1,66 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    WHERE u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 2
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        q.CreationDate AS QuestionCreation,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY
+    GROUP BY q.Id, q.Title, q.ViewCount, q.Score, q.CreationDate
+    HAVING COUNT(a.Id) >= 2
+),
+HighlyEngagedComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    WHERE c.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY
+    GROUP BY c.PostId
+    HAVING COUNT(c.Id) >= 5 AND AVG(c.Score) > 0
+)
+SELECT
+    tq.QuestionId,
+    tq.Title,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.TotalAnswerScore,
+    hec.CommentCount AS RecentCommentCount,
+    hec.AvgCommentScore AS AvgRecentCommentScore,
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.PostCount,
+    ru.CommentCount AS UserCommentCount
+FROM TopQuestionsWithAnswers tq
+LEFT JOIN HighlyEngagedComments hec ON hec.PostId = tq.QuestionId
+LEFT JOIN Posts qp ON qp.Id = tq.QuestionId
+LEFT JOIN Users ru ON ru.Id = qp.OwnerUserId
+WHERE tq.TotalAnswerScore > 5
+  AND ru.Reputation > 1000
+  AND ru.UserId IN (SELECT UserId FROM RecentActiveUsers)
+ORDER BY tq.ViewCount DESC, tq.TotalAnswerScore DESC
+LIMIT 50;

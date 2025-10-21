@@ -1,0 +1,179 @@
+with
+active_users as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         coalesce(u.location,'') as location,
+         count(distinct b.id) filter (where b.class=1) as gold_badges,
+         count(distinct b.id) filter (where b.class=2) as silver_badges,
+         count(distinct b.id) filter (where b.class=3) as bronze_badges,
+         sum(coalesce(vt_up.cnt,0)) as upvotes_cast,
+         sum(coalesce(vt_down.cnt,0)) as downvotes_cast,
+         row_number() over (order by u.reputation desc, u.lastaccessdate desc) as rank_by_rep
+  from users u
+  left join badges b on b.userid = u.id
+  left join (
+    select userid, count(*) as cnt from votes where votetypeid = 2 group by userid
+  ) vt_up on vt_up.userid = u.id
+  left join (
+    select userid, count(*) as cnt from votes where votetypeid = 3 group by userid
+  ) vt_down on vt_down.userid = u.id
+  where u.lastaccessdate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location
+),
+questions as (
+  select p.id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         coalesce(p.tags,'') as raw_tags,
+         regexp_split_to_array(substring(coalesce(p.tags,'') from 2 for greatest(length(coalesce(p.tags,''))-2,0)), '><') as tags_array,
+         (coalesce(p.score,0) * 3
+          + log(greatest(coalesce(p.viewcount,0),1)) * 2
+          + coalesce(p.favoritecount,0) * 5
+          + coalesce(p.answercount,0) * 1.5
+          ) / greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.creationdate, cast('2024-10-01 12:34:56' as timestamp)))) / 86400.0, 1) as popularity
+  from posts p
+  where p.posttypeid = 1
+),
+answers_ranked as (
+  select a.id,
+         a.parentid as questionid,
+         a.owneruserid,
+         a.score,
+         a.creationdate,
+         a.body,
+         a.commentcount,
+         a.owneruserid is null as anonymous_answer,
+         row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc) as rn,
+         dense_rank() over (partition by a.parentid order by a.score desc nulls last) as drank,
+         u.reputation as answerer_reputation
+  from posts a
+  left join users u on u.id = a.owneruserid
+  where a.posttypeid = 2
+),
+activity_spikes as (
+  select q.id as questionid,
+         q.title,
+         q.popularity,
+         q.tags_array,
+         q.creationdate,
+         q.viewcount,
+         q.score,
+         q.answercount,
+         (select count(*) from posts a where a.posttypeid=2 and a.parentid = q.id and a.creationdate <= q.creationdate + interval '7 days') as answers_first_week,
+         (select count(*) from posts a where a.posttypeid=2 and a.parentid = q.id and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days') as answers_last_week,
+         greatest(
+           coalesce((select max(c.creationdate) from comments c where c.postid = q.id), timestamp '1970-01-01'),
+           coalesce((select max(ph.creationdate) from posthistory ph where ph.postid = q.id), timestamp '1970-01-01'),
+           coalesce((select max(p2.lastactivitydate) from posts p2 where p2.id = q.id), timestamp '1970-01-01')
+         ) as last_touched
+  from questions q
+),
+tag_pairs as (
+  select t1.tag as tag_a, t2.tag as tag_b, count(*) as cooccurrence, avg(q.popularity) as avg_pop
+  from questions q
+  cross join lateral (
+    select unnest(q.tags_array) as tag
+  ) t1
+  cross join lateral (
+    select unnest(q.tags_array) as tag
+  ) t2
+  where t1.tag < t2.tag
+  group by t1.tag, t2.tag
+  having count(*) > 5
+),
+controversial as (
+  select p.id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) filter (where v.votetypeid in (2,3)) as ups,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) filter (where v.votetypeid in (2,3)) as downs,
+         count(v.id) as total_votes_recorded,
+         abs(sum(case when v.votetypeid = 2 then 1 else -1 end)) as vote_balance,
+         count(distinct coalesce(v.userid,-1)) as distinct_voters
+  from posts p
+  left join votes v on v.postid = p.id and v.votetypeid in (2,3)
+  where p.posttypeid in (1,2)
+  and exists (
+    select 1 from votes v2 where v2.postid = p.id and v2.votetypeid in (2,3) and v2.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+  )
+  group by p.id, p.title, p.owneruserid, p.creationdate
+  having count(v.id) >= 10 and abs(sum(case when v.votetypeid = 2 then 1 else -1 end)) < greatest(3, count(v.id) * 0.2)
+),
+user_influence as (
+  select au.id as userid,
+         au.displayname,
+         au.reputation,
+         coalesce(sum(case when p.posttypeid = 1 then greatest(p.score,0) * 2 else greatest(p.score,0) end),0) as authored_score_weighted,
+         coalesce((select count(*) from comments c where c.userid = au.id),0) as comments_made,
+         coalesce((select count(*) from posts p2 where p2.owneruserid = au.id and p2.posttypeid = 1 and p2.answercount > 0),0) as answered_questions_count,
+         (au.reputation::numeric * 0.6
+           + coalesce(sum(case when p.posttypeid = 1 then greatest(p.score,0) * 2 else greatest(p.score,0) end),0) * 1.2
+           + coalesce(sum(case when b.class = 1 then 50 when b.class=2 then 20 else 5 end),0) * 3
+           + log(greatest(coalesce((select count(*) from comments c where c.userid = au.id),0),1)) * 2
+         ) / greatest(1, least(au.reputation/1000.0 + 1, 50)) as influence_score
+  from active_users au
+  left join posts p on p.owneruserid = au.id
+  left join badges b on b.userid = au.id
+  group by au.id, au.displayname, au.reputation
+)
+select
+  q.id as question_id,
+  q.title,
+  substring(q.title from 1 for 120) || case when length(q.title) > 120 then '...' else '' end as short_title,
+  q.popularity,
+  q.viewcount,
+  q.answercount,
+  q.score as question_score,
+  (select count(*) from comments c where c.postid = q.id) as comment_count,
+  coalesce(a_best.id, null) as top_answer_id,
+  coalesce(a_best.score, 0) as top_answer_score,
+  a_best.answerer_reputation,
+  us.displayname as question_owner,
+  us.reputation as owner_reputation,
+  us.gold_badges,
+  us.silver_badges,
+  us.bronze_badges,
+  sp.cooccurrence as related_tag_cooccurrence,
+  sp.avg_pop as related_tag_avg_popularity,
+  cs.ups,
+  cs.downs,
+  cs.total_votes_recorded,
+  cs.vote_balance,
+  case
+    when q.popularity > (select avg(popularity) from questions) then 'above_avg_popularity'
+    when q.popularity = (select avg(popularity) from questions) then 'avg_popularity'
+    else 'below_avg_popularity'
+  end as popularity_band,
+  us.rank_by_rep,
+  ui.influence_score,
+  (q.answercount > 0 and a_best.id is not null) as has_top_answer,
+  (cs.total_votes_recorded > 0 and cs.ups::numeric / greatest(cs.total_votes_recorded,1) < 0.6 and cs.downs > 0) as likely_controversial,
+  extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - greatest(coalesce((select max(c.creationdate) from comments c where c.postid = q.id), cast('1970-01-01' as timestamp)), cast('1970-01-01' as timestamp)))) / 86400.0 as days_since_last_touch,
+  case
+    when (select count(*) from posts a where a.posttypeid=2 and a.parentid = q.id and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days') > 3 then true
+    else false
+  end as recent_answer_spike
+from activity_spikes q
+left join lateral (
+  select a.id, a.score, a.answerer_reputation
+  from answers_ranked a
+  where a.questionid = q.questionid and a.rn = 1
+  order by a.score desc nulls last, a.creationdate asc
+  limit 1
+) a_best on true
+left join users us on us.id = q.owneruserid
+left join tag_pairs sp on sp.tag_a = (q.tags_array[1]) or sp.tag_b = (q.tags_array[1])
+left join controversial cs on cs.id = q.questionid
+left join user_influence ui on ui.userid = us.id
+where q.popularity is not null
+order by q.popularity desc nulls last, q.last_touched desc
+limit 250;

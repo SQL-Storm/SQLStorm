@@ -1,0 +1,135 @@
+-- {"query": "6066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1078} 
+WITH
+RecentQuestionActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+TopTags AS (
+  SELECT
+    tag.TagName,
+    SUM(tag.Count) AS TagTotal
+  FROM Tags tag
+  GROUP BY tag.TagName
+  HAVING SUM(tag.Count) > 1000
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    MAX(r.LastActivityDate) AS LastSeen
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts r ON r.OwnerUserId = u.Id
+  WHERE u.Reputation > 100
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.AboutMe, u.Views, u.UpVotes, u.DownVotes
+),
+FlaggedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    pv.VoteTypeId,
+    pv.UserId AS VoterId,
+    v.UserId AS VotedUser,
+    p.OwnerUserId,
+    c.Name AS CloseReason
+  FROM Posts p
+  JOIN Votes pv ON pv.PostId = p.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN PostHistory ph2 ON ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 11
+  LEFT JOIN CloseReasonTypes c ON c.Id = CAST(ph.Comment AS varchar)
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 6
+  WHERE pv.VoteTypeId = 6
+    AND p.PostTypeId = 1
+)
+SELECT
+  -- detailed composite metrics for benchmarking
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  COUNT(DISTINCT q.PostId) AS RecentQuestionCount,
+  SUM(q.ViewCount) AS TotalQuestionViews,
+  AVG(q.Score) AS AvgQuestionScore,
+  MAX(q.LastActivityDate) AS LastQuestionActivity,
+  STRING_AGG(t.TagName, ',') AS TopTagNames,
+  ht.TagTotal AS GlobalTagPopularity,
+  ua.Reputation AS UserReputation,
+  ua.Views AS UserViews,
+  CASE
+    WHEN ua.Reputation IS NULL THEN 0
+    ELSE (ua.UpVotes - ua.DownVotes)
+  END AS ReputationDelta,
+  CASE
+    WHEN r.LastSeen IS NULL THEN '2020-01-01'
+    ELSE TO_CHAR(r.LastSeen, 'YYYY-MM-DD HH24:MI:SS')
+  END AS LastSeenTimestamp,
+  CASE
+    WHEN f.PostId IS NULL THEN false
+    ELSE true
+  END AS HasFlaggedPost,
+  f.PostId AS FlaggedPostId
+FROM Users u
+LEFT JOIN RecentQuestionActivity rqa ON rqa.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    ph.PostId,
+    ph.Text AS TitleTag
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 1
+) t ON t.PostId = rqa.PostId
+LEFT JOIN (
+  SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  FROM Posts p
+  WHERE p.Id = rqa.PostId
+) t2 ON true
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS TagCount
+  FROM Posts p
+  JOIN Tags tg ON tg.Id = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId
+) tt ON tt.OwnerUserId = u.Id
+LEFT JOIN TopTags ht ON TRUE
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN (
+  SELECT DISTINCT PostId
+  FROM Votes
+  WHERE VoteTypeId = 6
+) f ON f.PostId = v.PostId
+LEFT JOIN (
+  SELECT DISTINCT p.Id AS PostId
+  FROM Posts p
+  JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 6
+) f ON f.PostId = rqa.PostId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  ht.TagTotal,
+  ua.Reputation,
+  ua.Views,
+  f.PostId,
+  rqa.LastActivityDate,
+  rqa.TotalQuestionViews
+ORDER BY LastQuestionActivity DESC
+LIMIT 100;

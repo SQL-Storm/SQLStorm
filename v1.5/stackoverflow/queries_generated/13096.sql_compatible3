@@ -1,0 +1,66 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS EditsMade,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId
+    WHERE u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+HighScoredPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        u.DisplayName,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts AS p
+    JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > (SELECT AVG(Score) * 1.5 FROM Posts WHERE PostTypeId IN (1, 2))
+),
+TagTrends AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.ViewCount) AS AvgViewCount,
+        LAG(COUNT(p.Id), 1, 0) OVER (ORDER BY COUNT(p.Id) DESC) AS PrevPostCount
+    FROM Tags AS t
+    LEFT JOIN Posts AS p ON t.Id = ANY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')::int[])
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+FinalResults AS (
+    SELECT 
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.EditsMade,
+        hsp.Title AS TopContributedPost,
+        hsp.Score,
+        tt.TagName AS TopTrendingTag,
+        tt.AvgViewCount
+    FROM UserActivity AS ua
+    LEFT JOIN HighScoredPosts AS hsp ON ua.Id = hsp.Id AND hsp.PostRank = 1
+    LEFT JOIN TagTrends AS tt ON tt.PostCount = (SELECT MAX(PostCount) FROM TagTrends)
+    WHERE ua.ReputationRank <= 100
+)
+SELECT 
+    DisplayName,
+    QuestionsAsked,
+    AnswersGiven,
+    EditsMade,
+    TopContributedPost,
+    Score,
+    TopTrendingTag,
+    AvgViewCount
+FROM FinalResults
+WHERE TopContributedPost IS NOT NULL
+ORDER BY AvgViewCount DESC NULLS LAST
+LIMIT 20;

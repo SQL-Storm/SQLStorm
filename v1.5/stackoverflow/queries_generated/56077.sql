@@ -1,0 +1,27 @@
+-- {"query": "56077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 236} 
+
+SELECT 
+    u.Id, 
+    u.Reputation, 
+    u.DisplayName, 
+    COUNT(p.Id) AS PostCount, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount, 
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount, 
+    SUM(v.VoteTypeId = 2) AS UpVotes, 
+    SUM(v.VoteTypeId = 3) AS DownVotes, 
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedQuestions, 
+    SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedQuestions
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+GROUP BY 
+    u.Id, 
+    u.Reputation, 
+    u.DisplayName
+ORDER BY 
+    PostCount DESC;

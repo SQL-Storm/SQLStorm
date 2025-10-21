@@ -1,0 +1,119 @@
+-- {"query": "16051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 121420, "output_tokens": 112553} 
+
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS join_year,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS avg_post_score,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS rep_rank_in_year,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS badge_rank_overall
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+        AND u.Reputation > 100
+        AND COALESCE(u.Location, '') NOT LIKE '%deleted%'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+top_posts_with_engagement AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS favorite_count,
+        (p.Score * 1.0 + COALESCE(p.ViewCount, 0) * 0.001 + COALESCE(p.AnswerCount, 0) * 5 + 
+         COALESCE(p.CommentCount, 0) * 0.5 + COALESCE(p.FavoriteCount, 0) * 2) AS engagement_score,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS user_total_posts,
+        STRING_AGG(DISTINCT SUBSTRING(t.tag_name, 1, 20), ', ' ORDER BY t.tag_name) 
+            FILTER (WHERE t.tag_name IS NOT NULL) AS post_tags
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '><' FROM REPLACE(p.Tags, '><', '|')), '|')) AS tag_name
+    ) t ON p.Tags IS NOT NULL
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate BETWEEN '2015-01-01' AND '2023-12-31'
+        AND (p.Score >= 5 OR p.ViewCount > 1000)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.Tags
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvote_count,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvote_count,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS favorite_count,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS bounty_start_count,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS total_bounty_amount,
+        AVG(EXTRACT(EPOCH FROM (v.CreationDate - p.CreationDate)) / 3600.0) AS avg_hours_to_vote
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE v.CreationDate >= '2015-01-01'
+    GROUP BY v.PostId
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.join_year,
+    uam.post_count,
+    uam.question_count,
+    uam.answer_count,
+    uam.badge_count,
+    ROUND(uam.avg_post_score::numeric, 2) AS avg_post_score,
+    uam.rep_rank_in_year,
+    uam.badge_rank_overall,
+    tpe.Title AS best_post_title,
+    tpe.engagement_score,
+    tpe.post_tags,
+    COALESCE(vp.upvote_count, 0) AS best_post_upvotes,
+    COALESCE(vp.downvote_count, 0) AS best_post_downvotes,
+    COALESCE(vp.total_bounty_amount, 0) AS best_post_bounties,
+    ROUND(COALESCE(vp.avg_hours_to_vote, 0)::numeric, 2) AS avg_hours_to_vote,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = uam.Id AND c.Score > 0) AS helpful_comments,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+     FROM PostLinks pl 
+     INNER JOIN Posts p2 ON pl.PostId = p2.Id 
+     WHERE p2.OwnerUserId = uam.Id AND pl.LinkTypeId = 1) AS posts_with_links,
+    CASE 
+        WHEN uam.avg_post_score > 10 AND uam.badge_count > 20 THEN 'Elite Contributor'
+        WHEN uam.avg_post_score > 5 AND uam.badge_count > 10 THEN 'Active Contributor'
+        WHEN uam.post_count > 50 THEN 'Regular Contributor'
+        ELSE 'Casual Contributor'
+    END AS contributor_tier,
+    COALESCE(NULLIF(TRIM(SUBSTRING(uam.DisplayName, 1, 1)), ''), 'U') || 
+        CAST(uam.Id % 1000 AS VARCHAR) AS anonymized_id
+FROM user_activity_metrics uam
+LEFT JOIN LATERAL (
+    SELECT * FROM top_posts_with_engagement tpe2
+    WHERE tpe2.OwnerUserId = uam.Id
+    ORDER BY tpe2.engagement_score DESC NULLS LAST
+    LIMIT 1
+) tpe ON true
+LEFT JOIN vote_patterns vp ON tpe.post_id = vp.PostId
+WHERE uam.rep_rank_in_year <= 100
+    AND (uam.question_count > 0 OR uam.answer_count > 3)
+    AND NOT EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = uam.Id 
+            AND p.ClosedDate IS NOT NULL 
+        HAVING COUNT(*) > 10
+    )
+ORDER BY 
+    CASE WHEN uam.badge_rank_overall <= 50 THEN 0 ELSE 1 END,
+    uam.Reputation DESC,
+    tpe.engagement_score DESC NULLS LAST
+LIMIT 500;

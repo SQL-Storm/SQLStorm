@@ -1,0 +1,151 @@
+WITH RelevantTags AS (
+    SELECT
+        Id AS TagId,
+        TagName
+    FROM Tags
+    WHERE
+        TagName IN ('sql', 'performance', 'optimization', 'database', 'query-optimization', 'indexing', 'transactions', 'concurrency')
+),
+ActivePostsWithTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.Body,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        U_Owner.DisplayName AS OwnerDisplayName,
+        P.LastEditorUserId,
+        U_Editor.DisplayName AS LastEditorDisplayName,
+        STRING_AGG(RT.TagName, ',') AS RelevantTagNames,
+        COUNT(DISTINCT T.TagId) AS MatchedTagCount
+    FROM Posts P
+    JOIN Users U_Owner ON P.OwnerUserId = U_Owner.Id
+    LEFT JOIN Users U_Editor ON P.LastEditorUserId = U_Editor.Id
+    JOIN (
+        SELECT
+            P_Inner.Id AS PostId,
+            T_Inner.TagId
+        FROM Posts P_Inner
+        CROSS JOIN UNNEST(string_to_array(substr(P_Inner.Tags, 2, char_length(P_Inner.Tags) - 2), '><')) AS PostTag
+        JOIN RelevantTags T_Inner ON PostTag = T_Inner.TagName
+        WHERE P_Inner.PostTypeId = 1
+    ) T ON P.Id = T.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.ViewCount > 5000
+        AND P.AnswerCount > 10
+        AND P.CommentCount > 20
+        AND P.CreationDate >= DATE '2021-01-01'
+        AND P.LastActivityDate >= DATE '2023-01-01'
+    GROUP BY
+        P.Id, P.Title, P.Body, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.OwnerUserId, U_Owner.DisplayName,
+        P.LastEditorUserId, U_Editor.DisplayName
+    HAVING COUNT(DISTINCT T.TagId) >= 2
+),
+PostEngagementMetrics AS (
+    SELECT
+        AP.PostId,
+        AP.Title,
+        AP.OwnerUserId,
+        AP.OwnerDisplayName,
+        AP.PostCreationDate,
+        AP.LastActivityDate,
+        AP.RelevantTagNames,
+        AP.ViewCount,
+        AP.AnswerCount,
+        AP.CommentCount,
+        AP.FavoriteCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnQuestion,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesOnQuestion,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(PH.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT C.UserId) AS DistinctCommenters,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COALESCE(SUM(A.Score), 0) AS TotalAnswerScore,
+        COUNT(A.Id) AS ActualAnswerCount,
+        COUNT(DISTINCT A.OwnerUserId) AS DistinctAnswerers,
+        AVG(EXTRACT(EPOCH FROM (AP.LastActivityDate - AP.PostCreationDate)) / 3600 / 24) AS ActivityDurationDays,
+        (AP.Score * 0.5 + AP.ViewCount * 0.01 + AP.AnswerCount * 1.5 + AP.CommentCount * 0.8 + AP.FavoriteCount * 2.0) AS EngagementScore,
+        NTILE(10) OVER (ORDER BY AP.ViewCount DESC, AP.AnswerCount DESC, AP.PostScore DESC, AP.FavoriteCount DESC) AS EngagementQuintile
+    FROM ActivePostsWithTags AP
+    LEFT JOIN Votes V ON AP.PostId = V.PostId
+    LEFT JOIN PostHistory PH ON AP.PostId = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24)
+    LEFT JOIN Comments C ON AP.PostId = C.PostId
+    LEFT JOIN Posts A ON AP.PostId = A.ParentId AND A.PostTypeId = 2
+    GROUP BY
+        AP.PostId, AP.Title, AP.OwnerUserId, AP.OwnerDisplayName, AP.PostCreationDate,
+        AP.LastActivityDate, AP.RelevantTagNames, AP.ViewCount, AP.AnswerCount,
+        AP.CommentCount, AP.FavoriteCount, AP.Score
+),
+UserOverallScores AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT PEM.PostId) AS AuthoredQuestionsInScope,
+        SUM(PEM.TotalUpvotesOnQuestion) AS TotalUpvotesOnAuthoredQuestions,
+        SUM(PEM.TotalAnswerScore) AS TotalAnswerScoreFromAuthoredQuestions,
+        SUM(PEM.TotalCommentScore) AS TotalCommentScoreFromAuthoredQuestions,
+        COUNT(DISTINCT B.Id) AS GoldBadges,
+        COUNT(DISTINCT B_Silver.Id) AS SilverBadges,
+        AVG(U.Reputation * 0.1 + U.UpVotes * 0.05 + U.Views * 0.001) AS UserImpactScore
+    FROM Users U
+    LEFT JOIN PostEngagementMetrics PEM ON U.Id = PEM.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId AND B.Class = 1
+    LEFT JOIN Badges B_Silver ON U.Id = B_Silver.UserId AND B_Silver.Class = 2
+    WHERE U.Reputation > 25000 AND U.Views > 1000
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views
+    HAVING COUNT(DISTINCT PEM.PostId) > 0
+)
+SELECT
+    UOS.UserId,
+    UOS.DisplayName,
+    UOS.Reputation,
+    UOS.UserImpactScore,
+    UOS.AuthoredQuestionsInScope,
+    UOS.GoldBadges,
+    UOS.SilverBadges,
+    RANK() OVER (ORDER BY UOS.UserImpactScore DESC, UOS.Reputation DESC, UOS.TotalUpvotesOnAuthoredQuestions DESC, UOS.AuthoredQuestionsInScope DESC) AS UserRankByImpact,
+    PEM.PostId,
+    PEM.Title AS QuestionTitle,
+    PEM.RelevantTagNames,
+    PEM.EngagementScore,
+    PEM.EngagementQuintile,
+    PEM.ViewCount,
+    PEM.AnswerCount,
+    PEM.CommentCount,
+    PEM.FavoriteCount,
+    PEM.TotalUpvotesOnQuestion,
+    PEM.TotalDownvotesOnQuestion,
+    PEM.DistinctEditors,
+    PEM.LastEditDate,
+    PEM.TotalAnswerScore,
+    PEM.ActualAnswerCount,
+    PEM.DistinctAnswerers,
+    PEM.ActivityDurationDays,
+    LAG(PEM.PostCreationDate, 1, PEM.PostCreationDate) OVER (PARTITION BY UOS.UserId ORDER BY PEM.PostCreationDate) AS PreviousPostCreationDate,
+    LEAD(PEM.PostCreationDate, 1, PEM.PostCreationDate) OVER (PARTITION BY UOS.UserId ORDER BY PEM.PostCreationDate) AS NextPostCreationDate,
+    (SELECT COUNT(DISTINCT P_Link.RelatedPostId) FROM PostLinks P_Link WHERE P_Link.PostId = PEM.PostId AND P_Link.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(DISTINCT P_Link.RelatedPostId) FROM PostLinks P_Link WHERE P_Link.PostId = PEM.PostId AND P_Link.LinkTypeId = 3) AS DuplicatePostsCount,
+    (SELECT AVG(C_Inner.Score) FROM Comments C_Inner WHERE C_Inner.PostId = PEM.PostId AND C_Inner.UserId = UOS.UserId) AS AvgCommentScoreByUserOnPost,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges B_Comm WHERE B_Comm.UserId = UOS.UserId AND B_Comm.Name = 'Community Builder') THEN TRUE
+        ELSE FALSE
+    END AS IsCommunityBuilder
+FROM UserOverallScores UOS
+JOIN PostEngagementMetrics PEM ON UOS.UserId = PEM.OwnerUserId
+WHERE PEM.EngagementQuintile <= 3
+ORDER BY
+    UserRankByImpact,
+    PEM.EngagementScore DESC
+LIMIT 2000;

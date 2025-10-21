@@ -1,0 +1,88 @@
+-- {"query": "51050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 843} 
+
+WITH top_users AS (
+  SELECT u.Id AS user_id, u.Reputation, u.DisplayName,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+top_tags AS (
+  SELECT t.Id AS tag_id, t.TagName, t.Count,
+         ROW_NUMBER() OVER (ORDER BY t.Count DESC) as tag_rank
+  FROM Tags t
+  WHERE t.Count > 500
+),
+user_activity AS (
+  SELECT 
+    tu.user_id,
+    tu.Reputation,
+    tu.DisplayName,
+    COUNT(DISTINCT p.Id) as post_count,
+    SUM(p.ViewCount) as total_views,
+    AVG(p.Score) as avg_score,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) as positive_posts
+  FROM top_users tu
+  LEFT JOIN Posts p ON p.OwnerUserId = tu.user_id 
+    AND p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+  GROUP BY tu.user_id, tu.Reputation, tu.DisplayName
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+tag_posts AS (
+  SELECT 
+    tt.tag_id,
+    tt.TagName,
+    tt.Count as tag_usage,
+    p.Id as post_id,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.PostTypeId,
+    p.OwnerUserId,
+    ua.post_count as user_activity_score
+  FROM top_tags tt
+  JOIN Posts p ON POSITION(tt.TagName IN p.Tags) > 0
+    AND p.PostTypeId = 1  -- Questions only
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+  LEFT JOIN user_activity ua ON ua.user_id = p.OwnerUserId
+  WHERE ua.user_activity_score IS NOT NULL
+),
+monthly_stats AS (
+  SELECT 
+    DATE_TRUNC('month', p.CreationDate) as month,
+    tp.tag_id,
+    tp.TagName,
+    COUNT(DISTINCT tp.post_id) as questions_per_month,
+    AVG(tp.user_activity_score) as avg_user_activity,
+    SUM(tp.ViewCount) as total_monthly_views,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY tp.Score) as p90_score
+  FROM tag_posts tp
+  GROUP BY month, tp.tag_id, tp.TagName
+)
+SELECT 
+  ms.month,
+  ms.TagName,
+  ms.questions_per_month,
+  ms.total_monthly_views,
+  ms.avg_user_activity,
+  ms.p90_score,
+  LAG(ms.questions_per_month) OVER (PARTITION BY ms.TagName ORDER BY ms.month) as prev_month_questions,
+  (ms.questions_per_month - LAG(ms.questions_per_month) OVER (PARTITION BY ms.TagName ORDER BY ms.month)) / 
+    NULLIF(LAG(ms.questions_per_month) OVER (PARTITION BY ms.TagName ORDER BY ms.month), 0) * 100 as growth_pct,
+  RANK() OVER (PARTITION BY ms.month ORDER BY ms.total_monthly_views DESC) as view_rank,
+  (
+    SELECT COUNT(DISTINCT b.UserId) 
+    FROM Badges b 
+    JOIN top_users tu ON b.UserId = tu.user_id
+    WHERE tu.rep_rank <= 100
+    AND b.Date >= ms.month 
+    AND b.Date < ms.month + INTERVAL '1 month'
+    AND b.Class = 1  -- Gold badges only
+  ) as gold_badges_issued
+FROM monthly_stats ms
+WHERE ms.month >= CURRENT_DATE - INTERVAL '12 months'
+  AND ms.questions_per_month > 5
+ORDER BY ms.month DESC, ms.total_monthly_views DESC
+LIMIT 100;

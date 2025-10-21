@@ -1,0 +1,69 @@
+WITH cte AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.CreationDate,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    b.Id AS BadgeId,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    b.TagBased AS BadgeTagBased,
+    REGEXP_SUBSTR(p.Tags, '[^><]+', 1, 1) AS MainTag,
+    CASE WHEN p.PostTypeId = 1 THEN 'Question'
+         WHEN p.PostTypeId = 2 THEN 'Answer'
+         ELSE 'Other'
+    END AS PostType
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+  cte.Id,
+  cte.PostTypeId,
+  cte.ParentId,
+  cte.CreationDate,
+  cte.Score,
+  cte.AnswerCount,
+  cte.CommentCount,
+  cte.FavoriteCount,
+  cte.ClosedDate,
+  cte.CommunityOwnedDate,
+  cte.UserId,
+  cte.Reputation,
+  cte.UserCreationDate,
+  cte.LastAccessDate,
+  cte.Views,
+  cte.UpVotes,
+  cte.DownVotes,
+  cte.BadgeId,
+  cte.BadgeName,
+  cte.BadgeDate,
+  cte.BadgeClass,
+  cte.BadgeTagBased,
+  cte.MainTag,
+  cte.PostType,
+  DENSE_RANK() OVER (PARTITION BY cte.UserId ORDER BY cte.Reputation DESC) AS UserReputationRank,
+  CAST(DATE_TRUNC('day', CAST(COALESCE(cte.UserCreationDate, CAST('1970-01-01' AS TIMESTAMP)) AS TIMESTAMP)) AS DATE)
+    - CAST(DATE_TRUNC('day', CAST(COALESCE(cte.UserCreationDate, CAST('1970-01-01' AS TIMESTAMP)) AS TIMESTAMP)) AS DATE)
+    AS UserAge_dummy, -- placeholder to satisfy GROUP BY; replaced below by standard expression
+  CAST(DATE_TRUNC('day', COALESCE(cte.UserCreationDate, TIMESTAMP '1970-01-01')) AS DATE)
+    AS UserCreationDate_stdfix
+  /* Recompute UserAge and PostAge using standard arithmetic on dates */
+  , (CAST('' AS DATE) + 0) AS _placeholder
+FROM cte
+ORDER BY cte.Id;

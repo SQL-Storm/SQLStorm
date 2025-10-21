@@ -1,0 +1,111 @@
+WITH TaggedQuestions AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate AS QuestionDate,
+    p.Score AS QuestionScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    tag.TagName
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag(TagName)
+  WHERE
+    p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND (p.DeletionDate IS NULL OR p.DeletionDate = '')
+    AND p.AnswerCount > 2
+),
+AnswerStats AS (
+  SELECT
+    p.ParentId,
+    a.OwnerUserId,
+    COUNT(*) AS TotalAnswers,
+    SUM(a.Score) AS TotalAnswerScore,
+    AVG(a.Score) AS AvgAnswerScore,
+    MAX(a.CreationDate) AS LastAnswerDate,
+    MIN(a.CreationDate) AS FirstAnswerDate,
+    SUM(a.CommentCount) AS TotalAnswerComments
+  FROM Posts AS p
+    JOIN Posts AS a ON p.Id = a.ParentId
+  WHERE
+    a.PostTypeId = 2
+    AND (a.DeletionDate IS NULL OR a.DeletionDate = '')
+  GROUP BY
+    p.ParentId,
+    a.OwnerUserId
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    (
+      SELECT
+        COUNT(*)
+      FROM Badges AS b
+      WHERE
+        b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadges,
+    (
+      SELECT
+        COUNT(*)
+      FROM Comments AS c
+      WHERE
+        c.UserId = u.Id
+    ) AS TotalCommentsMade,
+    AVG(ph.CreationDate - p.CreationDate) AS AvgEditTime
+  FROM Users AS u
+    LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId
+      AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Posts AS p ON ph.PostId = p.Id
+  WHERE
+    u.Reputation > 1000
+    AND u.CreationDate < TIMESTAMP '2022-01-01'
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+),
+RankedAnswers AS (
+  SELECT
+    tq.TagName,
+    ue.DisplayName AS AnswererDisplayName,
+    ue.Reputation,
+    ans.TotalAnswerScore,
+    tq.QuestionScore,
+    ans.TotalAnswers,
+    ue.GoldBadges,
+    tq.ViewCount,
+    (ans.LastAnswerDate - tq.QuestionDate) AS TimeToLastAnswer,
+    DENSE_RANK() OVER (PARTITION BY tq.TagName ORDER BY ans.TotalAnswerScore DESC, ue.Reputation DESC) AS Rank
+  FROM TaggedQuestions AS tq
+    JOIN AnswerStats AS ans ON tq.Id = ans.ParentId
+    JOIN UserEngagement AS ue ON ans.OwnerUserId = ue.UserId
+  WHERE
+    tq.OwnerUserId <> ans.OwnerUserId
+    AND ans.TotalAnswerScore > tq.QuestionScore
+)
+SELECT
+  ra.TagName,
+  ra.Rank,
+  ra.AnswererDisplayName,
+  ra.Reputation,
+  ra.TotalAnswerScore,
+  ra.QuestionScore,
+  ra.TotalAnswers,
+  ra.GoldBadges,
+  ra.ViewCount,
+  ra.TimeToLastAnswer
+FROM RankedAnswers AS ra
+  JOIN Tags AS t ON ra.TagName = t.TagName
+WHERE
+  ra.Rank <= 5
+  AND t.Count > 1000
+ORDER BY
+  ra.TagName,
+  ra.Rank;

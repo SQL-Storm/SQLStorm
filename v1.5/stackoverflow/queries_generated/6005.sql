@@ -1,0 +1,116 @@
+-- {"query": "6005.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 865} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    COALESCE(p.OwnerUserId, -1) AS EffectiveOwner,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+    ) AS rn_by_type
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+    AND p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+Agg AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.LastActivityDate,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.ContentLicense,
+    CASE
+      WHEN rp.PostTypeId = 1 THEN 'Question'
+      WHEN rp.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS TypeLabel
+  FROM RankedPosts rp
+  WHERE rp.rn_by_type = 1
+)
+SELECT
+  a.PostId,
+  a.TypeLabel,
+  a.Title,
+  a.Tags,
+  a.CreationDate,
+  a.Score,
+  a.ViewCount,
+  a.LastActivityDate,
+  a.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.Location,
+  u.ProfileImageUrl,
+  wv.TotalUpVotes,
+  wv.TotalDownVotes,
+  vb.TotalBadges,
+  vl.LastLinkDate,
+  ll.LinkedCount,
+  lnk.RelatedPostId AS LinkedToPostId,
+  p2.Title AS RelatedPostTitle,
+  v.TotalVoteScore,
+  CASE
+    WHEN a.PostTypeId = 1 THEN (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = a.PostId AND pl.LinkTypeId = 1)
+    ELSE 0
+  END AS LinkedCountViaLinks,
+  CASE
+    WHEN a.PostTypeId = 1 THEN EXISTS (
+      SELECT 1 FROM Votes v WHERE v.PostId = a.PostId AND v.VoteTypeId = 2
+    )
+    ELSE FALSE
+  END AS HasUpvotes
+FROM Agg a
+LEFT JOIN Users u ON a.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT UserId, SUM(UpVotes) AS TotalUpVotes, SUM(DownVotes) AS TotalDownVotes
+  FROM Users u2
+  GROUP BY UserId
+) wv ON wv.UserId = a.OwnerUserId
+LEFT JOIN (
+  SELECT UserId, COUNT(*) AS TotalBadges
+  FROM Badges
+  GROUP BY UserId
+) vb ON vb.UserId = a.OwnerUserId
+LEFT JOIN (
+  SELECT PostId, MAX(CreationDate) AS LastLinkDate
+  FROM PostLinks
+  GROUP BY PostId
+) vl ON vl.PostId = a.PostId
+LEFT JOIN (
+  SELECT RelatedPostId, COUNT(*) AS LinkedCount
+  FROM PostLinks
+  GROUP BY RelatedPostId
+) ll ON ll.RelatedPostId = a.PostId
+LEFT JOIN Posts p2 ON p2.Id = a.ParentId
+LEFT JOIN PostLinks lnk ON lnk.PostId = a.PostId AND lnk.LinkTypeId = 1
+LEFT JOIN Votes v ON v.PostId = a.PostId
+ORDER BY a.CreationDate DESC
+LIMIT 100;

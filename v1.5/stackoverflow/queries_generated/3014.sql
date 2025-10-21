@@ -1,0 +1,109 @@
+-- {"query": "3014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 899} 
+WITH AnswerQuestions AS (
+    SELECT 
+        a.Id AS AnswerId,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        q.CreationDate AS QuestionCreation,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+)
+, TopAnswerPerQuestion AS (
+    SELECT 
+        AnswerId,
+        QuestionId,
+        QuestionTitle,
+        QuestionTags,
+        AnswerScore,
+        AnswerCreation
+    FROM AnswerQuestions
+    WHERE AnswerRank = 1
+)
+, UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+)
+, RecentVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    WHERE v.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY v.PostId
+)
+, QuestionClosedStatus AS (
+    SELECT 
+        p.Id AS PostId,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        p.ClosedDate
+    FROM Posts p
+)
+, PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    pc.IsClosed,
+    pc.ClosedDate,
+    u.DisplayName AS LastActivityUser,
+    COALESCE(bc.GoldBadges,0) AS GoldBadges,
+    COALESCE(bc.SilverBadges,0) AS SilverBadges,
+    COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+    rv.VoteCount AS RecentVoteCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+    ) AS DuplicateLinks,
+    ARRAY_AGG(DISTINCT pt.Tag) AS Tags,
+    (
+        SELECT COUNT(*) 
+        FROM Posts a 
+        WHERE a.ParentId = q.Id
+    ) AS AnswerCountSub,
+    (SELECT MAX(LastActivityDate) FROM Posts WHERE Id = q.Id) AS LastActivityDate,
+    STRING_AGG(DISTINCT ch.Comment, ', ') AS RecentComments
+FROM 
+    Posts q
+LEFT JOIN 
+    PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (10,11,12,13)
+LEFT JOIN 
+    Users u ON q.OwnerUserId = u.Id
+LEFT JOIN 
+    UserBadgeCounts bc ON u.Id = bc.UserId
+LEFT JOIN 
+    RecentVotes rv ON q.Id = rv.PostId
+LEFT JOIN 
+    QuestionClosedStatus pc ON q.Id = pc.PostId
+LEFT JOIN 
+    PostLinks pl ON q.Id = pl.PostId AND pl.LinkTypeId = 3
+LEFT JOIN 
+    PostTags pt ON q.Id = pt.PostId
+LEFT JOIN 
+    Comments c ON q.Id = c.PostId
+WHERE 
+    q.PostTypeId = 1
+GROUP BY 
+    q.Id, q.Title, q.AnswerCount, q.CommentCount, q.FavoriteCount, pc.IsClosed, pc.ClosedDate, u.DisplayName, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, rv.VoteCount, q.LastActivityDate
+ORDER BY 
+    q.CreationDate DESC
+LIMIT 10;

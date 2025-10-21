@@ -1,0 +1,140 @@
+WITH UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserQuestions AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(p.ViewCount) AS AvgQuestionViewCount,
+        COUNT(DISTINCT un.Tags) AS DistinctTagsCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            Id,
+            unnest(string_to_array(substr(Tags, 2, length(Tags) - 2), '><')) AS Tags
+        FROM Posts
+        WHERE PostTypeId = 1
+    ) un ON p.Id = un.Id
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswers AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT p.ParentId) AS AnsweredQuestionsCount,
+        SUM(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserVotes AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END),0) AS FavoriteVotesCount
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate))/86400 AS DaysSinceCreation,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        uq.QuestionCount,
+        uq.AvgQuestionScore,
+        uq.AvgQuestionViewCount,
+        uq.DistinctTagsCount,
+        ua.AnswerCount,
+        ua.AvgAnswerScore,
+        ua.AnsweredQuestionsCount,
+        ua.AcceptedAnswers,
+        uv.UpVotesCount,
+        uv.DownVotesCount,
+        uv.FavoriteVotesCount
+    FROM Users u
+    LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+    LEFT JOIN UserQuestions uq ON uq.UserId = u.Id
+    LEFT JOIN UserAnswers ua ON ua.UserId = u.Id
+    LEFT JOIN UserVotes uv ON uv.UserId = u.Id
+),
+TopTags AS (
+    SELECT
+        tag.TagName,
+        tag.Count,
+        COALESCE(uqtc.UserCount,0) AS UsersWithTagQuestions,
+        COALESCE(avgScore.AvgQuestionScore,0) AS AvgQuestionScoreWithTag
+    FROM Tags tag
+    LEFT JOIN (
+        SELECT un.Tags, COUNT(DISTINCT p.OwnerUserId) AS UserCount
+        FROM Posts p
+        CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS un(Tags)
+        WHERE p.PostTypeId = 1
+        GROUP BY un.Tags
+    ) uqtc ON uqtc.Tags = tag.TagName
+    LEFT JOIN (
+        SELECT un.Tags, AVG(p.Score) AS AvgQuestionScore
+        FROM Posts p
+        CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS un(Tags)
+        WHERE p.PostTypeId = 1
+        GROUP BY un.Tags
+    ) avgScore ON avgScore.Tags = tag.TagName
+    WHERE tag.Count > 50
+    ORDER BY tag.Count DESC
+    LIMIT 10
+)
+SELECT
+    ua.Id AS UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.DaysSinceCreation,
+    ua.TotalBadges,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionCount,
+    ua.AvgQuestionScore,
+    ua.AvgQuestionViewCount,
+    ua.DistinctTagsCount,
+    ua.AnswerCount,
+    ua.AvgAnswerScore,
+    ua.AnsweredQuestionsCount,
+    ua.AcceptedAnswers,
+    ua.UpVotesCount,
+    ua.DownVotesCount,
+    ua.FavoriteVotesCount,
+    COALESCE(json_agg(json_build_object(
+        'TagName', tt.TagName,
+        'TagCount', tt.Count,
+        'UsersWithTagQuestions', tt.UsersWithTagQuestions,
+        'AvgQuestionScoreWithTag', ROUND(tt.AvgQuestionScoreWithTag,2)
+    )) FILTER (WHERE tt.TagName IS NOT NULL), '[]'::json) AS TopTagsInfo
+FROM UserActivity ua
+LEFT JOIN LATERAL (
+    SELECT * FROM TopTags
+) tt ON true
+GROUP BY ua.Id, ua.DisplayName, ua.Reputation, ua.DaysSinceCreation, ua.TotalBadges, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+         ua.QuestionCount, ua.AvgQuestionScore, ua.AvgQuestionViewCount, ua.DistinctTagsCount,
+         ua.AnswerCount, ua.AvgAnswerScore, ua.AnsweredQuestionsCount, ua.AcceptedAnswers,
+         ua.UpVotesCount, ua.DownVotesCount, ua.FavoriteVotesCount
+ORDER BY ua.Reputation DESC
+LIMIT 50;

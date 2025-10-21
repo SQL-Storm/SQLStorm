@@ -1,0 +1,182 @@
+with recursive UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation
+),
+RecentTaggedQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Tags is not null
+),
+PopularAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName as OwnerDisplayName,
+        u.Id as OwnerUserId
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2 and a.Score >= 10
+),
+AnswerStats as (
+    select
+        p.Id as QuestionId,
+        count(pa.Id) as AnswerCount,
+        max(pa.Score) as MaxAnswerScore,
+        avg(pa.Score) as AvgAnswerScore
+    from Posts p
+    left join Posts pa on pa.ParentId = p.Id and pa.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id
+),
+PostCloseCounts as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes
+    from PostHistory ph
+    group by ph.PostId
+),
+TaggedQuestionsWithCloseInfo as (
+    select
+        rq.Id,
+        rq.OwnerUserId,
+        rq.Title,
+        rq.CreationDate,
+        rq.Score,
+        rq.Tags,
+        ac.AnswerCount,
+        ac.MaxAnswerScore,
+        ac.AvgAnswerScore,
+        coalesce(pcc.CloseVotes,0) as CloseVotes,
+        coalesce(pcc.ReopenVotes,0) as ReopenVotes
+    from RecentTaggedQuestions rq
+    left join AnswerStats ac on rq.Id = ac.QuestionId
+    left join PostCloseCounts pcc on rq.Id = pcc.PostId
+    where rq.rn <= 5
+),
+DuplicatesRelation as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where pl.LinkTypeId in (1,3)
+),
+DuplicatedQuestions as (
+    select distinct
+        dr.PostId as QuestionId,
+        p.Title as QuestionTitle,
+        dr.RelatedPostId as DuplicateOfId,
+        p2.Title as DuplicateOfTitle,
+        dr.LinkTypeName
+    from DuplicatesRelation dr
+    join Posts p on p.Id = dr.PostId and p.PostTypeId = 1
+    join Posts p2 on p2.Id = dr.RelatedPostId and p2.PostTypeId = 1
+),
+UserActivityRanking as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentEdits as (
+    select
+        ph.PostId,
+        ph.Id as EditId,
+        ph.CreationDate as EditDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9)
+)
+select
+    udr.UserId,
+    udr.DisplayName,
+    udr.GoldBadges,
+    udr.SilverBadges,
+    udr.BronzeBadges,
+    ua.ActivityRank,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    coalesce(sum(pq.Score),0) as TotalQuestionScore,
+    coalesce(sum(pq.AnswerCount),0) as TotalAnswersCounted,
+    (
+        select string_agg(distinct tag, ', ')
+        from (
+            select unnest(string_to_array(substring(tq.Tags from 2 for char_length(tq.Tags) - 2), '><')) as tag
+            from RecentTaggedQuestions tq
+            where tq.OwnerUserId = udr.UserId
+            limit 10
+        ) tags_sub
+    ) as DistinctTags,
+    (
+        select count(*)
+        from DuplicatedQuestions dq
+        where dq.QuestionId in (
+            select Id from RecentTaggedQuestions rtq where rtq.OwnerUserId = udr.UserId
+        )
+    ) as DuplicatesCount,
+    (
+        select ph.CreationDate
+        from PostHistory ph
+        where ph.UserId = udr.UserId
+        order by ph.CreationDate desc
+        limit 1
+    ) as LastEditDate,
+    (
+        udr.Reputation - lag(udr.Reputation) over (order by udr.Reputation)
+    ) as ReputationChangeSincePreviousUser,
+    (
+        coalesce(avg(pq.Score) filter (where pq.AnswerCount > 0), 0) over () 
+    ) as GlobalAvgScorePerQuestion
+from UserBadgeCounts udr
+left join UserActivityRanking ua on ua.UserId = udr.UserId
+left join TaggedQuestionsWithCloseInfo pq on pq.OwnerUserId = udr.UserId
+where ua.ActivityRank <= 100
+group by
+    udr.UserId,
+    udr.DisplayName,
+    udr.GoldBadges,
+    udr.SilverBadges,
+    udr.BronzeBadges,
+    ua.ActivityRank,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    udr.Reputation
+order by ua.ActivityRank
+limit 50;

@@ -1,0 +1,87 @@
+WITH
+TopUsers AS (
+  SELECT Id
+  FROM Users
+  WHERE Reputation > 1500
+),
+Q AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerDisplayName AS OwnerName,
+         p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+Answers AS (
+  SELECT q.PostId,
+         COUNT(a.Id) AS AnswerCount
+  FROM Q q
+  LEFT JOIN Posts a ON a.ParentId = q.PostId AND a.PostTypeId = 2
+  GROUP BY q.PostId
+),
+BadgeSummary AS (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+LastEdits AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastActivityDate
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  WHERE pht.Name ILIKE '%Edit%' OR pht.Name ILIKE '%Locked%' OR pht.Name ILIKE '%Closed%' OR pht.Name ILIKE '%Reopened%'
+  GROUP BY ph.PostId
+),
+NextPost AS (
+  SELECT p.Id,
+         LEAD(p.CreationDate) OVER (ORDER BY p.CreationDate) AS NextPostDate
+  FROM Posts p
+)
+SELECT
+  b.PostId,
+  b.Title,
+  b.CreationDate,
+  b.Score,
+  b.ViewCount,
+  b.OwnerName,
+  COALESCE(a.AnswerCount, 0) AS AnswerCount,
+  COALESCE(bs.BadgeCount, 0) AS BadgeCount,
+  le.LastActivityDate AS LastActivity,
+  np.NextPostDate
+FROM (
+  SELECT
+    b.PostId,
+    b.Title,
+    b.CreationDate,
+    b.Score,
+    b.ViewCount,
+    b.OwnerName,
+    b.OwnerUserId
+  FROM Q b
+) AS b
+LEFT JOIN Answers a ON a.PostId = b.PostId
+LEFT JOIN BadgeSummary bs ON bs.UserId = b.OwnerUserId
+LEFT JOIN LastEdits le ON le.PostId = b.PostId
+LEFT JOIN NextPost np ON np.Id = b.PostId
+WHERE b.Title IS NOT NULL
+ORDER BY b.CreationDate DESC
+LIMIT 100
+UNION ALL
+SELECT
+  p.Id,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  COALESCE(p.OwnerDisplayName, 'community') AS OwnerName,
+  NULL AS AnswerCount,
+  0 AS BadgeCount,
+  NULL AS LastActivity,
+  NULL AS NextPostDate
+FROM Posts p
+WHERE p.PostTypeId IN (4, 5)
+ORDER BY CreationDate DESC
+LIMIT 50;

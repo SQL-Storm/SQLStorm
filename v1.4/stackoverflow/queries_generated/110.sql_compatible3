@@ -1,0 +1,119 @@
+WITH
+user_base AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AccountId
+  FROM Users u
+),
+recent_votes AS (
+  SELECT
+    v.UserId,
+    count(*) AS vote_cnt,
+    sum(CASE WHEN v.VoteTypeId IN (2) THEN 1 ELSE 0 END) AS upvotes,
+    sum(CASE WHEN v.VoteTypeId IN (3) THEN 1 ELSE 0 END) AS downvotes
+  FROM Votes v
+  WHERE v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY)
+  GROUP BY v.UserId
+),
+badge_activity AS (
+  SELECT
+    b.UserId,
+    count(*) AS badge_cnt,
+    max(b.Date) AS last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+post_activity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    count(*) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+    count(*) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+    max(p.LastActivityDate) AS last_activity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+tag_activity AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS tag_count
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+combined AS (
+  SELECT
+    ub.Id,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.CreationDate,
+    ra.vote_cnt,
+    ra.upvotes,
+    ra.downvotes,
+    ba.badge_cnt,
+    pa.question_count,
+    pa.answer_count,
+    pa.last_activity,
+    NULL AS _dummy
+  FROM user_base ub
+  LEFT JOIN recent_votes ra ON ra.UserId = ub.Id
+  LEFT JOIN badge_activity ba ON ba.UserId = ub.Id
+  LEFT JOIN post_activity pa ON pa.UserId = ub.Id
+  LEFT JOIN LATERAL (
+    SELECT p.LastEditDate AS Timestamp
+    FROM Posts p
+    WHERE p.OwnerUserId = ub.Id
+      AND p.LastEditDate IS NOT NULL
+    ORDER BY p.LastEditDate DESC
+    LIMIT 1
+  ) ro ON TRUE
+),
+ranked AS (
+  SELECT
+    c.*,
+    ROW_NUMBER() OVER (
+      ORDER BY c.Reputation DESC,
+               COALESCE(c.vote_cnt,0) DESC,
+               COALESCE(c.badge_cnt,0) DESC,
+               c.last_activity DESC
+    ) AS rn
+  FROM combined c
+)
+SELECT
+  r.Id,
+  r.DisplayName,
+  r.Reputation,
+  r.CreationDate,
+  r.vote_cnt,
+  r.upvotes,
+  r.downvotes,
+  r.badge_cnt,
+  r.question_count,
+  r.answer_count,
+  r.last_activity,
+  (CASE
+     WHEN r.Reputation > 5000 THEN 'Top tier'
+     WHEN r.Reputation > 1000 THEN 'Mid tier'
+     ELSE 'New/Low tier'
+   END) AS Tier,
+  (
+    SELECT ARRAY_AGG(DISTINCT t.TagName)
+    FROM Tags t
+    JOIN Posts p ON p.OwnerUserId = r.Id
+    WHERE CAST(p.Tags AS TEXT) IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM UNNEST(string_to_array(p.Tags, '><')) AS value
+        WHERE CAST(value AS INTEGER) IN (
+          SELECT Id FROM Tags WHERE IsModeratorOnly = 0
+        )
+      )
+  ) AS TaggedTopics
+FROM ranked r
+WHERE r.rn <= 100
+ORDER BY r.Reputation DESC, r.vote_cnt DESC, r.badge_cnt DESC, r.last_activity DESC
+LIMIT 100;

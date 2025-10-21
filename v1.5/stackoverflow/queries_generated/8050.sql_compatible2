@@ -1,0 +1,331 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn_recent
+  from users u
+),
+post_basics as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid as owneruserid_fix
+  from posts p
+),
+post_norm as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    coalesce(p.viewcount, 0) as viewcount,
+    coalesce(p.owneruserid, -1) as owneruserid,
+    case
+      when p.posttypeid = 1 then 'Question'
+      when p.posttypeid = 2 then 'Answer'
+      else 'Other'
+    end as post_type_name,
+    upper(coalesce(nullif(regexp_replace(coalesce(p.title, ''), '\\s+', ' ', 'g'), ''), '(untitled)')) as title_norm,
+    array_length(string_to_array(coalesce(nullif(substring(p.tags, 2, length(p.tags)-2), ''), ''), '><'), 1) as tag_count
+  from posts p
+),
+q_with_accept as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_created,
+    q.acceptedanswerid,
+    q.viewcount,
+    q.score as q_score,
+    q.title_norm,
+    q.tag_count
+  from post_norm q
+  where q.posttypeid = 1
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_created,
+    a.score as a_score
+  from posts a
+  where a.posttypeid = 2
+),
+answer_firsts as (
+  select
+    a.question_id,
+    min(a.answer_created) as first_answer_time,
+    count(*) as total_answers
+  from answers a
+  group by a.question_id
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(distinct case when p.posttypeid in (1,2) then p.id end) as posts_authored,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upmods_cast,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downmods_cast,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_cast,
+    sum(coalesce(p.score,0)) as total_post_score,
+    max(p.creationdate) as last_post_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id
+),
+question_engagement as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.question_created,
+    q.acceptedanswerid,
+    q.viewcount,
+    q.q_score,
+    q.title_norm,
+    q.tag_count,
+    af.first_answer_time,
+    af.total_answers,
+    extract(epoch from (af.first_answer_time - q.question_created)) as secs_to_first_answer,
+    case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted
+  from q_with_accept q
+  left join answer_firsts af on af.question_id = q.question_id
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+    max(c.creationdate) as last_comment_at,
+    avg(nullif(length(c.text),0)) as avg_comment_len
+  from comments c
+  group by c.postid
+),
+post_votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_closed
+  from votes v
+  group by v.postid
+),
+badges_agg as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_cnt,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_cnt,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_cnt,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+dup_links as (
+  select
+    pl.postid as duplicate_of,
+    count(*) filter (where pl.linktypeid = 3) as dup_link_count,
+    count(*) filter (where pl.linktypeid = 1) as regular_link_count
+  from postlinks pl
+  group by pl.postid
+),
+closure_events as (
+  select
+    ph.postid,
+    min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as last_close_reason_raw
+  from posthistory ph
+  group by ph.postid
+),
+question_windowed as (
+  select
+    qe.*,
+    pv.upvotes,
+    pv.downvotes,
+    pv.bounty_started,
+    pv.bounty_closed,
+    coalesce(cs.comment_count, 0) as comment_count,
+    coalesce(cs.positive_comments, 0) as positive_comments,
+    cs.last_comment_at,
+    cs.avg_comment_len,
+    coalesce(dl.dup_link_count,0) as dup_link_count,
+    coalesce(dl.regular_link_count,0) as regular_link_count,
+    ce.first_closed_at,
+    ce.last_reopened_at,
+    ce.close_events,
+    ce.reopen_events,
+    ce.last_close_reason_raw,
+    sum(qe.viewcount) over (partition by date_trunc('month', qe.question_created)) as monthly_views,
+    avg(qe.q_score) over (partition by date_trunc('month', qe.question_created)) as monthly_avg_qscore,
+    percentile_cont(0.5) within group (order by qe.secs_to_first_answer) over (partition by date_trunc('month', qe.question_created)) as monthly_p50_time_to_answer
+  from question_engagement qe
+  left join post_votes_agg pv on pv.postid = qe.question_id
+  left join comment_stats cs on cs.postid = qe.question_id
+  left join dup_links dl on dl.duplicate_of = qe.question_id
+  left join closure_events ce on ce.postid = qe.question_id
+),
+asker_enriched as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.location_norm,
+    ru.cohort_month,
+    ua.posts_authored,
+    ua.upmods_cast,
+    ua.downmods_cast,
+    ua.favorites_cast,
+    ua.total_post_score,
+    ba.gold_cnt,
+    ba.silver_cnt,
+    ba.bronze_cnt,
+    ba.tag_badges
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join badges_agg ba on ba.userid = ru.user_id
+),
+accepted_answerers as (
+  select
+    q.question_id,
+    a.answerer_id as accepted_answerer_id
+  from q_with_accept q
+  join answers a on a.answer_id = q.acceptedanswerid
+),
+final_metric as (
+  select
+    qw.question_id,
+    qw.asker_id,
+    ae.displayname as asker_name,
+    ae.location_norm as asker_location,
+    ae.cohort_month as asker_cohort,
+    ae.posts_authored as asker_posts_authored,
+    ae.upmods_cast as asker_upmods_cast,
+    ae.downmods_cast as asker_downmods_cast,
+    ae.favorites_cast as asker_favorites_cast,
+    ae.total_post_score as asker_total_post_score,
+    ae.gold_cnt as asker_gold,
+    ae.silver_cnt as asker_silver,
+    ae.bronze_cnt as asker_bronze,
+    qw.question_created,
+    qw.q_score,
+    qw.viewcount,
+    qw.title_norm,
+    qw.tag_count,
+    qw.first_answer_time,
+    qw.total_answers,
+    qw.secs_to_first_answer,
+    qw.has_accepted,
+    qw.upvotes,
+    qw.downvotes,
+    qw.bounty_started,
+    qw.bounty_closed,
+    qw.comment_count,
+    qw.positive_comments,
+    qw.last_comment_at,
+    qw.avg_comment_len,
+    qw.dup_link_count,
+    qw.regular_link_count,
+    qw.first_closed_at,
+    qw.last_reopened_at,
+    qw.close_events,
+    qw.reopen_events,
+    qw.last_close_reason_raw,
+    qw.monthly_views,
+    qw.monthly_avg_qscore,
+    qw.monthly_p50_time_to_answer,
+    case
+      when qw.has_accepted = 1 then 'Accepted'
+      when qw.first_closed_at is not null then 'Closed'
+      when qw.total_answers is null or qw.total_answers = 0 then 'Unanswered'
+      else 'Open'
+    end as question_state,
+    case
+      when qw.tag_count >= 5 then 'HighTagDensity'
+      when qw.tag_count between 3 and 4 then 'MediumTagDensity'
+      when qw.tag_count between 1 and 2 then 'LowTagDensity'
+      else 'NoTags'
+    end as tag_density_bucket,
+    greatest(coalesce(qw.upvotes,0) - coalesce(qw.downvotes,0), -1000000) as net_votes_capped,
+    coalesce(qw.bounty_closed,0) - coalesce(qw.bounty_started,0) as net_bounty_delta,
+    case
+      when qw.secs_to_first_answer is null then null
+      when qw.secs_to_first_answer < 3600 then 'sub-hour'
+      when qw.secs_to_first_answer < 86400 then 'sub-day'
+      when qw.secs_to_first_answer < 604800 then 'sub-week'
+      else 'long-wait'
+    end as answer_latency_bucket
+  from question_windowed qw
+  left join asker_enriched ae on ae.user_id = qw.asker_id
+),
+ranked as (
+  select
+    f.*,
+    row_number() over (
+      partition by date_trunc('month', f.question_created)
+      order by
+        coalesce(f.q_score,0) desc,
+        coalesce(f.viewcount,0) desc,
+        f.question_id
+    ) as rn_top_in_month,
+    dense_rank() over (
+      order by
+        (coalesce(f.q_score,0) + coalesce(f.upvotes,0) - coalesce(f.downvotes,0)) desc
+    ) as dr_global_popularity
+  from final_metric f
+),
+accepted_vs_unaccepted as (
+  select
+    'accepted' as grp,
+    avg(coalesce(qw.viewcount,0)) as avg_views,
+    avg(coalesce(qw.q_score,0)) as avg_qscore
+  from question_windowed qw
+  where qw.has_accepted = 1
+  union all
+  select
+    'unaccepted' as grp,
+    avg(coalesce(qw.viewcount,0)) as avg_views,
+    avg(coalesce(qw.q_score,0)) as avg_qscore
+  from question_windowed qw
+  where qw.has_accepted = 0
+),
+final_union as (
+  select
+    cast(r.question_id as text) as key,
+    'detail' as kind,
+    r.question_state as metric1,
+    r.tag_density_bucket as metric2,
+    r.answer_latency_bucket as metric3,
+    cast(r.q_score as text) as metric_value1,
+    cast(r.viewcount as text) as metric_value2,
+    cast(r.net_votes_capped as text) as metric_value3,
+    cast(r.rn_top_in_month as text) as metric_aux1,
+    cast(r.dr_global_popularity as text) as metric_aux2
+  from ranked r
+  where r.rn_top_in_month <= 100
+  union all
+  select
+    concat('agg_', grp) as key,
+    'aggregate' as kind,
+    grp as metric1,
+    null as metric2,
+    null as metric3,
+    cast(round(avg_views,2) as text) as metric_value1,
+    cast(round(avg_qscore,2) as text) as metric_value2,
+    null as metric_value3,
+    null as metric_aux1,
+    null as metric_aux2
+  from accepted_vs_unaccepted
+)
+select *
+from final_union
+order by kind desc, key asc
+limit 1000;

@@ -1,0 +1,254 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        AVG(CAST(p.Score AS DECIMAL(18, 4))) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostActivitySummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Tags,
+        p.ClosedDate,
+        COALESCE(ph.MaxHistoryDate, p.CreationDate) AS LastHistoryEventDate,
+        COALESCE(ph.ModeratorEditCount, 0) AS ModeratorEditCount,
+        COALESCE(ph.CloseVoteCount, 0) AS CloseVoteCount,
+        COALESCE(ph.ReopenVoteCount, 0) AS ReopenVoteCount,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBountyAmount,
+        (SELECT COUNT(DISTINCT l.RelatedPostId) FROM PostLinks l WHERE l.PostId = p.Id AND l.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(DISTINCT l.RelatedPostId) FROM PostLinks l WHERE l.PostId = p.Id AND l.LinkTypeId = 3) AS DuplicatePostsCount
+    FROM
+        Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT
+            ph_inner.PostId,
+            MAX(ph_inner.CreationDate) AS MaxHistoryDate,
+            SUM(CASE WHEN ph_inner.PostHistoryTypeId IN (14, 15, 19, 20) AND ph_inner.UserId IS NOT NULL THEN 1 ELSE 0 END) AS ModeratorEditCount,
+            SUM(CASE WHEN ph_inner.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+            SUM(CASE WHEN ph_inner.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount
+        FROM
+            PostHistory ph_inner
+        GROUP BY
+            ph_inner.PostId
+    ) AS ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.Score >= 5
+        AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+),
+RankedUserPosts AS (
+    SELECT
+        ps.PostId,
+        ps.PostTypeName,
+        ps.OwnerUserId,
+        ps.PostScore,
+        ps.PostCreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.Body,
+        ps.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostScore DESC, ps.PostCreationDate DESC) AS rn_user_post_score,
+        DENSE_RANK() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostScore DESC) AS dr_user_post_score_dense,
+        LAG(ps.PostScore, 1, 0) OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostCreationDate) AS PreviousPostScore,
+        AVG(ps.PostScore) OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS AvgScoreLast3Posts
+    FROM
+        PostActivitySummary ps
+    WHERE
+        ps.OwnerUserId IS NOT NULL
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.TotalPostScore,
+    ue.AvgPostScore,
+    ru.PostId,
+    ru.PostTypeName,
+    ru.Title AS PostTitle,
+    ru.PostScore,
+    ru.PostCreationDate,
+    ru.LastActivityDate,
+    ru.rn_user_post_score AS UserPostRankByScore,
+    ru.dr_user_post_score_dense AS UserPostDenseRankByScore,
+    ru.PreviousPostScore,
+    ru.AvgScoreLast3Posts,
+    ps.ViewCount AS PostViewCount,
+    ps.AnswerCount,
+    ps.CommentCount AS PostCommentCount,
+    ps.FavoriteCount,
+    ps.TotalBountyAmount,
+    ps.LinkedPostsCount,
+    ps.DuplicatePostsCount,
+    ps.ModeratorEditCount,
+    ps.CloseVoteCount,
+    ps.ReopenVoteCount,
+    (ue.Reputation * (1 + (ue.TotalPosts + ue.TotalComments) / NULLIF(ue.TotalAnswers + ue.TotalQuestions, 0.0))) AS WeightedUserContribution,
+    CASE
+        WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 AND ps.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Question'
+        WHEN ps.PostTypeId = 1 AND ps.ClosedDate IS NOT NULL THEN 'Closed_Question'
+        WHEN ps.PostTypeId = 1 AND ps.FavoriteCount >= 50 THEN 'Highly_Favored_Question'
+        WHEN ps.PostTypeId = 2 AND ps.Score >= 20 THEN 'High_Scoring_Answer'
+        ELSE 'Other_Post'
+    END AS PostStatusCategory,
+    COALESCE(LENGTH(ps.Body) / 100, 0) AS BodyLengthInHundreds,
+    NULLIF(LENGTH(REPLACE(REPLACE(ps.Body, '<p>', ''), '</p>', '')), 0) AS BodyTextLength,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - ru.PostCreationDate) AS DaysSincePostCreation,
+    DATE_PART('hour', ps.LastActivityDate - ru.PostCreationDate) AS HoursUntilLastActivity,
+    (
+        SELECT
+            CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN TRUE ELSE FALSE END
+        FROM
+            Badges b
+        INNER JOIN Tags t ON LOWER(b.Name) = LOWER(t.TagName)
+        WHERE
+            b.UserId = ue.UserId
+            AND b.Class = 1
+            AND ru.Tags LIKE '%' || t.TagName || '%'
+            AND LENGTH(t.TagName) > 2
+    ) AS HasGoldBadgeForPostTag,
+    (
+        SELECT AVG(p_sub.Score)
+        FROM Posts p_sub
+        WHERE p_sub.PostTypeId = 1
+        AND p_sub.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+    ) AS GlobalAvgRecentQuestionScore
+FROM
+    UserEngagement ue
+INNER JOIN RankedUserPosts ru ON ue.UserId = ru.OwnerUserId
+INNER JOIN PostActivitySummary ps ON ru.PostId = ps.PostId
+WHERE
+    ue.Reputation >= 1000
+    AND ue.TotalPosts >= 5
+    AND ru.rn_user_post_score <= 5
+    AND ps.PostTypeName = 'Question'
+    AND (
+        ps.Tags LIKE '%<sql>%' OR ps.Tags LIKE '%<database>%' OR ps.Tags LIKE '%<performance>%'
+        OR (ps.PostScore >= 50 AND ps.AnswerCount >= 5)
+    )
+    AND ru.PostTitle IS NOT NULL
+    AND ps.Body IS NOT NULL
+    AND ps.LastActivityDate IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_sub
+        WHERE ph_sub.PostId = ps.PostId
+          AND ph_sub.PostHistoryTypeId IN (14, 15)
+          AND ph_sub.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+    )
+    
+UNION ALL
+    
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.TotalPostScore,
+    ue.AvgPostScore,
+    pas.PostId,
+    pas.PostTypeName,
+    pas.Title AS PostTitle,
+    pas.PostScore,
+    pas.PostCreationDate,
+    pas.LastActivityDate,
+    CAST(NULL AS BIGINT) AS UserPostRankByScore,
+    CAST(NULL AS BIGINT) AS UserPostDenseRankByScore,
+    CAST(NULL AS INT) AS PreviousPostScore,
+    CAST(NULL AS DECIMAL(18, 4)) AS AvgScoreLast3Posts,
+    pas.ViewCount AS PostViewCount,
+    pas.AnswerCount,
+    pas.CommentCount AS PostCommentCount,
+    pas.FavoriteCount,
+    pas.TotalBountyAmount,
+    pas.LinkedPostsCount,
+    pas.DuplicatePostsCount,
+    pas.ModeratorEditCount,
+    pas.CloseVoteCount,
+    pas.ReopenVoteCount,
+    (ue.Reputation * (1 + (ue.TotalPosts + ue.TotalComments) / NULLIF(ue.TotalAnswers + ue.TotalQuestions, 0.0))) AS WeightedUserContribution,
+    CASE
+        WHEN pas.PostTypeId = 1 AND pas.AnswerCount > 0 AND pas.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Question'
+        WHEN pas.PostTypeId = 1 AND pas.ClosedDate IS NOT NULL THEN 'Closed_Question'
+        WHEN pas.PostTypeId = 1 AND pas.FavoriteCount >= 50 THEN 'Highly_Favored_Question'
+        WHEN pas.PostTypeId = 2 AND pas.Score >= 20 THEN 'High_Scoring_Answer'
+        ELSE 'Other_Post'
+    END AS PostStatusCategory,
+    COALESCE(LENGTH(pas.Body) / 100, 0) AS BodyLengthInHundreds,
+    NULLIF(LENGTH(REPLACE(REPLACE(pas.Body, '<p>', ''), '</p>', '')), 0) AS BodyTextLength,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - pas.PostCreationDate) AS DaysSincePostCreation,
+    DATE_PART('hour', pas.LastActivityDate - pas.PostCreationDate) AS HoursUntilLastActivity,
+    (
+        SELECT
+            CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN TRUE ELSE FALSE END
+        FROM
+            Badges b
+        INNER JOIN Tags t ON LOWER(b.Name) = LOWER(t.TagName)
+        WHERE
+            b.UserId = ue.UserId
+            AND b.Class = 1
+            AND pas.Tags LIKE '%' || t.TagName || '%'
+            AND LENGTH(t.TagName) > 2
+    ) AS HasGoldBadgeForPostTag,
+    (
+        SELECT AVG(p_sub.Score)
+        FROM Posts p_sub
+        WHERE p_sub.PostTypeId = 1
+        AND p_sub.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+    ) AS GlobalAvgRecentQuestionScore
+FROM
+    PostActivitySummary pas
+INNER JOIN UserEngagement ue ON pas.OwnerUserId = ue.UserId
+WHERE
+    (pas.ModeratorEditCount >= 1 OR pas.CloseVoteCount >= 1 OR pas.ReopenVoteCount >= 1 OR pas.TotalBountyAmount > 0)
+    AND pas.PostTypeName = 'Question'
+    AND pas.PostScore >= 10
+    AND pas.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3' YEAR)
+    AND pas.Title IS NOT NULL
+    AND pas.LastActivityDate IS NOT NULL
+    AND pas.OwnerUserId IS NOT NULL;

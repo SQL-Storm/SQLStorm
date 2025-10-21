@@ -1,0 +1,109 @@
+WITH popular_tags AS (
+  SELECT TagName, COUNT(*) as tag_usage_count
+  FROM Tags t
+  JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+  WHERE p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  GROUP BY TagName
+  HAVING COUNT(*) > 50
+),
+active_users AS (
+  SELECT u.Id, u.Reputation, u.UpVotes, u.DownVotes,
+         AVG(v.BountyAmount) as avg_bounty_given
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8
+  WHERE u.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    AND u.Reputation > 100
+    AND u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month'
+  GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+  HAVING COUNT(v.Id) > 0 OR u.UpVotes > 10
+),
+question_engagement AS (
+  SELECT p.Id as question_id, p.Title, p.Score, p.ViewCount,
+         p.AnswerCount, p.CommentCount, p.FavoriteCount,
+         p.CreationDate, p.OwnerUserId,
+         COUNT(DISTINCT a.Id) as distinct_answerers,
+         AVG(a.Score) as avg_answer_score,
+         COUNT(DISTINCT c.Id) as total_comments,
+         COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.Id END) as close_reopen_events,
+         STRING_AGG(DISTINCT au.DisplayName, ', ') as top_commenters
+  FROM Posts p
+  JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Users au ON au.Id = c.UserId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  WHERE p.PostTypeId = 1 
+    AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months'
+    AND p.Score > 5
+    AND EXISTS (SELECT 1 FROM popular_tags pt WHERE POSITION(pt.TagName IN p.Tags) > 0)
+  GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, 
+           p.CommentCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId
+  HAVING COUNT(a.Id) > 2 
+     AND AVG(a.Score) > 1
+     AND COUNT(DISTINCT c.UserId) > 3
+),
+user_expertise AS (
+  SELECT au.Id as user_id, au.Reputation,
+         COUNT(q.Id) as questions_asked,
+         COUNT(a.Id) as answers_given,
+         AVG(q.Score) as avg_question_score,
+         SUM(CASE WHEN vq.VoteTypeId = 2 THEN 1 ELSE 0 END) as total_upvotes_received,
+         COUNT(DISTINCT t.TagName) as tags_mastered,
+         ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY COUNT(a.Id) DESC) as rank_per_tag
+  FROM active_users au
+  JOIN Posts q ON q.OwnerUserId = au.Id AND q.PostTypeId = 1
+  JOIN Posts a ON a.OwnerUserId = au.Id AND a.PostTypeId = 2
+  LEFT JOIN Votes vq ON vq.PostId = q.Id AND vq.VoteTypeId IN (2, 3)
+  LEFT JOIN (SELECT DISTINCT Id, Tags FROM Posts WHERE PostTypeId = 1) tagged_questions 
+    ON tagged_questions.Id = q.Id
+  LEFT JOIN Tags t ON POSITION(t.TagName IN tagged_questions.Tags) > 0
+  WHERE q.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    AND a.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  GROUP BY au.Id, au.Reputation, t.TagName
+  HAVING COUNT(q.Id) > 5 AND COUNT(a.Id) > 10
+)
+SELECT 
+  qe.question_id,
+  qe.Title,
+  qe.Score as question_score,
+  qe.ViewCount as view_count,
+  qe.AnswerCount as answer_count,
+  qe.avg_answer_score,
+  qe.total_comments,
+  qe.close_reopen_events,
+  qe.distinct_answerers,
+  qe.top_commenters,
+  ue.user_id,
+  ue.Reputation as reputation,
+  ue.questions_asked,
+  ue.answers_given,
+  ue.avg_question_score,
+  ue.total_upvotes_received,
+  ue.tags_mastered,
+  pt.tag_usage_count,
+  STRING_AGG(DISTINCT pt.TagName, ' | ') as question_tags,
+  CASE 
+    WHEN qe.close_reopen_events > 2 THEN 'Controversial'
+    WHEN qe.avg_answer_score > 10 THEN 'Expert Answered'
+    WHEN qe.ViewCount > 1000 THEN 'High Traffic'
+    ELSE 'Standard'
+  END as engagement_category,
+  ROW_NUMBER() OVER (ORDER BY qe.ViewCount * qe.Score DESC) as overall_popularity_rank,
+  DENSE_RANK() OVER (PARTITION BY pt.TagName ORDER BY ue.Reputation DESC, qe.Score DESC) as tag_expertise_rank
+FROM question_engagement qe
+JOIN active_users au ON au.Id = qe.OwnerUserId
+JOIN user_expertise ue ON ue.user_id = au.Id
+JOIN popular_tags pt ON POSITION(pt.TagName IN qe.Title || ' ' || qe.Tags) > 0
+LEFT JOIN Badges b ON b.UserId = au.Id AND b.Date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+LEFT JOIN PostLinks pl ON pl.PostId = qe.question_id AND pl.LinkTypeId = 3
+WHERE ue.rank_per_tag <= 5
+  AND (b.Class = 1 OR b.Class IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM PostHistory ph2 WHERE ph2.PostId = qe.question_id AND ph2.PostHistoryTypeId = 12)
+GROUP BY 
+  qe.question_id, qe.Title, qe.Score, qe.ViewCount, qe.AnswerCount, 
+  qe.avg_answer_score, qe.total_comments, qe.close_reopen_events, 
+  qe.distinct_answerers, qe.top_commenters, ue.user_id, ue.Reputation, 
+  ue.questions_asked, ue.answers_given, ue.avg_question_score, 
+  ue.total_upvotes_received, ue.tags_mastered, pt.tag_usage_count
+HAVING AVG(b.Date) > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months' OR b.Id IS NULL
+ORDER BY overall_popularity_rank
+LIMIT 100;

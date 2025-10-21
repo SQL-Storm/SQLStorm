@@ -1,0 +1,166 @@
+WITH QuestionDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Linked as Duplicate'
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) THEN 'Is Duplicate Of'
+            ELSE 'Not Linked as Duplicate'
+        END AS DuplicateStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerMetrics AS (
+    SELECT
+        a.ParentId,
+        COUNT(*) AS TotalAnswers,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 1) THEN 1 ELSE 0 END) AS AcceptedAnswerVotes,
+        AVG(CAST(a.Score AS DECIMAL(10, 2))) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+CommentActivity AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+UserPostActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS PostsModified,
+        MAX(ph.CreationDate) AS LastModificationDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.UserId
+),
+RecentQuestions AS (
+    SELECT
+        PostId,
+        Title,
+        OwnerUserId,
+        OwnerDisplayName,
+        PostCreationDate,
+        PostScore,
+        AnswerCount,
+        FavoriteCount,
+        OwnerReputation,
+        DuplicateStatus
+    FROM QuestionDetails
+    WHERE rn <= 1000
+),
+HotQuestions AS (
+    SELECT
+        pq.PostId,
+        pq.Title,
+        pq.OwnerUserId,
+        pq.OwnerDisplayName,
+        pq.PostCreationDate,
+        pq.PostScore,
+        pq.AnswerCount,
+        pq.FavoriteCount,
+        pq.OwnerReputation,
+        pq.DuplicateStatus,
+        COALESCE(am.TotalAnswers, 0) AS AnswerCountFromMetric,
+        COALESCE(ca.TotalComments, 0) AS CommentCountFromMetric,
+        CASE WHEN pq.FavoriteCount > 0 THEN pq.FavoriteCount ELSE 0 END AS NormalizedFavoriteCount
+    FROM RecentQuestions pq
+    LEFT JOIN AnswerMetrics am ON pq.PostId = am.ParentId
+    LEFT JOIN CommentActivity ca ON pq.PostId = ca.PostId
+    WHERE pq.PostScore > 10
+),
+PotentialReviewItems AS (
+    SELECT
+        hq.PostId,
+        hq.Title,
+        hq.OwnerDisplayName,
+        hq.PostCreationDate,
+        hq.PostScore,
+        hq.AnswerCount,
+        hq.FavoriteCount,
+        hq.OwnerReputation,
+        hq.DuplicateStatus,
+        hq.AnswerCountFromMetric,
+        hq.CommentCountFromMetric,
+        hq.NormalizedFavoriteCount,
+        CAST((DATEDIFF(day, hq.PostCreationDate, DATE '2024-10-01')) AS INTEGER) AS AgeInDays,
+        (hq.PostScore * 10) + (hq.AnswerCount * 5) + (hq.FavoriteCount * 2) AS EngagementScore,
+        LOWER(hq.Title) AS LowercaseTitle,
+        SUBSTRING(hq.Title FROM 1 FOR POSITION(' ' IN (hq.Title || ' ')) - 1) AS FirstWordOfTitle
+    FROM HotQuestions hq
+    WHERE hq.PostScore >= hq.OwnerReputation / 1000
+),
+FinalReview AS (
+    SELECT
+        pr.PostId,
+        pr.Title,
+        pr.OwnerDisplayName,
+        pr.PostCreationDate,
+        pr.PostScore,
+        pr.AnswerCount,
+        pr.FavoriteCount,
+        pr.OwnerReputation,
+        pr.DuplicateStatus,
+        pr.AnswerCountFromMetric,
+        pr.CommentCountFromMetric,
+        pr.NormalizedFavoriteCount,
+        pr.AgeInDays,
+        pr.EngagementScore,
+        pr.FirstWordOfTitle,
+        UPPER(pr.DuplicateStatus) AS UppercaseDuplicateStatus,
+        CASE WHEN pr.PostScore > 50 THEN 'High Score' WHEN pr.PostScore > 10 THEN 'Medium Score' ELSE 'Low Score' END AS ScoreCategory,
+        CASE WHEN pr.OwnerReputation > 100000 THEN 'Expert' WHEN pr.OwnerReputation > 10000 THEN 'Experienced' ELSE 'Novice' END AS ReputationTier,
+        CASE
+            WHEN DATEDIFF(day, pr.PostCreationDate, DATE '2024-10-01') < 7 THEN 'Recent'
+            WHEN DATEDIFF(day, pr.PostCreationDate, DATE '2024-10-01') BETWEEN 7 AND 30 THEN 'Mid-Term'
+            ELSE 'Long-Term'
+        END AS PostAgeCategory,
+        ROW_NUMBER() OVER (ORDER BY pr.EngagementScore DESC, pr.PostScore DESC, pr.FavoriteCount DESC) AS ReviewRank
+    FROM PotentialReviewItems pr
+    WHERE pr.CommentCountFromMetric > 0 OR pr.AnswerCountFromMetric > 0
+)
+SELECT
+    fr.PostId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.PostCreationDate,
+    fr.PostScore,
+    fr.AnswerCount,
+    fr.FavoriteCount,
+    fr.OwnerReputation,
+    fr.DuplicateStatus,
+    fr.AnswerCountFromMetric,
+    fr.CommentCountFromMetric,
+    fr.NormalizedFavoriteCount,
+    fr.AgeInDays,
+    fr.EngagementScore,
+    fr.FirstWordOfTitle,
+    fr.UppercaseDuplicateStatus,
+    fr.ScoreCategory,
+    fr.ReputationTier,
+    fr.PostAgeCategory,
+    fr.ReviewRank,
+    CASE WHEN fr.ReviewRank <= 10 THEN 'Top Priority' ELSE 'Standard Review' END AS PriorityLevel,
+    CASE WHEN fr.OwnerReputation IS NULL THEN 'Unknown Owner' ELSE 'Known Owner' END AS OwnerStatus,
+    'Review Processed' AS Status,
+    CAST(fr.EngagementScore * ABS(LOG(fr.AgeInDays + 1)) AS DECIMAL(18, 2)) AS WeightedEngagementScore,
+    LENGTH(fr.Title) AS TitleLength,
+    CONCAT(fr.OwnerDisplayName, ' (Rep: ', fr.OwnerReputation, ')') AS OwnerInfo
+FROM FinalReview fr
+WHERE fr.ReviewRank <= 50
+ORDER BY fr.ReviewRank;

@@ -1,0 +1,302 @@
+-- {"query": "29044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2743} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgesEarned,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalQuestionViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY BadgeCount DESC) as RankByBadges,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation
+    FROM UserPostStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Voted'
+            WHEN p.Score >= 10 THEN 'Moderately Voted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'Negative'
+        END as VotedLevel,
+        CASE 
+            WHEN p.FavoriteCount >= 10 THEN 'Popular'
+            WHEN p.FavoriteCount >= 5 THEN 'Well-liked'
+            WHEN p.FavoriteCount >= 1 THEN 'Notable'
+            ELSE 'Not Favorited'
+        END as FavoriteLevel,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as AgeInDays,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) as Upvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) as Downvotes,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' 
+            THEN CONCAT(
+                'Tags: ', 
+                STRING_AGG(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', '), 
+                ' | '
+            ) 
+            ELSE ''
+        END as TagSummary,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+            ) THEN 1
+            ELSE 0
+        END as HasHistoryEvents,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Comments c 
+                WHERE c.PostId = p.Id 
+                AND c.UserId IS NOT NULL
+            ) THEN 1
+            ELSE 0
+        END as HasUserComments
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+),
+UserPostAnalysis AS (
+    SELECT 
+        t1.UserId,
+        t1.DisplayName,
+        t1.TotalPosts,
+        t1.Questions,
+        t1.Answers,
+        t1.TotalQuestionScore,
+        t1.TotalAnswerScore,
+        t1.AvgQuestionScore,
+        t1.AvgAnswerScore,
+        t1.LastPostDate,
+        t1.BadgeCount,
+        t1.BadgesEarned,
+        t1.TotalQuestionViews,
+        COALESCE(t2.TotalQuestionViews, 0) as AvgViewsPerQuestion,
+        COALESCE((t1.TotalQuestionScore / NULLIF(t1.Questions, 0)), 0) as AvgScorePerQuestion,
+        CASE 
+            WHEN t1.Questions > 0 THEN (t1.Answers * 100.0 / t1.Questions)
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN t1.Reputation >= 100000 THEN 'Elite'
+            WHEN t1.Reputation >= 10000 THEN 'Superior'
+            WHEN t1.Reputation >= 1000 THEN 'Advanced'
+            ELSE 'Basic'
+        END as ReputationTier,
+        COALESCE(t1.BadgeCount, 0) + 
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = t1.UserId AND b.Class = 1), 
+            0
+        ) as CombinedBadgeScore
+    FROM TopUsers t1
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            AVG(ViewCount) as TotalQuestionViews
+        FROM Posts 
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) t2 ON t1.UserId = t2.OwnerUserId
+)
+SELECT 
+    CASE 
+        WHENupa.UserId IS NOT NULL THEN upa.UserId 
+        ELSE NULL 
+    END as UserId,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.DisplayName 
+        ELSE 'Unknown User' 
+    END as Display_Name,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.TotalPosts 
+        ELSE 0 
+    END as Total_Posts,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.Questions 
+        ELSE 0 
+    END as Questions_Requested,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.Answers 
+        ELSE 0 
+    END as Answers_Provided,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.TotalQuestionScore 
+        ELSE 0 
+    END as Total_Question_Score,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.TotalAnswerScore 
+        ELSE 0 
+    END as Total_Answer_Score,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.AvgQuestionScore 
+        ELSE 0 
+    END as Avg_Question_Score,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.AvgAnswerScore 
+        ELSE 0 
+    END as Avg_Answer_Score,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.LastPostDate 
+        ELSE NULL 
+    END as Last_Post_Date,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.BadgeCount 
+        ELSE 0 
+    END as Badge_Count,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.BadgesEarned 
+        ELSE NULL 
+    END as Badges_Earned,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.TotalQuestionViews 
+        ELSE 0 
+    END as Total_Question_Views,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.AvgViewsPerQuestion 
+        ELSE 0 
+    END as Avg_Views_Per_Question,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.AvgScorePerQuestion 
+        ELSE 0 
+    END as Avg_Score_Per_Question,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.AnswerToQuestionRatio 
+        ELSE 0 
+    END as Answer_To_Question_Ratio,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.ReputationTier 
+        ELSE 'Unknown' 
+    END as Reputation_Tier,
+    CASE 
+        WHEN upa.UserId IS NOT NULL THEN upa.CombinedBadgeScore 
+        ELSE 0 
+    END as Combined_Badge_Score,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.PostId 
+        ELSE NULL 
+    END as Post_Id,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.Title 
+        ELSE NULL 
+    END as Post_Title,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.Score 
+        ELSE 0 
+    END as Post_Score,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.ViewCount 
+        ELSE 0 
+    END as Post_View_Count,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.CreationDate 
+        ELSE NULL 
+    END as Post_Creation_Date,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.PostType 
+        ELSE NULL 
+    END as Post_Type,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.VotedLevel 
+        ELSE NULL 
+    END as Voted_Level,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.FavoriteLevel 
+        ELSE NULL 
+    END as Favorite_Level,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.AgeInDays 
+        ELSE 0 
+    END as Post_Age_Days,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.EngagementCount 
+        ELSE 0 
+    END as Engagement_Count,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.Upvotes 
+        ELSE 0 
+    END as Upvotes,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.Downvotes 
+        ELSE 0 
+    END as Downvotes,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.HasHistoryEvents 
+        ELSE 0 
+    END as Has_History_Events,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.HasUserComments 
+        ELSE 0 
+    END as Has_User_Comments,
+    CASE 
+        WHEN pah.PostId IS NOT NULL THEN pah.TagSummary 
+        ELSE '' 
+    END as Tag_Summary,
+    CASE 
+        WHEN upa.UserId IS NOT NULL AND pah.PostId IS NOT NULL THEN 
+            CASE 
+                WHEN upa.UserId = pah.OwnerUserId THEN 'Author'
+                ELSE 'Other User'
+            END
+        ELSE NULL
+    END as Authorship
+FROM UserPostAnalysis upa
+FULL OUTER JOIN PostAnalysis pah ON upa.UserId = pah.OwnerUserId
+WHERE (upa.UserId IS NOT NULL OR pah.PostId IS NOT NULL)
+AND (upa.ReputationTier IN ('Elite', 'Superior') OR pah.Post_Score >= 50 OR pah.ViewCount > 1000)
+GROUP BY 
+    upa.UserId, upa.DisplayName, upa.TotalPosts, upa.Questions, upa.Answers, 
+    upa.TotalQuestionScore, upa.TotalAnswerScore, upa.AvgQuestionScore, upa.AvgAnswerScore, 
+    upa.LastPostDate, upa.BadgeCount, upa.BadgesEarned, upa.TotalQuestionViews, 
+    upa.AvgViewsPerQuestion, upa.AvgScorePerQuestion, upa.AnswerToQuestionRatio, 
+    upa.ReputationTier, upa.CombinedBadgeScore,
+    pah.PostId, pah.Title, pah.Score, pah.ViewCount, pah.CreationDate, 
+    pah.PostType, pah.VotedLevel, pah.FavoriteLevel, pah.AgeInDays, 
+    pah.EngagementCount, pah.Upvotes, pah.Downvotes, pah.HasHistoryEvents, 
+    pah.HasUserComments, pah.TagSummary, pah.OwnerUserId
+HAVING 
+    (COUNT(*) > 1 OR COUNT(*) = 1)
+ORDER BY 
+    CASE WHEN upa.UserId IS NOT NULL THEN upa.TotalQuestionScore ELSE 0 END DESC,
+    CASE WHEN pah.PostId IS NOT NULL THEN pah.Score ELSE 0 END DESC;

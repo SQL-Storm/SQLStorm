@@ -1,0 +1,139 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        AVG(p.Score) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.DeletionDate IS NULL 
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    WHERE u.Reputation >= 100
+        AND u.LastAccessDate >= DATE '2024-10-01' - INTERVAL '30 days'
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+HighImpactQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.Tags,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+        LEAD(p.AnswerCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextQuestionAnswers,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'CLOSED'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'COMMUNITY'
+            ELSE 'OPEN'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.Score >= 10
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate)
+        AND LENGTH(COALESCE(p.Tags, '')) > 0
+),
+UserEngagementMetrics AS (
+    SELECT 
+        au.UserId,
+        au.TotalPosts,
+        au.QuestionsPosted,
+        au.AvgPostScore,
+        COALESCE(hq.PostId, 0) AS BestQuestionId,
+        COALESCE(hq.Score, 0) AS BestQuestionScore,
+        hq.ViewCount,
+        hq.AnswerCount,
+        (hq.Score - COALESCE(hq.PrevQuestionScore, 0)) AS ScoreImprovement,
+        CASE 
+            WHEN hq.PostStatus = 'CLOSED' THEN 1 
+            ELSE 0 
+        END AS HasClosedQuestions,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = au.UserId 
+           AND b.Class = 1 
+           AND b.Date >= DATE '2024-10-01' - INTERVAL '6 months') AS GoldBadgesRecent,
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 1) || LOWER(SUBSTRING(t.TagName, 2)), ', ' ORDER BY t.TagName)
+         FROM (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(hq.Tags, 2, LENGTH(hq.Tags)-2), '><')) AS tag
+               FROM HighImpactQuestions hq2 
+               WHERE hq2.OwnerUserId = au.UserId) tags
+         JOIN Tags t ON TRIM(tags.tag) = t.TagName
+         WHERE t.Count > 100) AS PopularTags
+    FROM ActiveUsers au
+    LEFT JOIN HighImpactQuestions hq ON au.UserId = hq.OwnerUserId
+    WHERE hq.Score = (
+        SELECT MAX(hq2.Score) 
+        FROM HighImpactQuestions hq2 
+        WHERE hq2.OwnerUserId = au.UserId
+    )
+)
+SELECT 
+    uem.UserId,
+    u.DisplayName,
+    u.Reputation,
+    au.RepRank,
+    uem.TotalPosts,
+    uem.BestQuestionScore,
+    uem.ViewCount AS BestQuestionViews,
+    uem.AnswerCount AS BestQuestionAnswers,
+    uem.GoldBadgesRecent,
+    COALESCE(uem.PopularTags, 'No popular tags') AS TagSummary,
+    CASE 
+        WHEN uem.ScoreImprovement > 20 THEN 'Improving'
+        WHEN uem.ScoreImprovement < -10 THEN 'Declining'
+        ELSE 'Stable'
+    END AS PerformanceTrend,
+    (uem.BestQuestionScore * 1.0 / NULLIF(uem.QuestionsPosted, 0)) AS ScorePerQuestion,
+    GREATEST(uem.ViewCount, 0) + COALESCE((SELECT SUM(v.BountyAmount) 
+                                          FROM Votes v 
+                                          WHERE v.PostId = uem.BestQuestionId 
+                                            AND v.VoteTypeId IN (8, 9)), 0) AS TotalImpact,
+    (SELECT COUNT(DISTINCT c.Id)
+     FROM Comments c
+     JOIN Posts p2 ON c.PostId = p2.Id
+     WHERE p2.OwnerUserId = uem.UserId
+       AND LENGTH(c.Text) > 100
+     AND c.CreationDate >= DATE '2024-10-01' - INTERVAL '3 months') AS InsightfulComments
+FROM UserEngagementMetrics uem
+JOIN ActiveUsers au ON uem.UserId = au.UserId
+JOIN Users u ON uem.UserId = u.Id
+LEFT JOIN (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS CloseVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Text LIKE '%101%' THEN 1 ELSE 0 END) AS DuplicateCloses
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+      AND ph.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+    GROUP BY ph.PostId
+    HAVING COUNT(*) >= 3
+) closing ON uem.BestQuestionId = closing.PostId
+WHERE au.RepRank <= 100
+    AND (uem.HasClosedQuestions = 0 OR closing.CloseVotes IS NULL)
+    AND NOT (u.Location IS NULL AND u.WebsiteUrl IS NOT NULL AND LENGTH(u.WebsiteUrl) < 10)
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Community Aggregate' AS DisplayName,
+    SUM(u.Reputation) AS Reputation,
+    0 AS RepRank,
+    SUM(uem.TotalPosts) AS TotalPosts,
+    AVG(uem.BestQuestionScore) AS BestQuestionScore,
+    AVG(uem.ViewCount) AS BestQuestionViews,
+    AVG(uem.AnswerCount) AS BestQuestionAnswers,
+    SUM(uem.GoldBadgesRecent) AS GoldBadgesRecent,
+    STRING_AGG(DISTINCT COALESCE(uem.PopularTags, 'No tags'), ' | ') AS TagSummary,
+    'Overall' AS PerformanceTrend,
+    AVG(uem.ScorePerQuestion) AS ScorePerQuestion,
+    SUM(uem.TotalImpact) AS TotalImpact,
+    SUM(uem.InsightfulComments) AS InsightfulComments
+FROM UserEngagementMetrics uem
+JOIN ActiveUsers au ON uem.UserId = au.UserId
+ORDER BY Reputation DESC NULLS LAST, TotalPosts DESC;

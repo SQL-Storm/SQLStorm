@@ -1,0 +1,162 @@
+WITH
+
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId IN (1, 2) AND
+        p.CreationDate >= DATEADD(month, -6, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+TopUsers AS (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS PostCount,
+        SUM(Score) AS TotalScore,
+        SUM(ViewCount) AS TotalViews
+    FROM
+        RecentPosts
+    GROUP BY
+        OwnerUserId
+),
+BadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+UserMetrics AS (
+    SELECT
+        tu.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS ProfileViews,
+        u.UpVotes,
+        u.DownVotes,
+        tu.PostCount,
+        tu.TotalScore,
+        tu.TotalViews,
+        bs.BadgeCount,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        COALESCE(u.WebsiteUrl, 'No Website') AS WebsiteUrl,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+        CASE
+            WHEN u.ProfileImageUrl IS NOT NULL THEN 'Has Profile Image'
+            ELSE 'No Profile Image'
+        END AS ProfileImageStatus
+    FROM
+        TopUsers tu
+    JOIN
+        Users u ON tu.OwnerUserId = u.Id
+    LEFT JOIN
+        BadgeStats bs ON tu.OwnerUserId = bs.UserId
+),
+PopularPosts AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        Title,
+        Tags,
+        Score,
+        ViewCount,
+        LAST_VALUE(Score) OVER (PARTITION BY PostId ORDER BY CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningScore,
+        LAST_VALUE(ViewCount) OVER (PARTITION BY PostId ORDER BY CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningViews,
+        LAG(Score, 1) OVER (PARTITION BY PostId ORDER BY CreationDate) AS PreviousScore,
+        LAG(ViewCount, 1) OVER (PARTITION BY PostId ORDER BY CreationDate) AS PreviousViews,
+        LEAD(Score, 1) OVER (PARTITION BY PostId ORDER BY CreationDate) AS NextScore,
+        LEAD(ViewCount, 1) OVER (PARTITION BY PostId ORDER BY CreationDate) AS NextViews
+    FROM
+        RecentPosts
+    WHERE
+        PostRank = 1
+),
+TagMetrics AS (
+    SELECT
+        t.TagName,
+        COUNT(pp.PostId) AS PostCount,
+        SUM(pp.Score) AS TotalScore,
+        SUM(pp.ViewCount) AS TotalViews,
+        AVG(pp.Score) AS AvgScore,
+        MAX(pp.Score) AS MaxScore,
+        MIN(pp.Score) AS MinScore
+    FROM
+        Tags t
+    JOIN
+        PopularPosts pp ON pp.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY
+        t.TagName
+)
+SELECT
+    um.OwnerUserId,
+    um.DisplayName,
+    um.Reputation,
+    um.ProfileViews,
+    um.UpVotes,
+    um.DownVotes,
+    um.PostCount,
+    um.TotalScore,
+    um.TotalViews,
+    um.BadgeCount,
+    um.GoldBadges,
+    um.SilverBadges,
+    um.BronzeBadges,
+    um.WebsiteUrl,
+    um.Location,
+    um.AboutMeLength,
+    um.ProfileImageStatus,
+    pp.PostId,
+    pp.PostTypeId,
+    pp.Title,
+    pp.Tags,
+    pp.Score,
+    pp.ViewCount,
+    pp.RunningScore,
+    pp.RunningViews,
+    pp.PreviousScore,
+    pp.PreviousViews,
+    pp.NextScore,
+    pp.NextViews,
+    tm.TagName,
+    tm.PostCount AS TagPostCount,
+    tm.TotalScore AS TagTotalScore,
+    tm.TotalViews AS TagTotalViews,
+    tm.AvgScore,
+    tm.MaxScore,
+    tm.MinScore
+FROM
+    UserMetrics um
+JOIN
+    PopularPosts pp ON um.OwnerUserId = pp.OwnerUserId
+LEFT JOIN
+    TagMetrics tm ON pp.Tags LIKE CONCAT('%<', tm.TagName, '>%')
+WHERE
+    um.Reputation > 1000 AND
+    um.PostCount > 10 AND
+    tm.PostCount IS NOT NULL
+ORDER BY
+    um.Reputation DESC,
+    pp.Score DESC,
+    tm.TotalScore DESC
+LIMIT 100;

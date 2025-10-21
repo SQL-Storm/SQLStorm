@@ -1,0 +1,52 @@
+-- {"query": "13003.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 587} 
+
+WITH UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersProvided,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgScore,
+        MAX(P.CreationDate) AS LastActivityDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.Reputation > 1000
+    GROUP BY U.Id, U.DisplayName
+),
+TopTags AS (
+    SELECT 
+        T.TagName,
+        COUNT(*) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts P
+    CROSS JOIN LATERAL string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'') AS TagArray
+    JOIN Tags T ON T.TagName = TagArray
+    WHERE P.PostTypeId = 1
+    GROUP BY T.TagName
+)
+SELECT 
+    UA.UserId,
+    UA.DisplayName,
+    UA.QuestionsAsked,
+    UA.AnswersProvided,
+    UA.AcceptedAnswers,
+    UA.TotalScore,
+    UA.RunningAvgScore,
+    TT.TagName AS MostCommonTag,
+    TT.PostCount,
+    CASE 
+        WHEN UA.QuestionsAsked > 0 THEN (UA.AcceptedAnswers::FLOAT / UA.QuestionsAsked) * 100
+        ELSE NULL 
+    END AS AcceptanceRate,
+    COALESCE((SELECT MAX(B.Date) FROM Badges B WHERE B.UserId = UA.UserId AND B.Class = 1), '1900-01-01') AS LastGoldBadgeDate
+FROM UserActivity UA
+LEFT JOIN LATERAL (
+    SELECT TagName, PostCount 
+    FROM TopTags 
+    WHERE TagRank = 1
+) TT ON TRUE
+WHERE UA.LastActivityDate > CURRENT_DATE - INTERVAL '6 months'
+ORDER BY UA.TotalScore DESC, UA.LastActivityDate ASC
+LIMIT 100;

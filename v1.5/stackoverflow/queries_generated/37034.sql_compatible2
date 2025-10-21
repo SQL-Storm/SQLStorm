@@ -1,0 +1,154 @@
+WITH
+-- recent active questions with tag arrays and basic aggregates
+questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(p.Tags, '') AS TagsRaw,
+         -- split tags of form '<tag1><tag2>' into array elements
+         CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[]
+              ELSE substring(p.Tags, 2, length(p.Tags)-2)
+                   )  -- corrected: remove extra cast
+         END AS Tags,
+         p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    AND p.Score IS NOT NULL
+),
+-- top answer stats per question
+answer_stats AS (
+  SELECT parent.Id AS QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.Score >= 0) AS PosAnswerCount,
+         COUNT(a.Id) FILTER (WHERE a.Score < 0) AS NegAnswerCount,
+         MAX(a.Score) AS MaxAnswerScore,
+         AVG(a.Score) AS AvgAnswerScore,
+         SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnsweredByRegisteredUsers
+  FROM Posts a
+  JOIN Posts parent ON a.ParentId = parent.Id
+  WHERE a.PostTypeId = 2
+  GROUP BY parent.Id
+),
+-- compute hotness score combining views, score, answers, age decay, and tag rarity
+tag_rarity AS (
+  SELECT t.TagName,
+         GREATEST(LOG(100000.0 / NULLIF(t.Count,0)), 0) AS RarityScore
+  FROM Tags t
+),
+question_tag_stats AS (
+  SELECT q.Id AS QuestionId,
+         ARRAY_AGG(DISTINCT tr.TagName) FILTER (WHERE tr.TagName IS NOT NULL) AS TagList,
+         COALESCE(SUM(tr.RarityScore),0) AS TagRaritySum,
+         COALESCE(MAX(tr.RarityScore),0) AS TagRarityMax,
+         COUNT(DISTINCT tr.TagName) AS TagCount
+  FROM questions q
+  LEFT JOIN LATERAL UNNEST(q.Tags) AS tg(tag) ON TRUE
+  LEFT JOIN tag_rarity tr ON tr.TagName = tg.tag
+  GROUP BY q.Id
+),
+-- recent activity: last comment, last edit, last answer times
+recent_activity AS (
+  SELECT q.Id AS QuestionId,
+         MAX(c.CreationDate) AS LastCommentAt,
+         MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS LastEditAt,
+         MAX(a.CreationDate) FILTER (WHERE a.PostTypeId = 2) AS LastAnswerAt
+  FROM questions q
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY q.Id
+),
+-- user reputation and badge-weighted influence
+user_influence AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldCount,
+         COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverCount,
+         COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeCount,
+         -- influence metric: reputation plus badges with weights
+         (u.Reputation * 0.01 + COALESCE(SUM(
+            CASE b.Class WHEN 1 THEN 50 WHEN 2 THEN 10 WHEN 3 THEN 2 ELSE 0 END
+         ),0)) AS InfluenceScore
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+-- votes aggregation for question and its answers
+vote_agg AS (
+  SELECT p.Id AS PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+  GROUP BY p.Id
+),
+-- compute final composite hotness and engagement score
+composite AS (
+  SELECT q.*,
+         qs.TagCount, qs.TagRaritySum, qs.TagRarityMax, qs.TagList,
+         COALESCE(a.PosAnswerCount,0) AS PosAnswerCount,
+         COALESCE(a.NegAnswerCount,0) AS NegAnswerCount,
+         COALESCE(a.MaxAnswerScore,0) AS MaxAnswerScore,
+         COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         ra.LastCommentAt, ra.LastEditAt, ra.LastAnswerAt,
+         COALESCE(vq.UpVotes,0) AS QuestionUpVotes,
+         COALESCE(vq.DownVotes,0) AS QuestionDownVotes,
+         COALESCE(vq.Favorites,0) AS QuestionFavorites,
+         ui.InfluenceScore AS OwnerInfluence,
+         -- age in days
+         GREATEST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) / 86400.0, 0) AS AgeDays,
+         -- time decay factor: recent => closer to 1, older => smaller
+         (1 / (1 + GREATEST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) / 86400.0, 1) / 30)) AS AgeDecay
+  FROM questions q
+  LEFT JOIN question_tag_stats qs ON qs.QuestionId = q.Id
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN recent_activity ra ON ra.QuestionId = q.Id
+  LEFT JOIN vote_agg vq ON vq.PostId = q.Id
+  LEFT JOIN user_influence ui ON ui.UserId = q.OwnerUserId
+)
+SELECT
+  c.Id AS QuestionId,
+  c.Title,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.TagList,
+  c.TagCount,
+  c.TagRaritySum,
+  c.PosAnswerCount,
+  c.NegAnswerCount,
+  c.MaxAnswerScore,
+  c.AvgAnswerScore,
+  c.LastCommentAt,
+  c.LastEditAt,
+  c.LastAnswerAt,
+  c.QuestionUpVotes,
+  c.QuestionDownVotes,
+  c.QuestionFavorites,
+  c.OwnerInfluence,
+  c.AgeDays,
+  -- compute engagement: views * (upvotes - downvotes + favorites*2) scaled by answers and owner influence
+  ( (c.ViewCount::numeric + GREATEST(c.Score,0)::numeric * 50)
+    * (GREATEST(c.QuestionUpVotes - c.QuestionDownVotes, 0)::numeric + 1)
+    * (1 + GREATEST(c.PosAnswerCount,0) / 10.0)
+    * (1 + c.OwnerInfluence / 1000.0)
+    * c.AgeDecay
+    + c.TagRaritySum * 100
+  )::numeric(18,3) AS EngagementScore,
+  -- compute novelty: favors rare tags and low-view high-score questions
+  ( (c.TagRaritySum * 10)
+    + (GREATEST(0, c.Score)::numeric * 20)
+    - LOG(1 + c.ViewCount::numeric)::numeric * 5
+    + (1 / (1 + c.AgeDays)) * 100
+  )::numeric(12,3) AS NoveltyScore,
+  -- final composite for ranking: weighted combination
+  (
+    ( ( (c.ViewCount::numeric / NULLIF(GREATEST((SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId=1),1),0)) * 0.25 )
+      + (c.Score::numeric / NULLIF(GREATEST((SELECT AVG(Score) FROM Posts WHERE PostTypeId=1),1),0) * 0.25)
+      + (c.EngagementScore::numeric / NULLIF(GREATEST( (SELECT AVG(( (ViewCount::numeric + GREATEST(Score,0)::numeric * 50) * (1+1) * 1) FROM Posts WHERE PostTypeId=1),1),0) ,1) * 0.35)
+      + (c.NoveltyScore::numeric * 0.15)
+    )
+  )::numeric(18,6) AS CompositeRankScore
+FROM composite c
+ORDER BY CompositeRankScore DESC
+LIMIT 250;

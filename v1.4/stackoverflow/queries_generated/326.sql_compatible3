@@ -1,0 +1,82 @@
+WITH
+user_base AS (
+  SELECT Id AS UserId, DisplayName, Reputation, CreationDate
+  FROM Users
+),
+post_aggregation AS (
+  SELECT OwnerUserId AS UserId,
+         SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         MAX(LastActivityDate) AS LastActive,
+         SUM(Score) AS TotalPostScore
+  FROM Posts
+  GROUP BY OwnerUserId
+),
+vote_aggregation AS (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+badge_aggregation AS (
+  SELECT UserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+user_combined AS (
+  SELECT ub.UserId,
+         ub.DisplayName,
+         ub.Reputation,
+         COALESCE(pa.LastActive, ub.CreationDate) AS LastActive,
+         COALESCE(pa.QuestionCount, 0) AS QuestionCount,
+         COALESCE(pa.AnswerCount, 0) AS AnswerCount,
+         COALESCE(pa.TotalPostScore, 0) AS TotalPostScore,
+         COALESCE(va.UpVotes, 0) AS UpVotes,
+         COALESCE(va.DownVotes, 0) AS DownVotes,
+         COALESCE(ba.BadgeCount, 0) AS BadgeCount
+  FROM user_base ub
+  LEFT JOIN post_aggregation pa ON pa.UserId = ub.UserId
+  LEFT JOIN vote_aggregation va ON va.UserId = ub.UserId
+  LEFT JOIN badge_aggregation ba ON ba.UserId = ub.UserId
+),
+user_score AS (
+  SELECT UserId, DisplayName, Reputation, LastActive, QuestionCount, AnswerCount,
+         TotalPostScore, UpVotes, DownVotes, BadgeCount,
+         (Reputation + UpVotes * 3 - DownVotes + QuestionCount * 5 + BadgeCount * 2) AS Score
+  FROM user_combined
+),
+ranked AS (
+  SELECT UserId, DisplayName, Reputation, LastActive, QuestionCount, AnswerCount,
+         TotalPostScore, UpVotes, DownVotes, BadgeCount, Score,
+         ROW_NUMBER() OVER (ORDER BY Score DESC, LastActive DESC NULLS LAST) AS rn
+  FROM user_score
+),
+premium AS (
+  SELECT 'premium' AS SetName, UserId, DisplayName, Score, LastActive, BadgeCount
+  FROM ranked
+  WHERE rn <= 100
+),
+secondary AS (
+  SELECT 'secondary' AS SetName, UserId, DisplayName, Score, LastActive, BadgeCount
+  FROM ranked
+  WHERE Score >= 50 AND Score < 1000
+),
+top_sets AS (
+  SELECT * FROM premium
+  UNION ALL
+  SELECT * FROM secondary
+)
+SELECT
+  SetName,
+  UserId,
+  DisplayName,
+  Score,
+  LastActive,
+  BadgeCount,
+  CONCAT('Status: ', CASE WHEN LastActive IS NULL THEN 'Never Active' ELSE TO_CHAR(LastActive, 'YYYY-MM-DD HH24:MI:SS') END,
+         ' | Score: ', Score) AS Meta
+FROM top_sets
+ORDER BY SetName, Score DESC
+FETCH FIRST 200 ROWS ONLY;

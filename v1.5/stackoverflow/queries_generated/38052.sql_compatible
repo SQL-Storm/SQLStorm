@@ -1,0 +1,158 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from users)
+),
+q_posts as (
+  select p.id as post_id, p.owneruserid as user_id, p.creationdate, p.score, p.viewcount, p.title, p.tags
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts)
+),
+a_posts as (
+  select p.id as post_id, p.parentid as question_id, p.owneruserid as user_id, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+    and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts)
+),
+q_activity as (
+  select
+    q.post_id,
+    q.user_id,
+    (q.creationdate)::date as q_date,
+    q.score as q_score,
+    q.viewcount as q_views,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+    count(distinct a.post_id) as answers_count,
+    max(case when q.acceptedanswerid is not null then 1 else 0 end) as is_accepted_any
+  from q_posts q
+  left join votes v on v.postid = q.post_id and v.creationdate >= q.creationdate and v.creationdate < q.creationdate + interval '30 days'
+  left join a_posts a on a.question_id = q.post_id and a.creationdate < q.creationdate + interval '30 days'
+  group by q.post_id, q.user_id, q.creationdate, q.score, q.viewcount
+),
+answer_latency as (
+  select
+    q.post_id,
+    min(a.creationdate) - q.creationdate as first_answer_latency,
+    min(case when a.user_id = q.user_id then null else a.creationdate end) - q.creationdate as first_external_answer_latency
+  from q_posts q
+  left join a_posts a on a.question_id = q.post_id
+  group by q.post_id, q.creationdate
+),
+comment_bursts as (
+  select
+    c.postid as post_id,
+    count(*) filter (where c.creationdate < p.creationdate + interval '1 day') as comments_1d,
+    count(*) filter (where c.creationdate < p.creationdate + interval '7 days') as comments_7d,
+    max(c.creationdate) as last_comment_at
+  from posts p
+  join comments c on c.postid = p.id
+  where p.posttypeid = 1
+    and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts)
+  group by c.postid, p.creationdate
+),
+hot_candidates as (
+  select
+    q.post_id,
+    q.user_id,
+    q.q_date,
+    q.q_score,
+    q.q_views,
+    q.net_votes,
+    q.answers_count,
+    q.is_accepted_any,
+    coalesce(cb.comments_1d, 0) as comments_1d,
+    coalesce(cb.comments_7d, 0) as comments_7d,
+    coalesce(extract(epoch from al.first_answer_latency)/3600.0, 999999.0) as first_answer_latency_hours,
+    coalesce(extract(epoch from al.first_external_answer_latency)/3600.0, 999999.0) as first_external_answer_latency_hours
+  from q_activity q
+  left join comment_bursts cb on cb.post_id = q.post_id
+  left join answer_latency al on al.post_id = q.post_id
+),
+user_rollups as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    date_trunc('month', ru.creationdate) as cohort_month,
+    count(distinct hp.post_id) as questions_asked,
+    sum(hp.answers_count) as answers_received_30d,
+    avg(nullif(hp.first_answer_latency_hours, 999999.0)) as avg_first_answer_latency_h,
+    percentile_cont(0.5) within group (order by nullif(hp.first_external_answer_latency_hours, 999999.0)) as p50_ext_answer_latency_h,
+    sum(case when hp.net_votes > 0 then 1 else 0 end) as positive_net_vote_q_count,
+    sum(hp.comments_7d) as comments_7d_total,
+    sum(case when hp.q_views >= 1000 then 1 else 0 end) as k_views_plus_q
+  from recent_users ru
+  join hot_candidates hp on hp.user_id = ru.user_id
+  group by ru.user_id, ru.displayname, ru.reputation, date_trunc('month', ru.creationdate)
+),
+tag_explode as (
+  select
+    q.post_id,
+    lower(unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><'))) as tag
+  from q_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_stats as (
+  select
+    t.tag,
+    count(distinct t.post_id) as q_count,
+    avg(h.net_votes) as avg_net_votes,
+    avg(h.q_views) as avg_views,
+    percentile_cont(0.9) within group (order by h.q_views) as p90_views,
+    avg(h.answers_count) as avg_answers_30d
+  from tag_explode t
+  join hot_candidates h on h.post_id = t.post_id
+  group by t.tag
+  having count(distinct t.post_id) >= 50
+),
+dupe_graph as (
+  select
+    pl.relatedpostid as canonical_question_id,
+    count(*) as dup_count_2y
+  from postlinks pl
+  join posts pq on pq.id = pl.postid and pq.posttypeid = 1
+  where pl.linktypeid = 3
+    and pq.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts)
+  group by pl.relatedpostid
+),
+edits_7d as (
+  select
+    ph.postid as post_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events_7d
+  from posthistory ph
+  join posts p on p.id = ph.postid
+  where p.posttypeid = 1
+    and ph.creationdate >= p.creationdate
+    and ph.creationdate < p.creationdate + interval '7 days'
+    and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts)
+  group by ph.postid
+),
+final as (
+  select
+    ur.user_id,
+    ur.displayname,
+    ur.reputation,
+    ur.cohort_month,
+    ur.questions_asked,
+    ur.answers_received_30d,
+    round(ur.avg_first_answer_latency_h::numeric, 2) as avg_first_answer_latency_h,
+    round(ur.p50_ext_answer_latency_h::numeric, 2) as p50_ext_answer_latency_h,
+    ur.positive_net_vote_q_count,
+    ur.comments_7d_total,
+    ur.k_views_plus_q,
+    coalesce(sum(case when h.q_views >= ts.p90_views then 1 else 0 end), 0) as questions_in_top10p_views_for_tag,
+    coalesce(sum(e.edit_events_7d), 0) as edit_events_7d_total,
+    coalesce(sum(dg.dup_count_2y), 0) as dupes_pointing_to_their_questions
+  from user_rollups ur
+  left join hot_candidates h on h.user_id = ur.user_id
+  left join tag_explode te on te.post_id = h.post_id
+  left join tag_stats ts on ts.tag = te.tag
+  left join edits_7d e on e.post_id = h.post_id
+  left join dupe_graph dg on dg.canonical_question_id = h.post_id
+  group by ur.user_id, ur.displayname, ur.reputation, ur.cohort_month, ur.questions_asked, ur.answers_received_30d, ur.avg_first_answer_latency_h, ur.p50_ext_answer_latency_h, ur.positive_net_vote_q_count, ur.comments_7d_total, ur.k_views_plus_q
+)
+select *
+from final
+order by questions_in_top10p_views_for_tag desc nulls last, answers_received_30d desc, reputation desc
+limit 200;

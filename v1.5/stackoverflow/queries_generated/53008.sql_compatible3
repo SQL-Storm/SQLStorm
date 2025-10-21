@@ -1,0 +1,89 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        SUM(CASE WHEN TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges
+    GROUP BY UserId
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        STRING_AGG(t.TagName, ', ') AS Tags
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY p.Id, p.Title, p.ViewCount, p.AnswerCount, p.FavoriteCount
+    ORDER BY p.ViewCount DESC
+    LIMIT 100
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    WHERE v.CreationDate > DATE '2024-10-01' - INTERVAL '1 year'
+    GROUP BY v.PostId
+),
+CommentStats AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT 
+    ua.UserId,
+    ua.Reputation,
+    ua.PostCount,
+    ua.TotalScore,
+    ua.AvgViewCount,
+    ua.LastPostDate,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.TagBasedBadges,
+    tq.QuestionId,
+    tq.Title,
+    tq.ViewCount AS QuestionViews,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.Tags,
+    va.Upvotes,
+    va.Downvotes,
+    va.UniqueVoters,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    RANK() OVER (PARTITION BY tq.Tags ORDER BY ua.TotalScore DESC) AS RankInTag
+FROM UserActivity ua
+INNER JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId AND p.PostTypeId = 2
+LEFT JOIN TopQuestions tq ON p.ParentId = tq.QuestionId
+LEFT JOIN VoteAnalysis va ON tq.QuestionId = va.PostId
+LEFT JOIN CommentStats cs ON tq.QuestionId = cs.PostId
+WHERE ua.Reputation > 1000 AND bs.GoldBadges >= 1
+ORDER BY ua.TotalScore DESC, tq.ViewCount DESC
+LIMIT 500;

@@ -1,0 +1,107 @@
+WITH UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id
+),
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT p.Id) AS PostsLast30Days
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+     AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+  GROUP BY u.Id
+),
+BadgeAgg AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgesEarned,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TagEngagement AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  GROUP BY t.Id, t.TagName
+),
+Joined AS (
+  SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.CreationDate,
+    us.LastAccessDate,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes,
+    us.Location,
+    us.ProfileImageUrl,
+    us.EmailHash,
+    us.AccountId,
+    COALESCE(rs.PostsLast30Days, 0) AS PostsLast30Days,
+    COALESCE(ba.BadgesEarned, 0) AS BadgesEarned,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ua.QuestionCount, 0) AS QuestionCount,
+    COALESCE(ua.AnswerCount, 0) AS AnswerCount
+  FROM UserStats us
+  LEFT JOIN RecentActivity rs ON rs.UserId = us.UserId
+  LEFT JOIN BadgeAgg ba ON ba.UserId = us.UserId
+  LEFT JOIN (
+    SELECT UserId,
+           COUNT(*) AS QuestionCount,
+           SUM(CASE WHEN p.IsDeleted = 0 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    GROUP BY UserId
+  ) ua ON ua.UserId = us.UserId
+)
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  u.Views AS ProfileViews,
+  u.UpVotes,
+  u.DownVotes,
+  u.AccountId,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.EmailHash,
+  u.ProfileImageUrl,
+  u.BadgesEarned,
+  u.GoldBadges,
+  u.PostsLast30Days,
+  u.QuestionCount,
+  u.AnswerCount,
+  (u.QuestionCount - u.AnswerCount) AS ContentRatio,
+  (u.Views * 0.1) + (COALESCE(u.BadgesEarned,0) * 0.5) AS CompositeScore,
+  STRING_AGG(CONCAT(t.TagName, ':', t.TagCount), ' | ') AS TagEngagement
+FROM Joined u
+LEFT JOIN TagEngagement t ON TRUE
+GROUP BY
+  u.DisplayName, u.Reputation, u.Location, u.Views, u.UpVotes, u.DownVotes,
+  u.AccountId, u.CreationDate, u.LastAccessDate, u.EmailHash, u.ProfileImageUrl,
+  u.BadgesEarned, u.GoldBadges, u.PostsLast30Days, u.QuestionCount, u.AnswerCount
+ORDER BY CompositeScore DESC
+LIMIT 100;

@@ -1,0 +1,150 @@
+-- {"query": "6004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1336} 
+WITH
+
+-- Sample: compute a rich performance benchmark dataset combining users, posts, votes, and history
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.DisplayName,
+    u.Location,
+    u.EmailHash,
+    -- engagement score with NULL-safe arithmetic
+    (COALESCE(vs.UpModCount,0) - COALESCE(vs.DownModCount,0) + COALESCE(vs.BountyImpact,0)) AS EngagementScore
+  FROM Users u
+  LEFT JOIN (
+    -- Upvotes and downvotes counts for the user via Votes on their posts
+    SELECT
+      p.OwnerUserId AS UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpModCount,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownModCount,
+      SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS BountyImpact
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+  ) vs ON vs.UserId = u.Id
+  WHERE u.AccountId IS NOT NULL
+),
+-- Posts with complex predicates and calculated fields
+post_frag AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    -- window function: rank posts by score within each post type over last 365 days
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RkByTypeScore,
+    -- compute a derived metric
+    (p.Score * 1.0 / NULLIF(p.ViewCount,0)) AS ScorePerView
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '365 days'
+),
+-- Correlated subquery to fetch tag-related wiki/excerpt posts for each question
+tag_related AS (
+  SELECT
+    t.Id AS TagPostId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+),
+-- Complex joins: posts -> post history (recent edits/closures) with nulls and expressions
+history_enhanced AS (
+  SELECT
+    ph.Id AS HistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID,
+    ph.ContentLicense,
+    -- interpret CloseReasonId from Comment when Type is 10 (Post Closed)
+    CASE
+      WHEN ph.PostHistoryTypeId = 10 THEN CAST((ph.Comment->>'CloseReasonId') AS smallint)
+      ELSE NULL
+    END AS CloseReasonId
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= NOW() - INTERVAL '180 days'
+),
+-- Outer join scenario: PostLinks possibly linking to related posts (some may be NULL on purpose)
+linked_posts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate
+  FROM PostLinks pl
+  LEFT JOIN Posts p ON p.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId IS NOT NULL
+),
+-- Set operation: union a synthetic benchmark subset with a selective real subset
+benchmark_set AS (
+  (SELECT 'A' AS Src, u.UserId, p.PostId, ph.HistoryId
+   FROM user_stats u
+   CROSS JOIN post_frag p
+   LEFT JOIN history_enhanced ph ON ph.PostId = p.PostId
+   WHERE p.RkByTypeScore <= 50)
+  UNION ALL
+  (SELECT 'B' AS Src, u.UserId, p.PostId, ph.HistoryId
+   FROM user_stats u
+   JOIN post_frag p ON p.OwnerUserId = u.UserId
+   LEFT JOIN history_enhanced ph ON ph.PostId = p.PostId
+   WHERE p.RkByTypeScore BETWEEN 51 AND 200)
+)
+SELECT
+  bs.Src,
+  bs.UserId,
+  us.DisplayName AS UserDisplayName,
+  bs.PostId,
+  pf.Title AS PostTitle,
+  pf.PostTypeId,
+  pf.CreationDate AS PostCreationDate,
+  pf.ViewCount,
+  pf.Score,
+  pf.RkByTypeScore,
+  pf.ScorePerView,
+  pi.TagPostId,
+  t.TagName,
+  t.Count AS TagCount,
+  hb.HistoryId,
+  hb.PostHistoryTypeId,
+  hb.CreationDate AS HistoryDate,
+  hb.CloseReasonId,
+  ll.RelatedPostId AS LinkedPostId,
+  ll.LinkTypeId,
+  ll.CreationDate AS LinkCreationDate,
+  -- a few random expressions to exercise NULL handling and string ops
+  CASE WHEN pf.OwnerUserId IS NULL THEN 'Unknown' ELSE (SELECT DisplayName FROM Users WHERE Id = pf.OwnerUserId) END AS OwnerNameCached,
+  LOWER(COALESCE(pf.Title, 'Untitled')) AS TitleLower,
+  LENGTH(COALESCE(pf.Body, '')) AS BodyLength,
+  CASE
+    WHEN pf.CommentCount IS NULL THEN 0
+    WHEN pf.CommentCount > 100 THEN 100
+    ELSE pf.CommentCount
+  END AS CommentCountClamped
+FROM benchmark_set bs
+JOIN post_frag pf ON pf.PostId = bs.PostId
+LEFT JOIN Users us ON us.Id = bs.UserId
+LEFT JOIN tag_related t ON t.ExcerptPostId = pf.PostId OR t.WikiPostId = pf.PostId
+LEFT JOIN history_enhanced hb ON hb.PostId = pf.PostId
+LEFT JOIN linked_posts ll ON ll.PostId = pf.PostId
+ORDER BY bs.Src, pf.RkByTypeScore DESC
+LIMIT 100;

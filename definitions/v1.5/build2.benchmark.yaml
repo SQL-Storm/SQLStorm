@@ -1,0 +1,27 @@
+title: SQLStorm v1.5 Build2 Benchmark (Compatibility 3)
+repetitions: 1
+warmup: 0
+timeout: 1
+fetch_result: false
+output: results/v1.5/build2
+systems:
+  - title: Umbra
+    dbms: umbra
+    disabled: false
+    settings:
+      usedirectio: true
+      optimizer.sidewayinformationpassing: false
+    parameter:
+      version: "25.01"
+  - title: DuckDB
+    dbms: duckdb
+    disabled: false
+    settings: { }
+    parameter:
+      version: "1.2.0"
+  - title: Postgres
+    dbms: postgres
+    disabled: false
+    settings: { }
+    parameter:
+      version: "17.0"

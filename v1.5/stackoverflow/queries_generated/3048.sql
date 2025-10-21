@@ -1,0 +1,138 @@
+-- {"query": "3048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1169} 
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.Tags LIKE '%' || 'performance' || '%' THEN 1 ELSE 0 END) AS PerformanceTaggedQuestions
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 33, 34)
+    GROUP BY ph.PostId
+),
+LatestVotes AS (
+    SELECT
+        v.PostId,
+        v.UserId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId, v.UserId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+),
+VoterProfiles AS (
+    SELECT DISTINCT
+        lv.PostId,
+        u.DisplayName AS VoterName,
+        u.Reputation AS VoterReputation,
+        v.VoteTypeId
+    FROM LatestVotes lv
+    JOIN Users u ON lv.UserId = u.Id
+    WHERE lv.rn = 1
+),
+CommentsStat AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate) AS CommentTexts
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate AS QuestionDate,
+        p.Score AS QuestionScore,
+        a.Id AS AcceptedAnswerId
+    FROM Posts p
+    LEFT OUTER JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE p.PostTypeId = 1
+),
+TagsUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(*) AS UsageCount,
+        MAX(t.WikiPostId) AS WikiPostId
+    FROM Tags t
+    GROUP BY t.TagName
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(uu.Reputation, 0) AS OwnerReputation,
+        EXISTS (
+            SELECT 1 FROM VoteTypes vt WHERE vt.Id = 2 AND vt.Name LIKE '%upvote%'
+        ) AS HasUpVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS NumComments
+    FROM Posts p
+    LEFT OUTER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT OUTER JOIN Users uu ON p.OwnerUserId = uu.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.CreationDate >= NOW() - INTERVAL '1 year'
+      AND (p.Tags IS NOT NULL AND array_length(string_to_array(p.Tags, '><'), 1) >= 2)
+      AND (
+            p.Tags LIKE '%performance%' AND
+            (p.Score > 10 OR u.Reputation > 2000)
+          )
+),
+FinalResults AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.AvgScore,
+        u.PerformanceTaggedQuestions,
+        re.EditCount,
+        re.LastEditDate,
+        rv.VoterName,
+        rv.Reputation AS VoterReputation,
+        c.CommentCount,
+        c.AvgCommentScore,
+        c.CommentTexts,
+        qd.QuestionId,
+        qd.Title,
+        qd.Tags,
+        qd.QuestionDate,
+        qd.QuestionScore,
+        qd.AcceptedAnswerId,
+        tu.UsageCount AS TagUsageCount,
+        co.PostId AS ComplexPostId,
+        co.Title AS ComplexPostTitle,
+        co.Score AS ComplexPostScore,
+        co.CreationDate AS ComplexPostDate,
+        co.Tags AS ComplexPostTags,
+        co.OwnerReputation AS ComplexPostOwnerReputation,
+        co.HasUpVotes,
+        co.NumComments
+    FROM UserPostStats u
+    LEFT OUTER JOIN RecentEdits re ON u.UserId = re.PostId
+    LEFT OUTER JOIN VoterProfiles rv ON u.UserId = rv.PostId
+    LEFT OUTER JOIN CommentsStat c ON u.UserId = c.PostId
+    LEFT OUTER JOIN QuestionDetails qd ON u.UserId = qd.QuestionId
+    LEFT OUTER JOIN TagsUsage tu ON tu.TagName = ANY(string_to_array(qd.Tags, '><'))
+    LEFT OUTER JOIN ComplexFilteredPosts co ON co.PostId = u.UserId
+    WHERE u.UserId % 2 = 0 -- sample predicate for performance distribution
+)
+SELECT * FROM FinalResults
+ORDER BY UserId
+LIMIT 100;

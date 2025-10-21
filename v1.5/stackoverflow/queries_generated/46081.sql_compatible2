@@ -1,0 +1,120 @@
+WITH RECURSIVE UserInfluenceGraph AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COALESCE(AVG(p.Score), 0) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    WHERE u.CreationDate >= DATE '2024-10-01' - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT a.Id) >= 5
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS TagPostCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedQuestions
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId, TagName
+),
+TopTagExperts AS (
+    SELECT 
+        te.*,
+        t.Count AS TagPopularity,
+        ROW_NUMBER() OVER (PARTITION BY te.TagName ORDER BY te.TagPostCount DESC, te.AvgTagScore DESC) AS ExpertRank
+    FROM TagExpertise te
+    INNER JOIN Tags t ON te.TagName = t.TagName
+    WHERE t.Count >= 1000
+),
+AnswerQuality AS (
+    SELECT 
+        a.OwnerUserId,
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvoteCount,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToAnswer
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE a.PostTypeId = 2
+        AND a.OwnerUserId IS NOT NULL
+        AND a.CreationDate >= DATE '2024-10-01' - INTERVAL '18 months'
+    GROUP BY a.OwnerUserId, a.Id, a.ParentId, a.Score, a.CreationDate, q.Score, q.ViewCount, q.AcceptedAnswerId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) AS TagBasedBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Date >= DATE '2024-10-01' - INTERVAL '2 years'
+    GROUP BY b.UserId
+),
+EditingActivity AS (
+    SELECT 
+        ph.UserId AS EditorId,
+        COUNT(DISTINCT ph.PostId) AS PostsEdited,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 8 THEN ph.Id END) AS RollbackCount,
+        AVG(LENGTH(ph.Text)) AS AvgEditLength
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.CreationDate >= DATE '2024-10-01' - INTERVAL '18 months'
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 8, 24)
+    GROUP BY ph.UserId
+)
+SELECT 
+    uig.UserId,
+    uig.DisplayName,
+    uig.Reputation,
+    uig.QuestionCount,
+    uig.AnswerCount,
+    uig.TotalViews,
+    ROUND(CAST(uig.AvgQuestionScore AS numeric), 2) AS AvgQuestionScore,
+    COUNT(DISTINCT tte.TagName) AS ExpertTagCount,
+    STRING_AGG(DISTINCT tte.TagName, ', ' ORDER BY tte.TagName) FILTER (WHERE tte.ExpertRank <= 3) AS TopExpertiseTags,
+    ROUND(AVG(aq.AnswerScore)::numeric, 2) AS AvgAnswerScore,
+    ROUND(AVG(aq.HoursToAnswer)::numeric, 2) AS AvgHoursToAnswer,
+    SUM(aq.IsAccepted) AS AcceptedAnswers,
+    ROUND((SUM(aq.IsAccepted)::numeric / NULLIF(COUNT(aq.AnswerId), 0)) * 100, 2) AS AcceptanceRate,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ea.PostsEdited, 0) AS PostsEdited,
+    COALESCE(ea.EditCount, 0) AS TotalEdits,
+    ROUND((uIg.Reputation::numeric / NULLIF(EXTRACT(EPOCH FROM (DATE '2024-10-01' - uig.CreationDate)) / 86400, 0))::numeric, 2) AS ReputationPerDay,
+    ROUND((SUM(aq.UpvoteCount)::numeric / NULLIF(SUM(aq.UpvoteCount + aq.DownvoteCount), 0)) * 100, 2) AS PositiveVoteRatio
+FROM UserInfluenceGraph uig
+LEFT JOIN TopTagExperts tte ON uig.UserId = tte.OwnerUserId AND tte.ExpertRank <= 5
+LEFT JOIN AnswerQuality aq ON uig.UserId = aq.OwnerUserId
+LEFT JOIN BadgeAchievements ba ON uig.UserId = ba.UserId
+LEFT JOIN EditingActivity ea ON uig.UserId = ea.EditorId
+GROUP BY uig.UserId, uig.DisplayName, uig.Reputation, uig.QuestionCount, uig.AnswerCount, 
+         uig.TotalViews, uig.AvgQuestionScore, uig.CreationDate, ba.GoldBadges, 
+         ba.SilverBadges, ba.BronzeBadges, ea.PostsEdited, ea.EditCount
+HAVING COUNT(aq.AnswerId) >= 10
+ORDER BY uig.Reputation DESC, AcceptanceRate DESC
+LIMIT 100;

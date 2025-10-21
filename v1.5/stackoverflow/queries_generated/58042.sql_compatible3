@@ -1,0 +1,47 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+UserPosts AS (
+    SELECT p.OwnerUserId, p.Id AS PostId, p.Title, p.Score, p.ViewCount, p.Tags,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+           (SELECT SUM(v.VoteTypeId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+           (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > DATE '2020-01-01'
+),
+TagUsage AS (
+    SELECT t.TagName,
+           COUNT(pt.PostId) AS UsageCount,
+           pt.OwnerUserId
+    FROM Tags t
+    JOIN (
+        SELECT DISTINCT p.OwnerUserId,
+                        /* Normalize tags into a comma-separated list without the surrounding <...> */
+                        REGEXP_REPLACE(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><', ',') AS Tag
+        FROM UserPosts p
+    ) AS pt ON t.TagName = ANY(string_to_array(pt.Tag, ','))
+    GROUP BY t.TagName, pt.OwnerUserId
+)
+SELECT tu.DisplayName AS DisplayName,
+       tu.GoldBadges AS GoldBadges,
+       tu.ReputationRank AS ReputationRank,
+       up.PostId AS PostId,
+       up.Title AS Title,
+       up.Score AS Score,
+       up.CommentCount AS CommentCount,
+       up.Upvotes AS Upvotes,
+       up.EditCount AS EditCount,
+       STRING_AGG(tua.TagName, ', ' ORDER BY tua.UsageCount DESC) AS TopTags,
+       AVG(up.Score) OVER (PARTITION BY tu.Id) AS AvgPostScore,
+       MAX(up.ViewCount) OVER () AS MaxGlobalViews
+FROM TopUsers AS tu
+JOIN UserPosts AS up ON tu.Id = up.OwnerUserId
+LEFT JOIN TagUsage AS tua ON tu.Id = tua.OwnerUserId
+GROUP BY tu.DisplayName, tu.GoldBadges, tu.ReputationRank, up.PostId, up.Title, up.Score, up.CommentCount, up.Upvotes, up.EditCount
+HAVING AVG(up.Score) > 10 AND SUM(up.Upvotes) > 50
+ORDER BY tu.ReputationRank, up.Score DESC
+LIMIT 100;

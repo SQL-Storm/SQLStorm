@@ -1,0 +1,103 @@
+-- {"query": "26033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 708} 
+
+WITH TopPosts AS (
+  SELECT 
+    p.Id, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    p.FavoriteCount, 
+    p.ClosedDate, 
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RowNum
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId IN (1, 2)
+),
+UserBadges AS (
+  SELECT 
+    u.Id, 
+    COUNT(b.Id) AS BadgeCount
+  FROM 
+    Users u
+  LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id
+),
+PostHistoryDetails AS (
+  SELECT 
+    ph.PostId, 
+    ph.PostHistoryTypeId, 
+    ph.CreationDate, 
+    ph.UserId, 
+    ph.Comment, 
+    ph.Text, 
+    LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevCreationDate
+  FROM 
+    PostHistory ph
+  WHERE 
+    ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+)
+SELECT 
+  p.Id, 
+  p.Title, 
+  p.Score, 
+  p.ViewCount, 
+  p.AnswerCount, 
+  p.FavoriteCount, 
+  p.ClosedDate, 
+  u.DisplayName, 
+  u.Reputation, 
+  ub.BadgeCount, 
+  phd.PostHistoryTypeId, 
+  phd.CreationDate, 
+  phd.Comment, 
+  phd.Text, 
+  phd.PrevCreationDate, 
+  COUNT(DISTINCT v.Id) AS VoteCount, 
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount, 
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount, 
+  STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+FROM 
+  Posts p
+JOIN 
+  TopPosts tp ON p.Id = tp.Id
+JOIN 
+  Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+  UserBadges ub ON u.Id = ub.Id
+LEFT JOIN 
+  PostHistoryDetails phd ON p.Id = phd.PostId
+LEFT JOIN 
+  Votes v ON p.Id = v.PostId
+LEFT JOIN 
+  PostTags pt ON p.Id = pt.PostId
+LEFT JOIN 
+  Tags t ON pt.TagId = t.Id
+WHERE 
+  p.PostTypeId = 1
+  AND p.Score > 0
+  AND p.ViewCount > 100
+  AND p.AnswerCount > 0
+  AND p.FavoriteCount > 0
+  AND p.ClosedDate IS NULL
+GROUP BY 
+  p.Id, 
+  p.Title, 
+  p.Score, 
+  p.ViewCount, 
+  p.AnswerCount, 
+  p.FavoriteCount, 
+  p.ClosedDate, 
+  u.DisplayName, 
+  u.Reputation, 
+  ub.BadgeCount, 
+  phd.PostHistoryTypeId, 
+  phd.CreationDate, 
+  phd.Comment, 
+  phd.Text, 
+  phd.PrevCreationDate
+ORDER BY 
+  p.Score DESC, 
+  p.ViewCount DESC;

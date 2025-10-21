@@ -1,0 +1,68 @@
+WITH RecursiveActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS TotalPosts
+    FROM 
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(p.Id) > 0
+),
+BadgeStatistics AS (
+    SELECT 
+        b.UserId, 
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        s.TagName
+    FROM Posts p
+    JOIN (
+        SELECT TRIM(value) AS TagName
+        FROM (
+            SELECT value
+            FROM (
+                SELECT REPLACE(REPLACE(p.Tags, '<', ''), '>', '') AS TagsClean
+            ) AS t
+            CROSS APPLY
+                STRING_SPLIT(t.TagsClean, ' ')
+        ) AS inner_split
+        WHERE value <> ''
+    ) AS s ON s.TagName IS NOT NULL
+)
+SELECT 
+    rau.DisplayName, 
+    rau.Reputation, 
+    rau.TotalPosts,
+    bs.GoldBadges, 
+    bs.SilverBadges, 
+    bs.BronzeBadges,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    AVG(COALESCE(v.BountyAmount, 0)) AS AverageBounty,
+    STRING_AGG(DISTINCT pt.TagName, ', ') AS TagsUsed
+FROM 
+    RecursiveActiveUsers rau
+LEFT JOIN BadgeStatistics bs ON rau.Id = bs.UserId
+LEFT JOIN Posts p ON rau.Id = p.OwnerUserId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostTags pt ON p.Id = pt.PostId
+GROUP BY 
+    rau.DisplayName, 
+    rau.Reputation, 
+    rau.TotalPosts, 
+    bs.GoldBadges, 
+    bs.SilverBadges, 
+    bs.BronzeBadges
+ORDER BY rau.Reputation DESC, bs.GoldBadges DESC
+LIMIT 100;

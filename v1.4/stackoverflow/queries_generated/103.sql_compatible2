@@ -1,0 +1,83 @@
+WITH
+PostStats AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS PostCount,
+    COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+VoteStats AS (
+  SELECT
+    v.UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+  FROM Votes v
+  GROUP BY v.UserId
+),
+BadgeCounts AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+LastActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+TopPostPerUser AS (
+  SELECT
+    q.OwnerUserId,
+    q.Title,
+    q.Score,
+    q.ViewCount
+  FROM (
+    SELECT
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      ROW_NUMBER() OVER (
+        PARTITION BY p.OwnerUserId
+        ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST
+      ) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+  ) q
+  WHERE q.rn = 1
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  (CASE WHEN u.Version IS NULL THEN 1 ELSE 0 END) AS _unused_null_check,
+  ps.PostCount,
+  ps.TotalPostScore,
+  ps.LastPostDate,
+  vs.UpVotesGiven,
+  vs.DownVotesGiven,
+  bc.TotalBadges,
+  bc.GoldBadges,
+  la.LastActivity,
+  tpt.Title AS MostViewedPostTitle,
+  tpt.Score AS MostViewedPostScore,
+  tpt.ViewCount AS MostViewedPostViews
+FROM Users u
+LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+LEFT JOIN VoteStats vs ON vs.UserId = u.Id
+LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+LEFT JOIN LastActivity la ON la.UserId = u.Id
+LEFT JOIN TopPostPerUser tpt ON tpt.OwnerUserId = u.Id
+ORDER BY u.Reputation DESC NULLS LAST
+LIMIT 100;

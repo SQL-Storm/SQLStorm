@@ -1,0 +1,74 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViewCount,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT 
+        Tag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgTagScore
+    FROM (
+        SELECT
+            NULLIF(REGEXP_REPLACE(p.Tags, '^[<>]|[<>]$', '', 'g'), '') AS TagsCleaned,
+            p.Score
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+    ) s
+    CROSS JOIN LATERAL (
+        SELECT 
+            TRIM(value) AS Tag
+        FROM STRING_SPLIT(s.TagsCleaned, '><')
+    ) AS t(Tag)
+    GROUP BY Tag
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.PostCount,
+    ups.AvgPostScore,
+    ups.MedianViewCount,
+    tp.Tag AS MostFrequentTag,
+    tp.TagCount,
+    tp.AvgTagScore,
+    CASE 
+        WHEN ups.PostCount > 0 AND tp.TagCount > 100 THEN 'Influential'
+        WHEN ups.PostCount > 10 THEN 'Active'
+        ELSE 'Casual'
+    END AS UserCategory,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = ups.UserId 
+          AND b.Class = 1
+    ) AS GoldBadgeCount,
+    COALESCE(
+        (
+            SELECT MAX(v.CreationDate) 
+            FROM Votes v 
+            JOIN Posts p ON v.PostId = p.Id 
+            WHERE p.OwnerUserId = ups.UserId AND v.VoteTypeId = 2
+        ), 
+        TIMESTAMP '1970-01-01 00:00:00'
+    ) AS LastUpvoteReceived
+FROM UserPostStats ups
+JOIN TagPopularity tp ON tp.Tag IN (
+        SELECT Tag
+        FROM TagPopularity tp2
+        WHERE tp2.Tag IN (
+            SELECT TRIM(value)
+            FROM STRING_SPLIT((SELECT STRING_AGG(p2.Tags, ',') FROM Posts p2 WHERE p2.Tags IS NOT NULL), '><')
+        )
+    )
+WHERE ups.PostCount > 5 
+  AND ups.AvgPostScore > 1
+ORDER BY ups.PostCount * ups.AvgPostScore DESC
+LIMIT 100;

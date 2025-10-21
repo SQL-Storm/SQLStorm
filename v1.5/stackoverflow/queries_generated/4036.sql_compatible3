@@ -1,0 +1,133 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.Score, 0) * 2 + POWER(COALESCE(p.ViewCount, 0), 0.5) + COALESCE(p.AnswerCount, 0) * 3 AS WeightedScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY (COALESCE(p.Score, 0) * 2 + POWER(COALESCE(p.ViewCount, 0), 0.5) + COALESCE(p.AnswerCount, 0) * 3) DESC,
+                     p.CreationDate ASC NULLS LAST
+        ) AS RankInType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > TIMESTAMP '2024-10-01 12:34:56')
+), BadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+), AnswerScores AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(*) AS TotalAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+), DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+), PostComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        STRING_AGG(
+            COALESCE(NULLIF(TRIM(SUBSTR(c.Text, 1, 40)), ''), '[no comment text]'),
+            ' | '
+            ) AS RecentCommentsSnippet
+    FROM Comments c
+    GROUP BY c.PostId
+), PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS VARCHAR(255))
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+    GROUP BY ph.PostId
+), UserAggregates AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(bc.TotalBadges, 0) AS TotalBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+    FROM Users u
+    LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+), CorrelatedActivity AS (
+    SELECT
+        p.Id AS PostId,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.CreationDate >= p.CreationDate) AS HistoryRevisions,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount, 
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount
+    FROM Posts p
+)
+SELECT
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.WeightedScore,
+    rp.RankInType,
+    rp.OwnerUserId,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalBadges,
+    ua.ReputationRank,
+    COALESCE(ascores.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(ascores.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(ascores.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(dl.DuplicateCount, 0) AS DuplicateLinksCount,
+    COALESCE(pc.TotalComments, 0) AS TotalComments,
+    COALESCE(pc.TotalCommentScore, 0) AS TotalCommentScore,
+    LEFT(pc.RecentCommentsSnippet, 600) AS RecentCommentsSnippet,
+    COALESCE(pcr.CloseReasons, 'None') AS CloseReasons,
+    ca.HistoryRevisions,
+    ca.UpVotesCount,
+    ca.DownVotesCount,
+    CONCAT_WS(' | ',
+        rp.Title,
+        'Posted by: ', COALESCE(ua.DisplayName, 'Anonymous'),
+        'Score/View:', CAST(rp.Score AS VARCHAR) || '/' || COALESCE(CAST(rp.ViewCount AS VARCHAR), '0'),
+        CASE
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END,
+        'Badges(G/S/B):', CAST(ua.GoldBadges AS VARCHAR) || '/' || CAST(ua.SilverBadges AS VARCHAR) || '/' || CAST(ua.BronzeBadges AS VARCHAR),
+        'Duplicates:', COALESCE(CAST(dl.DuplicateCount AS VARCHAR), '0')
+    ) AS SummaryInfo
+FROM RankedPosts rp
+LEFT JOIN UserAggregates ua ON ua.Id = rp.OwnerUserId
+LEFT JOIN AnswerScores ascores ON ascores.QuestionId = rp.Id
+LEFT JOIN DuplicateLinks dl ON dl.PostId = rp.Id
+LEFT JOIN PostComments pc ON pc.PostId = rp.Id
+LEFT JOIN PostCloseReasons pcr ON pcr.PostId = rp.Id
+LEFT JOIN CorrelatedActivity ca ON ca.PostId = rp.Id
+WHERE rp.RankInType <= 100
+ORDER BY rp.PostTypeId, rp.RankInType;

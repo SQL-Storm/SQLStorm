@@ -1,0 +1,95 @@
+WITH recent_questions AS (
+    SELECT 
+        p.Id AS post_id,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Title,
+        u.Reputation AS owner_rep,
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS owner_name,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT OUTER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    AND p.DeletedDate IS NULL
+),
+user_activity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS posts_edited,
+        AVG(DATE_PART('day', ph.CreationDate - ph.PostId)) AS avg_days_to_edit,
+        STRING_AGG(DISTINCT SUBSTR(ph.Comment, 1, 50), ' | ') AS edit_comments
+    FROM PostHistory ph
+    INNER JOIN recent_questions rq ON ph.PostId = rq.post_id
+    WHERE ph.PostHistoryTypeId IN (5, 6)
+    AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+    HAVING COUNT(DISTINCT ph.PostId) >= 3
+),
+top_bounties AS (
+    SELECT 
+        v.PostId,
+        SUM(v.BountyAmount) AS total_bounty,
+        COUNT(*) AS bounty_count
+    FROM Votes v
+    WHERE v.VoteTypeId = 8
+    GROUP BY v.PostId
+),
+linked_posts_stats AS (
+    SELECT 
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS outbound_links,
+        AVG(CAST(pl.RelatedPostScore AS double precision)) AS avg_linked_score
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+)
+SELECT 
+    rq.post_id,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score AS question_score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.owner_rep,
+    rq.owner_name,
+    COALESCE(ua.posts_edited, 0) AS editor_activity,
+    tb.total_bounty,
+    lps.outbound_links,
+    lps.avg_linked_score,
+    CASE 
+        WHEN rq.Title IS NULL THEN 'Untitled'
+        ELSE UPPER(SUBSTR(rq.Title, 1, 1)) || LOWER(SUBSTR(rq.Title, 2))
+    END AS title_case,
+    RANK() OVER (ORDER BY rq.ViewCount DESC, rq.Score DESC) AS view_rank,
+    (SELECT pa.Score FROM Posts pa WHERE pa.Id = rq.AcceptedAnswerId AND pa.PostTypeId = 2) AS accepted_answer_score,
+    (SELECT COUNT(*) FROM (
+        SELECT v1.PostId FROM Votes v1 WHERE v1.VoteTypeId = 2 AND v1.PostId = rq.post_id
+        UNION ALL
+        SELECT v2.PostId FROM Votes v2 WHERE v2.VoteTypeId = 3 AND v2.PostId = rq.post_id
+    ) upvotes_downvotes) AS total_votes,
+    CASE 
+        WHEN rq.AnswerCount > 0 AND rq.ViewCount > 0 
+        THEN ROUND((CAST(rq.Score AS double precision) / NULLIF(rq.ViewCount, 0)) * rq.AnswerCount, 2)
+        ELSE 0
+    END AS engagement_ratio,
+    (SELECT STRING_AGG(b.Name, ', ') 
+     FROM Badges b 
+     WHERE b.UserId = rq.OwnerUserId 
+     AND b.Class = 1
+    ) AS gold_badges
+FROM recent_questions rq
+LEFT JOIN user_activity ua ON rq.OwnerUserId = ua.UserId
+LEFT JOIN top_bounties tb ON rq.post_id = tb.PostId
+LEFT JOIN linked_posts_stats lps ON rq.post_id = lps.PostId
+WHERE rq.rn <= 10
+  AND (rq.owner_rep > 1000 OR rq.ViewCount > 10000)
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph2 
+      WHERE ph2.PostId = rq.post_id 
+      AND ph2.PostHistoryTypeId = 12
+      AND ph2.CreationDate > rq.CreationDate
+  )
+ORDER BY rq.CreationDate DESC, view_rank;

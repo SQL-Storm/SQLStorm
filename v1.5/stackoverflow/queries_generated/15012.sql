@@ -1,0 +1,57 @@
+-- {"query": "15012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 30355, "output_tokens": 8960} 
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostActivityRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS TagPostCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianTagScore
+    FROM Tags t
+    JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    WHERE t.Count > 50
+    GROUP BY t.TagName
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.TotalBadges,
+    tp.TagName AS MostPopularTag,
+    tp.TagPostCount,
+    CASE 
+        WHEN ubs.HasGoldBadge = 1 THEN 'Gold Badge Holder'
+        ELSE 'Non-Gold Badge User'
+    END AS UserCategory,
+    ROUND(
+        (SELECT AVG(v.Score) 
+         FROM Votes v 
+         JOIN Posts p ON v.PostId = p.Id 
+         WHERE p.OwnerUserId = ubs.UserId 
+           AND v.VoteTypeId IN (2,3)
+        ), 2
+    ) AS AverageVoteScore,
+    ubs.PostActivityRank
+FROM UserBadgeStats ubs
+JOIN TagPopularity tp ON tp.TagPostCount = (
+    SELECT MAX(TagPostCount) 
+    FROM TagPopularity
+)
+WHERE ubs.TotalBadges > 5
+    AND EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.UserId = ubs.UserId 
+          AND c.Score > 0
+    )
+ORDER BY ubs.TotalBadges DESC, AverageVoteScore DESC
+LIMIT 100;

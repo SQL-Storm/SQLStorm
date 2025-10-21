@@ -1,0 +1,129 @@
+-- {"query": "21015.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1269} 
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.DeletionDate IS NULL
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+    WHERE u.Reputation > 100
+        AND u.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 5
+),
+TopContributors AS (
+    SELECT 
+        au.*,
+        au.QuestionCount + au.AnswerCount AS TotalPosts,
+        LAG(au.Reputation) OVER (ORDER BY au.RepRank) AS PrevRep
+    FROM ActiveUsers au
+    WHERE au.RepRank <= 1000
+),
+RecentPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+        SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2) AS FirstTag,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.Score < 0 THEN 'Negative'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > cast('2024-10-01' as date) - INTERVAL '30 days')
+),
+LinkedPostsStats AS (
+    SELECT 
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkCount,
+        AVG(rp.Score) AS AvgLinkedScore,
+        STRING_AGG(DISTINCT SUBSTRING(rp.Tags, 2, 50), ' | ') AS LinkedTags
+    FROM PostLinks pl
+    JOIN RecentPosts rp ON pl.RelatedPostId = rp.Id
+    WHERE pl.LinkTypeId = 1  -- Linked posts
+    GROUP BY pl.PostId
+),
+BadgeAchievers AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    JOIN TopContributors tc ON b.UserId = tc.UserId
+    WHERE b.Date > cast('2024-10-01' as date) - INTERVAL '3 months'
+    GROUP BY b.UserId
+)
+SELECT 
+    rp.Id AS QuestionId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score AS QuestionScore,
+    rp.ViewCount,
+    rp.AnswerCount,
+    COALESCE(tc.TotalPosts, 0) AS UserTotalPosts,
+    tc.Reputation AS UserReputation,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    lps.LinkCount,
+    lps.AvgLinkedScore,
+    CASE 
+        WHEN tc.Reputation - COALESCE(tc.PrevRep, 0) > 1000 THEN 'RapidGrowth'
+        WHEN rp.PostStatus = 'Closed' AND rp.AnswerCount = 0 THEN 'ClosedNoAnswers'
+        WHEN lps.LinkCount > 5 THEN 'HighlyLinked'
+        ELSE 'Standard'
+    END AS ActivityCategory,
+    -- Complex string manipulation for tag analysis
+    CASE 
+        WHEN LENGTH(rp.Tags) > 100 THEN 'ManyTags'
+        WHEN rp.FirstTag IS NULL OR rp.FirstTag = '' THEN 'NoTags'
+        ELSE rp.FirstTag
+    END AS TagCategory,
+    -- Window function for ranking within categories
+    RANK() OVER (
+        PARTITION BY rp.PostStatus 
+        ORDER BY rp.ViewCount DESC, rp.Score DESC
+    ) AS StatusRank,
+    -- Complex calculation with NULL handling
+    GREATEST(
+        COALESCE(rp.AnswerCount, 0) * 10 + 
+        COALESCE(lps.LinkCount, 0) * 5 + 
+        COALESCE(tc.Reputation, 0) / 100, 
+        1
+    ) AS EngagementScore,
+    -- Set operation simulation with conditional aggregation
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = rp.Id 
+       AND c.Score > 0 
+       AND c.CreationDate > rp.CreationDate
+    ) AS PositiveCommentCount
+FROM RecentPosts rp
+LEFT JOIN TopContributors tc ON tc.UserId = rp.OwnerUserId
+LEFT JOIN LinkedPostsStats lps ON lps.PostId = rp.Id
+LEFT JOIN BadgeAchievers ba ON ba.UserId = tc.UserId
+WHERE (rp.Score > -5 OR rp.AnswerCount > 0)
+    AND (tc.RepRank IS NULL OR tc.RepRank <= 500 OR rp.ViewCount > 1000)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = rp.Id 
+          AND ph.PostHistoryTypeId = 12  -- Deleted
+          AND ph.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 day'
+    )
+ORDER BY EngagementScore DESC, rp.CreationDate DESC
+LIMIT 250;

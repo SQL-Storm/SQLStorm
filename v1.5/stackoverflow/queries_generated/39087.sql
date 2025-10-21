@@ -1,0 +1,99 @@
+-- {"query": "39087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 2613} 
+
+WITH
+  recent_questions AS (
+    SELECT id, title, tags, creationdate
+    FROM posts
+    WHERE posttypeid = 1
+      AND creationdate >= current_date - interval '1 year'
+  ),
+  question_tags AS (
+    SELECT
+      rq.id   AS question_id,
+      tag
+    FROM recent_questions rq,
+         unnest(
+           string_to_array(
+             substring(rq.tags, 2, length(rq.tags) - 2),
+             '><'
+           )
+         ) AS tag
+  ),
+  answers AS (
+    SELECT
+      p.parentid    AS question_id,
+      p.id          AS answer_id,
+      p.owneruserid AS owneruserid,
+      p.score       AS score,
+      p.creationdate
+    FROM posts p
+    WHERE p.posttypeid = 2
+      AND p.creationdate >= current_date - interval '1 year'
+  ),
+  first_answers AS (
+    SELECT
+      question_id,
+      min(creationdate) AS first_answer_date
+    FROM answers
+    GROUP BY question_id
+  ),
+  question_comments AS (
+    SELECT
+      postid      AS question_id,
+      count(*)    AS comment_count
+    FROM comments
+    GROUP BY postid
+  ),
+  tag_stats AS (
+    SELECT
+      qt.tag,
+      count(DISTINCT rq.id)                                                   AS question_count,
+      count(a.answer_id)                                                      AS total_answers,
+      avg(a.score)::numeric(10,2)                                              AS avg_answer_score,
+      avg(
+        extract(epoch FROM (fa.first_answer_date - rq.creationdate)) / 3600
+      )::numeric(10,2)                                                          AS avg_time_to_first_answer_hrs,
+      count(DISTINCT a.owneruserid)                                           AS distinct_answerers,
+      avg(coalesce(qc.comment_count, 0))::numeric(10,2)                        AS avg_comments_per_question
+    FROM question_tags qt
+    JOIN recent_questions rq ON qt.question_id = rq.id
+    LEFT JOIN answers a ON a.question_id = rq.id
+    LEFT JOIN first_answers fa ON fa.question_id = rq.id
+    LEFT JOIN question_comments qc ON qc.question_id = rq.id
+    GROUP BY qt.tag
+  )
+SELECT
+  ts.tag,
+  ts.question_count,
+  ts.total_answers,
+  ts.avg_answer_score,
+  ts.avg_time_to_first_answer_hrs,
+  ts.distinct_answerers,
+  ts.avg_comments_per_question,
+  top3.top_3_answers,
+  row_number() OVER (ORDER BY ts.question_count DESC)                       AS tag_rank
+FROM tag_stats ts
+LEFT JOIN LATERAL (
+  SELECT
+    jsonb_agg(
+      jsonb_build_object(
+        'answer_id', s.answer_id,
+        'score',     s.score,
+        'answerer_id', s.owneruserid
+      )
+      ORDER BY s.score DESC
+    ) AS top_3_answers
+  FROM (
+    SELECT
+      a.answer_id,
+      a.score,
+      a.owneruserid
+    FROM answers a
+    JOIN question_tags qt2 ON a.question_id = qt2.question_id
+    WHERE qt2.tag = ts.tag
+    ORDER BY a.score DESC
+    LIMIT 3
+  ) s
+) top3 ON true
+ORDER BY tag_rank
+LIMIT 10;

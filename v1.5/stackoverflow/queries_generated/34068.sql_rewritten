@@ -1,0 +1,100 @@
+-- {"query": "34068.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 833} 
+WITH RankedAnswers AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        u.Id AS OwnerUserId,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS Rank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2 -- Answers only
+),
+TopAnswers AS (
+    SELECT * FROM RankedAnswers WHERE Rank = 1
+),
+QuestionStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(SUM(v.VoteTypeId = 2)::int,0) AS UpVotesCount,
+        COALESCE(SUM(v.VoteTypeId = 3)::int,0) AS DownVotesCount,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        COUNT(a.Id) AS TotalAnswers,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+    FROM Posts q
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN LATERAL 
+        (SELECT unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) AS TagName) t ON true
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+ComplexResults AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.CreationDate AS QuestionCreationDate,
+        qs.QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.UpVotesCount,
+        qs.DownVotesCount,
+        qs.AvgAnswerScore,
+        qs.TotalAnswers,
+        qs.Tags,
+        ta.AnswerId,
+        ta.Score AS TopAnswerScore,
+        ta.OwnerUserId,
+        u.Reputation AS AnswererReputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ph.Comment AS CloseReason,
+        pt.Name AS PostTypeName
+    FROM QuestionStats qs
+    LEFT JOIN TopAnswers ta ON qs.QuestionId = ta.QuestionId
+    LEFT JOIN Users u ON ta.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = qs.QuestionId AND ph.PostHistoryTypeId = 10 -- Post Closed
+    LEFT JOIN PostTypes pt ON pt.Id = (SELECT PostTypeId FROM Posts WHERE Id = qs.QuestionId)
+    WHERE qs.AnswerCount > 0 AND qs.ViewCount > 1000
+    ORDER BY qs.ViewCount DESC
+    LIMIT 50
+)
+SELECT 
+    cr.QuestionId,
+    cr.Title,
+    cr.QuestionCreationDate,
+    cr.QuestionScore,
+    cr.ViewCount,
+    cr.AnswerCount,
+    cr.UpVotesCount,
+    cr.DownVotesCount,
+    cr.AvgAnswerScore,
+    cr.TotalAnswers,
+    cr.Tags,
+    cr.AnswerId AS TopAnswerId,
+    cr.TopAnswerScore,
+    cr.OwnerUserId AS TopAnswerUserId,
+    cr.AnswererReputation,
+    cr.GoldBadges,
+    cr.SilverBadges,
+    cr.BronzeBadges,
+    cr.CloseReason,
+    cr.PostTypeName
+FROM ComplexResults cr;

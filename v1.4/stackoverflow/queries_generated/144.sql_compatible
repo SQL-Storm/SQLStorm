@@ -1,0 +1,60 @@
+WITH
+recent AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= date_trunc('day', cast('2024-10-01 12:34:56' as timestamp)) - interval '180 days'
+),
+tag_exp AS (
+  SELECT r.Id, t.tag
+  FROM recent r
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(r.Tags, 2, length(r.Tags) - 2), '><')) AS tag
+  ) AS t ON true
+),
+owner_name AS (
+  SELECT r.Id, COALESCE(u.DisplayName, r.OwnerUserId::text) AS owner_name
+  FROM recent r
+  LEFT JOIN Users u ON u.Id = r.OwnerUserId
+),
+vote_summary AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         COUNT(*) AS vote_count
+  FROM Votes v
+  GROUP BY v.PostId
+),
+last_activity AS (
+  SELECT p.Id, p.LastActivityDate
+  FROM Posts p
+)
+SELECT
+  r.Id,
+  o.owner_name,
+  r.Title,
+  r.Score,
+  r.ViewCount,
+  (COALESCE(vs.upvotes, 0) - COALESCE(vs.downvotes, 0)) AS net_votes,
+  ROW_NUMBER() OVER (PARTITION BY r.OwnerUserId ORDER BY r.CreationDate DESC) AS recent_rank,
+  ARRAY_AGG(te.tag) FILTER (WHERE te.tag IS NOT NULL) AS tags_for_post,
+  COALESCE(vs.vote_count, 0) AS total_votes,
+  COALESCE(vs.upvotes, 0) AS upvotes_today,
+  la.LastActivityDate
+FROM recent r
+JOIN owner_name o ON o.Id = r.Id
+LEFT JOIN vote_summary vs ON vs.PostId = r.Id
+LEFT JOIN last_activity la ON la.Id = r.Id
+LEFT JOIN tag_exp te ON te.Id = r.Id
+GROUP BY
+  r.Id,
+  o.owner_name,
+  r.Title,
+  r.Score,
+  r.ViewCount,
+  la.LastActivityDate,
+  vs.vote_count,
+  vs.upvotes,
+  vs.downvotes
+ORDER BY net_votes DESC NULLS LAST, r.ViewCount DESC
+LIMIT 200;

@@ -1,0 +1,138 @@
+-- {"query": "49004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2026} 
+WITH UserQuestionStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalQuestionScore,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalQuestionViews,
+        COUNT(DISTINCT ph_closed.PostId) AS UniqueClosedQuestions,
+        COUNT(DISTINCT ph_reopened.PostId) AS UniqueReopenedQuestions,
+        COUNT(DISTINCT pl_linked.RelatedPostId) AS QuestionsReferencedAsLinked,
+        COUNT(DISTINCT pl_duplicate.RelatedPostId) AS QuestionsReferencedAsDuplicate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 year'
+      AND p.OwnerUserId IS NOT NULL
+    LEFT JOIN PostHistory ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10 -- Post Closed
+    LEFT JOIN PostHistory ph_reopened ON p.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11 -- Post Reopened
+    LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1 -- Linked
+    LEFT JOIN PostLinks pl_duplicate ON p.Id = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3 -- Duplicate
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) >= 5
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId AS UserId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE NULL END) AS AcceptedAnswerCount
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 -- Answers
+      AND a.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 year'
+      AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(a.Id) >= 10
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadgeCount,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    WHERE b.Date >= cast('2024-10-01' as date) - INTERVAL '3 year'
+    GROUP BY b.UserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        SUM(c.Score) AS TotalCommentScore
+    FROM Comments c
+    WHERE c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 year'
+      AND c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserHistoryEngagement AS (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24, 33, 34) THEN 1 ELSE NULL END) AS SignificantEditOrModerationCount,
+        COUNT(DISTINCT ph.PostId) AS UniquePostsEdited
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 year'
+      AND ph.UserId IS NOT NULL
+      AND ph.PostHistoryTypeId NOT IN (1, 2, 3, 16, 50, 52, 53, 66) -- Exclude initial/community/system-generated events
+    GROUP BY ph.UserId
+),
+UserTagContributions AS (
+    SELECT
+        u.Id AS UserId,
+        -- Aggregate top 5 most frequent tags from questions asked by the user in the last 3 years
+        STRING_AGG(DISTINCT tag_name, ',') AS TopQuestionTags
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL (
+        SELECT TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) AS tag_name
+        WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    ) AS parsed_tags
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 year'
+    GROUP BY u.Id
+    ORDER BY COUNT(parsed_tags.tag_name) DESC -- Order by frequency to pick top tags for each user
+    LIMIT 5 -- Limit for the lateral join context, not global
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(uqs.QuestionCount, 0) AS TotalQuestionsAsked,
+    COALESCE(uqs.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(uqs.AvgQuestionScore, 0.0) AS AverageQuestionScore,
+    COALESCE(uas.AnswerCount, 0) AS TotalAnswersGiven,
+    COALESCE(uas.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(uas.AvgAnswerScore, 0.0) AS AverageAnswerScore,
+    COALESCE(uas.AcceptedAnswerCount, 0) AS AcceptedAnswersCount,
+    COALESCE(ubs.GoldBadgeCount, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadgeCount, 0) AS SilverBadges,
+    COALESCE(uca.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(uca.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(uhe.SignificantEditOrModerationCount, 0) AS TotalSignificantEdits,
+    COALESCE(uhe.UniquePostsEdited, 0) AS UniquePostsWithEdits,
+    COALESCE(uqs.UniqueClosedQuestions, 0) AS QuestionsClosed,
+    COALESCE(uqs.UniqueReopenedQuestions, 0) AS QuestionsReopened,
+    COALESCE(uqs.QuestionsReferencedAsLinked, 0) AS QuestionsLinkedByOthers,
+    COALESCE(uqs.QuestionsReferencedAsDuplicate, 0) AS QuestionsMarkedAsDuplicateSource,
+    utc.TopQuestionTags,
+    (
+        u.Reputation * 0.05 +
+        COALESCE(uqs.AvgQuestionScore * 2.0, 0) +
+        COALESCE(uas.AvgAnswerScore * 1.5, 0) +
+        COALESCE(uas.AcceptedAnswerCount * 10.0, 0) +
+        COALESCE(ubs.GoldBadgeCount * 100.0, 0) +
+        COALESCE(ubs.SilverBadgeCount * 50.0, 0) +
+        COALESCE(uca.TotalCommentsMade * 0.1, 0) +
+        COALESCE(uhe.SignificantEditOrModerationCount * 0.2, 0) +
+        COALESCE(uqs.UniqueReopenedQuestions * 20.0, 0) -
+        COALESCE(uqs.UniqueClosedQuestions * 5.0, 0) +
+        COALESCE(uqs.QuestionsReferencedAsLinked * 3.0, 0) -
+        COALESCE(uqs.QuestionsReferencedAsDuplicate * 7.0, 0)
+    ) AS UserInfluenceScore,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank
+FROM Users u
+INNER JOIN UserQuestionStats uqs ON u.Id = uqs.UserId
+INNER JOIN UserAnswerStats uas ON u.Id = uas.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+LEFT JOIN UserHistoryEngagement uhe ON u.Id = uhe.UserId
+LEFT JOIN UserTagContributions utc ON u.Id = utc.UserId
+WHERE u.Reputation > 5000
+  AND u.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '3 year'
+  AND (COALESCE(ubs.GoldBadgeCount, 0) > 0 OR COALESCE(ubs.SilverBadgeCount, 0) > 0)
+ORDER BY UserInfluenceScore DESC, u.Reputation DESC
+LIMIT 100;

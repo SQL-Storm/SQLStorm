@@ -1,0 +1,68 @@
+-- {"query": "42080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2057, "output_tokens": 493} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id, 
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.Reputation,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(V.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) AND
+        P.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        P.Id, U.Reputation
+), TopUsers AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(B.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        U.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.CreationDate AS PostCreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    TU.Id AS UserId,
+    TU.Reputation,
+    TU.CreationDate AS UserCreationDate,
+    RP.CommentCount,
+    RP.VoteCount,
+    RP.PostRank,
+    TU.BadgeCount,
+    TU.UserRank
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+WHERE 
+    RP.PostRank <= 100 AND
+    TU.UserRank <= 100
+ORDER BY 
+    RP.Score DESC, 
+    TU.Reputation DESC;

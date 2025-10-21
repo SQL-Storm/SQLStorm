@@ -1,0 +1,83 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT bh.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostType,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    COALESCE(p.CommentCount, 0) AS ReportedComments,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostStatus,
+    MAX(bh.CreationDate) AS LastActivity,
+    STRING_AGG(DISTINCT bv.Name, ', ') AS BadgeNames
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory bh ON p.Id = bh.PostId
+LEFT JOIN (
+    SELECT p_inner.Id AS PostId, t.TagName
+    FROM Posts p_inner
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(p_inner.Tags, '>')) AS tag
+    ) AS tags
+    JOIN Tags t ON t.TagName = tags.tag
+) AS t ON p.Id = t.PostId
+LEFT JOIN (
+    SELECT UserId, Name
+    FROM Badges
+    WHERE Class IN (1, 2, 3)
+) AS bv ON p.OwnerUserId = bv.UserId
+WHERE p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= TIMESTAMP '2022-01-01 00:00:00'
+  AND p.CreationDate < TIMESTAMP '2023-01-01 00:00:00'
+  AND u.Reputation > 1000
+  AND p.Score >= 0
+  AND p.ViewCount >= 100
+  AND LENGTH(p.Title) > 10
+  AND LENGTH(p.Body) > 200
+GROUP BY 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName,
+    u.Reputation,
+    p.PostTypeId,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CommentsCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.Tags
+HAVING 
+    COUNT(DISTINCT c.Id) >= 5
+    AND COUNT(DISTINCT v.Id) >= 10
+    AND COUNT(DISTINCT bh.Id) >= 3
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    MAX(bh.CreationDate) DESC
+LIMIT 1000;

@@ -1,0 +1,79 @@
+WITH
+    post_tags AS (
+        SELECT
+            p.Id AS PostId,
+            p.Score,
+            p.AnswerCount,
+            p.OwnerUserId,
+            t.TagName
+        FROM Posts p
+        CROSS JOIN LATERAL
+            unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(TagName)
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+    ),
+
+    tag_metrics AS (
+        SELECT
+            pt.TagName,
+            COUNT(*) AS TotalQuestions,
+            AVG(pt.Score) AS AvgScore,
+            AVG(pt.AnswerCount) AS AvgAnswers,
+            SUM(CASE WHEN pt.AnswerCount > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS AvgAnswersPerQuestion,
+            COUNT(DISTINCT CASE WHEN pt.Score >= 5 THEN pt.PostId END) AS HighScoreQuestions,
+            COUNT(DISTINCT CASE WHEN pt.Score < 0 THEN pt.PostId END) AS LowScoreQuestions,
+            COUNT(DISTINCT CASE WHEN l.LinkTypeId = 3 THEN l.RelatedPostId END) AS DuplicateQuestions
+        FROM post_tags pt
+        LEFT JOIN PostLinks l
+            ON l.PostId = pt.PostId
+           AND l.LinkTypeId = 3
+        GROUP BY pt.TagName
+        HAVING COUNT(*) >= 200
+    ),
+
+    answer_votes AS (
+        SELECT
+            pt.TagName,
+            v.UserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM post_tags pt
+        JOIN Votes v
+            ON v.PostId = pt.PostId
+        GROUP BY pt.TagName, v.UserId
+    ),
+
+    top_answerers AS (
+        SELECT
+            av.TagName,
+            json_agg(
+                json_build_object(
+                    'UserId', av.UserId,
+                    'UpVotes', av.UpVotes
+                )
+                ORDER BY av.UpVotes DESC NULLS LAST
+            ) AS Top5Users
+        FROM answer_votes av
+        GROUP BY av.TagName
+    ),
+
+    final AS (
+        SELECT
+            tm.TagName,
+            tm.TotalQuestions,
+            tm.AvgScore,
+            tm.AvgAnswers,
+            tm.AvgAnswersPerQuestion,
+            tm.HighScoreQuestions,
+            tm.LowScoreQuestions,
+            tm.DuplicateQuestions,
+            ta.Top5Users
+        FROM tag_metrics tm
+        LEFT JOIN top_answerers ta
+            ON ta.TagName = tm.TagName
+        ORDER BY tm.TotalQuestions DESC
+        LIMIT 50
+    )
+
+SELECT *
+FROM final;

@@ -1,0 +1,191 @@
+-- {"query": "7006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2422} 
+with
+-- recent active questions with tag explode and normalized score
+QuestionBase as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as Views,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    -- explode tags into rows: tags are like '<tag1><tag2>'
+    regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '3 years'
+),
+-- best answer stats per question including accepted flag and length heuristics
+AnswerStats as (
+  select
+    q.QuestionId,
+    count(a.Id) filter (where a.PostTypeId = 2) as AnswerCountTotal,
+    count(a.Id) filter (where a.PostTypeId = 2 and a.Id = q.AcceptedAnswerId) as HasAccepted,
+    max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+    avg(char_length(coalesce(a.Body,''))) filter (where a.PostTypeId = 2) as AvgAnswerBodyLen,
+    sum(case when a.Score >= 5 then 1 else 0 end) filter (where a.PostTypeId = 2) as HighScoreAnswers
+  from (
+    select qb.QuestionId, p.AcceptedAnswerId
+    from QuestionBase qb
+    join Posts p on p.Id = qb.QuestionId
+  ) q
+  left join Posts a on a.ParentId = q.QuestionId and a.PostTypeId = 2
+  group by q.QuestionId, q.AcceptedAnswerId
+),
+-- user reputation and activity windows
+UserWindow as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.DisplayName,
+    -- rolling counts for posts/comments in last year relative to now
+    (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.CreationDate >= now() - interval '1 year') as PostsLastYear,
+    (select count(*) from Comments c2 where c2.UserId = u.Id and c2.CreationDate >= now() - interval '1 year') as CommentsLastYear,
+    -- median post score using window
+    (select percentile_disc(0.5) within group (order by p3.Score) from Posts p3 where p3.OwnerUserId = u.Id and p3.PostTypeId in (1,2)) as MedianPostScore
+  from Users u
+),
+-- compute close/reopen churn per question from PostHistory correlated subquery
+CloseReopen as (
+  select
+    ph.PostId as QuestionId,
+    sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesEvents,
+    sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenEvents,
+    bool_or(ph.PostHistoryTypeId = 10) as EverClosed,
+    max(ph.CreationDate) as LastHistoryEvent
+  from PostHistory ph
+  where ph.PostId is not null
+    and ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+-- links graph metrics: incoming duplicates and outgoing links
+LinkMetrics as (
+  select
+    l.PostId,
+    sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as OutgoingDuplicates,
+    sum(case when lt.Name = 'Linked' then 1 else 0 end) as OutgoingLinks,
+    inl.IncomingLinks,
+    inl.IncomingDuplicates
+  from PostLinks l
+  join LinkTypes lt on lt.Id = l.LinkTypeId
+  left join (
+    select RelatedPostId as PostId,
+      sum(case when lt2.Name = 'Linked' then 1 else 0 end) as IncomingLinks,
+      sum(case when lt2.Name = 'Duplicate' then 1 else 0 end) as IncomingDuplicates
+    from PostLinks pl2
+    join LinkTypes lt2 on lt2.Id = pl2.LinkTypeId
+    group by RelatedPostId
+  ) inl on inl.PostId = l.PostId
+  group by l.PostId, inl.IncomingLinks, inl.IncomingDuplicates
+),
+-- per-question aggregated votes including favorites and controversial measure
+VoteAgg as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(*) as TotalVotes,
+    case
+      when count(*) = 0 then 0
+      else abs(count(*) filter (where v.VoteTypeId = 2) - count(*) filter (where v.VoteTypeId = 3))::float / greatest(count(*),1)
+    end as VoteImbalance -- lower is more controversial
+  from Votes v
+  group by v.PostId
+),
+-- combine everything for heavy projections and window ordering
+Combined as (
+  select
+    qb.*,
+    coalesce(a.AnswerCountTotal,0) as AnswerCountTotal,
+    coalesce(a.HasAccepted,0) as HasAccepted,
+    coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(a.AvgAnswerBodyLen,0) as AvgAnswerBodyLen,
+    coalesce(a.HighScoreAnswers,0) as HighScoreAnswers,
+    coalesce(lm.OutgoingDuplicates,0) as OutgoingDuplicates,
+    coalesce(lm.OutgoingLinks,0) as OutgoingLinks,
+    coalesce(lm.IncomingLinks,0) as IncomingLinks,
+    coalesce(lm.IncomingDuplicates,0) as IncomingDuplicates,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    coalesce(v.Favorites,0) as Favorites,
+    coalesce(v.TotalVotes,0) as TotalVotes,
+    v.VoteImbalance,
+    coalesce(cr.CloseVotesEvents,0) as CloseVotesEvents,
+    coalesce(cr.ReopenEvents,0) as ReopenEvents,
+    coalesce(cr.EverClosed,false) as EverClosed,
+    uw.Reputation as OwnerReputation,
+    uw.PostsLastYear,
+    uw.CommentsLastYear,
+    uw.MedianPostScore,
+    -- computed complex heuristics
+    (coalesce(qb.Score,0)::float * 0.6
+      + log(1+coalesce(qb.ViewCount,0)) * 0.2
+      + least(10,coalesce(a.MaxAnswerScore,0)) * 1.5
+      + greatest(0, coalesce(v.Favorites,0)) * 0.8
+      - coalesce(v.VoteImbalance,0) * 5
+      - coalesce(cr.CloseVotesEvents,0) * 2
+      + case when qb.AnswerCount > 0 then 2 else 0 end
+    ) as HotnessScore
+  from QuestionBase qb
+  left join AnswerStats a on a.QuestionId = qb.QuestionId
+  left join LinkMetrics lm on lm.PostId = qb.QuestionId
+  left join VoteAgg v on v.PostId = qb.QuestionId
+  left join CloseReopen cr on cr.QuestionId = qb.QuestionId
+  left join Users u on u.Id = qb.OwnerUserId
+  left join UserWindow uw on uw.UserId = qb.OwnerUserId
+),
+-- rank by tag and global windows to exercise partitioned ordering
+Ranked as (
+  select
+    c.*,
+    row_number() over (partition by Tag order by HotnessScore desc, Views desc, AnswerCountTotal desc) as TagRank,
+    dense_rank() over (order by HotnessScore desc nulls last) as GlobalDenseRank,
+    ntile(10) over (order by HotnessScore desc) as Decile
+  from Combined c
+),
+-- select top candidates and enrich with correlated subqueries and lateral joins
+Selection as (
+  select
+    r.*,
+    -- correlated scalar subquery: most recent comment text on question
+    (select c.Text from Comments c where c.PostId = r.QuestionId order by c.CreationDate desc limit 1) as LastCommentText,
+    -- correlated: user who answered with highest score
+    (select a2.OwnerUserId from Posts a2 where a2.ParentId = r.QuestionId and a2.PostTypeId = 2 order by a2.Score desc nulls last limit 1) as TopAnswererUserId,
+    -- array of top 3 answer ids by score
+    (select array_agg(a3.Id order by a3.Score desc) from (select Id, Score from Posts a3 where a3.ParentId = r.QuestionId and a3.PostTypeId = 2 order by a3.Score desc limit 3) sub) as Top3AnswerIds,
+    -- approximate textual fingerprint length and null logic
+    case
+      when r.Title is null then 'NO_TITLE'
+      else left(regexp_replace(r.Title, '\s+', ' ', 'g'), 120)
+    end as TitleSnippet,
+    -- string concatenation of key metrics
+    concat('{Q:', r.QuestionId, ',T:', coalesce(r.Tag,'(none)'), ',H:', round(r.HotnessScore::numeric,2), ',D:', r.Decile, '}') as SmallDigest
+  from Ranked r
+  where (r.TagRank <= 5 and r.GlobalDenseRank <= 1000) -- moderately selective predicate
+     or r.HotnessScore > (select percentile_disc(0.9) within group (order by HotnessScore) from Combined)
+)
+-- final output with unions to force set-ops and heavier planning
+select * from Selection
+union
+select
+  S.QuestionId, S.Title, S.OwnerUserId, S.CreationDate, S.Score, S.Views, S.AnswerCount, S.FavoriteCount, S.Tags, S.Tag,
+  S.AnswerCountTotal, S.HasAccepted, S.MaxAnswerScore, S.AvgAnswerBodyLen, S.HighScoreAnswers,
+  S.OutgoingDuplicates, S.OutgoingLinks, S.IncomingLinks, S.IncomingDuplicates,
+  S.UpVotes, S.DownVotes, S.Favorites, S.TotalVotes, S.VoteImbalance,
+  S.CloseVotesEvents, S.ReopenEvents, S.EverClosed, S.OwnerReputation, S.PostsLastYear, S.CommentsLastYear, S.MedianPostScore,
+  S.HotnessScore, S.TagRank, S.GlobalDenseRank, S.Decile,
+  -- additional null-heavy computed columns to stress planner
+  null::text as LastCommentText,
+  null::int as TopAnswererUserId,
+  null::int[] as Top3AnswerIds,
+  'FALLBACK' as TitleSnippet,
+  concat('{Q:', S.QuestionId, ',fallback}') as SmallDigest
+from Selection S
+where S.GlobalDenseRank between 500 and 800
+order by HotnessScore desc nulls last, GlobalDenseRank, Tag nulls last;

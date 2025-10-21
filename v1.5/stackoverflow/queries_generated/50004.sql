@@ -1,0 +1,140 @@
+-- {"query": "50004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1414} 
+
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Score,
+        p.CreationDate,
+        -- Use LATERAL JOIN to unnest tags for each question
+        tag.TagName
+    FROM
+        Posts p,
+        LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag(TagName)
+    WHERE
+        p.PostTypeId = 1 -- Questions
+        AND p.ClosedDate IS NULL
+        AND p.DeletionDate IS NULL
+        AND p.AnswerCount > 2
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        qs.TagName,
+        COUNT(a.Id) AS TotalAnswersInTag,
+        SUM(a.Score) AS TotalAnswerScoreInTag,
+        AVG(a.Score) AS AvgAnswerScoreInTag,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersInTag,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgTimeToAnswerSeconds
+    FROM
+        Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    JOIN QuestionStats qs ON q.Id = qs.QuestionId
+    WHERE
+        a.PostTypeId = 2 -- Answers
+        AND a.OwnerUserId IS NOT NULL
+        AND a.DeletionDate IS NULL
+    GROUP BY
+        a.OwnerUserId,
+        qs.TagName
+),
+UserTagBadges AS (
+    SELECT
+        UserId,
+        Name AS TagName,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges
+    FROM
+        Badges
+    WHERE
+        TagBased = true
+    GROUP BY
+        UserId,
+        Name
+),
+UserEngagement AS (
+    SELECT
+        uas.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        uas.TagName,
+        uas.TotalAnswersInTag,
+        uas.TotalAnswerScoreInTag,
+        uas.AcceptedAnswersInTag,
+        COALESCE(utb.GoldBadges, 0) AS GoldBadges,
+        COALESCE(utb.SilverBadges, 0) AS SilverBadges,
+        -- Define a complex "TagExpertiseScore"
+        (
+            (uas.AvgAnswerScoreInTag * LOG(1 + uas.TotalAnswersInTag)) +
+            (uas.AcceptedAnswersInTag * 20) +
+            (COALESCE(utb.GoldBadges, 0) * 100) +
+            (COALESCE(utb.SilverBadges, 0) * 50)
+        ) / NULLIF(LOG(2 + uas.AvgTimeToAnswerSeconds / 3600.0), 0) AS TagExpertiseScore
+    FROM
+        UserAnswerStats uas
+    JOIN Users u ON uas.OwnerUserId = u.Id
+    LEFT JOIN UserTagBadges utb ON uas.OwnerUserId = utb.UserId AND uas.TagName = utb.TagName
+    WHERE
+        uas.TotalAnswersInTag > 10
+        AND u.Reputation > (SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY Reputation) FROM Users) -- Only users in the top 25% of reputation
+),
+RankedUsers AS (
+    SELECT
+        *,
+        DENSE_RANK() OVER (PARTITION BY TagName ORDER BY TagExpertiseScore DESC, Reputation DESC) AS RankInTag,
+        -- Find the time gap between a user's consecutive comments on posts within the same tag
+        AVG(CommentInterval) OVER (PARTITION BY OwnerUserId, TagName) AS AvgCommentIntervalInTag
+    FROM (
+        SELECT
+            ue.*,
+            EXTRACT(EPOCH FROM (c.CreationDate - LAG(c.CreationDate, 1, c.CreationDate) OVER (PARTITION BY ue.OwnerUserId, ue.TagName ORDER BY c.CreationDate))) AS CommentInterval
+        FROM
+            UserEngagement ue
+        -- Join to Comments to add another layer of complexity, analyzing comment frequency
+        JOIN Posts p_q ON p_q.OwnerUserId = ue.OwnerUserId
+        JOIN Comments c ON c.PostId = p_q.Id AND c.UserId = ue.OwnerUserId
+        WHERE
+            p_q.Id IN (SELECT QuestionId FROM QuestionStats qs WHERE qs.TagName = ue.TagName)
+    ) AS SubQueryWithIntervals
+)
+SELECT
+    ru.TagName,
+    ru.RankInTag,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TagExpertiseScore,
+    ru.TotalAnswersInTag,
+    ru.AcceptedAnswersInTag,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ph.CloseReason,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId = 5) AS PostFavorites -- Correlated Subquery
+FROM
+    RankedUsers ru
+-- Join to PostHistory to find the most common close reason for questions in the tags the user is an expert in
+LEFT JOIN LATERAL (
+    SELECT
+        crt.Name AS CloseReason,
+        ph.PostId
+    FROM
+        PostHistory ph
+    JOIN
+        CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id
+    WHERE
+        ph.PostHistoryTypeId = 10 -- Post Closed
+        AND ph.PostId IN (SELECT QuestionId FROM QuestionStats qs WHERE qs.TagName = ru.TagName AND qs.OwnerUserId != ru.OwnerUserId)
+    GROUP BY
+        crt.Name, ph.PostId
+    ORDER BY
+        COUNT(*) DESC
+    LIMIT 1
+) ph ON TRUE
+WHERE
+    ru.RankInTag <= 5
+ORDER BY
+    ru.TagName,
+    ru.RankInTag;

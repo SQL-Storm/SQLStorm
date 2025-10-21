@@ -1,0 +1,72 @@
+-- {"query": "52065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 762} 
+
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.ScoreAdjustment) AS TotalVoteScore,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        COUNT(DISTINCT pl.Id) AS LinkedPosts,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (1,2,3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagStats AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        AVG(p.Score) AS AvgTagScore,
+        COUNT(DISTINCT p.Id) AS TotalPostsInTag,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsInTag,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT c.Id) AS CommentsInTag
+    FROM Tags t
+    LEFT JOIN Posts p ON t.Id IN (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))::int)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY t.Id, t.TagName, t.Count
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.QuestionsCount,
+    ups.AnswersCount,
+    ups.AvgPostScore,
+    ups.TotalVoteScore,
+    ups.TotalVotes,
+    ups.UpvotesReceived,
+    ups.DownvotesReceived,
+    ups.BadgesCount,
+    ups.HighestBadgeClass,
+    ups.LinkedPosts,
+    ups.EditsCount,
+    ts.TagName,
+    ts.AvgTagScore,
+    ts.TotalPostsInTag,
+    ts.QuestionsInTag,
+    ts.TotalViews,
+    ts.CommentsInTag,
+    ROW_NUMBER() OVER (PARTITION BY ups.UserId ORDER BY ts.TotalPostsInTag DESC) AS TagRankForUser
+FROM UserPostStats ups
+JOIN Posts p ON ups.UserId = p.OwnerUserId
+JOIN Tags t ON t.Id IN (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))::int)
+JOIN TagStats ts ON t.Id = ts.TagId
+WHERE ups.TotalPosts > 10
+ORDER BY ups.Reputation DESC, ups.TotalPosts DESC, ts.TotalPostsInTag DESC
+LIMIT 100;

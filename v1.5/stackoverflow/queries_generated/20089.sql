@@ -1,0 +1,102 @@
+-- {"query": "20089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1171} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.FavoriteCount) AS TotalFavorites,
+        AVG(p.ViewCount) AS AverageViewCount,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Reputation > 1500 AND p.CommunityOwnedDate IS NULL AND p.ClosedDate IS NULL
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING
+        COUNT(p.Id) > 50 AND SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) > SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)
+),
+RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.CreationDate,
+        p.PostTypeId,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ASC) AS PostChronologicalRank,
+        LAG(p.CreationDate, 1) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ASC) AS PreviousPostDate,
+        LEAD(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ASC) AS NextPostScore
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId IN (SELECT UserId FROM UserActivitySummary)
+)
+SELECT
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    rp.Title AS SamplePostTitle,
+    rp.Score AS SamplePostScore,
+    pt.Name AS PostTypeName,
+    EXTRACT(EPOCH FROM (rp.CreationDate - rp.PreviousPostDate)) / 3600 AS HoursSincePreviousPost,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS CommentsOnSamplePost,
+    COALESCE(
+        (SELECT crt.Name
+         FROM PostHistory ph
+         JOIN CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id
+         WHERE ph.PostId = rp.PostId
+           AND ph.PostHistoryTypeId = 10 -- Post Closed
+         ORDER BY ph.CreationDate DESC
+         LIMIT 1),
+        'Not Applicable'
+    ) AS LastCloseReason,
+    CASE
+        WHEN uas.Reputation > 100000 THEN 'Elite'
+        WHEN uas.Reputation > 50000 THEN 'Veteran'
+        WHEN uas.Reputation > 10000 THEN 'Experienced'
+        ELSE 'Regular'
+    END || ' Contributor' AS UserTier,
+    (
+        SELECT STRING_AGG(b.Name, ', ' ORDER BY b.Date)
+        FROM Badges b
+        WHERE b.UserId = uas.UserId AND b.Class = 1 -- Gold Badges
+        GROUP BY b.UserId
+    ) AS GoldBadges,
+    CAST(uas.TotalScore AS NUMERIC) / NULLIF((SELECT SUM(Score) FROM Posts), 0) * 100 AS PercentageOfTotalSiteScore,
+    DENSE_RANK() OVER(ORDER BY uas.Reputation DESC, uas.TotalAnswers DESC) AS GlobalRank,
+    LOWER(SUBSTRING(uas.DisplayName FROM '^[a-zA-Z]+')) || '_' || (SELECT COUNT(*) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 2) AS UserHandle
+FROM
+    UserActivitySummary uas
+JOIN
+    RankedUserPosts rp ON uas.UserId = rp.OwnerUserId
+LEFT JOIN
+    PostTypes pt ON rp.PostTypeId = pt.Id
+WHERE
+    (rp.PostChronologicalRank = 1 OR rp.PostChronologicalRank % 10 = 0)
+    AND uas.LastPostDate > '2021-01-01'
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        JOIN Posts related ON pl.RelatedPostId = related.Id
+        WHERE pl.PostId = rp.PostId
+          AND pl.LinkTypeId = 1 -- Linked
+          AND related.Score > rp.Score
+    )
+ORDER BY
+    GlobalRank ASC,
+    uas.UserId,
+    rp.CreationDate DESC
+LIMIT 500;

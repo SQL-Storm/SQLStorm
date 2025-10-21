@@ -1,0 +1,37 @@
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName, 
+    COUNT(p.Id) AS TotalPosts, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions, 
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers, 
+    SUM(p.Score) AS TotalScore, 
+    COUNT(DISTINCT ph.Id) AS TotalEdits, 
+    COUNT(DISTINCT ph.PostId) AS UniquePostsEdited, 
+    COUNT(DISTINCT v.Id) AS TotalVotes, 
+    COUNT(DISTINCT c.Id) AS TotalComments, 
+    COUNT(DISTINCT b.Id) AS TotalBadges, 
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN 1 ELSE 0 END) AS TotalPostActions, 
+    COUNT(DISTINCT pl.Id) AS TotalPostLinks
+FROM 
+    Users AS u
+LEFT JOIN 
+    Posts AS p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory AS ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Votes AS v ON u.Id = v.UserId
+LEFT JOIN 
+    Comments AS c ON u.Id = c.UserId
+LEFT JOIN 
+    Badges AS b ON u.Id = b.UserId
+LEFT JOIN 
+    PostLinks AS pl ON u.Id = pl.CreationUserId
+WHERE 
+    u.CreationDate <= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+GROUP BY 
+    u.Id, u.DisplayName
+HAVING 
+    COUNT(p.Id) > 10 AND COUNT(DISTINCT ph.Id) > 5
+ORDER BY 
+    TotalScore DESC, TotalPosts DESC
+LIMIT 100;

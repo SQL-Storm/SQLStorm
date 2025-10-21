@@ -1,0 +1,169 @@
+-- {"query": "17020.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 49035, "output_tokens": 46772} 
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers_given,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS avg_post_score,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS all_tags_used,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS activity_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_analytics AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS bronze_badges,
+        MAX(Date) AS last_badge_earned,
+        STRING_AGG(Name || ' (' || 
+            CASE Class 
+                WHEN 1 THEN 'Gold' 
+                WHEN 2 THEN 'Silver' 
+                WHEN 3 THEN 'Bronze' 
+            END || ')', ', ' 
+            ORDER BY Date DESC
+            LIMIT 5
+        ) AS recent_badges
+    FROM Badges
+    GROUP BY UserId
+),
+complex_post_metrics AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS answer_count,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = p.Id 
+            AND c.Score >= 5
+            AND c.Text NOT LIKE '%thank%'
+            AND LENGTH(c.Text) > 50) AS quality_comments,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId IN (10, 12)
+        ) AS was_closed_or_deleted,
+        CASE 
+            WHEN p.ViewCount > 0 AND p.Score > 0 
+            THEN ROUND(LOG(p.ViewCount + 1) * SQRT(p.Score + 1), 2)
+            ELSE 0 
+        END AS engagement_score,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_score,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS users_best_post_title
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+        AND p.Title IS NOT NULL
+        AND LENGTH(p.Body) > 100
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.reputation_rank,
+    ua.activity_rank,
+    ua.questions_asked,
+    ua.answers_given,
+    ROUND(ua.avg_post_score::numeric, 2) AS avg_score,
+    COALESCE(ba.gold_badges, 0) || '/' || 
+        COALESCE(ba.silver_badges, 0) || '/' || 
+        COALESCE(ba.bronze_badges, 0) AS badge_count_gld_slv_brz,
+    CASE 
+        WHEN ba.last_badge_earned IS NULL THEN 'Never'
+        WHEN ba.last_badge_earned > cast('2024-10-01' as date) - INTERVAL '30 days' THEN 'Recently Active'
+        WHEN ba.last_badge_earned > cast('2024-10-01' as date) - INTERVAL '180 days' THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS badge_activity_status,
+    COALESCE(ba.recent_badges, 'No badges') AS recent_badges,
+    COALESCE(
+        (SELECT STRING_AGG(
+            UPPER(SUBSTRING(cpm.Title, 1, 1)) || LOWER(SUBSTRING(cpm.Title, 2, 30)) || 
+            CASE WHEN LENGTH(cpm.Title) > 31 THEN '...' ELSE '' END || 
+            ' (Score: ' || cpm.Score || ', Views: ' || cpm.ViewCount || ')',
+            ' | ' ORDER BY cpm.engagement_score DESC LIMIT 3
+        )
+        FROM complex_post_metrics cpm
+        WHERE cpm.post_id IN (
+            SELECT p2.Id 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = ua.Id
+                AND p2.PostTypeId = 1
+        )
+        AND cpm.quality_comments >= 2
+        AND NOT cpm.was_closed_or_deleted
+        ), 'No quality posts'
+    ) AS top_quality_posts,
+    SUBSTRING(ua.all_tags_used, 1, 100) || 
+        CASE WHEN LENGTH(ua.all_tags_used) > 100 THEN '...' ELSE '' END AS tags_snippet,
+    COALESCE((
+        SELECT COUNT(DISTINCT v.Id)
+        FROM Votes v
+        INNER JOIN Posts vp ON v.PostId = vp.Id
+        WHERE vp.OwnerUserId = ua.Id
+            AND v.VoteTypeId IN (2, 3)
+            AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'
+    ), 0) AS recent_vote_activity,
+    (
+        SELECT COUNT(DISTINCT pl.RelatedPostId)
+        FROM PostLinks pl
+        INNER JOIN Posts plp ON pl.PostId = plp.Id
+        WHERE plp.OwnerUserId = ua.Id
+            AND pl.LinkTypeId = 3
+    ) AS duplicate_links_created
+FROM user_activity ua
+LEFT OUTER JOIN badge_analytics ba ON ua.Id = ba.UserId
+WHERE ua.total_posts > 5
+    AND (ua.questions_asked > 0 OR ua.answers_given > 0)
+    AND ua.DisplayName IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph2
+        INNER JOIN Posts p3 ON ph2.PostId = p3.Id
+        WHERE p3.OwnerUserId = ua.Id
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+        GROUP BY p3.OwnerUserId
+        HAVING COUNT(*) > 3
+    )
+
+UNION ALL
+
+SELECT 
+    'SUMMARY STATISTICS' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS reputation_rank,
+    NULL AS activity_rank,
+    COUNT(*) AS questions_asked,
+    NULL AS answers_given,
+    NULL AS avg_score,
+    '' AS badge_count_gld_slv_brz,
+    '' AS badge_activity_status,
+    '' AS recent_badges,
+    'Total Active Users: ' || COUNT(*) AS top_quality_posts,
+    '' AS tags_snippet,
+    NULL AS recent_vote_activity,
+    NULL AS duplicate_links_created
+FROM user_activity
+WHERE total_posts > 5
+
+ORDER BY 
+    CASE WHEN DisplayName = 'SUMMARY STATISTICS' THEN 0 ELSE 1 END,
+    reputation_rank NULLS LAST,
+    activity_rank NULLS LAST
+LIMIT 100;

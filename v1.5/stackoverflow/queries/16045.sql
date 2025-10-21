@@ -1,0 +1,128 @@
+-- {"query": "16045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 107410, "output_tokens": 100345} 
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as question_score,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as answer_score,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY COUNT(DISTINCT p.Id) DESC) as yearly_activity_rank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+        AND u.CreationDate >= TIMESTAMP '2015-01-01'
+        AND (u.Location IS NULL OR UPPER(u.Location) NOT LIKE '%DELETED%')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+post_engagement_stats AS (
+    SELECT 
+        p.Id as post_id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) as comment_count,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) as linked_posts,
+        COUNT(DISTINCT c.Id) as actual_comments,
+        STRING_AGG(DISTINCT SUBSTRING(c.Text, 1, 50), ' | ') as sample_comments,
+        AVG(v.CreationDate - p.CreationDate) FILTER (WHERE v.VoteTypeId IN (2, 3)) as avg_vote_delay,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as max_bounty,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_post_score,
+        LEAD(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_post_views
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score >= 0
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2023-12-31'
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '30 days')
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate
+),
+tag_performance AS (
+    SELECT 
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) as tag_name,
+        COUNT(DISTINCT p.Id) as tag_post_count,
+        AVG(p.Score) as avg_tag_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        STDDEV(p.Score) as score_stddev
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND LENGTH(p.Tags) > 2
+    GROUP BY tag_name
+    HAVING COUNT(DISTINCT p.Id) >= 10
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.rep_rank,
+    CASE 
+        WHEN uam.post_count > 100 THEN 'Highly Active'
+        WHEN uam.post_count > 50 THEN 'Active'
+        WHEN uam.post_count > 20 THEN 'Moderate'
+        ELSE 'Low Activity'
+    END as activity_level,
+    uam.badge_count,
+    ROUND(CAST(uam.question_score AS NUMERIC) / NULLIF(uam.post_count, 0), 2) as avg_score_per_post,
+    pes.post_id,
+    COALESCE(pes.Title, 'No Title') as post_title,
+    pes.Score as post_score,
+    pes.upvotes - pes.downvotes as net_votes,
+    ROUND(CAST(pes.ViewCount AS NUMERIC) / NULLIF(pes.upvotes + pes.downvotes, 0), 2) as views_per_vote_ratio,
+    pes.linked_posts,
+    COALESCE(pes.sample_comments, 'No comments') as comment_sample,
+    EXTRACT(EPOCH FROM pes.avg_vote_delay) / 3600.0 as avg_hours_to_vote,
+    CASE 
+        WHEN pes.prev_post_score IS NULL THEN 'First Post'
+        WHEN pes.Score > COALESCE(pes.prev_post_score, 0) THEN 'Improving'
+        WHEN pes.Score = pes.prev_post_score THEN 'Stable'
+        ELSE 'Declining'
+    END as score_trend,
+    tp.avg_tag_score,
+    tp.median_views as tag_median_views,
+    CASE 
+        WHEN tp.score_stddev > 10 THEN 'High Variance'
+        WHEN tp.score_stddev > 5 THEN 'Medium Variance'
+        ELSE 'Low Variance'
+    END as tag_consistency,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pes.post_id 
+        AND ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.UserId IS NOT NULL) as edit_count,
+    EXISTS(
+        SELECT 1 
+        FROM Posts parent 
+        WHERE parent.AcceptedAnswerId = pes.post_id
+    ) as is_accepted_answer
+FROM user_activity_metrics uam
+INNER JOIN post_engagement_stats pes ON uam.Id = pes.OwnerUserId
+LEFT JOIN Posts p ON pes.post_id = p.Id
+LEFT JOIN tag_performance tp ON tp.tag_name = (
+    SELECT TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) 
+    LIMIT 1
+)
+WHERE pes.Score > (
+    SELECT AVG(Score) 
+    FROM Posts 
+    WHERE PostTypeId = pes.PostTypeId
+        AND CreationDate >= TIMESTAMP '2018-01-01'
+)
+    AND uam.yearly_activity_rank <= 100
+    AND (pes.max_bounty > 0 OR pes.upvotes >= 5)
+    AND COALESCE(pes.ViewCount, 0) > 100
+ORDER BY 
+    uam.Reputation DESC,
+    pes.Score DESC,
+    pes.ViewCount DESC NULLS LAST
+LIMIT 1000;

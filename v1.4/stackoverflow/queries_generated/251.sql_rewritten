@@ -1,0 +1,92 @@
+-- {"query": "251.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 9390} 
+WITH
+UserBase AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.LastAccessDate, u.CreationDate) AS LastActiveDate,
+    COALESCE(u.Location, '') AS Location,
+    COALESCE(u.Views, 0) AS Views,
+    COALESCE(u.UpVotes, 0) AS UpVotes,
+    COALESCE(u.DownVotes, 0) AS DownVotes,
+    u.EmailHash
+  FROM Users u
+),
+PostActivity AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TopTags AS (
+  SELECT
+    p.OwnerUserId,
+    STRING_AGG(DISTINCT t.TagName, ',') AS TopTags
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  GROUP BY p.OwnerUserId
+)
+SELECT
+  ub.UserId,
+  ub.DisplayName,
+  ub.Reputation,
+  ub.LastActiveDate,
+  ub.Location,
+  ub.Views,
+  ub.UpVotes,
+  ub.DownVotes,
+  COALESCE(pa.QuestionCount, 0) AS QuestionCount,
+  COALESCE(pa.AnswerCount, 0) AS AnswerCount,
+  COALESCE(pa.TotalViews, 0) AS TotalViews,
+  COALESCE(pa.AvgScore, 0) AS AvgScore,
+  COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+  COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+  COALESCE(tt.TopTags, '') AS TopTags,
+  (0.4 * ub.Reputation) +
+  (0.25 * COALESCE(pa.TotalViews, 0)) +
+  (0.2 * COALESCE(pa.QuestionCount, 0)) +
+  (0.15 * COALESCE(bs.TotalBadges, 0)) AS CompositeScore,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ub.UserId AND c.CreationDate > ub.LastActiveDate - INTERVAL '30 days') AS RecentComments,
+  CASE WHEN ub.EmailHash IS NULL THEN NULL ELSE LOWER(SUBSTR(ub.EmailHash, 1, 8)) END AS EmailHashPrefix
+FROM UserBase ub
+LEFT JOIN PostActivity pa ON pa.OwnerUserId = ub.UserId
+LEFT JOIN BadgeSummary bs ON bs.UserId = ub.UserId
+LEFT JOIN TopTags tt ON tt.OwnerUserId = ub.UserId
+WHERE ub.Reputation > 0
+UNION ALL
+SELECT
+  -1 AS UserId,
+  'Benchmark Row' AS DisplayName,
+  0 AS Reputation,
+  cast('2024-10-01 12:34:56' as timestamp) AS LastActiveDate,
+  NULL AS Location,
+  0 AS Views,
+  0 AS UpVotes,
+  0 AS DownVotes,
+  0 AS QuestionCount,
+  0 AS AnswerCount,
+  0 AS TotalViews,
+  0 AS AvgScore,
+  0 AS GoldBadges,
+  0 AS TotalBadges,
+  NULL AS TopTags,
+  0 AS CompositeScore,
+  0 AS RecentComments,
+  NULL AS EmailHashPrefix
+ORDER BY CompositeScore DESC
+LIMIT 100;

@@ -1,0 +1,55 @@
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  pc.CountComments,
+  pv.UpVotes,
+  pv.DownVotes,
+  COALESCE(pt.Name, 'Unknown') AS PostType,
+  STRING_AGG(CASE WHEN v.VoteTypeId IN (2,14,16) THEN 'positive' WHEN v.VoteTypeId IN (3,10,12) THEN 'negative' ELSE 'other' END, ';' ORDER BY v.CreationDate) AS VotePattern,
+  ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagsArray,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedCount,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+  (SELECT EXISTS (
+        SELECT 1
+        FROM Posts a
+        JOIN Votes vo ON a.Id = vo.PostId
+        WHERE a.OwnerUserId = u.Id AND vo.VoteTypeId = 14
+        LIMIT 1
+      )) AS HasModeratorVotes
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN (
+      SELECT PostId, COUNT(*) AS CountComments
+      FROM Comments
+      WHERE PostId IS NOT NULL
+      GROUP BY PostId
+  ) pc ON pc.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN (
+      SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+                     SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+      FROM Votes
+      GROUP BY PostId
+  ) pv ON pv.PostId = p.Id
+  LEFT JOIN LATERAL (
+      SELECT tg.TagName
+      FROM UNNEST(string_to_array(p.Tags, '><')) AS ta(tTag)
+      LEFT JOIN Tags tg ON tg.TagName = ta.tTag
+      LIMIT 1
+  ) t ON TRUE
+WHERE
+  p.CreationDate >= DATE_TRUNC('year', CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - INTERVAL '1 year'
+  AND p.PostTypeId IN (1, 2)
+  AND (p.Score IS NULL OR p.Score >= 0)
+GROUP BY
+  u.DisplayName, u.Reputation, p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, pt.Name, pc.CountComments, pv.UpVotes, pv.DownVotes, u.Id
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

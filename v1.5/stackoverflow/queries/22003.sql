@@ -1,0 +1,101 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(COUNT(p.Id), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COALESCE(MAX(p.Score), 0) AS MaxPostScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedQuestionsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COALESCE(COUNT(b.Id), 0) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+CombinedStats AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.QuestionScore,
+        ups.AnswerScore,
+        ups.AvgPostScore,
+        ups.MaxPostScore,
+        ups.AcceptedQuestionsCount,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.LastBadgeDate,
+        (ups.QuestionScore + ups.AnswerScore) * 1.0 / NULLIF(ups.TotalPosts, 0) AS WeightedScorePerPost,
+        CASE 
+            WHEN ubs.TotalBadges = 0 THEN 0
+            ELSE ROUND(ubs.GoldBadges * 10.0 + ubs.SilverBadges * 5.0 + ubs.BronzeBadges * 1.0, 2)
+        END AS BadgeScore
+    FROM UserPostStats ups
+    FULL OUTER JOIN UserBadgeStats ubs ON ups.UserId = ubs.UserId
+),
+RankedStats AS (
+    SELECT 
+        cs.*,
+        ROW_NUMBER() OVER (ORDER BY cs.BadgeScore DESC, cs.WeightedScorePerPost DESC) AS OverallRank,
+        RANK() OVER (PARTITION BY cs.Reputation ORDER BY cs.TotalBadges DESC) AS BadgeRankByRep,
+        DENSE_RANK() OVER (ORDER BY cs.AcceptedQuestionsCount DESC) AS AcceptedRank,
+        LAG(cs.TotalBadges, 1, 0) OVER (ORDER BY cs.UserId) AS PrevUserBadges,
+        LEAD(cs.MaxPostScore, 1, 0) OVER (ORDER BY cs.UserId DESC) AS NextUserMaxScore
+    FROM CombinedStats cs
+    WHERE cs.TotalPosts > 0 OR cs.TotalBadges > 0
+),
+UserActivity AS (
+    SELECT 
+        rs.UserId,
+        rs.DisplayName,
+        rs.OverallRank,
+        rs.BadgeRankByRep,
+        rs.AcceptedRank,
+        rs.PrevUserBadges,
+        rs.NextUserMaxScore,
+        COALESCE(rs.WeightedScorePerPost, 0) AS ScorePerPost,
+        rs.BadgeScore,
+        CASE 
+            WHEN rs.AcceptedQuestionsCount > 0 THEN 'Active Acceptor'
+            WHEN rs.TotalBadges >= 10 THEN 'Badge Collector'
+            ELSE 'Casual User'
+        END AS UserCategory,
+        (SELECT CONCAT('Has ', COUNT(*), ' comments on own posts')
+         FROM Comments c
+         WHERE c.UserId = rs.UserId AND c.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = rs.UserId)) AS SelfCommentInfo
+    FROM RankedStats rs
+)
+SELECT ua.*, 
+       CASE 
+           WHEN ua.ScorePerPost > 10 THEN 'High Scorer'
+           WHEN ua.ScorePerPost BETWEEN 5 AND 10 THEN 'Moderate Scorer'
+           ELSE 'Low Scorer'
+       END AS ScoringTier,
+       LEFT(ua.DisplayName, POSITION(' ' IN ua.DisplayName || ' ') - 1) AS FirstName,
+       ua.ScorePerPost * ua.BadgeScore AS CompositeMetric,
+       ua.UserCategory
+FROM UserActivity ua
+WHERE ua.UserId IN (
+    SELECT u.Id FROM Users u 
+    WHERE u.Reputation > 100 
+    UNION 
+    SELECT DISTINCT b.UserId FROM Badges b WHERE b.Name LIKE '%top%'
+)
+ORDER BY ua.OverallRank, (ua.ScorePerPost * ua.BadgeScore) DESC
+LIMIT 100;

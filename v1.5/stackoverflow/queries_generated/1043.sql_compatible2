@@ -1,0 +1,82 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        COALESCE(COUNT(v.Id), 0) AS VoteCount,
+        COALESCE(MAX(v.CreationDate), TIMESTAMP '1970-01-01') AS LastVoteDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNum
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId 
+    WHERE 
+        p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month'
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId, p.OwnerUserId
+),
+TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounties,
+        COUNT(DISTINCT p.Id) AS PostCount
+    FROM 
+        Users u 
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE 
+        u.Reputation > 1000 
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 5
+),
+UserPostDetails AS (
+    SELECT 
+        pu.UserId,
+        pu.DisplayName,
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.VoteCount,
+        ps.LastVoteDate,
+        ROW_NUMBER() OVER (PARTITION BY pu.UserId ORDER BY ps.Score DESC) AS Rank
+    FROM 
+        TopUsers pu 
+    JOIN 
+        PostStats ps ON pu.UserId = ps.OwnerUserId
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.PostId,
+    up.Title,
+    up.Score,
+    up.VoteCount,
+    up.LastVoteDate,
+    CASE 
+        WHEN up.VoteCount > 10 THEN 'Highly Voted'
+        WHEN up.VoteCount BETWEEN 1 AND 10 THEN 'Moderately Voted'
+        ELSE 'Not Voted'
+    END AS VoteStatus,
+    COUNT(p2.Id) FILTER (WHERE p2.AcceptedAnswerId IS NOT NULL) AS AnswerCount,
+    AVG(ps.ViewCount) AS AvgViewCount
+FROM 
+    UserPostDetails up
+LEFT JOIN 
+    Posts p2 ON up.PostId = p2.ParentId
+JOIN 
+    PostHistory ph ON ph.PostId = up.PostId AND ph.PostHistoryTypeId IN (10, 11)
+WHERE 
+    up.Rank <= 5
+GROUP BY 
+    up.UserId, up.DisplayName, up.PostId, up.Title, up.Score, up.VoteCount, up.LastVoteDate
+ORDER BY 
+    up.Score DESC, up.VoteCount DESC;

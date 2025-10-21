@@ -1,0 +1,83 @@
+WITH QuestionAnswers AS (
+    SELECT
+        q.Id AS question_id,
+        q.CreationDate AS q_created,
+        a.Id AS answer_id,
+        a.CreationDate AS a_created
+    FROM Posts q
+    JOIN Posts a
+      ON a.ParentId = q.Id
+     AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+FirstAnswerTime AS (
+    SELECT
+        question_id,
+        MIN(a_created - q_created) AS first_answer_interval
+    FROM QuestionAnswers
+    GROUP BY question_id
+),
+TagExpansion AS (
+    SELECT
+        q.Id   AS qid,
+        TRIM(BOTH '<>' FROM UNNEST(
+            STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><')
+        )) AS tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.Tags IS NOT NULL
+),
+TagStats AS (
+    SELECT
+        te.tag,
+        COUNT(*) AS question_count,
+        AVG(fat.first_answer_interval) AS avg_time_to_answer,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY fat.first_answer_interval) AS median_time_to_answer
+    FROM TagExpansion te
+    JOIN FirstAnswerTime fat
+      ON fat.question_id = te.qid
+    GROUP BY te.tag
+),
+TopTags AS (
+    SELECT
+        tag,
+        question_count,
+        avg_time_to_answer,
+        median_time_to_answer,
+        RANK() OVER (ORDER BY question_count DESC) AS popularity_rank
+    FROM TagStats
+)
+SELECT
+    tt.popularity_rank,
+    tt.tag,
+    tt.question_count,
+    tt.avg_time_to_answer,
+    tt.median_time_to_answer,
+    u.DisplayName               AS top_asker,
+    u.Reputation                AS asker_reputation,
+    vs.answer_count,
+    vs.total_score,
+    vs.avg_score
+FROM TopTags tt
+JOIN LATERAL (
+    SELECT
+        q.OwnerUserId AS asker_id,
+        COUNT(a.*)    AS answer_count,
+        SUM(a.Score)  AS total_score,
+        AVG(a.Score)  AS avg_score
+    FROM Posts q
+    JOIN Posts a
+      ON a.ParentId = q.Id
+     AND a.PostTypeId = 2
+    JOIN TagExpansion te
+      ON te.qid = q.Id
+     AND te.tag = tt.tag
+    WHERE q.OwnerUserId IS NOT NULL
+    GROUP BY q.OwnerUserId
+    ORDER BY answer_count DESC
+    LIMIT 1
+) vs ON TRUE
+JOIN Users u
+  ON u.Id = vs.asker_id
+ORDER BY tt.popularity_rank
+LIMIT 50;

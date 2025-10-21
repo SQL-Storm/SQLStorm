@@ -1,0 +1,145 @@
+WITH
+  -- base set of recent posts
+  recent_posts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.Title,
+      p.Tags,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.Score,
+      p.ViewCount,
+      p.OwnerUserId,
+      p.OwnerDisplayName,
+      p.AcceptedAnswerId,
+      p.ParentId,
+      p.Body,
+      p.ContentLicense,
+      p.CommentCount AS PostCommentCount,
+      p.LastEditDate
+    FROM Posts p
+  ),
+  -- attach post type name
+  posts_with_type AS (
+    SELECT rp.*, pt.Name AS PostTypeName
+    FROM recent_posts rp
+    LEFT JOIN PostTypes pt ON rp.PostTypeId = pt.Id
+  ),
+  -- owner/user info
+  owner AS (
+    SELECT
+      pwt.PostId,
+      pwt.PostTypeName,
+      pwt.Title,
+      COALESCE(pwt.Tags, '') AS Tags,
+      pwt.CreationDate,
+      pwt.LastActivityDate,
+      pwt.Score,
+      pwt.ViewCount,
+      pwt.OwnerUserId,
+      pwt.OwnerDisplayName,
+      pwt.AcceptedAnswerId,
+      pwt.ParentId,
+      pwt.Body,
+      pwt.ContentLicense,
+      pwt.PostCommentCount,
+      pwt.LastEditDate,
+      u.Reputation,
+      u.Location,
+      u.WebsiteUrl,
+      u.EmailHash
+    FROM posts_with_type pwt
+    LEFT JOIN Users u ON pwt.OwnerUserId = u.Id
+  ),
+  -- tags per post (string list)
+  tag_list AS (
+    SELECT t.ExcerptPostId AS PostId,
+           STRING_AGG(t.TagName, ',' ORDER BY t.TagName) AS TagsList
+    FROM Tags t
+    GROUP BY t.ExcerptPostId
+  ),
+  -- vote aggregations
+  vote_summary AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN v.VoteTypeId = 16 THEN 1 ELSE 0 END) AS ModeratorVotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ),
+  -- comment counts
+  comments_count AS (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ),
+  -- duplicate links
+  duplicates AS (
+    SELECT PostId, COUNT(*) AS DuplicateCount
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY PostId
+  ),
+  -- last close date (from PostHistory)
+  last_history AS (
+    SELECT ph.PostId,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+  ),
+  -- merged view with computed metrics
+  merged AS (
+    SELECT
+      o.PostId,
+      o.PostTypeName,
+      o.Title,
+      COALESCE(tl.TagsList, o.Tags) AS TagsList,
+      o.CreationDate,
+      o.LastActivityDate,
+      o.Score,
+      o.ViewCount,
+      o.OwnerUserId,
+      o.OwnerDisplayName,
+      o.Reputation,
+      o.Location,
+      o.WebsiteUrl,
+      o.EmailHash,
+      COALESCE(vs.UpVotes, 0) AS UpVotes,
+      COALESCE(vs.DownVotes, 0) AS DownVotes,
+      COALESCE(vs.ModeratorVotes, 0) AS ModeratorVotes,
+      COALESCE(cc.CommentCount, 0) AS CommentCount,
+      COALESCE(du.DuplicateCount, 0) AS DuplicateCount,
+      lh.LastClosedDate,
+      CASE WHEN lh.LastClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS PostStatus,
+      (o.Score * 1.25 + o.ViewCount * 0.75 + COALESCE(cc.CommentCount, 0) * 0.6) AS PerformanceIndex,
+      (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = o.PostId AND v2.VoteTypeId = 2) AS UpVotesFromCorrelation,
+      (CASE WHEN EXISTS (SELECT 1 FROM Votes v3 WHERE v3.PostId = o.PostId AND v3.VoteTypeId = 6) THEN 1 ELSE 0 END) AS HasCloseVote
+    FROM owner o
+      LEFT JOIN tag_list tl ON o.PostId = tl.PostId
+      LEFT JOIN vote_summary vs ON o.PostId = vs.PostId
+      LEFT JOIN comments_count cc ON o.PostId = cc.PostId
+      LEFT JOIN duplicates du ON o.PostId = du.PostId
+      LEFT JOIN last_history lh ON o.PostId = lh.PostId
+  ),
+  -- add a window function rank by post type
+  ranked AS (
+    SELECT m.*,
+           ROW_NUMBER() OVER (PARTITION BY m.PostTypeName ORDER BY m.Score DESC, m.LastActivityDate DESC) AS TypeRank
+    FROM merged m
+  ),
+  set1 AS (
+    SELECT * FROM ranked WHERE TypeRank <= 100
+  ),
+  set2 AS (
+    SELECT * FROM ranked WHERE LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days' AND UpVotes > 100
+  ),
+  combined AS (
+    SELECT * FROM set1
+    UNION ALL
+    SELECT * FROM set2
+  )
+SELECT *
+FROM combined
+ORDER BY TypeRank, LastActivityDate DESC
+LIMIT 400;

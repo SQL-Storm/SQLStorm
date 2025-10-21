@@ -1,0 +1,62 @@
+-- {"query": "59089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 1105} 
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCount,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) as GoldBadges,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) as SilverBadges,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) as QuestionCount,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) as AnswerCount,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1 AND p4.ClosedDate IS NOT NULL) as ClosedQuestions,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 1 AND p5.AcceptedAnswerId IS NOT NULL) as AcceptedAnswers,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (
+        SELECT DISTINCT unnest(string_to_array(p.Tags, '><')) as TagName 
+        WHERE p.Tags IS NOT NULL AND p.Tags != ''
+    ) t) as AllTags,
+    (SELECT STRING_AGG(ph.Comment, ' | ') FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13) ORDER BY ph.CreationDate DESC LIMIT 5) as RecentHistoryComments,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) as IsDuplicateOfCount,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) as AvgBountyAmount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 24) as EditCount,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) as LastEditDate,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (14, 15)) as LockUnlockCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) as FavoriteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 6) as CloseVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 7) as ReopenVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 10) as DeletionVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 11) as UndeletionVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 12) as SpamVotes
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE 
+    p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= '2020-01-01 00:00:00'
+    AND p.ViewCount > 100
+    AND (
+        (p.PostTypeId = 1 AND p.Score > 5) 
+        OR 
+        (p.PostTypeId = 2 AND p.Score > 10)
+    )
+GROUP BY 
+    p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName, u.Reputation, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags
+HAVING 
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) > 0
+    AND (
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) > 10
+        OR
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) > 5
+    )
+ORDER BY 
+    p.Score DESC, p.ViewCount DESC
+LIMIT 1000;

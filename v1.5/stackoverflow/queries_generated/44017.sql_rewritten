@@ -1,0 +1,36 @@
+-- {"query": "44017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 38998, "output_tokens": 15659} 
+WITH top_posts AS (
+  SELECT p.Id, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags, p.CreationDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  ORDER BY p.Score DESC
+  LIMIT 1000
+),
+tag_scores AS (
+  SELECT 
+    t.TagName,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS question_score_sum,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS answer_score_sum,
+    SUM(p.ViewCount) AS view_count_sum,
+    SUM(p.AnswerCount) AS answer_count_sum,
+    SUM(p.CommentCount) AS comment_count_sum,
+    SUM(p.FavoriteCount) AS favorite_count_sum,
+    COUNT(*) AS post_count
+  FROM top_posts p
+  JOIN Posts_Tags pt ON p.Id = pt.PostId
+  JOIN Tags t ON pt.TagId = t.Id
+  GROUP BY t.TagName
+),
+tag_rankings AS (
+  SELECT
+    TagName,
+    ROW_NUMBER() OVER (ORDER BY question_score_sum DESC, answer_score_sum DESC, view_count_sum DESC, answer_count_sum DESC, comment_count_sum DESC, favorite_count_sum DESC, post_count DESC) AS question_rank,
+    ROW_NUMBER() OVER (ORDER BY answer_score_sum DESC, question_score_sum DESC, view_count_sum DESC, answer_count_sum DESC, comment_count_sum DESC, favorite_count_sum DESC, post_count DESC) AS answer_rank,
+    ROW_NUMBER() OVER (ORDER BY view_count_sum DESC, question_score_sum DESC, answer_score_sum DESC, answer_count_sum DESC, comment_count_sum DESC, favorite_count_sum DESC, post_count DESC) AS view_rank,
+    ROW_NUMBER() OVER (ORDER BY answer_count_sum DESC, question_score_sum DESC, answer_score_sum DESC, view_count_sum DESC, comment_count_sum DESC, favorite_count_sum DESC, post_count DESC) AS answer_count_rank,
+    ROW_NUMBER() OVER (ORDER BY comment_count_sum DESC, question_score_sum DESC, answer_score_sum DESC, view_count_sum DESC, answer_count_sum DESC, favorite_count_sum DESC, post_count DESC) AS comment_count_rank,
+    ROW_NUMBER() OVER (ORDER BY favorite_count_sum DESC, question_score_sum DESC, answer_score_sum DESC, view_count_sum DESC, answer_count_sum DESC, comment_count_sum DESC, post_count DESC) AS favorite_count_rank,
+    ROW_NUMBER() OVER (ORDER BY post_count DESC, question_score_sum DESC, answer_score_sum DESC, view_count_sum DESC, answer_count_sum DESC, comment_count_sum DESC, favorite_count_sum DESC) AS post_count_rank
+  FROM tag_scores
+)
+SELECT * FROM tag_rankings;

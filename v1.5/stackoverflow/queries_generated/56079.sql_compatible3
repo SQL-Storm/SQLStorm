@@ -1,0 +1,44 @@
+WITH top_100_users AS (
+  SELECT Id, Reputation, CreationDate, DisplayName
+  FROM Users
+  ORDER BY Reputation DESC
+  LIMIT 100
+),
+top_100_posts AS (
+  SELECT Id, Score, ViewCount, Title, CreationDate, OwnerUserId
+  FROM Posts
+  ORDER BY Score DESC
+  LIMIT 100
+),
+user_post_intersection AS (
+  SELECT u.Id, u.Reputation, u.CreationDate, u.DisplayName, 
+         p.Id AS PostId, p.Score, p.ViewCount, p.Title, p.CreationDate AS PostCreationDate
+  FROM top_100_users AS u
+  JOIN top_100_posts AS p ON u.Id = p.OwnerUserId
+),
+post_votes AS (
+  SELECT p.Id AS PostId, 
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Posts AS p
+  LEFT JOIN Votes AS v ON p.Id = v.PostId
+  GROUP BY p.Id
+),
+post_tags AS (
+  SELECT p.Id AS PostId, STRING_AGG(t.TagName, ', ') AS Tags
+  FROM Posts AS p
+  LEFT JOIN (
+    SELECT DISTINCT
+      pt.PostId, pt.TagId
+    FROM PostTags pt
+  ) AS pt ON p.Id = pt.PostId
+  LEFT JOIN Tags AS t ON pt.TagId = t.Id
+  GROUP BY p.Id
+)
+SELECT upi.Id, upi.Reputation, upi.CreationDate, upi.DisplayName, 
+       upi.PostId, upi.Score, upi.ViewCount, upi.Title, upi.PostCreationDate,
+       pv.UpVotes, pv.DownVotes, pt.Tags
+FROM user_post_intersection AS upi
+LEFT JOIN post_votes AS pv ON upi.PostId = pv.PostId
+LEFT JOIN post_tags AS pt ON upi.PostId = pt.PostId
+ORDER BY upi.Reputation DESC, upi.Score DESC;

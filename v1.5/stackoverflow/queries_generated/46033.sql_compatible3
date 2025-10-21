@@ -1,0 +1,123 @@
+WITH TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearRank
+    FROM Users AS u
+    WHERE u.Reputation > 1000
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS TagArray,
+        EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 3600 AS HoursToClose
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+),
+AnswerQuality AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererUserId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 60 AS MinutesToAnswer,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        COUNT(c.Id) AS AnswerComments,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts AS a
+    JOIN Posts AS q ON a.ParentId = q.Id
+    LEFT JOIN Comments AS c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+    GROUP BY a.ParentId, a.OwnerUserId, a.Id, a.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId
+),
+UserEngagementScores AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT qm.QuestionId) AS QuestionsAsked,
+        COUNT(DISTINCT aq.AnswerId) AS AnswersGiven,
+        AVG(qm.QuestionScore) AS AvgQuestionScore,
+        AVG(aq.AnswerScore) AS AvgAnswerScore,
+        SUM(aq.IsAccepted) AS AcceptedAnswers,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        AVG(CASE WHEN aq.MinutesToAnswer IS NOT NULL THEN aq.MinutesToAnswer ELSE NULL END) AS AvgResponseTime
+    FROM TopUsersByReputation AS u
+    LEFT JOIN QuestionMetrics AS qm ON u.Id = qm.OwnerUserId
+    LEFT JOIN AnswerQuality AS aq ON u.Id = aq.AnswererUserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    WHERE u.YearRank <= 100
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT qm.QuestionId) AS QuestionCount,
+        AVG(qm.QuestionScore) AS AvgScore,
+        AVG(qm.ViewCount) AS AvgViews,
+        AVG(qm.AnswerCount) AS AvgAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qm.ViewCount) AS MedianViews
+    FROM QuestionMetrics AS qm
+    CROSS JOIN LATERAL UNNEST(qm.TagArray) AS t(TagName)
+    WHERE qm.TagArray IS NOT NULL
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT qm.QuestionId) >= 50
+),
+CrossTagAnalysis AS (
+    SELECT 
+        t1.TagName AS Tag1,
+        t2.TagName AS Tag2,
+        COUNT(*) AS CoOccurrence,
+        AVG(qm.QuestionScore) AS AvgCombinedScore
+    FROM QuestionMetrics AS qm
+    CROSS JOIN LATERAL UNNEST(qm.TagArray) AS t1(TagName)
+    CROSS JOIN LATERAL UNNEST(qm.TagArray) AS t2(TagName)
+    WHERE t1.TagName < t2.TagName
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) >= 20
+)
+SELECT 
+    ues.DisplayName,
+    ues.UserId,
+    ues.QuestionsAsked,
+    ues.AnswersGiven,
+    ROUND(CAST(ues.AvgQuestionScore AS NUMERIC), 2) AS AvgQuestionScore,
+    ROUND(CAST(ues.AvgAnswerScore AS NUMERIC), 2) AS AvgAnswerScore,
+    ues.AcceptedAnswers,
+    ROUND((CAST(ues.AcceptedAnswers AS DOUBLE PRECISION) / NULLIF(ues.AnswersGiven, 0) * 100.0), 2) AS AcceptanceRate,
+    ues.GoldBadges,
+    ues.SilverBadges,
+    ues.BronzeBadges,
+    ROUND(CAST(ues.AvgResponseTime AS NUMERIC), 2) AS AvgResponseTimeMinutes,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.QuestionCount DESC) FILTER (WHERE NULL) AS TopTags,
+    MAX(cta.CoOccurrence) AS MaxTagCoOccurrence
+FROM UserEngagementScores AS ues
+LEFT JOIN QuestionMetrics AS qm ON ues.UserId = qm.OwnerUserId
+LEFT JOIN LATERAL UNNEST(qm.TagArray) AS user_tag(TagName) ON TRUE
+LEFT JOIN TagPopularity AS tp ON user_tag.TagName = tp.TagName
+LEFT JOIN LATERAL (
+    SELECT ROW_NUMBER() OVER (PARTITION BY ues.UserId ORDER BY tp.QuestionCount DESC) AS tp_rank
+) AS ranked ON TRUE
+LEFT JOIN CrossTagAnalysis AS cta ON (cta.Tag1 = user_tag.TagName OR cta.Tag2 = user_tag.TagName)
+WHERE ues.QuestionsAsked + ues.AnswersGiven > 10
+GROUP BY ues.DisplayName, ues.UserId, ues.QuestionsAsked, ues.AnswersGiven, 
+         ues.AvgQuestionScore, ues.AvgAnswerScore, ues.AcceptedAnswers, 
+         ues.GoldBadges, ues.SilverBadges, ues.BronzeBadges, ues.AvgResponseTime
+ORDER BY (ues.AvgQuestionScore + ues.AvgAnswerScore) DESC, ues.AcceptedAnswers DESC
+LIMIT 500;

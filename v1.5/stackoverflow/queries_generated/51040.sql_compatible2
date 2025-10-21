@@ -1,0 +1,98 @@
+WITH monthly_posts AS (
+  SELECT 
+    DATE_TRUNC('month', p.CreationDate) AS month,
+    u.Id AS user_id,
+    u.Reputation,
+    COUNT(CASE WHEN pt.Id = 1 THEN 1 END) AS question_count,
+    COUNT(CASE WHEN pt.Id = 2 THEN 1 END) AS answer_count,
+    SUM(p.Score) AS total_score,
+    AVG(p.Score) AS avg_score
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE p.CreationDate >= DATE '2024-10-01' - INTERVAL '12 months'
+    AND p.Score IS NOT NULL
+  GROUP BY DATE_TRUNC('month', p.CreationDate), u.Id, u.Reputation
+),
+tag_activity AS (
+  SELECT 
+    DATE_TRUNC('month', p.CreationDate) AS month,
+    t.TagName,
+    COUNT(p.Id) AS tag_usage_count,
+    AVG(p.ViewCount) AS avg_views_per_tagged_post
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  CROSS JOIN LATERAL STRING_TO_ARRAY(
+    SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), 
+    '><'
+  ) AS tag_split(tag)
+  LEFT JOIN Tags t ON t.TagName = CAST(tag_split.tag AS VARCHAR)
+  WHERE pt.Id = 1 
+    AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '12 months'
+    AND p.Tags IS NOT NULL
+    AND LENGTH(p.Tags) > 2
+  GROUP BY DATE_TRUNC('month', p.CreationDate), t.TagName
+),
+user_engagement AS (
+  SELECT 
+    u.Id AS user_id,
+    DATE_TRUNC('month', COALESCE(c.CreationDate, v.CreationDate, b.Date)) AS month,
+    COUNT(DISTINCT c.Id) AS comment_count,
+    COUNT(DISTINCT v.Id) AS vote_count,
+    COUNT(DISTINCT b.Id) AS badge_count
+  FROM Users u
+  LEFT JOIN Comments c ON c.UserId = u.Id 
+    AND c.CreationDate >= DATE '2024-10-01' - INTERVAL '12 months'
+  LEFT JOIN Votes v ON v.UserId = u.Id 
+    AND v.CreationDate >= DATE '2024-10-01' - INTERVAL '12 months'
+    AND v.VoteTypeId IN (2, 3)
+  LEFT JOIN Badges b ON b.UserId = u.Id 
+    AND b.Date >= DATE '2024-10-01' - INTERVAL '12 months'
+    AND b.Class = 1
+  WHERE u.CreationDate < DATE '2024-10-01' - INTERVAL '12 months'
+  GROUP BY u.Id, DATE_TRUNC('month', COALESCE(c.CreationDate, v.CreationDate, b.Date))
+),
+monthly_trends AS (
+  SELECT 
+    mp.month,
+    mp.user_id,
+    mp.question_count,
+    mp.answer_count,
+    mp.total_score,
+    mp.avg_score,
+    ue.comment_count,
+    ue.vote_count,
+    ue.badge_count,
+    mp.Reputation / NULLIF(EXTRACT(EPOCH FROM (DATE '2024-10-01' - u.CreationDate)) / 86400, 0) AS reputation_per_day,
+    ta.tag_usage_count,
+    ta.avg_views_per_tagged_post
+  FROM monthly_posts mp
+  JOIN Users u ON mp.user_id = u.Id
+  LEFT JOIN user_engagement ue ON mp.user_id = ue.user_id AND mp.month = ue.month
+  LEFT JOIN tag_activity ta ON mp.month = ta.month
+    AND mp.question_count > 0
+)
+SELECT 
+  month,
+  COUNT(DISTINCT user_id) AS active_users,
+  AVG(question_count) AS avg_questions_per_user,
+  AVG(answer_count) AS avg_answers_per_user,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_score) AS median_total_score,
+  SUM(CASE WHEN reputation_per_day > 10 THEN 1 ELSE 0 END) AS high_reputation_users,
+  AVG(comment_count) AS avg_comments,
+  SUM(tag_usage_count) AS total_tag_usage,
+  CORR(total_score, vote_count) AS score_vote_correlation,
+  RANK() OVER (PARTITION BY month ORDER BY AVG(total_score) DESC) AS performance_rank,
+  SUM(COUNT(*) ) OVER (ORDER BY month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_users,
+  (
+   SELECT ta2.TagName
+   FROM tag_activity ta2
+   WHERE ta2.month = mt.month
+   ORDER BY ta2.tag_usage_count DESC
+   LIMIT 1
+  ) AS top_tag,
+  COUNT(CASE WHEN LAG(avg_score) OVER (PARTITION BY user_id ORDER BY month) < avg_score THEN 1 END) AS improving_users
+FROM monthly_trends mt
+GROUP BY month
+ORDER BY month DESC
+LIMIT 12;

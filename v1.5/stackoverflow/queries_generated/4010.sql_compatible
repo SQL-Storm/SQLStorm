@@ -1,0 +1,170 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id as ExcerptPostId,
+        p.Title as ExcerptTitle,
+        p.OwnerUserId as ExcerptOwner
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.IsRequired = 1
+    
+    union all
+    
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        p2.Id,
+        p2.Title,
+        p2.OwnerUserId
+    from Tags t2
+    join RecursiveTagHierarchy rth on t2.Id != rth.Id and t2.Count < rth.Count
+    left join Posts p2 on p2.Id = t2.ExcerptPostId
+    where t2.IsRequired = 1
+),
+UserActivityRanked as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct ph.PostId) as EditCount,
+        count(distinct b.Id) as BadgeCount,
+        rank() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)
+    left join Badges b on b.UserId = u.Id
+    where u.Location is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.Location
+),
+RecentHotPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as rn
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 52
+    where p.PostTypeId in (1, 2)
+),
+AnswerPopularity as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.ViewCount,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotesCount,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotesCount,
+        (count(v.Id) filter (where v.VoteTypeId = 2) - count(v.Id) filter (where v.VoteTypeId = 3)) as NetVotes
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.ParentId, a.Id, a.Score, a.ViewCount, u.Id, u.DisplayName
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateId,
+        pl.RelatedPostId as OriginalId,
+        pdu.Title as DuplicateTitle,
+        por.Title as OriginalTitle,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    inner join Posts pdu on pdu.Id = pl.PostId
+    inner join Posts por on por.Id = pl.RelatedPostId
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(b.Class) as BadgeScoreWeighted,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+ComplexTextSearch as (
+    select
+        p.Id,
+        p.Title,
+        p.Body,
+        p.Tags,
+        coalesce(array_to_string(array_agg(distinct substring(tag from 2 for char_length(tag) - 2)), ','), '') as ExtractedTags,
+        length(p.Body) - length(replace(lower(p.Body), 'sql', ''))/3 as SqlKeywordCount,
+        case when p.LastActivityDate is null then 'No Activity' else to_char(p.LastActivityDate, 'YYYY-MM-DD') end as LastActivityDay
+    from Posts p
+    cross join lateral string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') tag
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+    group by p.Id, p.Title, p.Body, p.Tags, p.LastActivityDate
+),
+CorrelatedClosedQuestions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.ClosedDate,
+        (select string_agg(distinct crt.Name, ', ') 
+         from PostHistory ph
+         join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+         where ph.PostId = q.Id and ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasons,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 6) as CloseVoteCount,
+        q.Score,
+        q.ViewCount
+    from Posts q
+    where q.PostTypeId = 1 and q.ClosedDate is not null
+)
+select 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.EditCount,
+    ua.BadgeCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.BadgeScoreWeighted,
+    rhp.Title as RecentHotPostTitle,
+    rhp.Score as RecentHotPostScore,
+    rhp.ViewCount as RecentHotPostViews,
+    dp.DuplicateTitle,
+    dp.OriginalTitle,
+    dp.LinkTypeName,
+    acq.Title as ClosedQuestionTitle,
+    acq.CloseReasons,
+    acq.CloseVoteCount,
+    ap.AnswerId,
+    ap.AnswerScore,
+    ap.NetVotes,
+    cts.ExtractedTags,
+    cts.SqlKeywordCount,
+    cts.LastActivityDay
+from UserActivityRanked ua
+left join UserBadgeSummary ubs on ubs.UserId = ua.Id
+left join RecentHotPosts rhp on rhp.OwnerUserId = ua.Id and rhp.rn = 1
+left join DuplicateQuestions dp on dp.DuplicateId = (
+    select Id from Posts p where p.OwnerUserId = ua.Id limit 1
+)
+left join CorrelatedClosedQuestions acq on acq.QuestionId = (
+    select Id from Posts p where p.OwnerUserId = ua.Id and p.PostTypeId = 1 and p.ClosedDate is not null limit 1
+)
+left join AnswerPopularity ap on ap.OwnerUserId = ua.Id 
+left join ComplexTextSearch cts on cts.Id = (
+    select p.Id from Posts p where p.OwnerUserId = ua.Id and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+where ua.Location is not null
+and ua.EditCount > 5
+and (ubs.GoldBadges > 0 or ua.Reputation > 1000)
+order by ua.LocationRank, ua.Reputation desc
+limit 100;

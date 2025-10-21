@@ -1,0 +1,152 @@
+WITH RECURSIVE user_engagement_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+        EXTRACT(YEAR FROM u.CreationDate) AS join_year,
+        CASE 
+            WHEN u.Location IS NULL THEN 'Unknown'
+            WHEN LENGTH(TRIM(u.Location)) = 0 THEN 'Unknown'
+            ELSE UPPER(SUBSTRING(u.Location FROM 1 FOR 30))
+        END AS normalized_location
+    FROM Users u
+    WHERE u.Reputation > 1000
+        AND u.CreationDate >= DATE '2020-01-01'
+),
+post_analytics AS (
+    SELECT 
+        p.Id AS post_id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS favorites,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS has_accepted_answer,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS score_rank,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_date,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS total_posts_by_user,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS rolling_avg_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= DATE '2020-01-01'
+        AND p.OwnerUserId IS NOT NULL
+),
+tag_performance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_usage_count,
+        COUNT(DISTINCT p.Id) AS posts_with_tag,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS median_views,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS questions_with_accepted_answers
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+    HAVING AVG(p.Score) > 5
+),
+vote_aggregations AS (
+    SELECT 
+        v.PostId,
+        v.UserId AS voter_id,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS favorites,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS max_bounty,
+        STRING_AGG(DISTINCT vt.Name, ', ' ORDER BY vt.Name) AS vote_types_list
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate >= DATE '2020-01-01'
+    GROUP BY v.PostId, v.UserId
+),
+comment_sentiment AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        COUNT(*) AS comment_count,
+        AVG(c.Score) AS avg_comment_score,
+        SUM(LENGTH(c.Text)) AS total_comment_length,
+        MAX(c.CreationDate) AS last_comment_date,
+        STRING_AGG(SUBSTRING(c.Text FROM 1 FOR 50), ' | ' ORDER BY c.CreationDate DESC) FILTER (WHERE c.Score > 5) AS top_comments
+    FROM Comments c
+    WHERE c.CreationDate >= DATE '2020-01-01'
+    GROUP BY c.PostId, c.UserId
+)
+SELECT DISTINCT
+    uem.DisplayName,
+    uem.Reputation,
+    uem.normalized_location,
+    uem.join_year,
+    COALESCE(pa.total_posts_by_user, 0) AS total_posts,
+    ROUND(AVG(pa.Score) OVER (PARTITION BY uem.Id), 2) AS user_avg_score,
+    ROUND(pa.rolling_avg_score, 2) AS rolling_avg_score,
+    tp.TagName AS most_common_tag,
+    tp.avg_score AS tag_avg_score,
+    tp.median_views AS tag_median_views,
+    COALESCE(va.upvotes, 0) AS received_upvotes,
+    COALESCE(va.downvotes, 0) AS received_downvotes,
+    COALESCE(va.max_bounty, 0) AS highest_bounty,
+    cs.comment_count,
+    ROUND(COALESCE(cs.avg_comment_score, 0), 2) AS avg_comment_score,
+    cs.top_comments,
+    CASE 
+        WHEN pa.score_rank = 1 THEN 'Top Post'
+        WHEN pa.score_rank <= 5 THEN 'Top 5 Post'
+        ELSE 'Regular Post'
+    END AS post_ranking,
+    CAST((EXTRACT(EPOCH FROM (pa.prev_post_date - pa.prev_post_date))) / 86400 AS INTEGER) AS days_since_prev_post,
+    b.badge_count,
+    b.gold_badges,
+    CASE 
+        WHEN uem.Reputation > 10000 AND pa.total_posts_by_user > 50 THEN 'Power User'
+        WHEN uem.Reputation > 5000 THEN 'Active User'
+        ELSE 'Regular User'
+    END AS user_category,
+    COALESCE(
+        (SELECT COUNT(*) FROM PostLinks pl 
+         WHERE pl.PostId = pa.post_id AND pl.LinkTypeId = 3),
+        0
+    ) AS duplicate_links,
+    (SELECT STRING_AGG(pt.Name, ', ')
+     FROM Posts p2
+     INNER JOIN PostTypes pt ON p2.PostTypeId = pt.Id
+     WHERE p2.OwnerUserId = uem.Id
+     GROUP BY p2.OwnerUserId
+     LIMIT 1) AS post_types_authored
+FROM user_engagement_metrics uem
+INNER JOIN post_analytics pa ON uem.Id = pa.OwnerUserId
+LEFT OUTER JOIN LATERAL (
+    SELECT t.TagName, t.avg_score, t.median_views
+    FROM tag_performance t
+    INNER JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.OwnerUserId = uem.Id
+    ORDER BY t.avg_score DESC
+    LIMIT 1
+) tp ON TRUE
+LEFT JOIN vote_aggregations va ON pa.post_id = va.PostId
+FULL OUTER JOIN comment_sentiment cs ON pa.post_id = cs.PostId AND uem.Id = cs.UserId
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) AS badge_count,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold_badges
+    FROM Badges
+    WHERE UserId = uem.Id
+) b ON TRUE
+WHERE pa.score_rank <= 10
+    AND (va.upvotes > va.downvotes OR va.upvotes IS NULL)
+    AND (cs.comment_count IS NULL OR cs.comment_count BETWEEN 1 AND 100)
+    AND uem.net_votes > 0
+ORDER BY 
+    COALESCE(pa.total_posts_by_user, 0) DESC,
+    uem.Reputation DESC,
+    RAND()
+LIMIT 500;

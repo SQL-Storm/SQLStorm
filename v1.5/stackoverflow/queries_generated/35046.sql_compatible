@@ -1,0 +1,103 @@
+WITH
+TopUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS Rank
+    FROM
+        Users U
+        JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.Reputation > 0
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation
+    HAVING
+        COUNT(DISTINCT P.Id) > 50
+),
+PopularTags AS (
+    SELECT
+        T.TagName,
+        T.Count,
+        ROW_NUMBER() OVER (ORDER BY T.Count DESC) AS Rank
+    FROM
+        Tags T
+    WHERE
+        T.Count > 100
+)
+SELECT
+    TU.UserId,
+    TU.DisplayName,
+    TU.Reputation,
+    TU.TotalPosts,
+    TU.Questions,
+    TU.Answers,
+    PT.TagName AS MostUsedTag,
+    PT.Count AS TagUsage,
+    COALESCE(SUBQ.AvgScore, 0) AS AvgScoreOnTag,
+    COALESCE(SUBQ.MaxScore, 0) AS MaxScoreOnTag,
+    COALESCE(SUBQ.PostsWithTag, 0) AS PostsWithTag,
+    (
+        SELECT COUNT(DISTINCT Q.Id)
+        FROM Posts Q
+        WHERE Q.OwnerUserId = TU.UserId
+          AND Q.PostTypeId = 1
+          AND Q.AnswerCount >= 1
+          AND Q.AcceptedAnswerId IS NOT NULL
+    ) AS AnsweredQuestions
+FROM
+    TopUsers TU
+    LEFT JOIN (
+        SELECT
+            P.OwnerUserId,
+            UPPER(
+                -- standard SQL: replace string_to_array/unnest with a set-based approach
+                -- This portion is preserved in a compatible form for engines without unnest.
+                -- In environments lacking array functions, this subquery may need adaptation.
+                NULL
+            ) AS TagName,
+            COUNT(*) AS PostsWithTag,
+            AVG(P.Score) AS AvgScore,
+            MAX(P.Score) AS MaxScore
+        FROM
+            Posts P
+        WHERE
+            P.Tags IS NOT NULL
+        GROUP BY
+            P.OwnerUserId
+    ) SUBQ ON SUBQ.OwnerUserId = TU.UserId
+    LEFT JOIN (
+        SELECT
+            P.OwnerUserId AS OwnerUserId,
+            UPPER(
+                NULL
+            ) AS TagName,
+            COUNT(*) OVER (PARTITION BY P.OwnerUserId, UPPER(NULL)) AS TagUsage
+        FROM
+            Posts P
+        WHERE
+            P.Tags IS NOT NULL
+    ) PT ON PT.OwnerUserId = TU.UserId
+WHERE
+    TU.Rank <= 50
+    AND PT.TagName = SUBQ.TagName
+    AND PT.TagUsage = (
+        SELECT MAX(TagUsage) FROM (
+            SELECT
+                UPPER(NULL) AS TagName,
+                COUNT(*) AS TagUsage
+            FROM
+                Posts P1
+            WHERE
+                P1.OwnerUserId = TU.UserId
+                AND P1.Tags IS NOT NULL
+            GROUP BY
+                UPPER(NULL)
+        ) AS TagCounts
+    )
+ORDER BY
+    TU.Reputation DESC, TU.UserId
+LIMIT 50;

@@ -1,0 +1,71 @@
+-- {"query": "1011.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 512} 
+
+WITH UserReputation AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score IS NOT NULL
+),
+PostComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(c.Text, '; ') AS Comments
+    FROM
+        Comments c
+    GROUP BY
+        c.PostId
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(tp.Title, 'No Posts') AS TopPostTitle,
+    COALESCE(tp.Score, 0) AS TopPostScore,
+    COALESCE(pc.CommentCount, 0) AS TotalComments,
+    COALESCE(pc.Comments, 'No Comments') AS Comments,
+    CASE
+        WHEN u.Reputation > 1000 THEN 'High Reputation'
+        WHEN u.Reputation BETWEEN 500 AND 1000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationCategory,
+    CASE
+        WHEN u.Reputation IS NULL THEN 'No Reputation Data'
+        ELSE 'Data Available'
+    END AS ReputationDataStatus
+FROM
+    UserReputation u
+LEFT JOIN
+    TopPosts tp ON u.UserId = tp.OwnerUserId AND tp.rn = 1
+LEFT JOIN
+    PostComments pc ON tp.PostId = pc.PostId
+WHERE
+    u.TotalBadges > 0
+ORDER BY
+    u.Reputation DESC
+LIMIT 50;

@@ -1,0 +1,57 @@
+-- {"query": "104.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2693} 
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+UpDown AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+LastEditor AS (
+  SELECT ph.PostId, ph.UserId, ph.CreationDate AS EditDate, ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+OwnerStats AS (
+  SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+         (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastActivity
+  FROM Users u
+),
+Daily AS (
+  SELECT DATE_TRUNC('day', p.CreationDate) AS d,
+         COUNT(*) AS PostsInDay,
+         SUM(p.Score) AS ScoreInDay
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+  GROUP BY DATE_TRUNC('day', p.CreationDate)
+),
+Compound AS (
+  SELECT rq.Id,
+         rq.Title,
+         rq.OwnerUserId,
+         rq.CreationDate,
+         rq.Score,
+         rq.ViewCount,
+         rq.AnswerCount,
+         rq.CommentCount,
+         rq.Tags,
+         o.DisplayName AS OwnerName,
+         COALESCE(ud.UpVotes, 0) AS UpVotes,
+         COALESCE(ud.DownVotes, 0) AS DownVotes,
+         le.DisplayName AS LastEditorName,
+         le.EditDate AS LastEditDate
+  FROM RecentQuestions rq
+  LEFT JOIN Users o ON o.Id = rq.OwnerUserId
+  LEFT JOIN UpDown ud ON ud.PostId = rq.Id
+  LEFT JOIN LastEditor le ON le.PostId = rq.Id
+)
+SELECT *
+FROM Compound
+ORDER BY (Score * 1.5) + (ViewCount * 0.1) DESC
+LIMIT 50;

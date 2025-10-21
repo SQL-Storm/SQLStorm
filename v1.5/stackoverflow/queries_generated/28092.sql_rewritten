@@ -1,0 +1,85 @@
+-- {"query": "28092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1493} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId IN (2, 8)) AS UpVoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        NTILE(4) OVER (ORDER BY Reputation DESC) AS ReputationQuartile,
+        ROW_NUMBER() OVER (PARTITION BY NTILE(4) OVER (ORDER BY Reputation DESC) ORDER BY (QuestionCount + AnswerCount + CommentCount) DESC) AS ActivityRank,
+        (QuestionCount * 3 + AnswerCount * 2 + CommentCount) AS ActivityScore,
+        (UpVoteCount - DownVoteCount) AS NetVotes
+    FROM UserActivity
+),
+ClosedPosts AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT ph.PostId) AS ClosedPostCount
+    FROM Posts p
+    INNER JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY p.OwnerUserId
+),
+UserTags AS (
+    SELECT 
+        u.Id AS UserId,
+        STRING_AGG(DISTINCT tag, ', ') WITHIN GROUP (ORDER BY tag_count DESC) AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    CROSS APPLY (
+        SELECT 
+            tag,
+            COUNT(*) AS tag_count
+        FROM (
+            SELECT TRIM('>' FROM TRIM('<' FROM value)) AS tag
+            FROM STRING_SPLIT(p.Tags, '><')
+        ) t
+        GROUP BY tag
+    ) tags
+    GROUP BY u.Id
+)
+SELECT 
+    ru.UserId,
+    ru.ReputationQuartile,
+    ru.ActivityRank,
+    ru.ActivityScore,
+    ru.NetVotes,
+    COALESCE(cp.ClosedPostCount, 0) AS ClosedPostCount,
+    ut.TopTags,
+    CASE 
+        WHEN u.WebsiteUrl IS NOT NULL AND u.Location IS NOT NULL THEN 'Full Profile'
+        WHEN u.WebsiteUrl IS NULL AND u.Location IS NULL THEN 'Minimal Profile'
+        ELSE 'Partial Profile' 
+    END AS ProfileStatus,
+    COALESCE((
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ru.UserId)
+        AND pl.LinkTypeId = 3
+    ), 0) AS DuplicateLinks
+FROM RankedUsers ru
+LEFT JOIN ClosedPosts cp ON ru.UserId = cp.UserId
+LEFT JOIN UserTags ut ON ru.UserId = ut.UserId
+LEFT JOIN Users u ON ru.UserId = u.Id
+WHERE ru.Reputation > 1000
+ORDER BY 
+    ru.ReputationQuartile, 
+    ru.ActivityScore DESC, 
+    ru.NetVotes DESC;

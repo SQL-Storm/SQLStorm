@@ -1,0 +1,120 @@
+-- {"query": "20029.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1351} 
+
+WITH UserQuestionStats AS (
+    -- Step 1: Aggregate user and question data, calculate ranks and running averages
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount AS QuestionCommentCount,
+        p.AcceptedAnswerId,
+        -- Window function to rank a user's questions by score
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS QuestionRank,
+        -- Window function to get the user's average question score
+        AVG(p.Score) OVER(PARTITION BY u.Id) AS AvgUserScore,
+        -- Window function to find the time elapsed since the user's previous question
+        p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS TimeSinceLastQuestion
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1 -- Questions only
+        AND u.Reputation > 1500 -- Filter for experienced users
+        AND p.ClosedDate IS NULL -- Exclude closed questions
+        AND p.DeletionDate IS NULL -- Exclude deleted questions
+),
+AnswerAggregates AS (
+    -- Step 2: Aggregate data for answers related to the questions in the first CTE
+    SELECT
+        a.ParentId,
+        COUNT(a.Id) AS NumAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(a.CommentCount) AS TotalAnswerCommentCount,
+        MAX(c.Score) AS MaxCommentScoreOnAnswers,
+        -- Correlated subquery to find the reputation of the top answerer for this question
+        (SELECT Reputation FROM Users WHERE Id = (
+            SELECT OwnerUserId FROM Posts
+            WHERE ParentId = a.ParentId AND PostTypeId = 2
+            ORDER BY Score DESC
+            LIMIT 1
+        )) AS TopAnswererReputation
+    FROM
+        Posts a
+    LEFT JOIN
+        Comments c ON a.Id = c.PostId
+    WHERE
+        a.PostTypeId = 2 -- Answers only
+        AND a.ParentId IN (SELECT PostId FROM UserQuestionStats WHERE QuestionRank <= 10)
+    GROUP BY
+        a.ParentId
+)
+-- Final SELECT: Combine user stats, question details, and answer aggregates
+SELECT
+    uqs.DisplayName,
+    uqs.Reputation,
+    uqs.Title AS QuestionTitle,
+    uqs.Score AS QuestionScore,
+    uqs.QuestionRank,
+    uqs.ViewCount,
+    -- Complicated CASE statement for categorizing question performance
+    CASE
+        WHEN uqs.Score > uqs.AvgUserScore * 2 AND uqs.AnswerCount > 2 THEN 'High-Performing'
+        WHEN uqs.Score > uqs.AvgUserScore THEN 'Above Average'
+        WHEN uqs.Score < 0 THEN 'Poorly Received'
+        ELSE 'Standard'
+    END AS PerformanceCategory,
+    -- String manipulation and calculations
+    (uqs.Score + (uqs.FavoriteCount * 5) + (SELECT COUNT(*) FROM Votes v WHERE v.PostId = uqs.PostId AND v.VoteTypeId = 2)) / NULLIF(uqs.ViewCount, 0)::float AS EngagementRatio,
+    array_length(string_to_array(substring(uqs.Tags, 2, length(uqs.Tags) - 2), '><'), 1) AS TagCount,
+    -- Use COALESCE for data from the outer join
+    COALESCE(aa.NumAnswers, 0) AS AnswerCount,
+    COALESCE(aa.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(aa.TopAnswererReputation, 0) AS TopAnswererReputation,
+    -- Time calculation and NULL logic
+    EXTRACT(EPOCH FROM uqs.TimeSinceLastQuestion) / 3600 AS HoursSinceLastPost,
+    -- Correlated subquery to count edits by users other than the owner
+    (SELECT COUNT(*)
+     FROM PostHistory ph
+     WHERE ph.PostId = uqs.PostId
+       AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, or Tags
+       AND ph.UserId != uqs.UserId
+    ) AS EditsByOthers
+FROM
+    UserQuestionStats uqs
+LEFT JOIN
+    AnswerAggregates aa ON uqs.PostId = aa.ParentId
+WHERE
+    uqs.QuestionRank <= 5 -- Focus on the top 5 questions per user
+    AND uqs.Score > 10
+    AND uqs.AnswerCount > 0
+    -- Complex predicate combining multiple conditions
+    AND (
+        uqs.Score > uqs.AvgUserScore
+        OR EXISTS (
+            -- Subquery to check for specific badges held by the user
+            SELECT 1
+            FROM Badges b
+            WHERE b.UserId = uqs.UserId AND b.Name IN ('Strunk & White', 'Copy Editor', 'Explainer')
+        )
+    )
+    AND uqs.PostId NOT IN (
+        -- Subquery using a set operator (fictional example of filtering out 'migrated' posts)
+        SELECT PostId FROM PostLinks WHERE LinkTypeId = 3 -- Duplicate posts
+        UNION
+        SELECT RelatedPostId FROM PostLinks WHERE LinkTypeId = 3
+    )
+ORDER BY
+    uqs.Reputation DESC,
+    EngagementRatio DESC,
+    QuestionScore DESC
+LIMIT 500;

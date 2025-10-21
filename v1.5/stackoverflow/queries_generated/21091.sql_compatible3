@@ -1,0 +1,153 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate > u.CreationDate 
+        AND p.CreationDate <= u.CreationDate + INTERVAL '1 year'
+        AND p.DeletionDate IS NULL
+    WHERE u.Reputation >= 100 
+        AND u.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY 
+                (p.ViewCount * 0.1 + p.Score * 2 + COALESCE(p.AnswerCount, 0) * 5 + p.CommentCount * 0.5) DESC
+        ) AS ImpactRank,
+        LAG(p.Score) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate
+        ) AS PrevPostScore,
+        LEAD(p.Title) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate
+        ) AS NextPostTitle,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            WHEN p.Score > 50 AND p.AnswerCount >= 3 THEN 'HighValue'
+            ELSE 'Regular'
+        END AS PostCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.Score > 0
+        AND (p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 OR p.PostTypeId = 2)
+        AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+UserEngagementTrends AS (
+    SELECT 
+        au.UserId,
+        au.QuestionCount,
+        au.AnswerCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 AND v.UserId = au.UserId THEN v.Id END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS TotalVotesGiven,
+        AVG(DATE_PART('day', ph.CreationDate - au.UserCreationDate)) AS AvgDaysToFirstEdit,
+        STRING_AGG(
+            DISTINCT COALESCE(pt.Name, 'Unknown'), 
+            ' | '
+        ) OVER (
+            PARTITION BY au.UserId 
+            ORDER BY ph.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS ActivityTypes
+    FROM ActiveUsers au
+    LEFT JOIN PostHistory ph ON au.UserId = ph.UserId 
+        AND ph.PostId IN (SELECT PostId FROM HighImpactPosts WHERE OwnerUserId = au.UserId)
+        AND ph.CreationDate > au.UserCreationDate
+    LEFT JOIN Posts post ON ph.PostId = post.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = ph.PostHistoryTypeId
+    LEFT JOIN PostTypes pt ON post.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON au.UserId = v.UserId 
+        AND v.CreationDate BETWEEN au.UserCreationDate AND au.UserCreationDate + INTERVAL '1 year'
+    GROUP BY au.UserId, au.QuestionCount, au.AnswerCount
+)
+SELECT 
+    au.UserId,
+    u.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.AvgPostScore,
+    hip.PostId,
+    hip.Title,
+    hip.Score AS PostScore,
+    hip.ViewCount,
+    hip.ImpactRank,
+    hip.PostCategory,
+    COALESCE(hip.PrevPostScore, 0) AS PreviousPostScore,
+    LENGTH(COALESCE(hip.Tags, '')) AS TagLength,
+    CASE 
+        WHEN hip.ClosedDate IS NOT NULL AND hip.ClosedDate < hip.CreationDate + INTERVAL '7 days' 
+        THEN 'QuickClose'
+        WHEN hip.AnswerCount > au.AnswerCount * 0.5 THEN 'HighEngagement'
+        ELSE 'Standard'
+    END AS EngagementLevel,
+    ut.EditCount,
+    ut.UpvotesGiven,
+    ut.TotalVotesGiven,
+    ut.ActivityTypes,
+    (au.QuestionCount * 10.0 + au.AnswerCount * 15.0 + ut.EditCount * 5.0) / 
+        NULLIF(GREATEST(au.PostCount, 1), 0) AS EngagementScore,
+    CAST(
+        CONCAT(
+            'User: ', COALESCE(u.DisplayName, 'Anonymous'),
+            ' | Rep: ', CAST(au.Reputation AS TEXT),
+            ' | Posts: Q', CAST(au.QuestionCount AS TEXT), ' A', CAST(au.AnswerCount AS TEXT),
+            CASE 
+                WHEN hip.PostCategory = 'HighValue' THEN ' ⭐'
+                WHEN hip.PostCategory = 'Closed' THEN ' ❌'
+                ELSE ''
+            END,
+            CASE 
+                WHEN ut.EditCount > 10 THEN ' (Editor)'
+                WHEN ut.UpvotesGiven > 50 THEN ' (Voter)'
+                ELSE ''
+            END
+        ) AS TEXT
+    ) AS UserSummary,
+    COALESCE(hip.AnswerCount, 0) + COALESCE(au.AnswerCount, 0) AS TotalAnswers,
+    GREATEST(hip.ViewCount, 0) * (1.0 + COALESCE(hip.Score, 0) / 100.0) AS WeightedViews,
+    (SELECT AVG(p2.Score) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = au.UserId 
+        AND p2.Id != hip.PostId 
+        AND p2.CreationDate BETWEEN hip.CreationDate - INTERVAL '30 days' 
+                              AND hip.CreationDate + INTERVAL '30 days'
+    ) AS PeerAvgScore
+FROM ActiveUsers au
+INNER JOIN Users u ON au.UserId = u.Id
+LEFT JOIN HighImpactPosts hip ON au.UserId = hip.OwnerUserId 
+    AND hip.ImpactRank <= 3
+    AND (hip.PostCategory != 'Closed' OR hip.ClosedDate IS NULL)
+LEFT JOIN UserEngagementTrends ut ON au.UserId = ut.UserId
+WHERE au.Reputation BETWEEN 100 AND 10000
+    AND (hip.PostId IS NULL OR hip.ViewCount > 100 OR hip.Score > 25)
+    AND (ut.EditCount IS NULL OR ut.EditCount > 0 OR ut.UpvotesGiven > 10)
+    AND NOT (u.Location ILIKE '%spam%' OR u.DisplayName ILIKE '%bot%')
+    AND (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+         FROM PostLinks pl 
+         WHERE pl.PostId = hip.PostId 
+            AND pl.LinkTypeId = 1) <= 20
+ORDER BY 
+    au.Reputation DESC,
+    COALESCE(hip.ImpactRank, 999) ASC,
+    au.UserCreationDate DESC
+LIMIT 1000;

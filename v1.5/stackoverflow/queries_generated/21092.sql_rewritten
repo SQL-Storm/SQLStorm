@@ -1,0 +1,113 @@
+-- {"query": "21092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1231} 
+WITH user_activity AS (
+  SELECT 
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS total_posts,
+    AVG(p.Score) AS avg_post_score,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+    COUNT(DISTINCT c.Id) AS comment_count,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+  FROM Users u
+  LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+  LEFT OUTER JOIN Comments c ON u.Id = c.UserId AND c.PostId = p.Id
+  WHERE u.Reputation > 0
+    AND u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING COUNT(DISTINCT p.Id) > 5
+),
+active_users_with_badges AS (
+  SELECT 
+    ua.*,
+    COUNT(DISTINCT b.Id) AS badge_count,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    STRING_AGG(DISTINCT b.Name, '; ') AS badge_names
+  FROM user_activity ua
+  LEFT OUTER JOIN Badges b ON ua.user_id = b.UserId 
+    AND b.Date >= (SELECT MIN(ua2.CreationDate) FROM user_activity ua2 WHERE ua2.user_id = ua.user_id)
+  GROUP BY ua.user_id, ua.DisplayName, ua.Reputation, ua.total_posts, ua.avg_post_score, 
+           ua.question_count, ua.answer_count, ua.comment_count, ua.reputation_rank
+),
+accepted_answers AS (
+  SELECT DISTINCT 
+    p.OwnerUserId AS user_id,
+    COUNT(p.Id) OVER (PARTITION BY p.OwnerUserId) AS accepted_count
+  FROM Posts p
+  INNER JOIN Posts q ON p.Id = q.AcceptedAnswerId
+  WHERE p.PostTypeId = 2 AND q.PostTypeId = 1
+),
+upvoted_posts AS (
+  SELECT 
+    v.PostId,
+    COUNT(v.Id) AS upvote_count,
+    AVG(v.CreationDate) AS avg_upvote_date
+  FROM Votes v
+  INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE vt.Name = 'UpMod'
+    AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '6 months'
+  GROUP BY v.PostId
+  HAVING COUNT(v.Id) > 10
+),
+tagged_questions AS (
+  SELECT 
+    p.Id AS post_id,
+    p.Tags,
+    LENGTH(p.Tags) - LENGTH(REGEXP_REPLACE(p.Tags, '<[^>]+>', '')) AS tag_count_estimate,
+    SUBSTRING(p.Tags FROM 2 FOR 20) AS first_tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1 
+    AND p.Tags IS NOT NULL 
+    AND p.Tags != ''
+    AND p.ClosedDate IS NULL
+)
+SELECT 
+  auwb.user_id,
+  auwb.DisplayName,
+  auwb.Reputation,
+  auwb.reputation_rank,
+  auwb.total_posts,
+  auwb.avg_post_score,
+  auwb.question_count,
+  auwb.answer_count,
+  COALESCE(aa.accepted_count, 0) AS accepted_answers_count,
+  auwb.badge_count,
+  auwb.gold_badges,
+  auwb.badge_names,
+  tq.tag_count_estimate,
+  tq.first_tag,
+  up.upvote_count AS high_engagement_posts,
+  CASE 
+    WHEN auwb.reputation_rank <= 100 THEN 'Elite'
+    WHEN auwb.reputation_rank <= 1000 THEN 'Veteran'
+    WHEN auwb.total_posts > 50 THEN 'Active'
+    ELSE 'Regular'
+  END AS user_tier,
+  (auwb.question_count * 1.0 / NULLIF(auwb.total_posts, 0)) * 100 AS question_percentage,
+  GREATEST(auwb.Reputation - (COALESCE(aa.accepted_count, 0) * 100), 0) AS adjusted_reputation,
+  ROW_NUMBER() OVER (
+    PARTITION BY 
+      CASE WHEN auwb.gold_badges > 0 THEN 'Gold Holder' ELSE 'No Gold' END
+    ORDER BY auwb.total_posts DESC, auwb.avg_post_score DESC
+  ) AS tiered_ranking
+FROM active_users_with_badges auwb
+FULL OUTER JOIN accepted_answers aa ON auwb.user_id = aa.user_id
+LEFT OUTER JOIN Posts p ON auwb.user_id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+LEFT OUTER JOIN tagged_questions tq ON p.Id = tq.post_id 
+  AND tq.tag_count_estimate > (SELECT AVG(tag_count_estimate) FROM tagged_questions)
+LEFT OUTER JOIN upvoted_posts up ON p.Id = up.PostId
+WHERE (auwb.total_posts > 10 OR auwb.badge_count > 5)
+  AND (tq.first_tag IS NULL OR tq.first_tag NOT LIKE '%java%' OR auwb.question_count > 20)
+  AND NOT EXISTS (
+    SELECT 1 FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.UserId = auwb.user_id 
+      AND ph.PostId = p.Id
+      AND pht.Name IN ('Post Deleted', 'Post Locked')
+      AND ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 months'
+  )
+ORDER BY 
+  auwb.reputation_rank ASC,
+  COALESCE(up.upvote_count, 0) DESC NULLS LAST,
+  (auwb.question_count + COALESCE(aa.accepted_count, 0)) DESC;

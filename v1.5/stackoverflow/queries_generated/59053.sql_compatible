@@ -1,0 +1,78 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT v.Id) as VoteCount,
+    COUNT(DISTINCT bh.Id) as HistoryCount,
+    COUNT(DISTINCT pl.Id) as LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        ELSE 'Other'
+    END as PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+        ELSE 'Open'
+    END as PostStatus,
+    AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.OwnerUserId) as AvgScoreByUser,
+    RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+    COUNT(*) OVER () as TotalPosts,
+    SUM(p.Score) OVER (ORDER BY p.CreationDate) as CumulativeScore,
+    LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+    LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory bh ON p.Id = bh.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT 
+        PostId,
+        STRING_AGG(TagName, ', ') as TagName
+    FROM (
+        SELECT 
+            p.Id as PostId,
+            TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(p.Tags, '><'))) as TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.Tags != ''
+    ) tag_split
+    GROUP BY PostId
+) t ON p.Id = t.PostId
+WHERE p.CreationDate >= DATE '2023-01-01'
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND (p.Score >= 0 OR p.Score IS NULL)
+    AND u.Reputation >= 100
+GROUP BY 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName,
+    u.Reputation,
+    p.PostTypeId,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.AcceptedAnswerId
+HAVING 
+    COUNT(DISTINCT c.Id) > 0
+    OR COUNT(DISTINCT v.Id) > 0
+    OR COUNT(DISTINCT bh.Id) > 0
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 1000;

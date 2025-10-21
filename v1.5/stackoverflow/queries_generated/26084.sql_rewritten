@@ -1,0 +1,116 @@
+-- {"query": "26084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 831} 
+WITH TopPosts AS (
+  SELECT 
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.LastEditDate,
+    u.Reputation,
+    u.DisplayName,
+    u.LastAccessDate,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RowNum
+  FROM 
+    Posts p
+  JOIN 
+    Users u ON p.OwnerUserId = u.Id
+  WHERE 
+    p.PostTypeId IN (1, 2)
+    AND p.Score > 0
+    AND p.ViewCount > 100
+),
+TopUsers AS (
+  SELECT 
+    u.Id,
+    u.Reputation,
+    u.DisplayName,
+    u.LastAccessDate,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS TotalScore,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RowNum
+  FROM 
+    Users u
+  JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  WHERE 
+    u.Reputation > 1000
+    AND u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+  GROUP BY 
+    u.Id, u.Reputation, u.DisplayName, u.LastAccessDate
+),
+UserBadges AS (
+  SELECT 
+    u.Id,
+    COUNT(b.Id) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM 
+    Users u
+  JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id
+),
+PostHistoryStats AS (
+  SELECT 
+    p.Id,
+    COUNT(ph.Id) AS HistoryCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS UndeleteCount
+  FROM 
+    Posts p
+  JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+  GROUP BY 
+    p.Id
+)
+SELECT 
+  tp.Id,
+  tp.Score,
+  tp.ViewCount,
+  tp.Title,
+  tp.Tags,
+  tu.Reputation,
+  tu.DisplayName,
+  tu.LastAccessDate,
+  ub.BadgeCount,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges,
+  phs.HistoryCount,
+  phs.CloseCount,
+  phs.ReopenCount,
+  phs.DeleteCount,
+  phs.UndeleteCount,
+  CASE 
+    WHEN tp.Score > 100 THEN 'High Score'
+    WHEN tp.Score > 50 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE 
+    WHEN tu.Reputation > 10000 THEN 'High Reputation'
+    WHEN tu.Reputation > 5000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS ReputationCategory,
+  ROW_NUMBER() OVER (ORDER BY tp.Score DESC) AS RowNum
+FROM 
+  TopPosts tp
+JOIN 
+  TopUsers tu ON tp.OwnerUserId = tu.Id
+JOIN 
+  UserBadges ub ON tu.Id = ub.Id
+JOIN 
+  PostHistoryStats phs ON tp.Id = phs.Id
+WHERE 
+  tp.RowNum <= 10
+  AND tu.RowNum <= 10
+ORDER BY 
+  tp.Score DESC;

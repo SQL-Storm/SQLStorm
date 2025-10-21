@@ -1,0 +1,127 @@
+-- {"query": "49055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2032} 
+
+WITH UserPostStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS TotalQuestionViewCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND P_Parent.AcceptedAnswerId = P.Id THEN P.Id END) AS AcceptedAnswersCount,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT PH_Edit.PostId) AS EditsMadeToOwnedPosts,
+        COUNT(DISTINCT PH_Close.PostId) AS OwnedPostsClosed,
+        MAX(P.CreationDate) AS LastPostCreationDate
+    FROM Users AS U
+    JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts AS P_Parent ON P.PostTypeId = 2 AND P.ParentId = P_Parent.Id -- To check for accepted answers
+    LEFT JOIN PostHistory AS PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit Title, Edit Body, Edit Tags, Rollback Body, Rollback Tags
+    LEFT JOIN PostHistory AS PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10 -- Post Closed
+    WHERE P.CreationDate >= '2020-01-01'
+    GROUP BY U.Id, U.DisplayName
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges AS B
+    WHERE B.Date >= '2020-01-01'
+    GROUP BY B.UserId
+),
+UserCommentStats AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS TotalComments,
+        SUM(C.Score) AS TotalCommentScore,
+        AVG(C.Score) AS AvgCommentScore
+    FROM Comments AS C
+    WHERE C.CreationDate >= '2020-01-01'
+    GROUP BY C.UserId
+),
+UserVoteActivity AS (
+    SELECT
+        V.UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Votes AS V
+    WHERE V.CreationDate >= '2020-01-01' AND V.UserId IS NOT NULL
+    GROUP BY V.UserId
+),
+UserReceivedVoteStats AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM Posts AS P
+    JOIN Votes AS V ON P.Id = V.PostId
+    WHERE P.CreationDate >= '2020-01-01' AND V.CreationDate >= '2020-01-01' AND P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+TopTagsPerUser AS (
+    SELECT
+        T.UserId,
+        STRING_AGG(T.TagName, ', ') AS TopTags
+    FROM (
+        SELECT
+            P.OwnerUserId AS UserId,
+            UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName,
+            COUNT(*) AS TagUsageCount,
+            RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(*) DESC, UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) ASC) AS rn
+        FROM Posts AS P
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ' ' AND P.CreationDate >= '2020-01-01'
+        GROUP BY P.OwnerUserId, UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><'))
+    ) AS T
+    WHERE T.rn <= 3 -- Get top 3 tags per user
+    GROUP BY T.UserId
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    COALESCE(UPS.QuestionsCount, 0) AS QuestionsCount,
+    COALESCE(UPS.AnswersCount, 0) AS AnswersCount,
+    COALESCE(UPS.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+    COALESCE(UPS.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(UPS.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(UPS.TotalQuestionViewCount, 0) AS TotalQuestionViewCount,
+    COALESCE(UPS.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(UBS.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UCS.TotalComments, 0) AS TotalComments,
+    COALESCE(UCS.AvgCommentScore, 0.0) AS AvgCommentScore,
+    COALESCE(UVA.UpVotesGiven, 0) AS UpVotesGiven,
+    COALESCE(UVA.DownVotesGiven, 0) AS DownVotesGiven,
+    COALESCE(URS.UpVotesReceived, 0) AS UpVotesReceived,
+    COALESCE(URS.DownVotesReceived, 0) AS DownVotesReceived,
+    COALESCE(UPS.EditsMadeToOwnedPosts, 0) AS EditsMadeToOwnedPosts,
+    COALESCE(UPS.OwnedPostsClosed, 0) AS OwnedPostsClosed,
+    COALESCE(TTU.TopTags, 'N/A') AS TopUserTags,
+    -- Composite Impact Score calculation based on various weighted metrics
+    (
+        COALESCE(UPS.AcceptedAnswersCount, 0) * 10.0 +
+        COALESCE(UPS.TotalAnswerScore, 0) * 0.75 +
+        COALESCE(UPS.TotalQuestionScore, 0) * 0.25 +
+        COALESCE(UBS.GoldBadges, 0) * 15.0 +
+        COALESCE(UBS.SilverBadges, 0) * 5.0 +
+        COALESCE(UCS.TotalComments, 0) * 0.1 +
+        COALESCE(URS.UpVotesReceived, 0) * 0.5 -
+        COALESCE(URS.DownVotesReceived, 0) * 1.0 +
+        COALESCE(UPS.TotalQuestionViewCount, 0) * 0.001
+    ) AS CompositeImpactScore
+FROM Users AS U
+LEFT JOIN UserPostStats AS UPS ON U.Id = UPS.UserId
+LEFT JOIN UserBadgeStats AS UBS ON U.Id = UBS.UserId
+LEFT JOIN UserCommentStats AS UCS ON U.Id = UCS.UserId
+LEFT JOIN UserVoteActivity AS UVA ON U.Id = UVA.UserId
+LEFT JOIN UserReceivedVoteStats AS URS ON U.Id = URS.UserId
+LEFT JOIN TopTagsPerUser AS TTU ON U.Id = TTU.UserId
+WHERE
+    U.CreationDate >= '2019-01-01' -- Only consider users created after this date for better relevance in "recent activity" query
+    AND (UPS.UserId IS NOT NULL OR UBS.UserId IS NOT NULL OR UCS.UserId IS NOT NULL OR UVA.UserId IS NOT NULL OR URS.UserId IS NOT NULL) -- Only include users with some activity
+ORDER BY CompositeImpactScore DESC, U.Reputation DESC
+LIMIT 100;

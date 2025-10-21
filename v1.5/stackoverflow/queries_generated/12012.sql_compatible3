@@ -1,0 +1,125 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC, P.CreationDate) AS GlobalPostRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON CAST(T.Id AS VARCHAR) = P.Tags
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        T.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS RevisionCount,
+        MAX(PH.CreationDate) AS LastRevisionDate
+    FROM 
+        PostHistory PH
+    WHERE 
+        PH.PostHistoryTypeId IN (2, 5, 6)
+    GROUP BY 
+        PH.PostId
+),
+UserBadgeCounts AS (
+    SELECT 
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    UA.DisplayName,
+    UA.Reputation,
+    UA.QuestionsAsked,
+    UA.AnswersGiven,
+    UA.TotalQuestionScore,
+    UA.TotalAnswerScore,
+    COALESCE(UBC.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBC.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBC.BronzeBadges, 0) AS BronzeBadges,
+    RP.UserPostRank,
+    RP.GlobalPostRank,
+    PHS.RevisionCount,
+    PHS.LastRevisionDate,
+    TS.TagName,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore
+FROM 
+    UserActivity UA
+JOIN 
+    RankedPosts RP ON UA.Id = RP.OwnerUserId
+LEFT JOIN 
+    UserBadgeCounts UBC ON UA.Id = UBC.UserId
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    (
+        SELECT
+            TS.TagName,
+            TS.PostCount,
+            TS.TotalScore,
+            TS.AvgScore
+        FROM
+            TagStats TS
+        WHERE 
+            TS.TagName IN (
+                SELECT TRIM(value)
+                FROM (
+                    SELECT string_to_array(RP.Tags, ',') AS arr
+                ) AS t
+                CROSS JOIN UNNEST(arr) AS value
+            )
+        ORDER BY 
+            TS.TotalScore DESC
+        LIMIT 1
+    ) AS TS ON true
+WHERE 
+    UA.Reputation > 1000
+ORDER BY 
+    UA.Reputation DESC, 
+    UA.QuestionsAsked DESC, 
+    UA.AnswersGiven DESC
+LIMIT 100;

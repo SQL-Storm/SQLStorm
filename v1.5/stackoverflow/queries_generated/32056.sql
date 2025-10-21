@@ -1,0 +1,28 @@
+-- {"query": "32056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 221} 
+
+SELECT 
+    U.Id AS UserId, 
+    U.DisplayName, 
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    AVG(P.Score) AS AvgPostScore,
+    COUNT(DISTINCT C.Id) AS TotalComments
+FROM 
+    Users U
+JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    Votes V ON P.Id = V.PostId
+LEFT JOIN 
+    Comments C ON P.Id = C.PostId
+WHERE 
+    U.CreationDate >= '2020-01-01'
+    AND U.Reputation >= 1000
+GROUP BY 
+    U.Id, U.DisplayName
+HAVING 
+    TotalUpVotes > TotalDownVotes
+ORDER BY 
+    TotalPosts DESC, AvgPostScore DESC
+LIMIT 50;

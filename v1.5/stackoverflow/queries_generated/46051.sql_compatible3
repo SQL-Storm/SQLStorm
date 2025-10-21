@@ -1,0 +1,110 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS question_count,
+        AVG(p.Score) AS avg_score,
+        SUM(p.ViewCount) AS total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId AS question_id,
+        a.Id AS answer_id,
+        a.OwnerUserId AS answerer_id,
+        a.Score AS answer_score,
+        a.CreationDate AS answer_date,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rank
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId IN (2, 3)
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate
+),
+QuestionEngagement AS (
+    SELECT 
+        q.Id AS question_id,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.Score AS question_score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        COUNT(DISTINCT ph.Id) AS edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.Id END) AS close_reopen_count,
+        MAX(CASE WHEN am.answer_rank = 1 THEN am.answer_score END) AS top_answer_score,
+        MAX(CASE WHEN am.answer_rank = 1 THEN am.comment_count END) AS top_answer_comments,
+        COUNT(DISTINCT am.answer_id) AS total_answers,
+        AVG(am.answer_score) AS avg_answer_score
+    FROM Posts q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+    LEFT JOIN AnswerMetrics am ON am.question_id = q.Id
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= TIMESTAMP '2020-01-01'
+      AND q.OwnerUserId IS NOT NULL
+    GROUP BY q.Id, q.OwnerUserId, q.Title, q.Tags, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Id) AS total_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS bronze_badges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) AS tag_based_badges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    tqa.question_count,
+    tqa.avg_score AS avg_question_score,
+    tqa.total_views,
+    COALESCE(ubs.total_badges, 0) AS total_badges,
+    COALESCE(ubs.gold_badges, 0) AS gold_badges,
+    COALESCE(ubs.silver_badges, 0) AS silver_badges,
+    qe.question_id,
+    qe.Title AS question_title,
+    qe.question_score,
+    qe.ViewCount AS question_views,
+    qe.edit_count,
+    qe.close_reopen_count,
+    qe.total_answers,
+    COALESCE(qe.avg_answer_score, 0) AS avg_answer_score,
+    COALESCE(qe.top_answer_score, 0) AS top_answer_score,
+    COALESCE(qe.top_answer_comments, 0) AS top_answer_comments,
+    COUNT(DISTINCT pl.RelatedPostId) AS related_posts_count,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS duplicate_links,
+    EXTRACT(EPOCH FROM (MAX(qe.ViewCount) / NULLIF(qe.total_answers, 0))) AS views_per_answer_ratio
+FROM TopQuestionAuthors tqa
+INNER JOIN Users u ON u.Id = tqa.OwnerUserId
+INNER JOIN QuestionEngagement qe ON qe.OwnerUserId = tqa.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = u.Id
+LEFT JOIN PostLinks pl ON pl.PostId = qe.question_id
+WHERE qe.question_score >= 10
+  AND qe.ViewCount >= 1000
+  AND u.Reputation >= 500
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location,
+    tqa.question_count, tqa.avg_score, tqa.total_views,
+    ubs.total_badges, ubs.gold_badges, ubs.silver_badges,
+    qe.question_id, qe.Title, qe.question_score, qe.ViewCount,
+    qe.edit_count, qe.close_reopen_count, qe.total_answers,
+    qe.avg_answer_score, qe.top_answer_score, qe.top_answer_comments
+HAVING COUNT(DISTINCT pl.RelatedPostId) >= 2
+ORDER BY 
+    tqa.total_views DESC,
+    qe.question_score DESC,
+    qe.total_answers DESC
+LIMIT 500;

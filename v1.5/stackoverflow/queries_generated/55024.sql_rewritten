@@ -1,0 +1,108 @@
+-- {"query": "55024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 2385} 
+WITH
+    q AS (
+        SELECT
+            p.Id               AS question_id,
+            p.OwnerUserId      AS owner_user_id,
+            p.CreationDate,
+            p.Score            AS question_score,
+            p.ViewCount,
+            p.FavoriteCount,
+            p.Tags,
+            p.Title
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    a AS (
+        SELECT
+            p.ParentId                         AS question_id,
+            COUNT(*)                           AS answer_count,
+            MAX(p.Score)                       AS top_answer_score,
+            AVG(p.Score)                       AS avg_answer_score,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS answer_up_votes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS answer_down_votes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ),
+    cmt AS (
+        SELECT
+            c.PostId            AS question_id,
+            COUNT(*)            AS comment_count,
+            MAX(c.CreationDate) AS last_comment_date
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                AS tag_question_count,
+            SUM(p.Score)               AS tag_score_sum,
+            AVG(p.ViewCount)           AS tag_avg_views
+        FROM Tags t
+        JOIN Posts p ON p.Tags LIKE ('%<'||t.TagName||'>%')
+        WHERE p.PostTypeId = 1
+        GROUP BY t.TagName
+    ),
+    user_badges AS (
+        SELECT
+            b.UserId,
+            JSON_AGG(JSON_BUILD_OBJECT('name', b.Name, 'class', b.Class, 'date', b.Date)) AS badges_json,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS bronze
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    post_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+        FROM Votes v
+        GROUP BY v.PostId
+    )
+SELECT
+    q.question_id,
+    q.Title,
+    q.question_score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.CreationDate,
+    COALESCE(a.answer_count, 0)       AS answer_count,
+    COALESCE(a.top_answer_score, 0)   AS top_answer_score,
+    COALESCE(a.avg_answer_score, 0)   AS avg_answer_score,
+    COALESCE(cmt.comment_count, 0)    AS comment_count,
+    cmt.last_comment_date,
+    COALESCE(pv.up_votes, 0)          AS question_up_votes,
+    COALESCE(pv.down_votes, 0)        AS question_down_votes,
+    u.DisplayName,
+    u.Reputation,
+    ub.badges_json,
+    ub.gold,
+    ub.silver,
+    ub.bronze,
+    ARRAY_AGG(DISTINCT tl.tag_name)                               AS tags,
+    JSONB_OBJECT_AGG(tl.tag_name, JSONB_BUILD_OBJECT(
+        'question_count', ts.tag_question_count,
+        'score_sum',      ts.tag_score_sum,
+        'avg_views',      ts.tag_avg_views
+    ))                                                            AS tag_metrics
+FROM q
+LEFT JOIN a      ON a.question_id = q.question_id
+LEFT JOIN cmt    ON cmt.question_id = q.question_id
+LEFT JOIN post_votes pv ON pv.PostId = q.question_id
+LEFT JOIN Users u ON u.Id = q.owner_user_id
+LEFT JOIN user_badges ub ON ub.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM q.Tags), '><')) AS tag_name
+) tl ON TRUE
+LEFT JOIN tag_stats ts ON ts.TagName = tl.tag_name
+GROUP BY
+    q.question_id, q.Title, q.question_score, q.ViewCount, q.FavoriteCount,
+    q.CreationDate, a.answer_count, a.top_answer_score, a.avg_answer_score,
+    cmt.comment_count, cmt.last_comment_date, pv.up_votes, pv.down_votes,
+    u.DisplayName, u.Reputation, ub.badges_json, ub.gold, ub.silver, ub.bronze
+ORDER BY q.question_score DESC NULLS LAST, q.CreationDate DESC
+LIMIT 100;

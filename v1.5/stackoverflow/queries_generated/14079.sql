@@ -1,0 +1,95 @@
+-- {"query": "14079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 186800, "output_tokens": 80876} 
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.AnswerCount,
+    p.CreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.CommentCount,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN CAST(DATEDIFF(p.ClosedDate, p.CreationDate) AS DECIMAL(10,2)) ELSE NULL END AS ClosedDays,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN CAST(DATEDIFF(p.CommunityOwnedDate, p.CreationDate) AS DECIMAL(10,2)) ELSE NULL END AS CommunityOwnedDays,
+    COALESCE(DATEDIFF(CASE WHEN p.LastEditDate IS NOT NULL THEN p.LastEditDate ELSE p.LastActivityDate END, p.CreationDate), 0) AS EditDays,
+    CASE WHEN p.AnswerCount > 0 THEN CAST(SUM(CASE WHEN pa.OwnerUserId = p.OwnerUserId THEN pa.Score ELSE 0 END) / CAST(p.AnswerCount AS DECIMAL(10,2)) AS DECIMAL(10,2)) ELSE NULL END AS OwnerAnswerScoreAvg,
+    CASE WHEN p.AnswerCount > 0 THEN CAST(SUM(CASE WHEN pa.OwnerUserId <> p.OwnerUserId THEN pa.Score ELSE 0 END) / CAST(p.AnswerCount AS DECIMAL(10,2)) AS DECIMAL(10,2)) ELSE NULL END AS NonOwnerAnswerScoreAvg,
+    CASE WHEN p.AnswerCount > 0 THEN CAST(SUM(CASE WHEN pa.OwnerUserId = p.OwnerUserId THEN pa.Score ELSE 0 END) / CAST(SUM(pa.Score) AS DECIMAL(10,2)) AS DECIMAL(10,2)) ELSE NULL END AS OwnerAnswerScorePerc,
+    CASE WHEN p.AnswerCount > 0 THEN CAST(SUM(CASE WHEN pa.OwnerUserId <> p.OwnerUserId THEN pa.Score ELSE 0 END) / CAST(SUM(pa.Score) AS DECIMAL(10,2)) AS DECIMAL(10,2)) ELSE NULL END AS NonOwnerAnswerScorePerc,
+    CAST(DATEDIFF(COALESCE(p.ClosedDate, p.LastActivityDate), p.CreationDate) AS DECIMAL(10,2)) AS LifetimeDays,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    b.Id AS BadgeId,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    b.TagBased AS BadgeTagBased,
+    b.Date AS BadgeDate,
+    CASE WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) ELSE NULL END AS BountyCount,
+    CASE WHEN p.PostTypeId = 1 THEN (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) ELSE NULL END AS BountyAmount,
+    CASE WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 7) ELSE NULL END AS ReopenVoteCount
+  FROM Posts p
+  LEFT JOIN Posts pa ON p.Id = pa.ParentId
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY
+    p.Id, p.PostTypeId, p.OwnerUserId, p.ParentId, p.AcceptedAnswerId, p.AnswerCount, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.FavoriteCount, p.CommentCount, p.ClosedDate, p.CommunityOwnedDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes, b.Id, b.Name, b.Class, b.TagBased, b.Date
+),
+agg AS (
+  SELECT
+    PostId,
+    MAX(ClosedDays) AS ClosedDays,
+    MAX(CommunityOwnedDays) AS CommunityOwnedDays,
+    MAX(EditDays) AS EditDays,
+    MAX(OwnerAnswerScoreAvg) AS OwnerAnswerScoreAvg,
+    MAX(NonOwnerAnswerScoreAvg) AS NonOwnerAnswerScoreAvg,
+    MAX(OwnerAnswerScorePerc) AS OwnerAnswerScorePerc,
+    MAX(NonOwnerAnswerScorePerc) AS NonOwnerAnswerScorePerc,
+    MAX(LifetimeDays) AS LifetimeDays,
+    MAX(Reputation) AS Reputation,
+    MAX(Views) AS Views,
+    MAX(UpVotes) AS UpVotes,
+    MAX(DownVotes) AS DownVotes,
+    STRING_AGG(CAST(BadgeId AS VARCHAR(10)) + ',' + BadgeName + ',' + CAST(BadgeClass AS VARCHAR(1)) + ',' + CAST(BadgeTagBased AS VARCHAR(1)) + ',' + CAST(BadgeDate AS VARCHAR(20)), ';') AS Badges
+  FROM cte
+  GROUP BY PostId
+)
+SELECT
+  p.Id AS PostId,
+  p.PostTypeId,
+  p.OwnerUserId,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.AnswerCount,
+  p.CreationDate,
+  p.LastEditDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.FavoriteCount,
+  p.CommentCount,
+  a.ClosedDays,
+  a.CommunityOwnedDays,
+  a.EditDays,
+  a.OwnerAnswerScoreAvg,
+  a.NonOwnerAnswerScoreAvg,
+  a.OwnerAnswerScorePerc,
+  a.NonOwnerAnswerScorePerc,
+  a.LifetimeDays,
+  a.Reputation,
+  a.Views,
+  a.UpVotes,
+  a.DownVotes,
+  a.Badges,
+  CASE WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) ELSE NULL END AS BountyCount,
+  CASE WHEN p.PostTypeId = 1 THEN (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) ELSE NULL END AS BountyAmount,
+  CASE WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 7) ELSE NULL END AS ReopenVoteCount
+FROM Posts p
+LEFT JOIN agg a ON p.Id = a.PostId
+ORDER BY p.Id;

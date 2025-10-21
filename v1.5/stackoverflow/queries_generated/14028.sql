@@ -1,0 +1,36 @@
+-- {"query": "14028.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 67715, "output_tokens": 30048} 
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, 
+         DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS user_post_rank,
+         DENSE_RANK() OVER (ORDER BY p.CreationDate) AS overall_post_rank,
+         CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId ELSE p.ParentId END AS related_post_id
+  FROM Posts p
+),
+tagged_posts AS (
+  SELECT c.Id, c.PostTypeId, c.OwnerUserId, c.CreationDate, c.Score, c.ViewCount, c.AnswerCount, c.FavoriteCount, 
+         c.user_post_rank, c.overall_post_rank, c.related_post_id,
+         CASE WHEN p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') ELSE ARRAY[] END AS tags
+  FROM cte c
+  LEFT JOIN Posts p ON c.Id = p.Id
+)
+SELECT 
+  t.Id,
+  t.PostTypeId,
+  t.OwnerUserId,
+  t.CreationDate,
+  t.Score,
+  t.ViewCount,
+  t.AnswerCount,
+  t.FavoriteCount,
+  t.user_post_rank,
+  t.overall_post_rank,
+  COALESCE(r.Score, 0) AS related_post_score,
+  COALESCE(r.ViewCount, 0) AS related_post_views,
+  COALESCE(r.AnswerCount, 0) AS related_post_answers,
+  COALESCE(r.FavoriteCount, 0) AS related_post_favorites,
+  t.tags,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId IN (2, 3)) AS vote_count,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = t.Id) AS comment_count
+FROM tagged_posts t
+LEFT JOIN cte r ON t.related_post_id = r.Id
+ORDER BY t.overall_post_rank DESC, t.AnswerCount DESC, t.Score DESC, t.ViewCount DESC, t.FavoriteCount DESC;

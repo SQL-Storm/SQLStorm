@@ -1,0 +1,62 @@
+-- {"query": "58005.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1189} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(b.Id) AS GoldBadges
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 5
+), PostStats AS (
+    SELECT p.OwnerUserId, 
+           COUNT(DISTINCT p.Id) AS TotalQuestions,
+           COUNT(DISTINCT p.AcceptedAnswerId) AS AcceptedAnswers,
+           AVG(p.Score) AS AvgScore,
+           SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate BETWEEN '2020-01-01' AND '2023-01-01'
+    GROUP BY p.OwnerUserId
+), VoteAnalysis AS (
+    SELECT v.PostId, 
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+           COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    GROUP BY v.PostId
+), PostHistoryEdits AS (
+    SELECT ph.PostId, 
+           COUNT(ph.Id) AS EditCount,
+           STRING_AGG(DISTINCT ph.Text, '; ') AS EditReasons
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 5
+    GROUP BY ph.PostId
+    HAVING COUNT(ph.Id) > 3
+)
+SELECT au.DisplayName,
+       au.Reputation,
+       au.GoldBadges,
+       ps.TotalQuestions,
+       ps.AcceptedAnswers,
+       ps.AvgScore,
+       ps.TotalViews,
+       RANK() OVER (ORDER BY ps.TotalViews DESC) AS ViewRank,
+       va.Upvotes,
+       va.Downvotes,
+       (va.Upvotes - va.Downvotes) AS NetVotes,
+       phe.EditCount,
+       phe.EditReasons,
+       (SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = au.Id)) AS TotalComments,
+       (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+        FROM Posts p
+        JOIN unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) t(TagName)
+        WHERE p.OwnerUserId = au.Id) AS FrequentTags
+FROM ActiveUsers au
+JOIN PostStats ps ON au.Id = ps.OwnerUserId
+JOIN Posts p ON au.Id = p.OwnerUserId
+JOIN VoteAnalysis va ON p.Id = va.PostId
+JOIN PostHistoryEdits phe ON p.Id = phe.PostId
+WHERE ps.AcceptedAnswers > ps.TotalQuestions * 0.5
+ORDER BY au.Reputation DESC, ps.TotalViews DESC, NetVotes DESC
+LIMIT 100;

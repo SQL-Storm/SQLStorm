@@ -1,0 +1,112 @@
+WITH TagUsageStats AS (
+    SELECT
+        t.TagName,
+        COUNT(*) AS TotalPosts,
+        AVG(pc.AnswerCount) OVER (PARTITION BY t.TagName) AS AvgAnswerCount
+    FROM
+        Tags t
+        LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+        LEFT JOIN (
+            SELECT
+                ParentId,
+                COUNT(*) AS AnswerCount
+            FROM
+                Posts
+            WHERE
+                PostTypeId = 2
+            GROUP BY
+                ParentId
+        ) pc ON p.Id = pc.ParentId
+    WHERE
+        t.TagName IS NOT NULL
+    GROUP BY
+        t.TagName
+),
+ActiveQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        c.Text,
+        c.CreationDate,
+        c.UserDisplayName AS CommenterName
+    FROM
+        Comments c
+    WHERE
+        c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month'
+),
+PostHistoryExtensions AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.UserDisplayName AS EditorName,
+        ph.Comment AS EditComment,
+        ph.RevisionGUID,
+        ARRAY_AGG(ph2.PostHistoryTypeId) AS ChangeTypes
+    FROM
+        PostHistory ph
+        LEFT JOIN PostHistory ph2 ON ph.PostId = ph2.PostId AND ph2.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17)
+    GROUP BY
+        ph.PostId, ph.CreationDate, ph.UserDisplayName, ph.Comment, ph.RevisionGUID
+),
+QuestionScoreStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        COUNT(*) OVER () AS TotalQuestions
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.OwnerName,
+    q.OwnerReputation,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    t.TagName,
+    t.TotalPosts,
+    t.AvgAnswerCount,
+    c.Text AS RecentComment,
+    c.CreationDate AS CommentDate,
+    c.CommenterName,
+    he.EditDate,
+    he.EditorName,
+    he.EditComment,
+    he.ChangeTypes,
+    qss.ScoreRank,
+    qss.TotalQuestions
+FROM
+    ActiveQuestions q
+    LEFT JOIN LATERAL (
+        SELECT CAST(unnest(string_to_array(substr(q.Tags, 2, length(q.Tags) - 2), '><')) AS TEXT) AS TagName
+    ) AS tag_names ON TRUE
+    LEFT JOIN TagUsageStats t ON t.TagName = tag_names.TagName
+    LEFT JOIN RecentComments c ON c.PostId = q.Id
+    LEFT JOIN PostHistoryExtensions he ON he.PostId = q.Id
+    LEFT JOIN QuestionScoreStats qss ON qss.Id = q.Id
+WHERE
+    t.TotalPosts > 10
+ORDER BY
+    q.Score DESC
+LIMIT 100;

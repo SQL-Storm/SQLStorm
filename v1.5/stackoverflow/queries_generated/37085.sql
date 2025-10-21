@@ -1,0 +1,176 @@
+-- {"query": "37085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2074} 
+WITH
+-- recent active questions with tag arrays
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'), ARRAY[]::varchar[]) AS TagArray,
+         p.OwnerUserId, p.AcceptedAnswerId, p.AnswerCount, p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '2 years'
+),
+-- answers joined to their parent question and owner metrics
+Answers AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.Score AS AnswerScore, a.CreationDate AS AnswerDate, a.OwnerUserId AS AnswerOwner,
+         u.Reputation AS AnswererReputation, u.UpVotes AS AnswererUpVotes, u.DownVotes AS AnswererDownVotes
+  FROM Posts a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= now() - interval '2 years'
+),
+-- aggregate answer stats per question
+AnswerAgg AS (
+  SELECT QuestionId,
+         count(*) FILTER (WHERE AnswerScore >= 10) AS HighScoreAnswers,
+         count(*) AS TotalAnswers,
+         max(AnswerScore) AS MaxAnswerScore,
+         avg(AnswerScore) AS AvgAnswerScore,
+         bool_or(AnswerDate <= q.CreationDate + interval '7 days') AS HasEarlyAnswer
+  FROM Answers a
+  JOIN Questions q ON a.QuestionId = q.Id
+  GROUP BY QuestionId
+),
+-- compute time-to-accept for accepted answers
+AcceptedTimes AS (
+  SELECT q.Id AS QuestionId,
+         a.Id AS AcceptedAnswerId,
+         extract(epoch FROM (a.CreationDate - q.CreationDate)) AS SecondsToAccepted,
+         extract(epoch FROM (q.CreationDate - u.CreationDate)) AS SecondsFromOwnerSignup
+  FROM Questions q
+  JOIN Posts a ON q.AcceptedAnswerId = a.Id
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  WHERE q.AcceptedAnswerId IS NOT NULL
+),
+-- recent comment activity per post
+CommentAgg AS (
+  SELECT c.PostId,
+         count(*) AS CommentCountRecent,
+         max(c.CreationDate) AS LastCommentDate,
+         count(*) FILTER (WHERE c.CreationDate >= now() - interval '30 days') AS CommentsLast30Days
+  FROM Comments c
+  GROUP BY c.PostId
+),
+-- tag popularity baseline (tags that appear on many questions in last 2 years)
+TagExplode AS (
+  SELECT q.Id AS QuestionId, unnest(q.TagArray) AS Tag
+  FROM Questions q
+),
+TagPopularity AS (
+  SELECT Tag, count(DISTINCT QuestionId) AS QuestionsWithTag
+  FROM TagExplode
+  GROUP BY Tag
+  HAVING count(DISTINCT QuestionId) >= 25
+),
+-- find cross-linked duplicates and inbound links
+LinkStats AS (
+  SELECT pl.PostId AS SourcePost, pl.RelatedPostId AS TargetPost, lt.Name AS LinkType
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate >= now() - interval '2 years'
+),
+InboundLinks AS (
+  SELECT TargetPost, count(*) AS InboundLinkCount, count(*) FILTER (WHERE LinkType = 'Duplicate') AS DuplicateFlagCount
+  FROM LinkStats
+  GROUP BY TargetPost
+),
+-- user-level badge and vote signal
+UserSignals AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         count(b.Id) FILTER (WHERE b.TagBased = 1) AS TagBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+-- vote signals per post (recent)
+VoteAgg AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+         count(*) FILTER (WHERE v.CreationDate >= now() - interval '30 days') AS VotesLast30Days
+  FROM Votes v
+  GROUP BY v.PostId
+),
+-- post edit churn and history signals
+HistoryAgg AS (
+  SELECT ph.PostId,
+         count(*) AS RevisionCount,
+         max(ph.CreationDate) AS LastRevisionDate,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS ContentEdits,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS ClosureOrDeletionEvents
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+)
+-- final heavy-weight analytic query: rank question-tag pairs by a composite engagement score
+SELECT
+  q.Id AS QuestionId,
+  q.Title,
+  q.CreationDate,
+  q.Score AS QuestionScore,
+  q.ViewCount,
+  q.AnswerCount,
+  COALESCE(aa.TotalAnswers,0) AS TotalAnswersRecent,
+  COALESCE(aa.HighScoreAnswers,0) AS HighScoreAnswersRecent,
+  COALESCE(vu.UpVotes,0) AS PostUpVotes,
+  COALESCE(ca.CommentCountRecent,0) AS RecentCommentCount,
+  COALESCE(il.InboundLinkCount,0) AS InboundLinks,
+  COALESCE(h.RevisionCount,0) AS RevisionCount,
+  COALESCE(at.SecondsToAccepted, NULL) AS SecondsToAccepted,
+  -- extract top tag by overall popularity and compute tag-weighted score
+  tp.Tag AS RepresentativeTag,
+  tp.QuestionsWithTag,
+  -- composite engagement score (weighted sum + logarithmic scale components)
+  (
+    -- base: question score and views scaled
+    (q.Score * 2.5) +
+    (ln(greatest(q.ViewCount,1)) * 3.0) +
+    -- answers: prefer questions with many recent high-score answers and early answers
+    (COALESCE(aa.HighScoreAnswers,0) * 8.0) +
+    (COALESCE(aa.TotalAnswers,0) * 1.5) +
+    (CASE WHEN COALESCE(aa.HasEarlyAnswer,false) THEN 6.0 ELSE 0 END) +
+    -- social signals
+    (COALESCE(vu.UpVotes,0) * 2.0) - (COALESCE(vu.DownVotes,0) * 1.5) +
+    (COALESCE(ca.CommentCountRecent,0) * 1.2) +
+    (COALESCE(il.InboundLinkCount,0) * 4.0) +
+    -- stability penalty: many revisions or closure events reduce score
+    GREATEST(0, 20 - COALESCE(h.RevisionCount,0)) +
+    GREATEST(0, 10 - COALESCE(h.ClosureOrDeletionEvents,0)*5) -
+    -- acceptance speed bonus (faster accepted answers get higher bonus)
+    COALESCE(LEAST(30, 30 - floor(at.SecondsToAccepted/3600)), 0) * 1.5 +
+    -- tag popularity multiplier (popular tags boost baseline modestly)
+    (LN(GREATEST(tp.QuestionsWithTag,1)) * 2.2)
+  ) AS EngagementScore,
+  -- dense rank of questions within tag by EngagementScore
+  dense_rank() OVER (PARTITION BY tp.Tag ORDER BY
+     (
+      (q.Score * 2.5) + (ln(greatest(q.ViewCount,1)) * 3.0) + (COALESCE(aa.HighScoreAnswers,0) * 8.0) +
+      (COALESCE(vu.UpVotes,0) * 2.0) + (COALESCE(ca.CommentCountRecent,0) * 1.2) + (COALESCE(il.InboundLinkCount,0) * 4.0)
+     ) DESC
+  ) AS TagRank
+FROM Questions q
+-- pick representative tag per question by joining to popular tags and choosing the most popular tag for that question
+JOIN LATERAL (
+  SELECT te.Tag, tp.QuestionsWithTag
+  FROM (SELECT unnest(q.TagArray) AS Tag) te
+  JOIN TagPopularity tp ON tp.Tag = te.Tag
+  ORDER BY tp.QuestionsWithTag DESC NULLS LAST
+  LIMIT 1
+) tp ON true
+LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+LEFT JOIN VoteAgg vu ON vu.PostId = q.Id
+LEFT JOIN CommentAgg ca ON ca.PostId = q.Id
+LEFT JOIN InboundLinks il ON il.TargetPost = q.Id
+LEFT JOIN HistoryAgg h ON h.PostId = q.Id
+LEFT JOIN AcceptedTimes at ON at.QuestionId = q.Id
+-- filter to ensure tag popularity and reasonably active posts
+WHERE tp.Tag IS NOT NULL
+  AND (q.ViewCount >= 100 OR COALESCE(aa.TotalAnswers,0) >= 2 OR COALESCE(ca.CommentCountRecent,0) >= 3)
+ORDER BY EngagementScore DESC
+LIMIT 250;

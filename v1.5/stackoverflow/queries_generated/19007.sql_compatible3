@@ -1,0 +1,195 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS TotalProfileViews,
+        u.UpVotes AS TotalUpvotesGiven,
+        u.DownVotes AS TotalDownvotesGiven,
+        COUNT(DISTINCT CASE WHEN q.PostTypeId = 1 THEN q.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN a.PostTypeId = 2 THEN a.Id END) AS AnswersPosted,
+        SUM(CASE WHEN q.PostTypeId = 1 THEN q.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN a.PostTypeId = 2 THEN a.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN q.PostTypeId = 1 THEN q.ViewCount END) AS AvgQuestionViewCount,
+        MAX(COALESCE(q.LastActivityDate, a.LastActivityDate, u.LastAccessDate)) AS LatestActivityDateByUser,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgesCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgesCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgesCount
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionEditAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEditDate,
+        (ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) AS TimeSincePreviousEdit,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_edit,
+        COUNT(ph.Id) OVER (PARTITION BY ph.PostId) AS TotalEditsForPost
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostCommentActivity AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(COALESCE(LENGTH(c.Text), 0)) AS AvgCommentLength,
+        COUNT(c.Id) FILTER (WHERE c.Text ILIKE '%great%' OR c.Text ILIKE '%thanks%' OR c.Text ILIKE '%helpful%') AS PositiveComments,
+        COUNT(c.Id) FILTER (WHERE c.Text ILIKE '%bug%' OR c.Text ILIKE '%issue%' OR c.Text ILIKE '%wrong%') AS NegativeComments,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+TaggedPostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))) AS TagName,
+        t.Id AS TagId,
+        t.Count AS TagUseCount,
+        (t.ExcerptPostId IS NOT NULL OR t.WikiPostId IS NOT NULL) AS HasTagWikiContent
+    FROM Posts p
+    JOIN Tags t ON TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))) = t.TagName
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.QuestionsPosted,
+    ues.AnswersPosted,
+    ues.TotalQuestionScore,
+    ues.TotalAnswerScore,
+    ues.GoldBadgesCount,
+    CAST(
+        (ues.Reputation * 0.15) +
+        (COALESCE(ues.AvgQuestionViewCount, 0) * 0.02) +
+        (COALESCE(ues.TotalAnswerScore, 0) * 0.25) +
+        (ues.GoldBadgesCount * 12) +
+        (ues.SilverBadgesCount * 3) -
+        (ues.TotalDownvotesGiven * 0.05)
+    AS NUMERIC(10, 2)) AS InfluenceScore,
+    p.Id AS QuestionId,
+    p.Title AS QuestionTitle,
+    p.ViewCount AS QuestionViews,
+    p.AnswerCount AS QuestionAnswers,
+    p.CreationDate AS QuestionCreationDate,
+    COALESCE(p.LastEditDate, p.CreationDate) AS LastContentUpdate,
+    CASE
+        WHEN p.Title IS NULL THEN 'NO TITLE AVAILABLE'
+        WHEN LENGTH(p.Title) < 30 THEN 'SHORT_TITLE: ' || UPPER(SUBSTRING(p.Title FROM 1 FOR 25))
+        ELSE 'STANDARD_TITLE: ' || UPPER(SUBSTRING(TRIM(p.Title FROM 1 FOR 50)) )
+    END AS ProcessedTitleFragment,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = ues.UserId AND p2.PostTypeId = 1 AND p2.Id != p.Id AND p2.CreationDate < p.CreationDate) AS AvgPreviousQuestionScoreByUser,
+    DENSE_RANK() OVER (PARTITION BY ues.UserId ORDER BY p.ViewCount DESC, p.CreationDate DESC) AS UserQuestionViewRank,
+    qa.TotalEditsForPost,
+    qa.TimeSincePreviousEdit AS LatestEditInterval,
+    pca.TotalComments,
+    pca.AvgCommentLength,
+    pca.PositiveComments,
+    pca.NegativeComments,
+    tpd.TagName AS TopTagName,
+    tpd.HasTagWikiContent,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        JOIN Posts related_p ON pl.RelatedPostId = related_p.Id
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1
+          AND related_p.CommunityOwnedDate IS NOT NULL
+          AND EXISTS (SELECT 1 FROM TaggedPostDetails tpd_inner WHERE tpd_inner.PostId = related_p.Id AND tpd_inner.TagName = 'sql')
+    ) AS HasLinkedCommunityOwnedSqlPost,
+    CASE
+        WHEN p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months') THEN 'Very Recent'
+        WHEN p.LastActivityDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months') AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months') THEN 'Recent'
+        WHEN p.LastActivityDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months') THEN 'Moderate'
+        ELSE 'Old'
+    END AS ActivityCategory
+FROM UserEngagementSummary ues
+INNER JOIN Posts p ON ues.UserId = p.OwnerUserId
+LEFT JOIN (
+    SELECT PostId, EditorUserId, EditDate, TimeSincePreviousEdit, TotalEditsForPost
+    FROM QuestionEditAnalysis
+    WHERE rn_latest_edit = 1
+) qa ON p.Id = qa.PostId
+LEFT JOIN PostCommentActivity pca ON p.Id = pca.PostId
+LEFT JOIN TaggedPostDetails tpd ON p.Id = tpd.PostId
+    AND tpd.TagUseCount = (
+        SELECT MAX(TagUseCount) FROM TaggedPostDetails WHERE PostId = p.Id
+    )
+WHERE
+    p.PostTypeId = 1
+    AND ues.Reputation >= 2500
+    AND ues.QuestionsPosted >= 10
+    AND p.ViewCount > 1000
+    AND p.Score >= 10
+    AND (
+        p.AcceptedAnswerId IS NOT NULL OR
+        (p.AnswerCount > 2 AND p.FavoriteCount >= 5) OR
+        (p.ClosedDate IS NULL AND p.CommunityOwnedDate IS NULL AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'))
+    )
+    AND (pca.TotalComments IS NULL OR pca.TotalComments >= 3)
+    AND qa.TotalEditsForPost IS NOT NULL
+    AND qa.EditorUserId IS NOT NULL
+
+UNION ALL
+
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.QuestionsPosted,
+    ues.AnswersPosted,
+    ues.TotalQuestionScore,
+    ues.TotalAnswerScore,
+    ues.GoldBadgesCount,
+    CAST(
+        (ues.Reputation * 0.18) +
+        (COALESCE(ues.TotalAnswerScore, 0) * 0.35) +
+        (ues.GoldBadgesCount * 15) -
+        (ues.TotalDownvotesGiven * 0.08)
+    AS NUMERIC(10, 2)) AS InfluenceScore,
+    NULL AS QuestionId,
+    'N/A - Answer-Focused User' AS QuestionTitle,
+    NULL AS QuestionViews,
+    ues.AnswersPosted AS QuestionAnswers,
+    NULL AS QuestionCreationDate,
+    ues.LatestActivityDateByUser AS LastContentUpdate,
+    'ANSWER_ONLY_PROFILE' AS ProcessedTitleFragment,
+    (SELECT AVG(a_sub.Score) FROM Posts a_sub WHERE a_sub.OwnerUserId = ues.UserId AND a_sub.PostTypeId = 2) AS AvgAnswerScoreByUser,
+    NULL AS UserQuestionViewRank,
+    NULL AS TotalEditsForPost,
+    NULL AS LatestEditInterval,
+    NULL AS TotalComments,
+    NULL AS AvgCommentLength,
+    NULL AS PositiveComments,
+    NULL AS NegativeComments,
+    NULL AS TopTagName,
+    FALSE AS HasTagWikiContent,
+    FALSE AS HasLinkedCommunityOwnedSqlPost,
+    CASE
+        WHEN ues.LatestActivityDateByUser > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months') THEN 'Recent'
+        ELSE 'Old'
+    END AS ActivityCategory
+FROM UserEngagementSummary ues
+WHERE
+    ues.QuestionsPosted < 5
+    AND ues.AnswersPosted >= 20
+    AND ues.Reputation >= 1500
+    AND ues.GoldBadgesCount > 0
+    AND ues.LatestActivityDateByUser > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+ORDER BY InfluenceScore DESC, Reputation DESC, LastContentUpdate DESC
+LIMIT 1500;

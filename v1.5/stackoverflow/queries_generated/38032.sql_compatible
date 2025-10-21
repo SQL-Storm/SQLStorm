@@ -1,0 +1,219 @@
+with params as (
+  select
+    date '2015-01-01' as start_ts,
+    date '2018-01-01' as mid_ts,
+    date '2021-01-01' as end_ts,
+    100 as top_n
+),
+active_answerers as (
+  select
+    date_trunc('quarter', p.CreationDate) as qtr,
+    u.Id as user_id,
+    u.DisplayName,
+    count(*) filter (where p.PostTypeId = 2) as answers,
+    sum(GREATEST(p.Score, 0)) filter (where p.PostTypeId = 2) as pos_answer_score,
+    sum(LEAST(p.Score, 0)) filter (where p.PostTypeId = 2) as neg_answer_score,
+    PERCENTILE_CONT(0.5) within group (order by p.Score) filter (where p.PostTypeId = 2) as median_ans_score,
+    MAX(u.Reputation) as rep_snapshot
+  from Posts p
+  join Users u on u.Id = p.OwnerUserId
+  where p.PostTypeId = 2
+  group by 1, 2, 3
+),
+question_difficulty as (
+  select
+    date_trunc('quarter', q.CreationDate) as qtr,
+    unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags) - 2), '><')) as tag,
+    count(*) as questions,
+    avg(coalesce(q.Score, 0)) as avg_q_score,
+    stddev_samp(coalesce(q.Score, 0)) as std_q_score,
+    avg(case when q.AcceptedAnswerId is not null then 1.0 else 0.0 end) as accepted_ratio
+  from Posts q
+  where q.PostTypeId = 1
+    and q.Tags is not null
+  group by 1, 2
+),
+aq as (
+  select
+    a.Id as answer_id,
+    a.OwnerUserId as answerer_id,
+    q.Id as question_id,
+    q.OwnerUserId as asker_id,
+    a.CreationDate as answer_ts,
+    q.CreationDate as question_ts,
+    extract(epoch from (a.CreationDate - q.CreationDate)) / 3600.0 as hours_to_answer,
+    cast((a.Id = q.AcceptedAnswerId) as int) as is_accepted,
+    q.Score as q_score,
+    a.Score as a_score,
+    date_trunc('quarter', a.CreationDate) as qtr,
+    unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags) - 2), '><')) as tag
+  from Posts a
+  join Posts q on q.Id = a.ParentId and a.PostTypeId = 2 and q.PostTypeId = 1
+  where q.Tags is not null
+),
+user_tag_perf as (
+  select
+    qtr,
+    answerer_id as user_id,
+    tag,
+    count(*) as answers,
+    avg(hours_to_answer) as avg_hours_to_answer,
+    PERCENTILE_CONT(0.5) within group (order by hours_to_answer) as p50_hours,
+    avg(is_accepted) as accept_rate,
+    avg(a_score) as avg_ans_score,
+    avg(q_score) as avg_q_score_seen,
+    corr(a_score, q_score) as corr_ans_vs_question_score
+  from aq
+  group by 1, 2, 3
+),
+user_perf as (
+  select
+    qtr,
+    user_id,
+    sum(answers) as total_answers,
+    avg(accept_rate) as mean_accept_rate,
+    PERCENTILE_CONT(0.5) within group (order by accept_rate) as median_accept_rate,
+    avg(avg_hours_to_answer) as mean_hours_to_answer,
+    avg(avg_ans_score) as mean_ans_score,
+    avg(corr_ans_vs_question_score) as mean_corr_ans_q,
+    count(*) filter (where accept_rate >= 0.5) as tags_with_ge50_accept
+  from user_tag_perf
+  group by 1, 2
+),
+rising_users as (
+  select
+    u2.user_id,
+    u2.total_answers as answers_mid,
+    u2.mean_accept_rate as ar_mid,
+    u1.total_answers as answers_start,
+    u1.mean_accept_rate as ar_start,
+    (u2.mean_accept_rate - u1.mean_accept_rate) as delta_ar,
+    (u2.total_answers - u1.total_answers) as delta_answers
+  from params p
+  join user_perf u1 on u1.qtr >= p.start_ts and u1.qtr < p.mid_ts
+  join user_perf u2 on u2.qtr >= p.mid_ts and u2.qtr < p.end_ts and u2.user_id = u1.user_id
+  group by u2.user_id, u2.total_answers, u2.mean_accept_rate, u1.total_answers, u1.mean_accept_rate
+),
+tag_trends as (
+  select
+    t2.tag,
+    avg(t2.accepted_ratio) as ar_mid,
+    avg(t1.accepted_ratio) as ar_start,
+    (avg(t2.accepted_ratio) - avg(t1.accepted_ratio)) as delta_ar,
+    avg(t2.avg_q_score) - avg(t1.avg_q_score) as delta_qscore
+  from params p
+  join question_difficulty t1 on t1.qtr >= p.start_ts and t1.qtr < p.mid_ts
+  join question_difficulty t2 on t2.qtr >= p.mid_ts and t2.qtr < p.end_ts and t2.tag = t1.tag
+  group by 1
+),
+user_engagement as (
+  select
+    date_trunc('quarter', a.CreationDate) as qtr,
+    a.OwnerUserId as user_id,
+    count(distinct c.Id) as comments_on_answers,
+    sum(coalesce(v_up.cnt, 0)) as upvotes_on_answers,
+    sum(coalesce(v_dn.cnt, 0)) as downvotes_on_answers
+  from Posts a
+  left join LATERAL (
+    select count(*) as cnt
+    from Votes v
+    where v.PostId = a.Id and v.VoteTypeId = 2
+  ) v_up on true
+  left join LATERAL (
+    select count(*) as cnt
+    from Votes v
+    where v.PostId = a.Id and v.VoteTypeId = 3
+  ) v_dn on true
+  left join Comments c on c.PostId = a.Id
+  where a.PostTypeId = 2
+  group by 1, 2
+),
+combined as (
+  select
+    up.qtr,
+    up.user_id,
+    up.total_answers,
+    up.mean_accept_rate,
+    up.median_accept_rate,
+    up.mean_hours_to_answer,
+    up.mean_corr_ans_q,
+    up.tags_with_ge50_accept,
+    coalesce(ue.comments_on_answers, 0) as comments_on_answers,
+    coalesce(ue.upvotes_on_answers, 0) as upvotes_on_answers,
+    coalesce(ue.downvotes_on_answers, 0) as downvotes_on_answers
+  from user_perf up
+  left join user_engagement ue on ue.qtr = up.qtr and ue.user_id = up.user_id
+),
+scored as (
+  select
+    c.*,
+    (c.mean_accept_rate * 3.0)
+    + (ln(1 + c.total_answers) * 1.5)
+    + (coalesce(c.mean_corr_ans_q, 0) * 0.5)
+    + (ln(1 + c.upvotes_on_answers) * 0.75)
+    - (ln(1 + greatest(c.mean_hours_to_answer, 0)) * 0.5)
+    - (ln(1 + c.downvotes_on_answers) * 0.5) as perf_score
+  from combined c
+),
+rising_filtered as (
+  select s.*
+  from scored s
+  join params p on s.qtr >= p.mid_ts and s.qtr < p.end_ts
+  join rising_users r on r.user_id = s.user_id and r.delta_ar > 0.05 and r.delta_answers > 5
+),
+top_user_tags as (
+  select
+    a.qtr,
+    a.answerer_id as user_id,
+    a.tag,
+    count(*) as tag_answers,
+    avg(a.is_accepted) as tag_accept_rate,
+    row_number() over (partition by a.answerer_id order by count(*) desc, avg(a.is_accepted) desc) as rn
+  from aq a
+  join params p on a.qtr >= p.mid_ts and a.qtr < p.end_ts
+  group by 1, 2, 3
+),
+user_tag_hardness as (
+  select
+    tut.user_id,
+    tut.tag,
+    tt.delta_ar as tag_delta_accept,
+    tt.delta_qscore as tag_delta_qscore
+  from top_user_tags tut
+  join tag_trends tt on tt.tag = tut.tag
+  where tut.rn <= 3
+),
+ranked as (
+  select
+    rf.*,
+    u.DisplayName,
+    dense_rank() over (order by rf.perf_score desc nulls last, rf.total_answers desc) as drnk
+  from rising_filtered rf
+  join Users u on u.Id = rf.user_id
+)
+select
+  r.drnk as rank,
+  r.user_id,
+  r.DisplayName,
+  r.qtr,
+  round(r.perf_score::numeric, 4) as perf_score,
+  r.total_answers,
+  round(r.mean_accept_rate::numeric, 4) as mean_accept_rate,
+  round(r.median_accept_rate::numeric, 4) as median_accept_rate,
+  round(r.mean_hours_to_answer::numeric, 2) as mean_hours_to_answer,
+  r.tags_with_ge50_accept,
+  r.upvotes_on_answers,
+  r.downvotes_on_answers,
+  jsonb_agg(jsonb_build_object(
+    'tag', uth.tag,
+    'deltaAccepted', uth.tag_delta_accept,
+    'deltaQScore', uth.tag_delta_qscore
+  ) order by uth.tag) filter (where uth.tag is not null) as top_tag_trends
+from ranked r
+left join user_tag_hardness uth on uth.user_id = r.user_id
+join params p on true
+where r.drnk <= p.top_n
+group by
+  r.drnk, r.user_id, r.DisplayName, r.qtr, r.perf_score, r.total_answers, r.mean_accept_rate,
+  r.median_accept_rate, r.mean_hours_to_answer, r.tags_with_ge50_accept, r.upvotes_on_answers, r.downvotes_on_answers
+order by r.drnk, r.user_id;

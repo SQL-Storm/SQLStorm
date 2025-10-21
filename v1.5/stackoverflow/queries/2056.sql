@@ -1,0 +1,70 @@
+WITH MostActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC, COUNT(DISTINCT C.Id) DESC) AS ActivityRank
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+QuestionVotes AS (
+    SELECT
+        Q.Id AS QuestionId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Posts Q
+    LEFT JOIN Votes V ON Q.Id = V.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id
+),
+AverageBadgeEarningTime AS (
+    SELECT
+        U.Id AS UserId,
+        AVG((EXTRACT(EPOCH FROM (B.Date - U.CreationDate))) / 86400.0) AS AvgDaysToBadge
+    FROM
+        Users U
+    INNER JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+),
+LinkedPostAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicateCount
+    FROM
+        PostLinks PL
+    GROUP BY PL.PostId
+)
+SELECT DISTINCT
+    U.DisplayName,
+    COALESCE(QV.UpVotes, 0) - COALESCE(QV.DownVotes, 0) AS NetVotes,
+    MAU.ActivityRank,
+    ADE.AvgDaysToBadge,
+    LPA.LinkedCount,
+    LPA.DuplicateCount
+FROM
+    Users U
+LEFT JOIN MostActiveUsers MAU ON U.Id = MAU.UserId
+LEFT JOIN QuestionVotes QV ON U.Id = (
+    SELECT P.OwnerUserId
+    FROM Posts P
+    WHERE P.Id = QV.QuestionId
+)
+LEFT JOIN AverageBadgeEarningTime ADE ON U.Id = ADE.UserId
+LEFT JOIN LinkedPostAnalysis LPA ON U.Id = (
+    SELECT P.OwnerUserId
+    FROM Posts P
+    WHERE P.Id = LPA.PostId
+)
+WHERE
+    U.Reputation > 1000
+    AND (COALESCE(0, 0) > 5 OR COALESCE(QV.UpVotes, 0) > 10)
+ORDER BY
+    NetVotes DESC,
+    MAU.ActivityRank ASC,
+    ADE.AvgDaysToBadge DESC;

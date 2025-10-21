@@ -1,0 +1,145 @@
+-- {"query": "44093.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 213342, "output_tokens": 73641} 
+Here is an elaborate SQL query for performance benchmarking on the StackOverflow database schema:
+
+```sql
+WITH post_counts AS (
+  SELECT 
+    p.PostTypeId,
+    COUNT(*) AS total_posts
+  FROM Posts p
+  GROUP BY p.PostTypeId
+),
+top_voted_posts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rank_score
+  FROM Posts p
+  WHERE p.Score > 0
+),
+top_viewed_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.ViewCount,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS rank_view
+  FROM Posts p
+  WHERE p.ViewCount > 0
+),
+top_answered_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.AnswerCount,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.AnswerCount DESC) AS rank_answer
+  FROM Posts p
+  WHERE p.AnswerCount > 0
+),
+top_favorited_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.FavoriteCount,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.FavoriteCount DESC) AS rank_favorite
+  FROM Posts p
+  WHERE p.FavoriteCount > 0
+),
+post_info AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.ContentLicense,
+    pc.total_posts,
+    tvp.rank_score,
+    tvp.Score AS vote_score,
+    tvp2.rank_view,
+    tvp2.ViewCount AS view_count,
+    ta.rank_answer,
+    ta.AnswerCount AS answer_count,
+    tf.rank_favorite,
+    tf.FavoriteCount AS favorite_count
+  FROM Posts p
+  LEFT JOIN post_counts pc ON p.PostTypeId = pc.PostTypeId
+  LEFT JOIN top_voted_posts tvp ON p.Id = tvp.Id
+  LEFT JOIN top_viewed_posts tvp2 ON p.Id = tvp2.Id
+  LEFT JOIN top_answered_posts ta ON p.Id = ta.Id
+  LEFT JOIN top_favorited_posts tf ON p.Id = tf.Id
+),
+user_info AS (
+  SELECT
+    u.Id AS user_id,
+    u.Reputation,
+    u.CreationDate AS user_creation_date,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId
+  FROM Users u
+),
+user_badges AS (
+  SELECT
+    b.UserId,
+    b.Name,
+    b.Date,
+    b.Class,
+    b.TagBased
+  FROM Badges b
+)
+SELECT
+  pi.Id AS post_id,
+  pi.PostTypeId,
+  pi.CreationDate AS post_creation_date,
+  pi.OwnerUserId,
+  pi.LastEditorUserId,
+  pi.LastEditDate AS last_edit_date,
+  pi.LastActivityDate AS last_activity_date,
+  pi.ClosedDate AS closed_date,
+  pi.CommunityOwnedDate AS community_owned_date,
+  pi.ContentLicense,
+  pi.total_posts AS total_posts_per_type,
+  pi.rank_score AS rank_by_score,
+  pi.vote_score,
+  pi.rank_view AS rank_by_view,
+  pi.view_count,
+  pi.rank_answer AS rank_by_answer,
+  pi.answer_count,
+  pi.rank_favorite AS rank_by_favorite,
+  pi.favorite_count,
+  ui.user_id,
+  ui.Reputation AS user_reputation,
+  ui.user_creation_date,
+  ui.LastAccessDate AS user_last_access_date,
+  ui.WebsiteUrl AS user_website_url,
+  ui.Location AS user_location,
+  ui.AboutMe AS user_about_me,
+  ui.Views AS user_views,
+  ui.UpVotes AS user_upvotes,
+  ui.DownVotes AS user_downvotes,
+  ui.ProfileImageUrl AS user_profile_image_url,
+  ui.EmailHash AS user_email_hash,
+  ui.AccountId AS user_account_id,
+  ub.Name AS badge_name,
+  ub.Date AS badge_date,
+  ub.Class AS badge_class,
+  ub.TagBased AS badge_tag_based
+FROM post_info pi
+LEFT JOIN user_info ui ON pi.OwnerUserId = ui.user_id
+LEFT JOIN user_badges ub ON pi.OwnerUserId = ub.UserId
+ORDER BY pi.Id;
+```
+
+This query performs a deep dive into the StackOverflow database schema, combining data from multiple tables to provide a comprehensive view of post and user information. It includes various metrics such as post scores, view counts, answer counts, and favorite counts, along with user-related details like reputation, badges, and activity data. The use of common table expressions (CTEs) and window functions like `RANK()` allows for efficient data aggregation and ranking. This query can be used to analyze the performance characteristics of the database and identify areas for optimization.

@@ -1,0 +1,143 @@
+-- {"query": "5077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1090} 
+with recent_questions as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.ClosedDate,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+top_answerers as (
+    select 
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        u.DisplayName,
+        count(*) as AnswerCount,
+        max(a.Score) as MaxScore,
+        avg(a.Score) as AvgScore
+    from Posts a
+    join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+    group by a.ParentId, a.OwnerUserId, u.DisplayName
+),
+tag_counts as (
+    select 
+        t.TagName,
+        t.Count as TagTotalQuestions,
+        coalesce(sum(tg.Count), 0) as TagTotalUsage
+    from Tags t
+    left join Tags tg on tg.TagName = t.TagName
+    group by t.TagName, t.Count
+),
+recent_comments as (
+    select 
+        c.PostId,
+        count(*) as RecentCommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    group by c.PostId
+),
+question_activity as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.OwnerName,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.Tags,
+        rq.AnswerCount,
+        rq.ClosedDate,
+        rc.RecentCommentCount,
+        rc.LastCommentDate,
+        array_agg(distinct t.TagName) filter (where t.TagName is not null) as TagList
+    from recent_questions rq
+    left join recent_comments rc on rq.QuestionId = rc.PostId
+    left join lateral (
+        select unnest(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) as TagName
+    ) t on true
+    group by rq.QuestionId, rq.Title, rq.OwnerUserId, rq.OwnerName, rq.CreationDate, rq.Score, rq.ViewCount, rq.Tags, rq.AnswerCount, rq.ClosedDate, rc.RecentCommentCount, rc.LastCommentDate
+)
+select 
+    qa.QuestionId,
+    qa.Title,
+    qa.OwnerName,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.ClosedDate,
+    qa.CreationDate,
+    coalesce(qa.RecentCommentCount, 0) as RecentCommentCount,
+    qa.LastCommentDate,
+    array_to_string(qa.TagList, ', ') as TagList,
+    ta.DisplayName as TopAnswererName,
+    ta.AnswerCount as AnswersFromTopAnswerer,
+    ta.MaxScore as TopAnswererMaxScore,
+    ta.AvgScore as TopAnswererAvgScore,
+    (case 
+        when qa.ClosedDate is not null then 'Closed'
+        when qa.AnswerCount = 0 then 'Unanswered'
+        else 'Open'
+    end) as QuestionStatus,
+    (
+        select count(*) 
+        from Votes v 
+        where v.PostId = qa.QuestionId
+          and v.VoteTypeId = 2
+    ) as UpvoteCount,
+    (
+        select count(*) 
+        from Votes v 
+        where v.PostId = qa.QuestionId
+          and v.VoteTypeId = 3
+    ) as DownvoteCount,
+    (
+        select string_agg(b.Name, ', ')
+        from Badges b 
+        where b.UserId = qa.OwnerUserId
+        and b.Class = 1
+    ) as GoldBadgesOwner,
+    tc.TagTotalQuestions as MostUsedTagTotalQuestions,
+    tc.TagTotalUsage as MostUsedTagTotalUsage
+from question_activity qa
+left join lateral (
+    select ta.*
+    from top_answerers ta
+    where ta.QuestionId = qa.QuestionId
+    order by ta.AnswerCount desc, ta.MaxScore desc
+    limit 1
+) ta on true
+left join lateral (
+    select tc.*
+    from tag_counts tc
+    where tc.TagName = (
+        select t from unnest(qa.TagList) as t
+        order by 1
+        limit 1
+    )
+    limit 1
+) tc on true
+where qa.rn = 1
+  and (
+    qa.Score > 5 
+    or qa.ViewCount > 2000 
+    or qa.RecentCommentCount > 2
+    or qa.ClosedDate is not null
+  )
+order by
+    qa.Score desc nulls last,
+    qa.ViewCount desc nulls last,
+    qa.CreationDate desc
+limit 100;

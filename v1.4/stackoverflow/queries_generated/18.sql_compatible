@@ -1,0 +1,119 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+TagInsights AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.OwnerUserId AS PostOwner,
+    p.CreationDate AS PostCreated
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+  WHERE t.IsModeratorOnly = 0
+),
+LinkSummary AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS LinkCount,
+    STRING_AGG(CAST(lt.Id AS VARCHAR), ',') AS LinkTypeIds
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+),
+VotesSummary AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyVotes,
+    COUNT(*) AS VoteCount
+  FROM Votes v
+  GROUP BY v.PostId
+),
+CorrelatedPairs AS (
+  SELECT
+    rp.Id AS RelatedPostId,
+    rp.Title AS RelatedTitle,
+    rp.OwnerUserId AS RelatedOwner
+  FROM Posts rp
+  JOIN VoteTypes vt ON vt.Id = 2
+  WHERE rp.PostTypeId = 1
+),
+RelationalOwnerInfo AS (
+  SELECT
+    CP.RelatedPostId,
+    CP.RelatedOwner
+  FROM CorrelatedPairs CP
+)
+SELECT
+  RAP.Id AS PostId,
+  RAP.Title AS PostTitle,
+  RAP.OwnerUserId,
+  RAP.CreationDate,
+  RAP.LastActivityDate,
+  RAP.ViewCount,
+  RAP.Score,
+  RAP.CommentCount,
+  RAP.AnswerCount,
+  RAP.FavoriteCount,
+  RAP.ContentLicense,
+  TI.TagName AS TopTag,
+  TI.Count AS TagCount,
+  TI.PostCreated AS PostCreated,
+  LS.LinkCount,
+  LS.LinkTypeIds,
+  VS.UpVotes AS NetUpVotes,
+  VS.DownVotes AS NetDownVotes,
+  VS.BountyVotes,
+  UA.DisplayName AS OwnerDisplayName,
+  UA.Reputation,
+  UA.LastAccessDate,
+  UA.Location,
+  UA.AboutMe,
+  RP.RelatedOwner AS RelatedOwner,
+  RP.RelatedTitle AS RelatedPostTitle
+FROM RecentActivePosts RAP
+LEFT JOIN TopAuthors UA ON RAP.OwnerUserId = UA.UserId
+LEFT JOIN TagInsights TI ON 1=1
+LEFT JOIN LinkSummary LS ON RAP.Id = LS.PostId
+LEFT JOIN VotesSummary VS ON RAP.Id = VS.PostId
+LEFT JOIN CorrelatedPairs CP ON RAP.Id = CP.RelatedPostId
+LEFT JOIN RelationalOwnerInfo RP ON CP.RelatedPostId = RP.RelatedPostId
+ORDER BY RAP.LastActivityDate DESC
+LIMIT 100;

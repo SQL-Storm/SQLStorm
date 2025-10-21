@@ -1,0 +1,56 @@
+WITH UserPostStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        SUM(CASE WHEN P.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts,
+        SUM(CASE WHEN P.Score < 0 THEN 1 ELSE 0 END) AS NegativePosts,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS AverageScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        PostCount,
+        PositivePosts,
+        NegativePosts,
+        AverageScore,
+        RANK() OVER (ORDER BY PostCount DESC) AS PostRank
+    FROM UserPostStats
+),
+PopularTags AS (
+    SELECT 
+        Tag,
+        COUNT(P.Id) AS TagPostCount
+    FROM (
+        SELECT TRIM(value) AS Tag
+        FROM Posts P
+        CROSS JOIN LATERAL (
+            SELECT value
+            FROM regex_split_to_table(P.Tags, '<>') AS value
+        ) AS s
+        WHERE P.PostTypeId = 1
+    ) AS t
+    GROUP BY Tag
+    ORDER BY TagPostCount DESC
+    LIMIT 10
+)
+SELECT 
+    RU.UserId,
+    RU.DisplayName,
+    RU.PostCount,
+    RU.PositivePosts,
+    RU.NegativePosts,
+    RU.AverageScore,
+    COALESCE(PT.TagPostCount, 0) AS PopularTagCount,
+    PT.Tag
+FROM RankedUsers RU
+LEFT JOIN PopularTags PT ON PT.Tag IN (
+    SELECT TRIM(value)
+    FROM regex_split_to_table(COALESCE(RU.DisplayName, ''), '<>') AS value
+)
+WHERE RU.PostRank <= 50
+ORDER BY RU.PostCount DESC, RU.AverageScore DESC;

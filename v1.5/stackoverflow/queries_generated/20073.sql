@@ -1,0 +1,194 @@
+-- {"query": "20073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1889} 
+
+WITH UserActivitySummary AS (
+  -- CTE 1: Aggregate user post and comment data
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    SUM(p.Score) AS TotalPostScore,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+    SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+    COUNT(c.Id) AS TotalCommentsMade,
+    (
+      SELECT
+        SUM(c_in.Score)
+      FROM Comments c_in
+      WHERE
+        c_in.UserId = u.Id
+    ) AS TotalCommentScore
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  WHERE
+    u.CreationDate > '2015-01-01' AND u.Reputation > 1000
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate
+), BadgeCounts AS (
+  -- CTE 2: Count badges by class for each user
+  SELECT
+    UserId,
+    COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+    MIN(Date) AS FirstBadgeDate
+  FROM Badges
+  GROUP BY
+    UserId
+), PostsWithRankedAnswers AS (
+  -- CTE 3: Rank answers for each question to find the top answers
+  SELECT
+    p.Id,
+    p.ParentId,
+    p.OwnerUserId,
+    p.Score,
+    p.Body,
+    ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as AnswerRank
+  FROM Posts p
+  WHERE
+    p.PostTypeId = 2 -- Answers
+    AND p.OwnerUserId IS NOT NULL
+), UserInteractionProfile AS (
+  -- CTE 4: Combine different user interactions
+  -- Questions and Answers
+  SELECT
+    OwnerUserId AS UserId,
+    'Post' AS ActivityType,
+    CreationDate AS ActivityDate,
+    Score
+  FROM Posts
+  WHERE
+    OwnerUserId IS NOT NULL
+  UNION ALL
+  -- Comments
+  SELECT
+    UserId,
+    'Comment' AS ActivityType,
+    CreationDate AS ActivityDate,
+    Score
+  FROM Comments
+  WHERE
+    UserId IS NOT NULL
+), FirstAndLastActivity AS (
+  -- CTE 5: Use window functions to find first/last activity dates
+  SELECT
+    UserId,
+    MIN(ActivityDate) AS FirstActivityDate,
+    MAX(ActivityDate) AS LastActivityDate,
+    LEAD(ActivityDate, 1) OVER (PARTITION BY UserId ORDER BY ActivityDate) - ActivityDate AS TimeToNextActivity
+  FROM UserInteractionProfile
+  GROUP BY
+    UserId
+)
+-- Main Query: Synthesize all information to create a comprehensive user report
+SELECT
+  uas.UserId,
+  uas.DisplayName,
+  uas.Reputation,
+  COALESCE(uas.AnswerCount, 0) AS AnswerCount,
+  COALESCE(uas.QuestionCount, 0) AS QuestionCount,
+  COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+  COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+  COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+  -- Complex scoring metric
+  (
+    uas.Reputation * 0.1 + uas.TotalPostScore * 0.3 + uas.TotalCommentScore * 0.15 + (COALESCE(bc.GoldBadges, 0) * 100) + (COALESCE(bc.SilverBadges, 0) * 25) + (COALESCE(bc.BronzeBadges, 0) * 5)
+  ) / (
+    EXTRACT(
+      EPOCH
+      FROM
+        (NOW() - uas.UserCreationDate)
+    ) / 86400.0
+  ) AS NormalizedActivityScore,
+  DENSE_RANK() OVER (
+    ORDER BY
+      (
+        uas.Reputation * 0.1 + uas.TotalPostScore * 0.3 + uas.TotalCommentScore * 0.15 + (COALESCE(bc.GoldBadges, 0) * 100) + (COALESCE(bc.SilverBadges, 0) * 25) + (COALESCE(bc.BronzeBadges, 0) * 5)
+      ) DESC
+  ) AS UserRank,
+  -- Use correlated subquery to find title of the user's highest scored answer's question
+  (
+    SELECT
+      q.Title
+    FROM Posts q
+    JOIN Posts a
+      ON q.Id = a.ParentId
+    WHERE
+      a.OwnerUserId = uas.UserId AND a.PostTypeId = 2
+    ORDER BY
+      a.Score DESC
+    LIMIT 1
+  ) AS BestAnswerQuestionTitle,
+  fala.LastActivityDate,
+  -- Categorize user based on their activity profile
+  CASE
+    WHEN COALESCE(uas.AnswerCount, 0) > COALESCE(uas.QuestionCount, 0) * 2 AND COALESCE(uas.AnswerCount, 0) > 10
+    THEN 'Prolific Answerer'
+    WHEN COALESCE(uas.QuestionCount, 0) > COALESCE(uas.AnswerCount, 0) * 2 AND COALESCE(uas.QuestionCount, 0) > 10
+    THEN 'Curious Inquirer'
+    WHEN COALESCE(bc.GoldBadges, 0) > 0
+    THEN 'Decorated Veteran'
+    ELSE 'Community Contributor'
+  END AS UserCategory,
+  -- Calculate ratio of accepted answers
+  CAST(
+    (
+      SELECT
+        COUNT(*)
+      FROM Posts ans
+      JOIN Posts q
+        ON ans.Id = q.AcceptedAnswerId
+      WHERE
+        ans.OwnerUserId = uas.UserId
+    ) AS REAL
+  ) / NULLIF(uas.AnswerCount, 0) AS AcceptedAnswerRatio,
+  -- String manipulation on post body of user's top-ranked answer
+  LEFT(
+    REPLACE(
+      REPLACE(TopAnswer.Body, '<p>', ''),
+      '</p>',
+      ''
+    ),
+    150
+  ) || '...' AS TopAnswerExcerpt
+FROM UserActivitySummary AS uas
+JOIN BadgeCounts AS bc
+  ON uas.UserId = bc.UserId
+JOIN FirstAndLastActivity AS fala
+  ON uas.UserId = fala.UserId
+LEFT JOIN PostsWithRankedAnswers AS TopAnswer
+  ON uas.UserId = TopAnswer.OwnerUserId AND TopAnswer.AnswerRank = 1
+WHERE
+  -- Complex predicate with subquery
+  uas.AnswerCount > (
+    SELECT
+      PERCENTILE_CONT(0.5) WITHIN GROUP (
+        ORDER BY
+          sub.AnswerCount
+      )
+    FROM UserActivitySummary sub
+  )
+  AND uas.TotalPostScore IS NOT NULL
+  AND bc.FirstBadgeDate < (uas.UserCreationDate + INTERVAL '30 day')
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks pl
+    JOIN Posts p_sub
+      ON pl.PostId = p_sub.Id
+    WHERE
+      p_sub.OwnerUserId = uas.UserId AND pl.LinkTypeId = 1 -- Linked
+  )
+ORDER BY
+  UserRank,
+  NormalizedActivityScore DESC
+LIMIT 200;

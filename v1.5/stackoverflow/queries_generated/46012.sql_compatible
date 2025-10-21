@@ -1,0 +1,109 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        COUNT(DISTINCT a.Id) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(a.Score) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopAnsweredQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId as QuestionOwnerId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank
+    FROM Posts p
+    INNER JOIN Posts a ON p.Id = a.ParentId
+    WHERE p.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND p.Score >= 10
+        AND p.CreationDate >= TIMESTAMP '2019-01-01'
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueContributors,
+        AVG(p.Score) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        COUNT(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) as QuestionsWithAcceptedAnswers
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+UserTagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as tag_array,
+        COUNT(*) as PostsInTag,
+        AVG(p.Score) as AvgScoreInTag,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as AcceptedAnswersInTag
+    FROM Posts p
+    WHERE p.PostTypeId = 2 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId, tag_array
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.CommentCount,
+    uem.BadgeCount,
+    ROUND(CAST(uem.AvgQuestionScore AS numeric), 2) as AvgQuestionScore,
+    ROUND(CAST(uem.AvgAnswerScore AS numeric), 2) as AvgAnswerScore,
+    COUNT(DISTINCT taq.QuestionId) as ParticipatedInTopQuestions,
+    SUM(CASE WHEN taq.AnswerRank = 1 THEN 1 ELSE 0 END) as TopAnswersProvided,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagUsageCount DESC) FILTER (WHERE tp.AvgPostScore > 5) as ExpertInPopularTags,
+    AVG(tp.AvgPostScore) as AvgScoreInPopularTags,
+    MAX(taq.QuestionScore) as HighestScoredQuestionAnswered,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY taq.AnswerScore) as MedianAnswerScore,
+    COUNT(DISTINCT ph.Id) as EditHistoryCount,
+    COUNT(DISTINCT pl.Id) as LinkedPostsCount
+FROM UserEngagementMetrics uem
+LEFT JOIN TopAnsweredQuestions taq ON uem.Id = taq.AnswerOwnerId AND taq.AnswerRank <= 5
+LEFT JOIN Posts p ON taq.QuestionId = p.Id
+LEFT JOIN TagPopularity tp ON p.Tags LIKE CONCAT('%<', tp.TagName, '>%')
+LEFT JOIN PostHistory ph ON ph.UserId = uem.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+LEFT JOIN PostLinks pl ON pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uem.Id)
+WHERE uem.Reputation > 1000
+    AND uem.QuestionCount + uem.AnswerCount > 10
+GROUP BY 
+    uem.Id,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.CommentCount,
+    uem.BadgeCount,
+    uem.AvgQuestionScore,
+    uem.AvgAnswerScore
+HAVING COUNT(DISTINCT taq.QuestionId) > 5
+ORDER BY 
+    uem.Reputation DESC,
+    COUNT(DISTINCT taq.QuestionId) DESC,
+    AVG(tp.AvgPostScore) DESC
+LIMIT 100;

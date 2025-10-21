@@ -1,0 +1,73 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS RankInClass,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, b.Class
+), PostDetails AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        ph.CreationDate AS LastEditDate,
+        COALESCE(ph.UserId, -1) AS LastEditorId,
+        STRING_AGG(DISTINCT split_tag, ', ') AS FirstThreeTags,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS QualityComments
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (5, 6)
+    LEFT JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS split_tag ON TRUE
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.Score > 10
+    GROUP BY p.Id, p.Title, p.Tags, p.Score, ph.CreationDate, ph.UserId
+    HAVING COUNT(DISTINCT ph.Id) > 2
+)
+SELECT 
+    pd.Id AS PostId,
+    pd.Title,
+    pd.FirstThreeTags,
+    pd.Score,
+    us.Reputation AS AuthorReputation,
+    us.BadgeCount,
+    us.RankInClass,
+    pd.Upvotes,
+    pd.QualityComments,
+    CASE 
+        WHEN pd.Score > 100 AND pd.Upvotes > 50 THEN 'High Performer'
+        WHEN pd.Score < 0 OR pd.QualityComments = 0 THEN 'Controversial'
+        ELSE 'Average'
+    END AS PostCategory,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pd.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    COALESCE((SELECT SUM(BountyAmount) FROM Votes v WHERE v.PostId = pd.Id AND v.VoteTypeId = 8), 0) AS TotalBounty
+FROM PostDetails pd
+INNER JOIN Users u ON u.Id = pd.LastEditorId
+INNER JOIN UserStats us ON u.Id = us.UserId
+WHERE us.Reputation > 1000 AND us.PostCount > 10
+    AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name = 'Legendary' AND b.Class = 1)
+UNION ALL
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    NULL AS FirstThreeTags,
+    p.Score,
+    u.Reputation AS AuthorReputation,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+    NULL AS RankInClass,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS QualityComments,
+    'Legacy' AS PostCategory,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS DuplicateLinks,
+    0 AS TotalBounty
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.CommunityOwnedDate IS NOT NULL AND p.PostTypeId = 2 AND p.CreationDate < TIMESTAMP '2015-01-01'
+ORDER BY COALESCE(pd.Score, 0) DESC, COALESCE(pd.LastEditDate, TIMESTAMP 'epoch') DESC NULLS LAST
+LIMIT 100;

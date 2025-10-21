@@ -1,0 +1,150 @@
+-- {"query": "7038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2010} 
+WITH
+-- recent active posts with tag explosion
+RecentQuestions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(p.Tags, '') AS Tags,
+         regexp_split_to_table(trim(both '<>' FROM COALESCE(p.Tags, '')), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '1 year'
+),
+-- compute per-question aggregated signals
+QuestionSignals AS (
+  SELECT rq.Id AS QuestionId,
+         COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCountComputed,
+         COALESCE(SUM(v.ScoreDelta),0) AS VoteScoreSum,
+         MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS TopAnswerScore,
+         COUNT(DISTINCT c.Id) AS CommentCount,
+         COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13)) AS CloseAndReopenEvents,
+         ARRAY_AGG(DISTINCT rq.Tag) FILTER (WHERE rq.Tag IS NOT NULL) AS TagList
+  FROM RecentQuestions rq
+  LEFT JOIN Posts a ON a.ParentId = rq.Id
+  LEFT JOIN (
+    SELECT v.PostId, CASE WHEN v.VoteTypeId=2 THEN 1 WHEN v.VoteTypeId=3 THEN -1 ELSE 0 END AS ScoreDelta
+    FROM Votes v
+    WHERE v.CreationDate >= now() - interval '2 years'
+  ) v ON v.PostId = rq.Id OR v.PostId = a.Id
+  LEFT JOIN Comments c ON c.PostId = rq.Id OR c.PostId = a.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = rq.Id
+  GROUP BY rq.Id
+),
+-- users with mixed reputation bands and recency windows
+ActiveUsers AS (
+  SELECT u.Id AS UserId, u.Reputation,
+         CASE WHEN u.Reputation >= 20000 THEN 'expert'
+              WHEN u.Reputation >= 5000 THEN 'pro'
+              WHEN u.Reputation >= 1000 THEN 'experienced'
+              WHEN u.Reputation >= 100 THEN 'established'
+              ELSE 'newbie' END AS RepBand,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= now() - interval '2 years') AS QuestionsAsked,
+         COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2 AND p2.CreationDate >= now() - interval '2 years') AS AnswersGiven,
+         ROW_NUMBER() OVER (PARTITION BY CASE WHEN u.Reputation >= 5000 THEN 'high' ELSE 'low' END ORDER BY u.Reputation DESC) rn
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  GROUP BY u.Id, u.Reputation
+  HAVING (COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= now() - interval '2 years') +
+          COUNT(p2.Id) FILTER (WHERE p2.PostTypeId = 2 AND p2.CreationDate >= now() - interval '2 years')) > 0
+),
+-- tag-centric hotness using window functions and complex expression
+TagHotness AS (
+  SELECT t.Tag,
+         COUNT(DISTINCT qs.QuestionId) AS QuestionsWithTag,
+         SUM(qs.VoteScoreSum) AS TotalScore,
+         SUM(qs.CommentCount) AS TotalComments,
+         SUM(CASE WHEN qs.TopAnswerScore IS NULL THEN 0 ELSE qs.TopAnswerScore END) AS SumTopAnswerScore,
+         (SUM(qs.ViewCount) OVER (PARTITION BY t.Tag))::bigint AS PartitionViews,
+         RANK() OVER (ORDER BY COUNT(DISTINCT qs.QuestionId) DESC, SUM(qs.VoteScoreSum) DESC) AS TagRank
+  FROM (
+    SELECT QuestionId, unnest(TagList) AS Tag, VoteScoreSum, CommentCount, TopAnswerScore, ViewCount
+    FROM QuestionSignals
+  ) t
+  JOIN QuestionSignals qs ON qs.Id = t.QuestionId
+  GROUP BY t.Tag
+),
+-- combine tag hotness with user expertise and cross-posting links
+TagUserMix AS (
+  SELECT th.Tag, th.TagRank, th.QuestionsWithTag, th.TotalScore,
+         au.UserId, au.RepBand,
+         COALESCE(badges.UserBadgeCount,0) AS UserBadgeCount,
+         COALESCE(user_posts.RecentPostsCount,0) AS UserRecentPosts,
+         (th.TotalScore::numeric / NULLIF(th.QuestionsWithTag,0))::numeric(12,4) AS AvgScorePerQuestion,
+         CASE WHEN au.Reputation > 10000 AND COALESCE(badges.UserBadgeCount,0) >= 5 THEN 1 ELSE 0 END AS IsInfluencer
+  FROM TagHotness th
+  LEFT JOIN ActiveUsers au ON au.rn <= 500 AND (au.RepBand IN ('expert','pro','experienced')) -- sample of active experts
+  LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS UserBadgeCount
+    FROM Badges b
+    WHERE b.Date >= now() - interval '3 years'
+    GROUP BY b.UserId
+  ) badges ON badges.UserId = au.UserId
+  LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS RecentPostsCount
+    FROM Posts p
+    WHERE p.CreationDate >= now() - interval '1 year'
+    GROUP BY p.OwnerUserId
+  ) user_posts ON user_posts.OwnerUserId = au.UserId
+  WHERE th.Tag IS NOT NULL
+),
+-- correlated subquery to find nearest duplicate links and compute distances
+DuplicateProximity AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         COALESCE((
+           SELECT MIN(abs(EXTRACT(epoch FROM (q.CreationDate - p2.CreationDate))))
+           FROM PostLinks pl
+           JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+           WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+         ), 1e18) AS NearestDuplicateAgeSeconds,
+         (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = q.Id AND pl2.LinkTypeId = 3) AS DuplicateLinksCount
+  FROM Posts q
+  WHERE q.PostTypeId = 1 AND q.CreationDate >= now() - interval '2 years'
+),
+-- final heavy select combining many things, using set operator and string math
+CandidateSet AS (
+  SELECT tu.Tag, tu.TagRank, tu.AvgScorePerQuestion, tu.IsInfluencer, tu.UserId, tu.RepBand,
+         dp.QuestionId, dp.Title AS QuestionTitle, dp.NearestDuplicateAgeSeconds, dp.DuplicateLinksCount
+  FROM TagUserMix tu
+  JOIN DuplicateProximity dp ON dp.QuestionId IN (
+    SELECT QuestionId FROM QuestionSignals qs WHERE qs.Id = dp.QuestionId LIMIT 1
+  ) -- intentionally convoluted correlated expression to stress planner
+  WHERE tu.TagRank <= 250
+  ORDER BY tu.TagRank ASC, tu.UserId NULLS LAST
+  LIMIT 1000
+
+  UNION
+
+  SELECT th.Tag, th.TagRank, th.TotalScore::numeric/th.QuestionsWithTag, 0 AS IsInfluencer, NULL AS UserId, 'aggregated' AS RepBand,
+         NULL::int AS QuestionId, NULL::varchar AS QuestionTitle, 1e18::numeric AS NearestDuplicateAgeSeconds, 0 AS DuplicateLinksCount
+  FROM TagHotness th
+  WHERE th.TagRank BETWEEN 1 AND 50
+),
+-- add windowed metrics over final candidates
+FinalWindowed AS (
+  SELECT c.*,
+         ROW_NUMBER() OVER (PARTITION BY c.Tag ORDER BY c.IsInfluencer DESC NULLS LAST, c.AvgScorePerQuestion DESC NULLS LAST) AS TagDenseRank,
+         AVG(c.AvgScorePerQuestion) OVER (PARTITION BY c.Tag) AS AvgScoreWithinTag,
+         COUNT(*) OVER () AS TotalCandidates
+  FROM CandidateSet c
+)
+SELECT fw.Tag,
+       fw.TagRank,
+       fw.TagDenseRank,
+       COALESCE(fw.UserId, -1) AS UserId,
+       fw.RepBand,
+       fw.IsInfluencer,
+       ROUND(COALESCE(fw.AvgScorePerQuestion, fw.TotalScore::numeric)::numeric,4) AS HotnessScore,
+       fw.QuestionId,
+       LEFT(COALESCE(fw.QuestionTitle, '---'), 120) AS QuestionTitleSnippet,
+       CASE WHEN fw.NearestDuplicateAgeSeconds >= 1e17 THEN NULL ELSE (fw.NearestDuplicateAgeSeconds/86400)::bigint END AS DaysToNearestDuplicate,
+       fw.DuplicateLinksCount,
+       fw.AvgScoreWithinTag,
+       fw.TotalCandidates,
+       md5(CONCAT(fw.Tag, COALESCE(fw.UserId::text,''), fw.RepBand)) AS SyntheticHash
+FROM FinalWindowed fw
+WHERE (fw.TagDenseRank <= 10 OR fw.IsInfluencer = 1)
+  AND fw.Tag IS NOT NULL
+ORDER BY fw.TagRank, fw.TagDenseRank, fw.IsInfluencer DESC
+LIMIT 500;

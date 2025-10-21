@@ -1,0 +1,163 @@
+-- {"query": "17054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 128425, "output_tokens": 127697} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) AS MedianScore,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400 AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        AVG(p.Score) AS TagAvgScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC NULLS LAST) AS TagRank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+      AND p.OwnerUserId IS NOT NULL
+      AND p.Score > 0
+    GROUP BY p.OwnerUserId, UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+),
+UserBadgePatterns AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT Name) AS UniqueBadges,
+        STRING_AGG(DISTINCT CASE WHEN Class = 1 THEN Name END, ', ' ORDER BY Name) AS GoldBadgeNames,
+        MIN(Date) AS FirstBadgeDate,
+        MAX(Date) AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+PostEditHistory AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7, 8, 9)) AS RollbackCount,
+        BOOL_OR(ph.PostHistoryTypeId = 10) AS WasClosed,
+        BOOL_OR(ph.PostHistoryTypeId = 11) AS WasReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+QuestionAnswerDynamics AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.CreationDate AS QuestionDate,
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.AcceptedAnswerId = a.Id AS IsAccepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 AS ResponseTimeHours,
+        DENSE_RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.ClosedDate IS NULL
+      AND q.Score >= 0
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Reputation, 0) AS Reputation,
+    ROUND(uam.AccountAgeDays::NUMERIC, 1) AS AccountAgeDays,
+    COALESCE(uam.PostCount, 0) AS TotalPosts,
+    COALESCE(uam.QuestionCount, 0) AS Questions,
+    COALESCE(uam.AnswerCount, 0) AS Answers,
+    ROUND(COALESCE(uam.AvgPostScore, 0)::NUMERIC, 2) AS AvgPostScore,
+    COALESCE(uam.MedianScore, 0) AS MedianScore,
+    COALESCE(uam.TotalViews, 0) AS TotalViews,
+    CASE 
+        WHEN uam.AccountAgeDays > 0 
+        THEN ROUND((uam.Reputation / NULLIF(uam.AccountAgeDays, 0))::NUMERIC, 2) 
+        ELSE 0 
+    END AS DailyRepGain,
+    COALESCE(te.Tag, 'no-top-tag') AS TopTag,
+    COALESCE(te.TagTotalScore, 0) AS TopTagScore,
+    COALESCE(ubp.GoldBadges, 0) + COALESCE(ubp.SilverBadges, 0) * 0.3 + COALESCE(ubp.BronzeBadges, 0) * 0.1 AS WeightedBadgeScore,
+    COALESCE(SUBSTRING(ubp.GoldBadgeNames FROM 1 FOR 100), 'none') AS GoldBadgeSample,
+    COUNT(DISTINCT qad.QuestionId) FILTER (WHERE qad.QuestionUserId = uam.Id) AS QuestionsAsked,
+    COUNT(DISTINCT qad.AnswerId) FILTER (WHERE qad.AnswerUserId = uam.Id) AS AnswersProvided,
+    COUNT(DISTINCT qad.AnswerId) FILTER (WHERE qad.AnswerUserId = uam.Id AND qad.IsAccepted) AS AcceptedAnswers,
+    AVG(qad.ResponseTimeHours) FILTER (WHERE qad.AnswerUserId = uam.Id AND qad.ResponseTimeHours > 0) AS AvgResponseTimeHours,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY qad.AnswerScore) FILTER (WHERE qad.AnswerUserId = uam.Id) AS Answer25thPercentileScore,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY qad.AnswerScore) FILTER (WHERE qad.AnswerUserId = uam.Id) AS Answer75thPercentileScore,
+    MAX(CASE 
+        WHEN qad.AnswerUserId = uam.Id AND qad.AnswerRank = 1 AND NOT qad.IsAccepted 
+        THEN qad.AnswerScore 
+    END) AS HighestUnacceptedAnswerScore,
+    COUNT(DISTINCT c.Id) AS CommentsLeft,
+    COALESCE(SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8), 0) AS TotalBountiesOffered,
+    COALESCE(SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 9), 0) AS TotalBountiesReceived,
+    CASE 
+        WHEN uam.PostCount > 10 
+        THEN ROUND((COUNT(DISTINCT qad.AnswerId) FILTER (WHERE qad.AnswerUserId = uam.Id AND qad.IsAccepted)::NUMERIC / 
+                   NULLIF(COUNT(DISTINCT qad.AnswerId) FILTER (WHERE qad.AnswerUserId = uam.Id), 0)) * 100, 2)
+        ELSE NULL
+    END AS AcceptanceRate,
+    CASE
+        WHEN uam.Reputation >= 10000 AND ubp.GoldBadges >= 5 THEN 'Elite Contributor'
+        WHEN uam.Reputation >= 5000 AND ubp.GoldBadges >= 1 THEN 'Veteran'
+        WHEN uam.Reputation >= 1000 THEN 'Regular'
+        WHEN uam.Reputation >= 100 THEN 'Newcomer'
+        ELSE 'Beginner'
+    END AS UserTier,
+    COALESCE(
+        CASE 
+            WHEN uam.Location IS NOT NULL AND LENGTH(uam.Location) > 0 
+            THEN UPPER(SUBSTRING(uam.Location FROM '^[^,]+'))
+            ELSE 'UNKNOWN'
+        END, 'UNKNOWN'
+    ) AS LocationCountry
+FROM UserActivityMetrics uam
+LEFT JOIN LATERAL (
+    SELECT * FROM TagExpertise te 
+    WHERE te.OwnerUserId = uam.Id AND te.TagRank = 1
+    LIMIT 1
+) te ON TRUE
+LEFT JOIN UserBadgePatterns ubp ON uam.Id = ubp.UserId
+LEFT JOIN QuestionAnswerDynamics qad ON uam.Id IN (qad.QuestionUserId, qad.AnswerUserId)
+LEFT JOIN Comments c ON c.UserId = uam.Id
+LEFT JOIN Votes v ON v.UserId = uam.Id AND v.VoteTypeId IN (8, 9)
+WHERE uam.AccountAgeDays >= 30
+  AND (uam.PostCount > 0 OR ubp.UniqueBadges > 0)
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM PostHistory ph 
+      WHERE ph.UserId = uam.Id 
+        AND ph.PostHistoryTypeId = 12
+        AND ph.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+  )
+GROUP BY 
+    uam.Id, uam.DisplayName, uam.Reputation, uam.AccountAgeDays,
+    uam.PostCount, uam.QuestionCount, uam.AnswerCount,
+    uam.AvgPostScore, uam.MedianScore, uam.TotalViews, uam.Location,
+    te.Tag, te.TagTotalScore,
+    ubp.GoldBadges, ubp.SilverBadges, ubp.BronzeBadges, ubp.GoldBadgeNames
+HAVING COUNT(DISTINCT qad.QuestionId) + COUNT(DISTINCT qad.AnswerId) > 0
+   OR COALESCE(ubp.GoldBadges, 0) + COALESCE(ubp.SilverBadges, 0) + COALESCE(ubp.BronzeBadges, 0) > 5
+ORDER BY 
+    uam.Reputation DESC,
+    WeightedBadgeScore DESC,
+    AcceptanceRate DESC NULLS LAST
+LIMIT 100;

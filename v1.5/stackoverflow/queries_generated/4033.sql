@@ -1,0 +1,203 @@
+-- {"query": "4033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1913} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date asc, b.Class asc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class is not null
+), RankedPostVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        v.VoteTypeId,
+        v.CreationDate,
+        row_number() over (partition by p.Id order by v.CreationDate desc) as RecentVoteRank
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId in (1, 2) -- questions and answers
+), TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName as OwnerName,
+        count(distinct c.Id) as CommentCount,
+        max(ph.CreationDate) as LastEditDate,
+        case
+            when p.AcceptedAnswerId is not null then 1
+            else 0
+        end as HasAcceptedAnswer
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join Comments c on c.PostId = p.Id and c.Score > 0
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6) -- edits on title, body or tags
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, p.AcceptedAnswerId
+    having count(distinct c.Id) > 2 and p.Score >= 5
+), RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level
+    from Tags t
+    where t.Count > 1000
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    from Tags t2
+    join RecursiveTagCounts r on r.Id <> t2.Id and length(t2.TagName) > length(r.TagName)
+    where t2.Count > r.Count / 10
+    and r.Level < 3
+), UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(q.QuestionCount, 0) as QuestionCount,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        coalesce(b.BadgeGold, 0) as BadgeGold,
+        coalesce(b.BadgeSilver, 0) as BadgeSilver,
+        coalesce(b.BadgeBronze, 0) as BadgeBronze,
+        u.Reputation
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) q on u.Id = q.OwnerUserId
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) a on u.Id = a.OwnerUserId
+    left join (
+        select UserId, count(*) as CommentCount
+        from Comments
+        group by UserId
+    ) c on u.Id = c.UserId
+    left join (
+        select UserId,
+            sum(case when Class = 1 then 1 else 0 end) as BadgeGold,
+            sum(case when Class = 2 then 1 else 0 end) as BadgeSilver,
+            sum(case when Class = 3 then 1 else 0 end) as BadgeBronze
+        from Badges
+        group by UserId
+    ) b on u.Id = b.UserId
+), DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id and p1.PostTypeId = 1
+    join Posts p2 on pl.RelatedPostId = p2.Id and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+), AnswersWithRanks as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+), HighRepActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount
+    from Users u
+    join UserActivitySummary ua on u.Id = ua.UserId
+    where u.Reputation > 10000
+        and u.LastAccessDate > (current_timestamp - interval '30 days')
+        and (ua.QuestionCount > 10 or ua.AnswerCount > 15)
+), PostsWithComplexFiltering as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        ph.TypeName,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as EditRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join (
+        select ph.PostId, pht.Name as TypeName, ph.CreationDate
+        from PostHistory ph
+        join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+        where ph.PostHistoryTypeId in (4,5,6,10,11)
+    ) ph on p.Id = ph.PostId
+    where p.PostTypeId = 1
+        and (p.Title ilike '%sql%' or p.Tags ilike '%<sql>%')
+        and p.Score > 10
+        and (p.AcceptedAnswerId is not null or p.FavoriteCount > 5)
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    coalesce(tq.CommentCount, 0) as PositiveComments,
+    tq.HasAcceptedAnswer,
+    dup.OriginalQuestionId,
+    dup.OriginalTitle,
+    a.AnswerId as TopAnswerId,
+    a.OwnerUserId as TopAnswerOwnerId,
+    u.DisplayName as TopAnswerOwnerName,
+    u.Reputation as TopAnswerOwnerReputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeGold,
+    ua.BadgeSilver,
+    ua.BadgeBronze,
+    json_agg(distinct rtb.BadgeName) filter (where rtb.BadgeName is not null) as UserBadges,
+    rt.Level as TagRecursionLevel,
+    rt.TagName as TagName,
+    pcf.EditRank,
+    pcf.TypeName as LastEditType
+from TopQuestions tq
+left join DuplicateQuestions dup on tq.Id = dup.DuplicateQuestionId
+left join AnswersWithRanks a on tq.Id = a.QuestionId and a.AnswerRank = 1
+left join Users u on a.OwnerUserId = u.Id
+left join UserActivitySummary ua on u.Id = ua.UserId
+left join RecursiveUserBadges rtb on rtb.UserId = ua.UserId and rtb.BadgeRank <= 3
+left join RecursiveTagCounts rt on strpos(tq.Tags, concat('<', rt.TagName, '>')) > 0
+left join PostsWithComplexFiltering pcf on pcf.Id = tq.Id
+where (dup.OriginalQuestionId is null or dup.LinkCreationDate > (current_timestamp - interval '180 days'))
+group by
+    tq.Id, tq.Title, tq.Score, tq.ViewCount, tq.CommentCount, tq.HasAcceptedAnswer,
+    dup.OriginalQuestionId, dup.OriginalTitle,
+    a.AnswerId, a.OwnerUserId,
+    u.DisplayName, u.Reputation,
+    ua.QuestionCount, ua.AnswerCount, ua.BadgeGold, ua.BadgeSilver, ua.BadgeBronze,
+    rt.Level, rt.TagName,
+    pcf.EditRank, pcf.TypeName
+order by tq.Score desc, tq.ViewCount desc
+limit 100;

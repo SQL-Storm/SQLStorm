@@ -1,0 +1,175 @@
+-- {"query": "4069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1586} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.ViewCount, 0) AS TagPostViewCount,
+        COALESCE(p.Score, 0) AS TagPostScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT 
+        th.Id,
+        th.TagName || ' > ' || t2.TagName,
+        th.Count + t2.Count,
+        th.TagPostViewCount + COALESCE(p2.ViewCount, 0),
+        th.TagPostScore + COALESCE(p2.Score, 0)
+    FROM RecursiveTagHierarchy th
+    JOIN Tags t2 ON t2.Id = (
+        SELECT TOP 1 Id FROM Tags 
+        WHERE Count < th.Count AND Id <> th.Id
+        ORDER BY Count DESC
+    )
+    LEFT JOIN Posts p2 ON p2.Id = t2.ExcerptPostId AND p2.PostTypeId = 1
+    WHERE th.Count > 1000
+    AND CHAR_LENGTH(th.TagName) < 70
+),
+UserBadgePoints AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END) AS BadgePoints
+    FROM Badges b
+    WHERE b.TagBased = 0
+    GROUP BY b.UserId
+),
+PostVotesAgg AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS Favorites
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY p.Id
+),
+RecentUserActivityRanked AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT ph.Id) AS EditsCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS LocationRank,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6)
+    WHERE u.Location IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+AnswerQuality AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score,
+        pva.UpVotes,
+        pva.DownVotes,
+        pva.Favorites,
+        (pva.UpVotes - pva.DownVotes) * 1.5 + COALESCE(pva.Favorites,0) * 2 AS QualityScore,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY (pva.UpVotes - pva.DownVotes)*1.5 + COALESCE(pva.Favorites,0)*2 DESC, a.Score DESC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN PostVotesAgg pva ON pva.PostId = a.Id
+    WHERE a.PostTypeId = 2 -- Answers
+),
+SelectedAnswers AS (
+    SELECT
+        aq.QuestionId,
+        aq.AnswerId,
+        aq.QualityScore
+    FROM AnswerQuality aq
+    WHERE aq.AnswerRank = 1
+),
+QuestionDetails AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score,
+        q.Tags,
+        u.DisplayName AS OwnerName,
+        ua.BadgePoints,
+        sa.AnswerId AS TopAnswerId,
+        sa.QualityScore AS TopAnswerQuality
+    FROM Posts q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadgePoints ua ON ua.UserId = u.Id
+    LEFT JOIN SelectedAnswers sa ON sa.QuestionId = q.Id
+    WHERE q.PostTypeId = 1 -- Questions
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+QuestionCombined AS (
+    SELECT
+        qd.*,
+        cq.CloseReason,
+        cq.CloseDate,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        STRING_AGG(DISTINCT usr.DisplayName, ', ') FILTER (WHERE usr.DisplayName IS NOT NULL) AS Commenters,
+        SUM(COALESCE(ph.Id, 0)) FILTER (WHERE ph.PostHistoryTypeId IN (4,5)) AS EditHistoryCount
+    FROM QuestionDetails qd
+    LEFT JOIN ClosedQuestions cq ON cq.PostId = qd.Id
+    LEFT JOIN Comments c ON c.PostId = qd.Id
+    LEFT JOIN Users usr ON usr.Id = c.UserId
+    LEFT JOIN PostHistory ph ON ph.PostId = qd.Id
+    GROUP BY qd.Id, qd.Title, qd.CreationDate, qd.ViewCount, qd.Score, qd.Tags, qd.OwnerName, qd.BadgePoints, qd.TopAnswerId, qd.TopAnswerQuality, cq.CloseReason, cq.CloseDate
+),
+FinalAggregated AS (
+    SELECT
+        qc.*,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(qc.TopAnswerQuality, 0) DESC, qc.Score DESC) AS OverallRank,
+        NTILE(5) OVER (ORDER BY qc.ViewCount DESC) AS ViewCountQuintile,
+        CASE 
+            WHEN qc.CloseReason IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        CASE 
+            WHEN qc.BadgePoints IS NULL THEN 0 
+            ELSE qc.BadgePoints 
+        END AS UserBadgePointsNonNull,
+        LENGTH(qc.Title) AS TitleLength,
+        COALESCE(NULLIF(qc.Tags, ''), '<untagged>') AS NormalizedTags,
+        CASE
+            WHEN qc.Score < 0 THEN 'Negative'
+            WHEN qc.Score = 0 THEN 'Neutral'
+            ELSE 'Positive'
+        END AS ScoreCategory
+    FROM QuestionCombined qc
+)
+SELECT
+    f.OverallRank,
+    f.Id AS QuestionId,
+    f.Title,
+    f.TitleLength,
+    f.NormalizedTags,
+    f.ViewCount,
+    f.Score,
+    f.ScoreCategory,
+    f.TopAnswerId,
+    f.TopAnswerQuality,
+    f.OwnerName,
+    f.UserBadgePointsNonNull,
+    f.IsClosed,
+    f.CloseReason,
+    f.CloseDate,
+    f.CommentsCount,
+    f.Commenters,
+    f.EditHistoryCount,
+    f.ViewCountQuintile
+FROM FinalAggregated f
+WHERE 
+    f.CreationDate > NOW() - INTERVAL '1 year'
+    AND f.ScoreCategory <> 'Neutral'
+ORDER BY f.OverallRank
+LIMIT 100;

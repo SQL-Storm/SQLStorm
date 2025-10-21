@@ -1,0 +1,94 @@
+-- {"query": "22078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 817} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(NULLIF(p.Score, 0)) AS AvgScore,
+        SUM(v.UpVotes) AS UpVotes,
+        SUM(v.DownVotes) AS DownVotes,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(b.Id) AS TotalBadges,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) ELSE NULL END, ',') AS TagsUsed
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2,3)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate < '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        RANK() OVER (ORDER BY (Reputation + COALESCE(UpVotes,0) * 10 - COALESCE(DownVotes,0) * 5 + COALESCE(TotalBadges,0) * 100) DESC) AS GlobalRank
+    FROM UserStats
+),
+ActiveUsers AS (
+    SELECT 
+        ru.*,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ru.Id AND p2.LastActivityDate > CURRENT_DATE - INTERVAL '30 days') AS RecentPosts
+    FROM RankedUsers ru
+    WHERE ru.TotalPosts > 0 OR ru.TotalComments > 0
+),
+FinalRanks AS (
+    SELECT 
+        au.*,
+        RANK() OVER (PARTITION BY SUBSTRING(TagsUsed, 1, POSITION(',' IN TagsUsed) - 1) ORDER BY au.GlobalRank) AS TagRank,
+        CASE 
+            WHEN au.AvgScore IS NULL THEN 'No Score'
+            WHEN au.AvgScore > 10 THEN 'High Scorer'
+            ELSE 'Normal'
+        END AS ScoreCategory
+    FROM ActiveUsers au
+)
+SELECT 
+    fr.Id,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    fr.AvgScore,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.TotalComments,
+    fr.TotalBadges,
+    fr.TagsUsed,
+    fr.GlobalRank,
+    fr.RecentPosts,
+    fr.TagRank,
+    fr.ScoreCategory,
+    CASE WHEN fr.TagsUsed IS NOT NULL AND LENGTH(fr.TagsUsed) > 0 THEN UPPER(SPLIT_PART(fr.TagsUsed, ',', 1)) ELSE 'NONE' END AS TopTag
+FROM FinalRanks fr
+WHERE fr.GlobalRank <= 100
+  AND (fr.Questions > fr.Answers OR fr.Answers IS NULL)
+UNION ALL
+SELECT 
+    fr.Id,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    fr.AvgScore,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.TotalComments,
+    fr.TotalBadges,
+    fr.TagsUsed,
+    fr.GlobalRank,
+    fr.RecentPosts,
+    fr.TagRank,
+    fr.ScoreCategory,
+    'AVERAGE' AS TopTag
+FROM FinalRanks fr
+WHERE fr.AvgScore > (
+    SELECT AVG(ru.AvgScore) 
+    FROM RankedUsers ru 
+    WHERE ru.AvgScore IS NOT NULL
+)
+ORDER BY GlobalRank, TagRank;

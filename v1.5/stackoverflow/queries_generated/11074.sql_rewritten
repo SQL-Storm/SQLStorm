@@ -1,0 +1,125 @@
+-- {"query": "11074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 899} 
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense,
+        Users.Reputation,
+        Users.DisplayName AS UserDisplayName,
+        Users.LastAccessDate,
+        Users.Location,
+        Users.Views,
+        Users.UpVotes,
+        Users.DownVotes
+    FROM 
+        Posts
+    LEFT JOIN 
+        Users ON Posts.OwnerUserId = Users.Id
+    WHERE 
+        Posts.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+),
+PostTags AS (
+    SELECT 
+        Posts.Id, 
+        string_to_array(substring(Posts.Tags, 2, length(Posts.Tags)-2), ''><<') AS TagArray
+    FROM 
+        Posts
+),
+TaggedPosts AS (
+    SELECT 
+        PostTags.Id,
+        UNNEST(PostTags.TagArray) AS TagName
+    FROM 
+        PostTags
+    WHERE 
+        PostTags.TagArray IS NOT NULL
+),
+PostVotes AS (
+    SELECT 
+        Votes.PostId, 
+        VoteTypes.Name AS VoteType, 
+        Users.DisplayName AS VotingUserDisplayName, 
+        Users.Reputation AS VotingUserReputation
+    FROM 
+        Votes
+    LEFT JOIN 
+        VoteTypes ON Votes.VoteTypeId = VoteTypes.Id
+    LEFT JOIN 
+        Users ON Votes.UserId = Users.Id
+),
+PostActivity AS (
+    SELECT 
+        Posts.Id,
+        COUNT(DISTINCT Comments.Id) AS CommentCount,
+        SUM(CASE WHEN PostVotes.PostId IS NOT NULL THEN 1 ELSE 0 END) AS VoteCount
+    FROM 
+        Posts
+    LEFT JOIN 
+        Comments ON Posts.Id = Comments.PostId
+    LEFT JOIN 
+        PostVotes ON Posts.Id = PostVotes.PostId
+    GROUP BY 
+        Posts.Id
+)
+SELECT 
+    RecentPosts.Id AS PostId,
+    RecentPosts.PostTypeId,
+    RecentPosts.AcceptedAnswerId,
+    RecentPosts.ParentId,
+    RecentPosts.CreationDate,
+    RecentPosts.Score,
+    RecentPosts.ViewCount,
+    RecentPosts.Body,
+    RecentPosts.OwnerUserId,
+    RecentPosts.OwnerDisplayName,
+    RecentPosts.LastEditDate,
+    RecentPosts.Title,
+    TaggedPosts.TagName,
+    RecentPosts.AnswerCount,
+    RecentPosts.CommentCount,
+    RecentPosts.FavoriteCount,
+    RecentPosts.ClosedDate,
+    RecentPosts.CommunityOwnedDate,
+    RecentPosts.ContentLicense,
+    Users.Reputation,
+    Users.DisplayName AS UserDisplayName,
+    Users.LastAccessDate,
+    Users.Location,
+    Users.Views,
+    Users.UpVotes,
+    Users.DownVotes,
+    COALESCE(PostActivity.CommentCount, 0) AS ActivityCommentCount,
+    COALESCE(PostActivity.VoteCount, 0) AS ActivityVoteCount,
+    COUNT(DISTINCT Badges.Id) OVER (PARTITION BY RecentPosts.OwnerUserId) AS BadgeCount,
+    SUM(RecentPosts.Score) OVER (PARTITION BY RecentPosts.OwnerUserId) AS TotalScore
+FROM 
+    RecentPosts
+LEFT JOIN 
+    TaggedPosts ON RecentPosts.Id = TaggedPosts.Id
+LEFT JOIN 
+    PostActivity ON RecentPosts.Id = PostActivity.Id
+LEFT JOIN 
+    Badges ON RecentPosts.OwnerUserId = Badges.UserId
+LEFT JOIN 
+    Users ON RecentPosts.OwnerUserId = Users.Id
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC, 
+    TotalScore DESC, 
+    BadgeCount DESC;

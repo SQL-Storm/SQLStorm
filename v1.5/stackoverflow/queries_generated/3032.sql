@@ -1,0 +1,151 @@
+-- {"query": "3032.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1200} 
+WITH PostStatistics AS (
+    SELECT
+        p.PostTypeId,
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountNested,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+),
+AnswerParent AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        qp.Title AS QuestionTitle,
+        qp.CreationDate AS QuestionCreationDate
+    FROM Posts a
+    LEFT JOIN Posts qp ON a.ParentId = qp.Id
+    WHERE a.PostTypeId = 2
+),
+TagAnalysis AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TagQuestions,
+        COUNT(DISTINCT a.AnswerId) AS TagAnswers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN AnswerParent a ON a.QuestionId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.Comment,
+        ph.PostHistoryTypeId,
+        ph.Comment AS EditComment,
+        ph.RevisionGUID
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,22,24,25,31,33,34,35,36,37,38,50,52,53,66)
+),
+ActiveBountyPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        v.BountyAmount,
+        v.CreationDate AS BountyStartDate
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE v.BountyAmount IS NOT NULL
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        rt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes rt ON pl.LinkTypeId = rt.Id
+    LEFT JOIN Posts p1 ON pl.PostId = p1.Id
+    LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE rt.Name IN ('Linked', 'Duplicate')
+),
+RelevantPosts AS (
+    SELECT
+        p.PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    FROM PostStatistics p
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+),
+MainQuery AS (
+    SELECT
+        ps.PostId,
+        ps.Title,
+        ps.CreationDate,
+        ps.OwnerDisplayName,
+        ps.OwnerReputation,
+        coalesce(Ab.AnswerId, 0) AS FirstAnswerId,
+        ca.QuestionId,
+        ca.QuestionTitle,
+        ca.QuestionCreationDate,
+        te.TagName,
+        te.TagQuestions,
+        te.TagAnswers,
+        ub.BadgeCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        re.EditDate,
+        re.EditorDisplayName,
+        re.Comment AS EditComment,
+        al.BountyAmount,
+        al.BountyStartDate
+    FROM
+        UserBadgeSummary ub
+    FULL OUTER JOIN
+        Posts ps ON ps.Id = ub.UserId
+    LEFT JOIN
+        AnswerParent ca ON ca.AnswerId = ps.Id
+    LEFT JOIN
+        TagAnalysis te ON POSITION(te.TagName IN ps.Tags) > 0
+    LEFT JOIN
+        RecentEdits re ON re.PostId = ps.Id
+    LEFT JOIN
+        ActiveBountyPosts al ON al.PostId = ps.Id
+    LEFT JOIN
+        PostLinks pl ON pl.PostId = ps.Id
+    LEFT JOIN
+        PostLinks pl2 ON pl2.RelatedPostId = ps.Id
+)
+
+SELECT
+    *
+FROM
+    MainQuery
+WHERE
+    (OwnerReputation IS NULL OR OwnerReputation >= 1000)
+    AND (AnswerCount > 0 OR ViewCount > 100);

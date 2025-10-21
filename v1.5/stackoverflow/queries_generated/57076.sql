@@ -1,0 +1,150 @@
+-- {"query": "57076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1251} 
+
+WITH RecursivePostTree AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName,
+        e.Reputation AS LastEditorReputation,
+        e.DisplayName AS LastEditorDisplayName,
+        1 AS Depth
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Users e ON p.LastEditorUserId = e.Id
+    WHERE
+        p.ParentId IS NULL
+    UNION ALL
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Reputation,
+        u.DisplayName,
+        e.Reputation,
+        e.DisplayName,
+        r.Depth + 1
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Users e ON p.LastEditorUserId = e.Id
+    INNER JOIN
+        RecursivePostTree r ON p.ParentId = r.PostId
+),
+TagStatistics AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.AnswerCount) AS AvgAnswerCount,
+        AVG(p.CommentCount) AS AvgCommentCount
+    FROM
+        Posts p
+    CROSS JOIN
+        Tags t
+    WHERE
+        p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY
+        t.TagName
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(c.Score) AS TotalCommentScore,
+        SUM(v.VoteTypeId = 2) AS TotalUpVotes,
+        SUM(v.VoteTypeId = 3) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName
+)
+SELECT
+    r.PostId,
+    r.PostTypeId,
+    pt.Name AS PostTypeName,
+    r.ParentId,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.OwnerReputation,
+    r.OwnerDisplayName,
+    r.LastEditorUserId,
+    r.LastEditorReputation,
+    r.LastEditorDisplayName,
+    r.LastEditDate,
+    r.LastActivityDate,
+    r.Title,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.Depth,
+    t.TagName,
+    ts.PostCount,
+    ts.TotalScore AS TagTotalScore,
+    ts.TotalViews AS TagTotalViews,
+    ts.AvgAnswerCount,
+    ts.AvgCommentCount,
+    ua.TotalPosts,
+    ua.TotalPostScore,
+    ua.TotalCommentScore,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastVoteDate
+FROM
+    RecursivePostTree r
+LEFT JOIN
+    PostTypes pt ON r.PostTypeId = pt.Id
+LEFT JOIN
+    Tags t ON r.Tags LIKE CONCAT('%<', t.TagName, '>%')
+LEFT JOIN
+    TagStatistics ts ON t.TagName = ts.TagName
+LEFT JOIN
+    UserActivity ua ON r.OwnerUserId = ua.UserId
+ORDER BY
+    r.CreationDate DESC,
+    r.Score DESC,
+    r.Depth DESC;

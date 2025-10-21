@@ -1,0 +1,116 @@
+-- {"query": "25061.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1761} 
+WITH 
+-- Gather per‑user statistics, including badge counts and post aggregates
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)      AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)      AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)      AS BronzeBadges,
+        COALESCE(SUM(p.Score),0)                    AS TotalPostScore,
+        COUNT(p.Id)                                 AS PostCount,
+        MAX(p.CreationDate)                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    LEFT JOIN Posts  p  ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- Compute tag‑level aggregates; use a LIKE pattern to match tags stored as "<tag>"
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count                           AS TagUseCount,
+        COALESCE(SUM(p.Score),0)          AS TagScore,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName, t.Count
+),
+
+-- Votes cast in the last 30 days, per user
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) AS VoteCount30d
+    FROM Votes v
+    WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY v.UserId
+),
+
+-- Top 100 users by reputation, with a ranking window function
+TopUsers AS (
+    SELECT 
+        us.*,
+        RANK() OVER (ORDER BY us.Reputation DESC) AS RepRank
+    FROM UserStats us
+    ORDER BY us.Reputation DESC
+    LIMIT 100
+)
+
+-- Final result combining everything; includes a lateral join to fetch the best tag for each user
+SELECT 
+    tu.Id                              AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalPostScore,
+    tu.PostCount,
+    tu.LastPostDate,
+    COALESCE(rv.VoteCount30d,0)        AS RecentVoteCount,
+    t.TagName,
+    t.TagUseCount,
+    t.TagScore,
+    t.TagRank
+FROM TopUsers tu
+LEFT JOIN RecentVotes rv 
+    ON rv.UserId = tu.Id
+LEFT JOIN LATERAL (
+        SELECT 
+            ts.TagName,
+            ts.TagUseCount,
+            ts.TagScore,
+            ts.TagRank
+        FROM TagStats ts
+        WHERE ts.TagRank <= 5               -- limit to the five most used tags overall
+        ORDER BY ts.TagScore DESC
+        LIMIT 1
+    ) t ON TRUE
+WHERE tu.LastPostDate IS NOT NULL 
+   OR tu.PostCount = 0
+
+UNION ALL
+
+-- Aggregate row summarising the whole result set
+SELECT 
+    NULL                               AS UserId,
+    'Aggregate'                        AS DisplayName,
+    NULL                               AS Reputation,
+    SUM(GoldBadges)                    AS GoldBadges,
+    SUM(SilverBadges)                  AS SilverBadges,
+    SUM(BronzeBadges)                  AS BronzeBadges,
+    SUM(TotalPostScore)                AS TotalPostScore,
+    SUM(PostCount)                     AS PostCount,
+    NULL                               AS LastPostDate,
+    SUM(RecentVoteCount)               AS RecentVoteCount,
+    NULL                               AS TagName,
+    NULL                               AS TagUseCount,
+    NULL                               AS TagScore,
+    NULL                               AS TagRank
+FROM (
+    SELECT 
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalPostScore,
+        tu.PostCount,
+        COALESCE(rv.VoteCount30d,0) AS RecentVoteCount
+    FROM TopUsers tu
+    LEFT JOIN RecentVotes rv 
+        ON rv.UserId = tu.Id
+) agg;

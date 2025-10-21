@@ -1,0 +1,113 @@
+WITH RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.Id AS AnswerOwnerId,
+        u.Reputation AS AnswerOwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT * FROM RankedAnswers WHERE AnswerRank <= 3
+),
+QuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        u.Id AS QuestionOwnerId,
+        u.DisplayName AS QuestionOwnerName,
+        u.Reputation AS QuestionOwnerReputation,
+        COALESCE(SUM(vt2.Count), 0) AS TotalAnswerUpVotes,
+        COALESCE(MAX(b.Class), 0) AS HighestBadgeClass
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.ParentId,
+            COUNT(*) AS Count
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ) vt2 ON vt2.ParentId = q.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT
+        UNNEST(string_to_array(substr(Tags, 2, length(Tags) - 2), '><')) AS Tag,
+        QuestionId
+    FROM QuestionStats
+),
+TagPopularity AS (
+    SELECT
+        Tag,
+        COUNT(QuestionId) AS QuestionsCount,
+        AVG(QuestionScore) AS AvgScore
+    FROM TopTags
+    JOIN QuestionStats AS qs ON TopTags.QuestionId = qs.QuestionId
+    GROUP BY Tag
+    ORDER BY QuestionsCount DESC
+    LIMIT 10
+),
+AnswerDetails AS (
+    SELECT
+        ta.AnswerId,
+        ta.QuestionId,
+        ta.Score AS AnswerScore,
+        ta.CreationDate AS AnswerCreationDate,
+        ta.AnswerOwnerId,
+        ta.AnswerOwnerReputation,
+        q.Title AS QuestionTitle,
+        q.ViewCount AS QuestionViewCount,
+        q.Score AS QuestionScore
+    FROM TopAnswers ta
+    JOIN Posts q ON q.Id = ta.QuestionId
+)
+SELECT
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.QuestionCreationDate,
+    q.ViewCount AS QuestionViews,
+    q.QuestionScore,
+    q.QuestionOwnerName,
+    q.QuestionOwnerReputation,
+    q.TotalAnswerUpVotes,
+    q.HighestBadgeClass,
+    STRING_AGG(DISTINCT tp.Tag, ', ') AS TopTags,
+    JSON_ARRAYAGG(
+        JSON_OBJECT(
+            'AnswerId', ad.AnswerId,
+            'AnswerScore', ad.AnswerScore,
+            'AnswerCreationDate', ad.AnswerCreationDate,
+            'AnswerOwnerId', ad.AnswerOwnerId,
+            'AnswerOwnerReputation', ad.AnswerOwnerReputation
+        )
+    ) AS TopAnswersDetails
+FROM QuestionStats q
+LEFT JOIN TagPopularity tp ON tp.QuestionId = q.QuestionId
+LEFT JOIN AnswerDetails ad ON ad.QuestionId = q.QuestionId
+WHERE q.QuestionCreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreationDate,
+    q.ViewCount,
+    q.QuestionScore,
+    q.QuestionOwnerName,
+    q.QuestionOwnerReputation,
+    q.TotalAnswerUpVotes,
+    q.HighestBadgeClass
+ORDER BY
+    q.TotalAnswerUpVotes DESC,
+    q.QuestionScore DESC
+LIMIT 20;

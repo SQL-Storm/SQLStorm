@@ -1,0 +1,25 @@
+-- {"query": "44032.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 73408, "output_tokens": 27361} 
+
+SELECT 
+  u.DisplayName, 
+  u.Reputation, 
+  u.UpVotes, 
+  u.DownVotes, 
+  u.Views,
+  COUNT(b.Id) AS TotalBadges,
+  COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+  COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+  COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+  COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBasedBadges,
+  COUNT(CASE WHEN b.TagBased = 0 THEN 1 END) AS NamedBadges,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalPosts,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS TotalQuestions,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS TotalAnswers,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS TotalComments,
+  (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS TotalUpVotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS TotalDownVotes
+FROM Users u
+LEFT JOIN Badges b ON u.Id = b.UserId
+GROUP BY u.Id
+ORDER BY u.Reputation DESC
+LIMIT 10;

@@ -1,0 +1,144 @@
+-- {"query": "27038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1745} 
+WITH ActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        MAX(P.LastActivityDate) AS LastPostActivity
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.LastAccessDate > DATE_TRUNC('month', cast('2024-10-01' as date)) - INTERVAL '1 month'
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.DisplayName, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+UserBadges AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS BadgeCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+PostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.Tags,
+				STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2 ), ''><''') AS TagsArray,
+        COALESCE(PH.Comment, 'No Comment') AS LastEditComment,
+        PH.CreationDate AS LastEditDate,
+        PH.UserId AS LastEditorId,
+        PH.UserDisplayName AS LastEditorName,
+        V.VoteTypeId,
+        V.UserId AS VoterId,
+        V.CreationDate AS VoteDate,
+				AGE(V.CreationDate) as voteAge
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId = 5
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+			AND (P.Score > 50 OR P.ViewCount > 10000)
+),
+TagMetrics AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TagCount,
+        COUNT(P.Id) AS RelatedPostCount,
+        SUM(P.Score) AS TotalTagScore,
+        MAX(P.LastActivityDate) AS LastTagActivity
+    FROM
+        Tags T
+    LEFT JOIN
+        PostMetrics P ON T.TagName = ANY(P.TagsArray)
+    GROUP BY
+        T.Id, T.TagName, T.Count
+),
+UserPostMetrics AS (
+    SELECT
+        P.OwnerUserId,
+        P.PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS PostRank,
+        NTILE(100) OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS PostPercentile,
+        LAG(P.Score, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScore,
+        LEAD(P.Score, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostScore
+    FROM
+        PostMetrics P
+)
+SELECT
+    AU.UserId,
+    AU.Reputation,
+    AU.DisplayName,
+    AU.LastAccessDate,
+    AU.Views,
+    AU.UpVotes,
+    AU.DownVotes,
+    AU.PostCount,
+    AU.TotalScore,
+    AU.LastPostActivity,
+    UB.BadgeCount,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+		COALESCE(UPM.PostRank, 999999) AS BestPostRank,
+		COALESCE(UPM.PostPercentile, 0) as TopPostUserPercentile,
+		COALESCE(UPM.PreviousPostScore, P.Score) - COALESCE(UPM.NextPostScore, P.Score) as PostScoreTrend,
+		CASE
+				WHEN UPPER(AU.DisplayName) LIKE '%BOT%' OR UPPER(AU.DisplayName) LIKE '%TEST%' then 'LIKELY Automated'
+			WHEN UB.SilverBadges > 100 then 'Experienced User'
+			WHEN COUNT(TS.*) FILTER (WHERE TS.IsModeratorOnly = true or TS.IsRequired = true) > 0 THEN 'GoldContent King'
+			ELSE 'Other'
+		end as Categorization,
+		array_to_string(array_agg(distinct LT.Name), ', ') AS LinkTypes,
+		min(P.CreationDate) OVER(PARTITION BY P.OwnerUserId ORDER BY P.VIEWCOUNT DESC) as LongestPostCreation
+FROM
+    ActiveUsers AU
+LEFT JOIN
+    UserBadges UB ON AU.UserId = UB.UserId
+LEFT JOIN
+    UserPostMetrics UPM ON AU.UserId = UPM.OwnerUserId
+LEFT JOIN
+    Votes V ON UPM.PostId = V.PostId
+LEFT JOIN
+    PostHistory PH ON V.PostId = PH.PostId
+LEFT JOIN
+    TagMetrics TS ON UPM.PostId = TS.TagId
+LEFT JOIN
+    PostLinks PL ON PL.PostId = UPM.PostId
+LEFT JOIN
+    LinkTypes LT ON PL.LinkTypeId = LT.Id
+JOIN
+			Posts P on P.OwnerUserId = AU.UserId
+GROUP BY
+    AU.UserId, AU.Reputation, AU.CreationDate, AU.DisplayName, AU.LastAccessDate, AU.Views, AU.UpVotes, AU.DownVotes,/*AU.TagsArray,*/ AU.PostCount, AU.TotalScore, AU.LastPostActivity, UB.BadgeCount, UB.GoldBadges, UB.SilverBadges, UB.BronzeBadges, UPM.PostRank, UPM.PostPercentile, UPM.PreviousPostScore, UPM.NextPostScore;

@@ -1,0 +1,188 @@
+-- {"query": "19016.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2886} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates fundamental user engagement metrics
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserTotalUpvotesGiven,
+        U.DownVotes AS UserTotalDownvotesGiven,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersWritten,
+        SUM(P.Score) AS SumOfPostScoresOwned,
+        SUM(C.Score) AS SumOfCommentScoresOwned,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        -- Calculate the average score of all posts owned by the user
+        COALESCE(AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL), 0) AS AvgPostScoreOwned
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+QuestionPerformanceMetrics AS (
+    -- CTE 2: Calculates performance metrics for questions, including answer-related stats
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.CommunityOwnedDate,
+        COALESCE(Q.LastActivityDate, Q.CreationDate) AS EffectiveLastActivityDate,
+        -- Complex calculation for normalized tag count
+        (LENGTH(Q.Tags) - LENGTH(REPLACE(Q.Tags, '><', '')) + 1) / 2 AS NormalizedTagCount,
+        -- Correlated subquery to get the highest score among its answers
+        (SELECT MAX(A.Score) FROM Posts A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2) AS TopAnswerScore,
+        -- Average score of all answers associated with this question
+        (SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2) AS AverageAnswerScore,
+        -- Count of unique users who provided an answer to this question
+        (SELECT COUNT(DISTINCT A_inner.OwnerUserId) FROM Posts A_inner WHERE A_inner.ParentId = Q.Id AND A_inner.PostTypeId = 2 AND A_inner.OwnerUserId IS NOT NULL) AS UniqueAnswererCount,
+        Q.AcceptedAnswerId IS NOT NULL AS HasAcceptedAnswer,
+        -- Check if any answer to this question has a particularly high score
+        EXISTS (SELECT 1 FROM Posts A_check WHERE A_check.ParentId = Q.Id AND A_check.PostTypeId = 2 AND A_check.Score > 50) AS HasHighScoringAnswer
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1 -- Only questions
+),
+PostHistoryAnalysis AS (
+    -- CTE 3: Analyzes historical events for questions
+    SELECT
+        PH.PostId AS QuestionId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS MajorEditCount, -- Title, Body, Tags edits
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEventCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenEventCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (12, 13) THEN PH.CreationDate ELSE NULL END) AS LastDeletionUndeletionDate,
+        -- Determines if the question has undergone a significant lifecycle change (closed and then reopened)
+        (COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) > 0 AND COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) > 0) AS WasClosedAndReopened
+    FROM PostHistory PH
+    WHERE PH.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+    GROUP BY PH.PostId
+),
+TagUsageFrequency AS (
+    -- CTE 4: Extracts and counts tags for questions using string parsing
+    SELECT
+        Q.Id AS QuestionId,
+        unnest(string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><')) AS TagName
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1 AND Q.Tags IS NOT NULL
+),
+QuestionComplexityMetrics AS (
+    -- CTE 5: Calculates metrics related to question body complexity and external links
+    SELECT
+        Q.Id AS QuestionId,
+        LENGTH(Q.Body) AS BodyLength,
+        LENGTH(REPLACE(Q.Body, '<code>', '')) - LENGTH(REPLACE(REPLACE(Q.Body, '<code>', ''), '</code>', '')) / LENGTH('<code>') AS CodeBlockCount,
+        COUNT(PL.RelatedPostId) AS LinkedQuestionsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicateLinksCount,
+        -- Check if the question body contains any external URLs (simplified check)
+        Q.Body ILIKE '%http%' OR Q.Body ILIKE '%www%' AS HasExternalLinksInBody
+    FROM Posts Q
+    LEFT JOIN PostLinks PL ON Q.Id = PL.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Body
+)
+-- Main Query: Integrates all CTEs to generate a comprehensive benchmark result
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    QPM.QuestionId,
+    QPM.Title AS QuestionTitle,
+    QPM.QuestionScore,
+    QPM.ViewCount,
+    QPM.AnswerCount,
+    QPM.FavoriteCount,
+    QPM.HasAcceptedAnswer,
+    PH.MajorEditCount,
+    PH.CloseEventCount,
+    PH.ReopenEventCount,
+    QCM.BodyLength,
+    QCM.CodeBlockCount,
+    QCM.LinkedQuestionsCount,
+    QCM.DuplicateLinksCount,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    -- Calculate a comprehensive "QuestionQualityScore"
+    (
+        (QPM.QuestionScore * 0.7)
+        + (QPM.ViewCount * 0.05)
+        + (COALESCE(QPM.AverageAnswerScore, 0) * 2.0)
+        + (QPM.FavoriteCount * 1.5)
+        - (PH.CloseEventCount * 10)
+        + (PH.ReopenEventCount * 5)
+        + (CASE WHEN QPM.HasAcceptedAnswer THEN 25 ELSE 0 END)
+        + (CASE WHEN QPM.CommunityOwnedDate IS NOT NULL THEN -10 ELSE 0 END)
+        + (QCM.CodeBlockCount * 2) -- Reward for code examples
+        + (QPM.HasHighScoringAnswer::int * 15)
+        - (QCM.HasExternalLinksInBody::int * 5) -- Small penalty for external links
+    ) AS QuestionQualityScore,
+    -- Calculate a "UserInfluenceRank" using a window function across all users
+    RANK() OVER (
+        ORDER BY
+            UES.Reputation DESC,
+            UES.GoldBadges DESC,
+            (UES.SumOfPostScoresOwned + UES.SumOfCommentScoresOwned) DESC
+    ) AS UserInfluenceRank,
+    -- Calculate a "PostEditDensity" for questions with edits, handling division by zero
+    COALESCE(PH.MajorEditCount::numeric / NULLIF(EXTRACT(EPOCH FROM (NOW() - QPM.QuestionCreationDate)) / (3600 * 24 * 30), 0), 0) AS EditsPerMonth,
+    -- Determine if the user is a "Veteran Contributor" based on age and activity
+    CASE
+        WHEN UES.Reputation > 10000 AND UES.UserCreationDate < (NOW() - INTERVAL '5 year') AND UES.LastAccessDate > (NOW() - INTERVAL '6 month')
+        THEN 'Veteran Active'
+        WHEN UES.Reputation > 5000 AND UES.UserCreationDate < (NOW() - INTERVAL '3 year')
+        THEN 'Veteran'
+        ELSE 'Contributor'
+    END AS UserContributionTier,
+    -- String manipulation on question title and conditional comment
+    UPPER(SUBSTRING(QPM.Title, 1, 30)) || '...' AS AbbreviatedTitle,
+    'Question created ' || EXTRACT(DAY FROM (NOW() - QPM.QuestionCreationDate)) || ' days ago.' AS CreationAgeDescription,
+    -- Correlated subquery to check for specific tag presence
+    EXISTS (
+        SELECT 1 FROM TagUsageFrequency TUF
+        WHERE TUF.QuestionId = QPM.QuestionId
+          AND TUF.TagName IN ('sql', 'performance', 'database-design', 'optimization')
+    ) AS IsRelevantTechQuestion,
+    -- Using NULLIF and COALESCE for calculations that might involve zero or nulls
+    COALESCE(QPM.UniqueAnswererCount::numeric / NULLIF(QPM.AnswerCount, 0), 0) AS AnswererDiversityRatio,
+    -- NTILE to categorize questions into quality percentiles
+    NTILE(5) OVER (ORDER BY QuestionQualityScore DESC, QPM.ViewCount DESC) AS QualityQuintile
+FROM UserEngagementSummary UES
+INNER JOIN QuestionPerformanceMetrics QPM ON UES.UserId = QPM.OwnerUserId
+LEFT JOIN PostHistoryAnalysis PH ON QPM.QuestionId = PH.QuestionId
+LEFT JOIN QuestionComplexityMetrics QCM ON QPM.QuestionId = QCM.QuestionId
+WHERE
+    UES.Reputation > 2000 -- Filter for users with significant reputation
+    AND QPM.QuestionScore >= 5 -- Filter for questions with a positive or decent score
+    AND QPM.ViewCount >= 500 -- Filter for relatively popular questions
+    AND QPM.AnswerCount > 0 -- Ensure there's at least one answer
+    AND QPM.QuestionCreationDate >= (NOW() - INTERVAL '3 year') -- Focus on recent active content
+    AND (
+        -- Complex predicate combining multiple conditions for question relevance and state
+        (QPM.Title ILIKE '%query%' OR QPM.Title ILIKE '%benchmark%' OR QPM.Title ILIKE '%index%')
+        AND QPM.EffectiveLastActivityDate > (NOW() - INTERVAL '1 year') -- Recently active
+        AND (PH.WasClosedAndReopened IS FALSE OR PH.WasClosedAndReopened IS NULL) -- Not a problematic question that was closed and reopened
+        AND QCM.BodyLength > 100 -- Not too short questions
+        AND (UES.GoldBadges >= 1 OR UES.SilverBadges >= 3) -- User is recognized with at least one gold or three silver badges
+        AND (
+            EXISTS (SELECT 1 FROM Tags T WHERE T.TagName = 'sql' AND T.Id IN (SELECT Id FROM TagUsageFrequency WHERE TagName = 'sql' AND QuestionId = QPM.QuestionId))
+            OR EXISTS (SELECT 1 FROM Tags T WHERE T.TagName = 'performance' AND T.Id IN (SELECT Id FROM TagUsageFrequency WHERE TagName = 'performance' AND QuestionId = QPM.QuestionId))
+        ) -- Question related to 'sql' or 'performance' tags
+    )
+ORDER BY
+    UserInfluenceRank ASC,
+    QuestionQualityScore DESC,
+    QPM.EffectiveLastActivityDate DESC
+LIMIT 500;

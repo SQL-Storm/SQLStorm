@@ -1,0 +1,43 @@
+-- {"query": "14086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 203145, "output_tokens": 88059} 
+SELECT 
+    CONCAT(COALESCE(u.DisplayName, 'DELETED'), ' ', COALESCE(u.Location, '')) AS 'Author Location',
+    DATEDIFF(cast('2024-10-01' as date), p.CreationDate) AS 'Post Age (Days)',
+    COALESCE(NULLIF(CAST(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS CHAR), ''), 'NONE') AS 'Post Tags',
+    CASE WHEN pt.Name = 'Question' THEN 
+        COALESCE(CAST(p.AnswerCount AS CHAR), 'NONE')
+    ELSE 'N/A' END AS 'Answer Count',
+    COALESCE(CAST(p.CommentCount AS CHAR), 'NONE') AS 'Comment Count',
+    COALESCE(CAST(p.FavoriteCount AS CHAR), 'NONE') AS 'Favorite Count',
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+         WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+         ELSE 'Open' END AS 'Post Status',
+    COALESCE(CAST(DATEDIFF(p.LastActivityDate, p.CreationDate) AS CHAR), 'NONE') AS 'Days to Last Activity',
+    COALESCE(CAST(DATEDIFF(p.LastEditDate, p.CreationDate) AS CHAR), 'NONE') AS 'Days to Last Edit',
+    COALESCE(CAST(DATEDIFF(p.ClosedDate, p.CreationDate) AS CHAR), 'NONE') AS 'Days to Closure',
+    COALESCE(CAST(DATEDIFF(p.CommunityOwnedDate, p.CreationDate) AS CHAR), 'NONE') AS 'Days to Community Ownership',
+    COALESCE(CAST(p.ViewCount AS CHAR), 'NONE') AS 'View Count',
+    COALESCE(CAST(p.Score AS CHAR), 'NONE') AS 'Post Score',
+    COALESCE(CAST(u.Reputation AS CHAR), 'NONE') AS 'Author Reputation',
+    COALESCE(CAST(u.UpVotes AS CHAR), 'NONE') AS 'Author Upvotes',
+    COALESCE(CAST(u.DownVotes AS CHAR), 'NONE') AS 'Author Downvotes',
+    COALESCE(CAST(u.Views AS CHAR), 'NONE') AS 'Author Views',
+    CASE WHEN p.PostTypeId = 2 THEN 
+        (SELECT COALESCE(CAST(p2.Score AS CHAR), 'NONE') 
+         FROM Posts p2 
+         WHERE p2.Id = p.ParentId)
+    ELSE 'N/A' END AS 'Parent Post Score',
+    CASE WHEN p.PostTypeId = 1 THEN 
+        (SELECT COALESCE(CAST(p2.AnswerCount AS CHAR), 'NONE') 
+         FROM Posts p2 
+         WHERE p2.Id = p.Id)
+    ELSE 'N/A' END AS 'Question Answer Count',
+    CASE WHEN p.PostTypeId = 2 THEN 
+        (SELECT COALESCE(CAST(p2.Score AS CHAR), 'NONE') 
+         FROM Posts p2 
+         WHERE p2.Id = p.AcceptedAnswerId)
+    ELSE 'N/A' END AS 'Accepted Answer Score'
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+ORDER BY p.CreationDate DESC
+LIMIT 100;

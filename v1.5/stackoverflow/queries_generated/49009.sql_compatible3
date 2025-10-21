@@ -1,0 +1,149 @@
+WITH UserContributionSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserRegistrationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViewsGenerated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.FavoriteCount ELSE 0 END) AS TotalQuestionFavoritesReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN c.Score IS NOT NULL THEN c.Score ELSE 0 END) AS TotalCommentScoreReceived,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT ph_edit.Id) AS TotalEditHistoryEntries,
+        MAX(ph_edit.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT v_up.PostId) AS UpVotedPostsCount,
+        COUNT(DISTINCT v_down.PostId) AS DownVotedPostsCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN PostHistory AS ph_edit ON u.Id = ph_edit.UserId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes AS v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes AS v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+UserAcceptedAnswers AS (
+    SELECT
+        a.OwnerUserId AS UserId,
+        COUNT(a.Id) AS AcceptedAnswersGivenByThisUser
+    FROM Posts AS a
+    INNER JOIN Posts AS q ON a.ParentId = q.Id AND q.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = 2 AND q.PostTypeId = 1
+    GROUP BY a.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges AS b
+    GROUP BY b.UserId
+),
+UserTagInterest AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.Tags LIKE '%<sql>%'
+                 THEN p.Score ELSE 0 END) AS SQL_TagScore,
+        SUM(CASE WHEN p.Tags LIKE '%<sql>%'
+                 THEN 1 ELSE 0 END) AS SQL_TagPosts,
+        SUM(CASE WHEN p.Tags LIKE '%<javascript>%'
+                 THEN p.Score ELSE 0 END) AS JavaScript_TagScore,
+        SUM(CASE WHEN p.Tags LIKE '%<javascript>%'
+                 THEN 1 ELSE 0 END) AS JavaScript_TagPosts,
+        SUM(CASE WHEN p.Tags LIKE '%<python>%'
+                 THEN p.Score ELSE 0 END) AS Python_TagScore,
+        SUM(CASE WHEN p.Tags LIKE '%<python>%'
+                 THEN 1 ELSE 0 END) AS Python_TagPosts,
+        SUM(CASE WHEN p.Tags LIKE '%<c#>%'
+                 THEN p.Score ELSE 0 END) AS CSharp_TagScore,
+        SUM(CASE WHEN p.Tags LIKE '%<c#>%'
+                 THEN 1 ELSE 0 END) AS CSharp_TagPosts,
+        SUM(CASE WHEN p.Tags LIKE '%<java>%'
+                 THEN p.Score ELSE 0 END) AS Java_TagScore,
+        SUM(CASE WHEN p.Tags LIKE '%<java>%'
+                 THEN 1 ELSE 0 END) AS Java_TagPosts
+    FROM Posts AS p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2) AND p.Tags IS NOT NULL
+      AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<javascript>%' OR p.Tags LIKE '%<python>%' OR p.Tags LIKE '%<c#>%' OR p.Tags LIKE '%<java>%')
+    GROUP BY p.OwnerUserId
+),
+QuestionLinkAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(pl.Id) AS TotalLinkedPosts,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS TotalDuplicateLinkedPosts,
+        SUM(q.Score) AS LinkedQuestionScoreSum
+    FROM Posts AS p
+    INNER JOIN PostLinks AS pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    INNER JOIN Posts AS q ON (q.Id = pl.PostId OR q.Id = pl.RelatedPostId) AND q.PostTypeId = 1
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    ucs.Reputation,
+    ucs.TotalPostsCreated,
+    ucs.QuestionsAsked,
+    ucs.AnswersProvided,
+    COALESCE(uaa.AcceptedAnswersGivenByThisUser, 0) AS AcceptedAnswersGiven,
+    ucs.TotalPostScoreReceived,
+    ucs.TotalQuestionViewsGenerated,
+    ucs.TotalQuestionFavoritesReceived,
+    ucs.TotalCommentsMade,
+    ucs.TotalEditHistoryEntries,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uti.SQL_TagScore, 0) AS SQLTagScore,
+    COALESCE(uti.SQL_TagPosts, 0) AS SQLTagPosts,
+    COALESCE(uti.JavaScript_TagScore, 0) AS JavaScriptTagScore,
+    COALESCE(uti.JavaScript_TagPosts, 0) AS JavaScriptTagPosts,
+    COALESCE(uti.Python_TagScore, 0) AS PythonTagScore,
+    COALESCE(uti.Python_TagPosts, 0) AS PythonTagPosts,
+    COALESCE( uti.CSharp_TagScore, 0) AS CSharpTagScore,
+    COALESCE(uti.CSharp_TagPosts, 0) AS CSharpTagPosts,
+    COALESCE(uti.Java_TagScore, 0) AS JavaTagScore,
+    COALESCE(uti.Java_TagPosts, 0) AS JavaTagPosts,
+    COALESCE(qla.TotalLinkedPosts, 0) AS TotalLinkedPosts,
+    COALESCE(qla.TotalDuplicateLinkedPosts, 0) AS TotalDuplicateLinkedPosts,
+    (
+        ucs.Reputation * 0.05 +
+        ucs.TotalPostScoreReceived * 0.2 +
+        ucs.TotalQuestionViewsGenerated * 0.0001 +
+        ucs.TotalQuestionFavoritesReceived * 0.5 +
+        COALESCE(uaa.AcceptedAnswersGivenByThisUser, 0) * 1.5 +
+        COALESCE(ubs.GoldBadges, 0) * 5 +
+        COALESCE(ubs.SilverBadges, 0) * 2 +
+        COALESCE(ubs.BronzeBadges, 0) * 0.5 +
+        ucs.TotalCommentsMade * 0.05 +
+        ucs.TotalEditHistoryEntries * 0.01 +
+        (COALESCE(uti.SQL_TagScore, 0) + COALESCE(uti.JavaScript_TagScore, 0) + COALESCE(uti.Python_TagScore, 0) + COALESCE(uti.CSharp_TagScore, 0) + COALESCE(uti.Java_TagScore, 0)) * 0.1 +
+        (COALESCE(uti.SQL_TagPosts, 0) + COALESCE(uti.JavaScript_TagPosts, 0) + COALESCE(uti.Python_TagPosts, 0) + COALESCE(uti.CSharp_TagPosts, 0) + COALESCE(uti.Java_TagPosts, 0)) * 0.05 +
+        COALESCE(qla.TotalLinkedPosts, 0) * 0.2 +
+        COALESCE(qla.TotalDuplicateLinkedPosts, 0) * (-0.5)
+    ) AS CompositeInfluenceScore,
+    ROW_NUMBER() OVER (ORDER BY ucs.Reputation DESC, ucs.TotalPostScoreReceived DESC) AS ReputationScoreRank,
+    RANK() OVER (ORDER BY COALESCE(uaa.AcceptedAnswersGivenByThisUser, 0) DESC, ucs.AnswersProvided DESC) AS AcceptedAnswerRank,
+    NTILE(10) OVER (ORDER BY (COALESCE(uti.SQL_TagScore, 0) + COALESCE(uti.JavaScript_TagScore, 0) + COALESCE(uti.Python_TagScore, 0) + COALESCE(uti.CSharp_TagScore, 0) + COALESCE(uti.Java_TagScore, 0)) DESC) AS TopLanguageTagExpertiseNTile,
+    LAG(ucs.TotalPostsCreated, 1, 0) OVER (ORDER BY ucs.Reputation DESC, u.Id) AS PreviousUserTotalPosts
+FROM Users AS u
+INNER JOIN UserContributionSummary AS ucs ON u.Id = ucs.UserId
+LEFT JOIN UserAcceptedAnswers AS uaa ON u.Id = uaa.UserId
+LEFT JOIN UserBadgeSummary AS ubs ON u.Id = ubs.UserId
+LEFT JOIN UserTagInterest AS uti ON u.Id = uti.UserId
+LEFT JOIN QuestionLinkAnalysis AS qla ON u.Id = qla.UserId
+WHERE ucs.Reputation >= 5000
+  AND u.LastAccessDate >= DATE '2023-01-01'
+  AND ucs.TotalPostsCreated >= 20
+  AND (ucs.QuestionsAsked + ucs.AnswersProvided) > 0
+ORDER BY CompositeInfluenceScore DESC, ucs.Reputation DESC
+LIMIT 500;

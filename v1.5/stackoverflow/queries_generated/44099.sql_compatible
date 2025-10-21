@@ -1,0 +1,50 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    u.Id AS UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    b.Id AS BadgeId,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    b.TagBased AS BadgeTagBased,
+    b.Date AS BadgeDate,
+    v.Id AS VoteId,
+    v.VoteTypeId,
+    v.BountyAmount,
+    v.CreationDate AS VoteDate,
+    c.Id AS CommentId,
+    c.Score AS CommentScore,
+    c.Text AS CommentText,
+    c.CreationDate AS CommentDate,
+    pl.Id AS PostLinkId,
+    pl.LinkTypeId,
+    pl.CreationDate AS PostLinkDate,
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    ph.Id AS PostHistoryId,
+    ph.PostHistoryTypeId,
+    ph.Comment,
+    ph.Text,
+    ph.CreationDate AS PostHistoryDate
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+ORDER BY p.Id, b.Date DESC, v.CreationDate DESC, c.CreationDate DESC, pl.CreationDate DESC, ph.CreationDate DESC;

@@ -1,0 +1,89 @@
+-- {"query": "52041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 804} 
+WITH tag_questions AS (
+    SELECT 
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name,
+        p.Id AS post_id,
+        p.Score,
+        p.AnswerCount,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(trim(p.Tags)) > 2
+),
+tag_stats AS (
+    SELECT 
+        t.tag_name,
+        COUNT(DISTINCT t.post_id) AS question_count,
+        AVG(t.Score) AS avg_score,
+        SUM(t.AnswerCount) AS total_answers,
+        AVG(u.Reputation) AS avg_reputation,
+        MAX(u.Reputation) AS max_reputation,
+        (SELECT array_agg(DISTINCT tt.tag_name ORDER BY tt.tag_name) FROM Tags tt) AS all_tags
+    FROM tag_questions t
+    LEFT JOIN Tags tag ON t.tag_name = tag.TagName
+    GROUP BY t.tag_name
+),
+user_tag_activity AS (
+    SELECT 
+        t.tag_name,
+        t.OwnerUserId,
+        COUNT(*) AS user_questions_in_tag,
+        SUM(t.AnswerCount) AS user_answers_count,
+        RANK() OVER (PARTITION BY t.tag_name ORDER BY COUNT(*) DESC, SUM(t.AnswerCount) DESC) AS user_rank_in_tag
+    FROM tag_questions t
+    GROUP BY t.tag_name, t.OwnerUserId
+),
+top_users_per_tag AS (
+    SELECT 
+        tag_name,
+        OwnerUserId,
+        user_questions_in_tag,
+        user_answers_count
+    FROM user_tag_activity
+    WHERE user_rank_in_tag = 1
+),
+badges_per_tag AS (
+    SELECT 
+        t.tag_name,
+        COUNT(b.Id) AS tag_badges_count
+    FROM top_users_per_tag tup
+    JOIN Badges b ON tup.OwnerUserId = b.UserId AND b.TagBased = 1
+    JOIN Tags tag ON tup.tag_name = tag.TagName
+    RIGHT JOIN tag_stats ts ON ts.tag_name = t.tag_name
+    GROUP BY t.tag_name
+),
+answer_stats AS (
+    SELECT 
+        p.ParentId AS question_id,
+        COUNT(*) AS answer_count,
+        AVG(a.Score) AS avg_answer_score,
+        MAX(a.Score) AS max_answer_score
+    FROM Posts a
+    JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+combined AS (
+    SELECT 
+        ts.tag_name,
+        ts.question_count,
+        ts.avg_score,
+        ts.total_answers,
+        ts.avg_reputation,
+        ts.max_reputation,
+        tup.user_questions_in_tag AS top_user_questions,
+        tup.user_answers_count AS top_user_answers,
+        bpt.tag_badges_count,
+        as_stats.avg_answer_score,
+        as_stats.max_answer_score,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT post_id FROM tag_questions WHERE tag_name = ts.tag_name) AND v.VoteTypeId = 2) AS total_upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT post_id FROM tag_questions WHERE tag_name = ts.tag_name) AND v.VoteTypeId = 3) AS total_downvotes,
+        ts.all_tags
+    FROM tag_stats ts
+    LEFT JOIN top_users_per_tag tup ON ts.tag_name = tup.tag_name
+    LEFT JOIN badges_per_tag bpt ON ts.tag_name = bpt.tag_name
+    LEFT JOIN answer_stats as_stats ON as_stats.question_id IN (SELECT post_id FROM tag_questions WHERE tag_name = ts.tag_name)
+)
+SELECT * FROM combined WHERE question_count > 10 ORDER BY question_count DESC, avg_score DESC LIMIT 50;

@@ -1,0 +1,105 @@
+-- {"query": "21089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1217} 
+WITH active_users AS (
+  SELECT 
+    u.Id AS user_id,
+    u.Reputation,
+    u.CreationDate AS user_creation,
+    u.DisplayName,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+    AVG(p.Score) AS avg_post_score,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id 
+    AND p.CreationDate > u.CreationDate 
+    AND p.DeletionDate IS NULL
+  WHERE u.Reputation >= 100 
+    AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+  HAVING COUNT(p.Id) >= 5
+),
+top_contributors AS (
+  SELECT 
+    au.*,
+    ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM au.user_creation) ORDER BY au.question_count + au.answer_count DESC) AS contribution_rank,
+    LAG(au.avg_post_score) OVER (PARTITION BY EXTRACT(YEAR FROM au.user_creation) ORDER BY au.reputation DESC) AS prev_user_avg_score
+  FROM active_users au
+),
+user_achievements AS (
+  SELECT 
+    tc.user_id,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END) AS gold_badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END) AS silver_badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Name END) AS bronze_badges,
+    STRING_AGG(DISTINCT SUBSTRING(b.Name, 1, 20), '; ') AS top_badges,
+    AVG(EXTRACT(EPOCH FROM (b.Date - tc.user_creation))/86400) AS avg_days_to_badge
+  FROM top_contributors tc
+  LEFT JOIN Badges b ON b.UserId = tc.user_id 
+    AND b.Date > tc.user_creation
+    AND b.TagBased = FALSE
+  GROUP BY tc.user_id, tc.user_creation
+),
+recent_posts_stats AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    COALESCE(ph.comment, '') AS close_reason_comment,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'CLOSED'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'COMMUNITY'
+      ELSE 'OPEN'
+    END AS post_status,
+    RANK() OVER (PARTITION BY EXTRACT(MONTH FROM p.CreationDate) ORDER BY p.ViewCount DESC) AS monthly_view_rank
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id 
+    AND ph.PostHistoryTypeId = 10 
+    AND ph.CreationDate = (SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10)
+  WHERE p.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.Score > -5
+)
+SELECT 
+  tc.user_id,
+  tc.DisplayName,
+  tc.Reputation,
+  tc.question_count,
+  tc.answer_count,
+  ROUND(tc.avg_post_score::numeric, 2) AS avg_score,
+  ua.gold_badges,
+  ua.silver_badges,
+  ua.bronze_badges,
+  ua.top_badges,
+  ROUND(COALESCE(ua.avg_days_to_badge, 0)::numeric, 1) AS avg_badge_days,
+  tc.contribution_rank,
+  COUNT(rps.post_id) AS recent_posts,
+  AVG(COALESCE(rps.Score, 0)) AS recent_avg_score,
+  SUM(COALESCE(rps.ViewCount, 0)) AS total_recent_views,
+  SUM(CASE WHEN rps.post_status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_posts,
+  STRING_AGG(DISTINCT COALESCE(rps.close_reason_comment, ''), ' | ') AS close_reasons_summary,
+  MAX(rps.monthly_view_rank) AS best_monthly_rank,
+  CASE 
+    WHEN tc.prev_user_avg_score IS NULL THEN 'FIRST'
+    WHEN tc.avg_post_score > tc.prev_user_avg_score THEN 'IMPROVED'
+    ELSE 'DECLINED'
+  END AS score_trend
+FROM top_contributors tc
+LEFT JOIN user_achievements ua ON ua.user_id = tc.user_id
+LEFT JOIN recent_posts_stats rps ON rps.OwnerUserId = tc.user_id 
+  AND rps.CreationDate > cast('2024-10-01' as date) - INTERVAL '3 months'
+  AND (rps.post_status = 'OPEN' OR rps.post_status = 'CLOSED')
+WHERE tc.contribution_rank <= 50
+  AND (tc.question_count > 0 OR tc.answer_count > 0)
+GROUP BY 
+  tc.user_id, tc.DisplayName, tc.Reputation, tc.question_count, tc.answer_count,
+  tc.avg_post_score, ua.gold_badges, ua.silver_badges, ua.bronze_badges, 
+  ua.top_badges, ua.avg_days_to_badge, tc.contribution_rank, tc.prev_user_avg_score
+HAVING COUNT(rps.post_id) > 0 OR ua.gold_badges > 0
+ORDER BY 
+  (tc.question_count + tc.answer_count * 1.5 + ua.gold_badges * 10) DESC,
+  tc.contribution_rank ASC
+LIMIT 100;

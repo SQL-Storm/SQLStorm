@@ -1,0 +1,173 @@
+WITH cte_post_history AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.UserDisplayName,
+    ph.Comment,
+    ph.Text,
+    CASE
+      WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35)
+      THEN JSON_VALUE(ph.Text, '$.VotingUserIds')
+      WHEN ph.PostHistoryTypeId = 17
+      THEN JSON_VALUE(ph.Text, '$.MigrationDetails')
+      ELSE NULL
+    END AS additional_data
+  FROM PostHistory ph
+),
+cte_post_links AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS link_type_name
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+cte_post_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    vt.Name AS vote_type_name,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+),
+cte_post_comments AS (
+  SELECT
+    c.PostId,
+    c.Score,
+    c.Text,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.UserId
+  FROM Comments c
+),
+cte_post_metadata AS (
+  SELECT
+    p.Id AS post_id,
+    p.PostTypeId,
+    pt.Name AS post_type_name,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CreationDate AS post_creation_date,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.Title,
+    STRING_SPLIT(p.Tags, '><') AS tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.ContentLicense
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+cte_user_metadata AS (
+  SELECT
+    u.Id AS user_id,
+    u.Reputation,
+    u.CreationDate AS user_creation_date,
+    u.DisplayName,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId
+  FROM Users u
+),
+cte_user_badges AS (
+  SELECT
+    b.UserId,
+    b.Name AS badge_name,
+    b.Date AS badge_date,
+    b.Class AS badge_class,
+    b.TagBased
+  FROM Badges b
+)
+SELECT
+  pm.post_id,
+  pm.post_type_name,
+  pm.AcceptedAnswerId,
+  pm.ParentId,
+  pm.post_creation_date,
+  pm.Score,
+  pm.ViewCount,
+  pm.OwnerUserId,
+  pm.OwnerDisplayName,
+  pm.LastEditorUserId,
+  pm.LastEditorDisplayName,
+  pm.LastEditDate,
+  pm.LastActivityDate,
+  pm.Title,
+  pm.tags,
+  pm.AnswerCount,
+  pm.CommentCount,
+  pm.FavoriteCount,
+  pm.ClosedDate,
+  pm.CommunityOwnedDate,
+  pm.ContentLicense,
+  cpl.PostId AS linked_post_id,
+  cpl.RelatedPostId,
+  cpl.link_type_name,
+  cpv.PostId AS voted_post_id,
+  cpv.VoteTypeId,
+  cpv.vote_type_name,
+  cpv.UserId AS voter_id,
+  cpv.CreationDate AS vote_date,
+  cpv.BountyAmount,
+  cpc.PostId AS commented_post_id,
+  cpc.Score AS comment_score,
+  cpc.Text AS comment_text,
+  cpc.CreationDate AS comment_date,
+  cpc.UserDisplayName AS comment_user_name,
+  cpc.UserId AS comment_user_id,
+  cub.UserId AS badge_user_id,
+  cub.badge_name,
+  cub.badge_date,
+  cub.badge_class,
+  cub.TagBased,
+  cum.user_id,
+  cum.Reputation,
+  cum.user_creation_date,
+  cum.DisplayName,
+  cum.LastAccessDate,
+  cum.WebsiteUrl,
+  cum.Location,
+  cum.AboutMe,
+  cum.Views,
+  cum.UpVotes,
+  cum.DownVotes,
+  cum.ProfileImageUrl,
+  cum.EmailHash,
+  cum.AccountId,
+  cph.PostHistoryTypeId,
+  cph.CreationDate AS history_date,
+  cph.UserId AS history_user_id,
+  cph.UserDisplayName AS history_user_name,
+  cph.Comment AS history_comment,
+  cph.Text AS history_text,
+  cph.additional_data
+FROM cte_post_metadata pm
+LEFT JOIN cte_post_links cpl ON pm.post_id = cpl.PostId
+LEFT JOIN cte_post_votes cpv ON pm.post_id = cpv.PostId
+LEFT JOIN cte_post_comments cpc ON pm.post_id = cpc.PostId
+LEFT JOIN cte_user_badges cub ON pm.OwnerUserId = cub.UserId
+LEFT JOIN cte_user_metadata cum ON pm.OwnerUserId = cum.user_id
+LEFT JOIN cte_post_history cph ON pm.post_id = cph.PostId
+ORDER BY pm.post_id, cpl.RelatedPostId, cpv.CreationDate, cpc.CreationDate, cub.badge_date, cph.CreationDate;

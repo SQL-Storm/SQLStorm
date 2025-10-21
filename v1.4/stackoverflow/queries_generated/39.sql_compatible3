@@ -1,0 +1,164 @@
+WITH
+
+-- sample traffic: compute per-user activity profile with advanced constructs
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    -- total posts by user
+    COUNT(p.Id) AS PostCount,
+    -- total comments on user's posts
+    SUM(CASE WHEN c.PostId IS NOT NULL THEN 1 ELSE 0 END) FILTER (WHERE c.PostId IS NOT NULL) AS CommentCountOnPosts,
+    -- total votes by user (excluding nulls)
+    COUNT(v.Id) AS VoteCount,
+    -- max score among user's posts
+    MAX(p.Score) AS MaxPostScore,
+    -- window function: rank users by Reputation within year of CreationDate
+    ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)
+                       ORDER BY u.Reputation DESC, u.Id) AS YearlyRank
+  FROM
+    Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+
+-- correlated subquery: for each user, find the most recent tag wiki they contributed to (if any)
+RecentTagWiki AS (
+  SELECT
+    u.Id AS UserId,
+    (SELECT MAX(p.LastActivityDate)
+     FROM Posts p
+     WHERE p.OwnerUserId = u.Id
+       AND p.PostTypeId IN (4,5) -- TagWikiExcerpt/TagWiki
+    ) AS MostRecentTagWikiActivity
+  FROM Users u
+),
+
+-- CTE: aggregated tag counts with complex string operations
+TagStats AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TotalTagCount,
+    AVG(COALESCE(t.Count,0)) AS AvgTagCount,
+    -- string expression: length of tag name
+    LENGTH(t.TagName) AS TagNameLength,
+    -- approximate NULL-safe case: whether tag is moderator only
+    CASE WHEN t.IsModeratorOnly = TRUE THEN 'ModeratorOnly' ELSE 'Public' END AS Visibility
+  FROM Tags t
+  GROUP BY t.TagName, t.IsModeratorOnly
+),
+
+-- set operation: join users with posts via FULL OUTER to capture users with no posts and posts with no users
+UserPostFull AS (
+  SELECT
+    u.Id AS UserId,
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.PostTypeId
+  FROM Users u
+  FULL OUTER JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  WHERE (u.Id IS NOT NULL OR p.Id IS NOT NULL)
+),
+
+-- fancy join chain: posts with related links and counts, including duplicates
+PostLinkAgg AS (
+  SELECT
+    pl.PostId,
+    COUNT(pl.RelatedPostId) AS RelatedCount,
+    SUM(CASE WHEN lt.Name ILIKE '%duplicate%' THEN 1 ELSE 0 END) AS DuplicateLinkCount
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  GROUP BY pl.PostId
+),
+
+-- correlated subquery within a join: for each post, compute the latest close reason if closed
+PostCloseReason AS (
+  SELECT
+    p.Id AS PostId,
+    MAX(pt.CreationDate) AS LastCloseVoteDate,
+    MAX(CASE WHEN ph.Comment LIKE '%close%' THEN ph.UserId END) AS LastCloserUserId
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes pt ON pt.Id = ph.PostHistoryTypeId
+  WHERE p.ClosedDate IS NOT NULL
+  GROUP BY p.Id
+)
+
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.CreationDate,
+  ua.LastAccessDate,
+  ua.PostCount,
+  ua.CommentCountOnPosts,
+  ua.VoteCount,
+  ua.MaxPostScore,
+  ua.YearlyRank,
+  rtv.MostRecentTagWikiActivity,
+  ts.TagName,
+  ts.TotalTagCount,
+  ts.AvgTagCount,
+  ts.TagNameLength,
+  ts.Visibility,
+  UP.PostId,
+  UP.Title,
+  UP.CreationDate AS PostCreationDate,
+  UP.PostTypeId,
+  FLG.RelatedCount,
+  FLG.DuplicateLinkCount,
+  PCL.LastCloseVoteDate,
+  PCL.LastCloserUserId
+FROM UserActivity ua
+LEFT JOIN RecentTagWiki rtv ON rtv.UserId = ua.UserId
+LEFT JOIN (
+  SELECT
+    t.UserId,
+    t.TagName,
+    t.TotalTagCount,
+    t.AvgTagCount,
+    t.TagNameLength,
+    t.Visibility
+  FROM TagStats t
+) ts ON ts.UserId = ua.UserId
+LEFT JOIN UserPostFull UP ON UP.UserId = ua.UserId
+LEFT JOIN PostLinkAgg FLG ON FLG.PostId = UP.PostId
+LEFT JOIN PostCloseReason PCL ON PCL.PostId = UP.PostId
+WHERE
+  ua.YearlyRank <= 50
+GROUP BY
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.CreationDate,
+  ua.LastAccessDate,
+  ua.PostCount,
+  ua.CommentCountOnPosts,
+  ua.VoteCount,
+  ua.MaxPostScore,
+  ua.YearlyRank,
+  rtv.MostRecentTagWikiActivity,
+  ts.TagName,
+  ts.TotalTagCount,
+  ts.AvgTagCount,
+  ts.TagNameLength,
+  ts.Visibility,
+  UP.PostId,
+  UP.Title,
+  UP.CreationDate,
+  UP.PostTypeId,
+  FLG.RelatedCount,
+  FLG.DuplicateLinkCount,
+  PCL.LastCloseVoteDate,
+  PCL.LastCloserUserId
+ORDER BY
+  ua.Reputation DESC, ua.UserId
+LIMIT 100;

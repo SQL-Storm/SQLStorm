@@ -1,0 +1,196 @@
+-- {"query": "37001.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2303} 
+WITH
+-- Top contributors: users with most combined question and answer score in last 2 years
+RecentPosts AS (
+  SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.CreationDate, p.Tags
+  FROM Posts p
+  WHERE p.CreationDate >= now() - interval '2 years'
+    AND p.OwnerUserId IS NOT NULL
+),
+UserAggregate AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 1) AS Questions,
+    COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 2) AS Answers,
+    SUM(rp.Score) AS TotalScore,
+    MAX(rp.CreationDate) AS LastPostDate,
+    AVG(rp.Score) FILTER (WHERE rp.PostTypeId = 2) AS AvgAnswerScore,
+    AVG(rp.Score) FILTER (WHERE rp.PostTypeId = 1) AS AvgQuestionScore
+  FROM Users u
+  JOIN RecentPosts rp ON rp.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TopUsers AS (
+  SELECT * FROM UserAggregate
+  ORDER BY TotalScore DESC NULLS LAST
+  LIMIT 100
+),
+-- For each top user, get their most active tags (from their questions' Tags field)
+ExplodedTags AS (
+  SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tag AS Tag,
+    COUNT(*) AS TagCount
+  FROM TopUsers tu
+  JOIN RecentPosts rp ON rp.OwnerUserId = tu.UserId AND rp.PostTypeId = 1 AND rp.Tags IS NOT NULL
+  -- tags stored like '<tag1><tag2>'; extract between angle brackets
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(rp.Tags FROM 2 FOR char_length(rp.Tags)-2), '><')) AS tag
+  ) t
+  GROUP BY tu.UserId, tu.DisplayName, tag
+),
+TopTagsPerUser AS (
+  SELECT
+    et.UserId,
+    et.DisplayName,
+    et.Tag,
+    et.TagCount,
+    ROW_NUMBER() OVER (PARTITION BY et.UserId ORDER BY et.TagCount DESC, et.Tag) AS rn
+  FROM ExplodedTags et
+),
+UserTop3Tags AS (
+  SELECT UserId, DisplayName, Tag, TagCount
+  FROM TopTagsPerUser
+  WHERE rn <= 3
+),
+-- For each top user and their top tag, compute cross-metrics: average response time to their questions, acceptance rate, comment activity, and answerers diversity
+UserQuestionMetrics AS (
+  SELECT
+    u.UserId,
+    t.Tag,
+    COUNT(q.Id) AS QuestionCount,
+    AVG(EXTRACT(EPOCH FROM (aa.CreationDate - q.CreationDate))/3600) FILTER (WHERE aa.CreationDate IS NOT NULL) AS AvgFirstAnswerHours,
+    SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedCount,
+    SUM(q.CommentCount) AS TotalComments,
+    COALESCE(NULLIF(COUNT(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId IS NOT NULL), 0),0) AS DistinctAnswerers
+  FROM UserTop3Tags u
+  JOIN Posts q ON q.PostTypeId = 1 AND q.OwnerUserId = u.UserId
+    AND q.Tags IS NOT NULL AND q.Tags LIKE '%' || ('<' || u.Tag || '>') || '%'
+  LEFT JOIN LATERAL (
+    -- first non-deleted answer to the question by CreationDate
+    SELECT a2.Id, a2.CreationDate, a2.OwnerUserId
+    FROM Posts a2
+    WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2
+    ORDER BY a2.CreationDate
+    LIMIT 1
+  ) aa ON true
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY u.UserId, t.Tag
+),
+-- Recent interactions: comments on user's posts and votes on their answers
+RecentInteractions AS (
+  SELECT
+    tu.UserId,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate >= now() - interval '180 days') AS RecentComments,
+    SUM(CASE WHEN v.VoteTypeId = 2 AND v.CreationDate >= now() - interval '365 days' THEN 1 ELSE 0 END) FILTER (WHERE v.PostId IS NOT NULL) AS RecentUpvotesOnTheirPosts,
+    SUM(CASE WHEN v.VoteTypeId = 3 AND v.CreationDate >= now() - interval '365 days' THEN 1 ELSE 0 END) FILTER (WHERE v.PostId IS NOT NULL) AS RecentDownvotesOnTheirPosts
+  FROM TopUsers tu
+  LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY tu.UserId
+),
+-- Badge overview for the top users
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) AS TagBadges
+  FROM Badges b
+  WHERE b.Date >= now() - interval '2 years'
+  GROUP BY b.UserId
+),
+-- Recent edit churn: post history edits on their posts
+UserEditChurn AS (
+  SELECT
+    tu.UserId,
+    COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24) AND ph.CreationDate >= now() - interval '365 days') AS RecentEdits,
+    COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.CreationDate >= now() - interval '365 days') AS EditedPosts
+  FROM TopUsers tu
+  LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY tu.UserId
+)
+-- Final combined report: join all pieces and produce heavy-weight aggregations and windowing for benchmarking
+SELECT
+  tu.UserId,
+  tu.DisplayName,
+  tu.Questions,
+  tu.Answers,
+  tu.TotalScore,
+  COALESCE(ub.Gold,0) AS GoldBadges,
+  COALESCE(ub.Silver,0) AS SilverBadges,
+  COALESCE(ub.Bronze,0) AS BronzeBadges,
+  COALESCE(ri.RecentComments,0) AS RecentComments_Last180d,
+  COALESCE(ri.RecentUpvotesOnTheirPosts,0) AS RecentUpvotes_Last365d,
+  COALESCE(ri.RecentDownvotesOnTheirPosts,0) AS RecentDownvotes_Last365d,
+  COALESCE(ec.RecentEdits,0) AS RecentEdits_Last365d,
+  COALESCE(ec.EditedPosts,0) AS EditedPosts_Last365d,
+  -- JSON-ish aggregates (text) of their top tags and metrics
+  (
+    SELECT string_agg(tag || ':' || TagCount::text, ', ' ORDER BY TagCount DESC)
+    FROM ExplodedTags et2
+    WHERE et2.UserId = tu.UserId
+    LIMIT 3
+  ) AS TopTags_Short,
+  -- detailed per-tag metrics as rows via array_agg of composite
+  (
+    SELECT array_to_string(array_agg(format('%s|q=%s|avgFirstAnswerHours=%s|accepted=%s|comments=%s|distinctAnswerers=%s',
+      uqm.Tag,
+      uqm.QuestionCount,
+      COALESCE(ROUND(uqm.AvgFirstAnswerHours::numeric,2)::text,'null'),
+      uqm.AcceptedCount,
+      uqm.TotalComments,
+      uqm.DistinctAnswerers
+    ) ORDER BY uqm.QuestionCount DESC), ' || ')
+    FROM UserQuestionMetrics uqm
+    WHERE uqm.UserId = tu.UserId
+  ) AS PerTag_Metrics,
+  -- global rank among top users by TotalScore and by Answers
+  ROW_NUMBER() OVER (ORDER BY tu.TotalScore DESC) AS Rank_ByTotalScore,
+  RANK() OVER (ORDER BY tu.Answers DESC) AS Rank_ByAnswers,
+  -- exposure estimate: sum of viewcount of their recent questions
+  (
+    SELECT COALESCE(SUM(q2.ViewCount),0)
+    FROM Posts q2
+    WHERE q2.PostTypeId = 1 AND q2.OwnerUserId = tu.UserId AND q2.CreationDate >= now() - interval '2 years'
+  ) AS RecentQuestionViews,
+  -- correlate reputation growth: simple proxy comparing account creation to last post activity
+  CASE WHEN tu.LastPostDate IS NOT NULL THEN EXTRACT(DAY FROM (tu.LastPostDate - u.CreationDate)) ELSE NULL END AS DaysToLastPost,
+  -- include user-level metadata
+  u.Reputation,
+  u.CreationDate AS AccountCreated,
+  u.LastAccessDate,
+  -- heavy subquery: find their top answer by score in last 2 years with its question and first commenter
+  (
+    SELECT format('AnsId=%s;Score=%s;QId=%s;QTitle=%s;FirstComment=%s',
+      a2.Id, a2.Score, a2.ParentId,
+      replace(coalesce(qt.Title,'[no title]'), E'\n',' '),
+      coalesce(fc.Text,'[no comment]')
+    )
+    FROM Posts a2
+    JOIN Posts qt ON qt.Id = a2.ParentId
+    LEFT JOIN LATERAL (
+      SELECT c.Text
+      FROM Comments c
+      WHERE c.PostId = a2.Id
+      ORDER BY c.CreationDate
+      LIMIT 1
+    ) fc ON true
+    WHERE a2.PostTypeId = 2
+      AND a2.OwnerUserId = tu.UserId
+      AND a2.CreationDate >= now() - interval '2 years'
+    ORDER BY a2.Score DESC NULLS LAST
+    LIMIT 1
+  ) AS TopAnswerSnapshot
+FROM TopUsers tu
+LEFT JOIN Users u ON u.Id = tu.UserId
+LEFT JOIN UserBadges ub ON ub.UserId = tu.UserId
+LEFT JOIN RecentInteractions ri ON ri.UserId = tu.UserId
+LEFT JOIN UserEditChurn ec ON ec.UserId = tu.UserId
+ORDER BY tu.TotalScore DESC, tu.UserId;

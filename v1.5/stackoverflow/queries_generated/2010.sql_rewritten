@@ -1,0 +1,41 @@
+-- {"query": "2010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 474} 
+WITH TopActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.Location,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+    FROM Users u
+    WHERE u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+BadgeCounts AS (
+    SELECT b.UserId, COUNT(*) AS TotalBadges, 
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentPosts AS (
+    SELECT p.OwnerUserId, COUNT(*) AS PostCount,
+           SUM(p.ViewCount) AS TotalViews,
+           SUM(p.CommentCount) AS TotalComments
+    FROM Posts p
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+    GROUP BY p.OwnerUserId
+)
+SELECT u.UserId, u.DisplayName, u.Reputation, b.TotalBadges, b.GoldBadges, 
+       b.SilverBadges, b.BronzeBadges, COALESCE(rp.PostCount, 0) AS PostCount,
+       COALESCE(rp.TotalViews, 0) AS TotalViews, COALESCE(rp.TotalComments, 0) AS TotalComments,
+       CASE 
+           WHEN r.PostCount IS NULL THEN 'New User'
+           WHEN r.PostCount > 50 THEN 'Prolific Poster'
+           ELSE 'Active User'
+       END AS UserActivity
+FROM TopActiveUsers u
+LEFT JOIN BadgeCounts b ON u.UserId = b.UserId
+LEFT JOIN RecentPosts rp ON u.UserId = rp.OwnerUserId
+LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS PostCount
+    FROM Posts
+    GROUP BY OwnerUserId
+) r ON u.UserId = r.OwnerUserId
+WHERE EXTRACT(DAY FROM u.LastAccessDate AT TIME ZONE 'UTC') = EXTRACT(DAY FROM cast('2024-10-01 12:34:56' as timestamp) AT TIME ZONE 'UTC')
+ORDER BY u.Rank;

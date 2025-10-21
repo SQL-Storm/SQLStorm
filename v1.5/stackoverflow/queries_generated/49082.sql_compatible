@@ -1,0 +1,194 @@
+WITH UserPostStats AS (
+    -- Aggregates post-related metrics for each user
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(P.Id) AS PostsCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        SUM(COALESCE(P.Score, 0)) AS TotalScoreOnPosts,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalViewsOnPosts,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoritesOnPosts
+    FROM Posts AS P
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserVoteStats AS (
+    -- Aggregates vote-related metrics for posts owned by each user
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpvotesReceived,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownvotesReceived,
+        COUNT(CASE WHEN V.VoteTypeId = 5 THEN V.Id END) AS FavoritesReceived -- Favorites on their posts (pre-October 2022)
+    FROM Posts AS P
+    JOIN Votes AS V ON P.Id = V.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserAcceptedAnswerStats AS (
+    -- Counts how many of a user's answers were accepted
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(DISTINCT Q.Id) AS AcceptedAnswersCount
+    FROM Posts AS Q -- Questions
+    JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id -- Answers
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2 AND A.OwnerUserId IS NOT NULL
+    GROUP BY A.OwnerUserId
+),
+UserCommentStats AS (
+    -- Counts comments made by each user
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS CommentsCount,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore
+    FROM Comments AS C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+UserHistoryStats AS (
+    -- Aggregates post history actions (edits, closes, opens, etc.) by user
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS HistoryActionsCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS EditsCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12, 14) THEN 1 ELSE 0 END) AS ModerationActionsCount -- Close, Delete, Lock
+    FROM PostHistory AS PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+UserBadgeStats AS (
+    -- Aggregates badge counts and types for each user
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS BadgesCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+UserTagContributionRaw AS (
+    -- Extracts and unnests tags from questions posted by users
+    SELECT
+        P.OwnerUserId AS UserId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')))) AS TagName,
+        EXTRACT(YEAR FROM P.CreationDate) AS CreationYear
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.OwnerUserId IS NOT NULL
+),
+PopularTags AS (
+    -- Identifies tags that appear in a significant number of questions globally
+    SELECT
+        TagName,
+        COUNT(TagName) AS GlobalTagPostCount
+    FROM UserTagContributionRaw
+    GROUP BY TagName
+    HAVING COUNT(TagName) > 1000
+),
+AllUserMetrics AS (
+    -- Combines all individual CTEs into a comprehensive user profile
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views,
+        COALESCE(UPS.PostsCount, 0) AS TotalPosts,
+        COALESCE(UPS.QuestionsCount, 0) AS TotalQuestions,
+        COALESCE(UPS.AnswersCount, 0) AS TotalAnswers,
+        COALESCE(UPS.TotalScoreOnPosts, 0) AS TotalPostScore,
+        COALESCE(UPS.TotalViewsOnPosts, 0) AS TotalPostViews,
+        COALESCE(UPS.TotalFavoritesOnPosts, 0) AS TotalPostsFavorited,
+        COALESCE(UVS.UpvotesReceived, 0) AS TotalUpvotesReceived,
+        COALESCE(UVS.DownvotesReceived, 0) AS TotalDownvotesReceived,
+        COALESCE(UVS.FavoritesReceived, 0) AS TotalFavoritesReceivedOnPosts,
+        COALESCE(UAS.AcceptedAnswersCount, 0) AS TotalAcceptedAnswersGiven,
+        COALESCE(UCS.CommentsCount, 0) AS TotalCommentsMade,
+        COALESCE(UCS.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(UHS.HistoryActionsCount, 0) AS TotalHistoryActions,
+        COALESCE(UHS.EditsCount, 0) AS TotalEditsMade,
+        COALESCE(UHS.ModerationActionsCount, 0) AS TotalModerationActions,
+        COALESCE(UBS.BadgesCount, 0) AS TotalBadges,
+        COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges
+    FROM Users AS U
+    LEFT JOIN UserPostStats AS UPS ON U.Id = UPS.UserId
+    LEFT JOIN UserVoteStats AS UVS ON U.Id = UVS.UserId
+    LEFT JOIN UserAcceptedAnswerStats AS UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserCommentStats AS UCS ON U.Id = UCS.UserId
+    LEFT JOIN UserHistoryStats AS UHS ON U.Id = UHS.UserId
+    LEFT JOIN UserBadgeStats AS UBS ON U.Id = UBS.UserId
+    WHERE U.Reputation > 1000
+)
+SELECT
+    AUM.UserId,
+    AUM.DisplayName,
+    AUM.Reputation,
+    AUM.Views,
+    AUM.TotalPosts,
+    AUM.TotalQuestions,
+    AUM.TotalAnswers,
+    AUM.TotalPostScore,
+    AUM.TotalPostViews,
+    AUM.TotalUpvotesReceived,
+    AUM.TotalDownvotesReceived,
+    AUM.TotalAcceptedAnswersGiven,
+    AUM.TotalCommentsMade,
+    AUM.TotalEditsMade,
+    AUM.TotalBadges,
+    AUM.GoldBadges,
+    AUM.SilverBadges,
+    AUM.BronzeBadges,
+    COUNT(DISTINCT UTC.TagName) AS DistinctTagsContributedTo,
+    COUNT(DISTINCT PT.TagName) AS DistinctPopularTagsContributedTo,
+    (
+        AUM.Reputation * 0.01 +
+        AUM.TotalPostScore * 0.1 +
+        AUM.TotalUpvotesReceived * 0.15 +
+        AUM.TotalAcceptedAnswersGiven * 2 +
+        AUM.TotalEditsMade * 0.05 +
+        AUM.TotalCommentsMade * 0.02 +
+        AUM.GoldBadges * 10 +
+        AUM.SilverBadges * 5 +
+        AUM.BronzeBadges * 1 +
+        COUNT(DISTINCT PT.TagName) * 0.5
+    ) AS CompositeContributionScore,
+    RANK() OVER (
+        ORDER BY
+            (
+                AUM.Reputation * 0.01 +
+                AUM.TotalPostScore * 0.1 +
+                AUM.TotalUpvotesReceived * 0.15 +
+                AUM.TotalAcceptedAnswersGiven * 2 +
+                AUM.TotalEditsMade * 0.05 +
+                AUM.TotalCommentsMade * 0.02 +
+                AUM.GoldBadges * 10 +
+                AUM.SilverBadges * 5 +
+                AUM.BronzeBadges * 1 +
+                COUNT(DISTINCT PT.TagName) * 0.5
+            ) DESC,
+            AUM.LastAccessDate
+    ) AS GlobalContributionRank,
+    JSONB_AGG(
+        JSONB_BUILD_OBJECT(
+            'Year', UTC.CreationYear,
+            'PostsInYear', CAST(COUNT(UTC.TagName) AS INTEGER)
+        )
+        ORDER BY UTC.CreationYear
+    ) FILTER (WHERE UTC.CreationYear IS NOT NULL) AS YearlyPostActivitySummary
+FROM AllUserMetrics AS AUM
+LEFT JOIN UserTagContributionRaw AS UTC ON AUM.UserId = UTC.UserId
+LEFT JOIN PopularTags AS PT ON UTC.TagName = PT.TagName
+GROUP BY
+    AUM.UserId, AUM.DisplayName, AUM.Reputation, AUM.CreationDate, AUM.LastAccessDate, AUM.Views,
+    AUM.TotalPosts, AUM.TotalQuestions, AUM.TotalAnswers, AUM.TotalPostScore, AUM.TotalPostViews,
+    AUM.TotalPostsFavorited, AUM.TotalUpvotesReceived, AUM.TotalDownvotesReceived, AUM.TotalFavoritesReceivedOnPosts,
+    AUM.TotalAcceptedAnswersGiven, AUM.TotalCommentsMade, AUM.TotalCommentScore, AUM.TotalHistoryActions,
+    AUM.TotalEditsMade, AUM.TotalModerationActions, AUM.TotalBadges, AUM.GoldBadges, AUM.SilverBadges, AUM.BronzeBadges
+HAVING
+    AUM.TotalPosts > 20
+    AND AUM.TotalUpvotesReceived > 50
+    AND AUM.TotalAcceptedAnswersGiven > 5
+ORDER BY GlobalContributionRank ASC
+LIMIT 50;

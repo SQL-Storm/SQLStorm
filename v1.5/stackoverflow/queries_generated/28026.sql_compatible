@@ -1,0 +1,82 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        (u.UpVotes * 1.0 / NULLIF(u.UpVotes + u.DownVotes, 0)) * 100 AS ScoreRatio,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostType,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS ViewRank,
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) AS TagCount,
+        COALESCE(ph.CloseReason, 'Not closed') AS CloseStatus
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            MAX(crt.Name) AS CloseReason
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+        WHERE ph.PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1
+),
+VoteAggregates AS (
+    SELECT 
+        PostId,
+        COUNT(*) FILTER (WHERE VoteTypeId = 2) AS Upvotes,
+        COUNT(*) FILTER (WHERE VoteTypeId = 3) AS Downvotes,
+        SUM(CASE WHEN VoteTypeId = 8 THEN BountyAmount ELSE 0 END) AS TotalBounty
+    FROM Votes
+    GROUP BY PostId
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    pa.PostId,
+    pa.PostType,
+    pa.ViewRank,
+    va.Upvotes - va.Downvotes AS NetVotes,
+    (pa.Score * 0.5 + pa.ViewCount * 0.3 + pa.AnswerCount * 1.2) * CASE WHEN pa.CloseStatus = 'Not closed' THEN 1.5 ELSE 0.8 END AS EngagementScore,
+    CONCAT(SUBSTRING(pa.CloseStatus FROM 1 FOR 3), '...') AS CloseAbbr,
+    EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId IN (8,9)) AS HasBounty,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 1) AS LinkedPosts
+FROM UserStats us
+LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN VoteAggregates va ON pa.PostId = va.PostId
+WHERE us.Reputation > 1000
+  AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+  AND (us.GoldBadges > 0 OR us.SilverBadges > 5)
+UNION ALL
+SELECT 
+    us.UserId,
+    us.Reputation,
+    NULL,
+    'N/A',
+    NULL,
+    NULL,
+    us.ScoreRatio,
+    NULL,
+    FALSE,
+    NULL
+FROM UserStats us
+WHERE us.Reputation <= 1000
+ORDER BY EngagementScore DESC NULLS LAST, NetVotes DESC
+LIMIT 100;

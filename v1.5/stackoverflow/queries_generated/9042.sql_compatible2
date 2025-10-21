@@ -1,0 +1,80 @@
+WITH
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QRank,
+        COUNT(c.Id)       OVER (PARTITION BY p.Id) AS CommentCount,
+        p.CreationDate
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+PopularTags AS (
+    SELECT
+        tag         AS TagName,
+        COUNT(*)    AS UsageCount
+    FROM Posts
+         CROSS JOIN UNNEST(string_to_array(substring(Tags,2,length(Tags)-2), '><')) AS tag
+    WHERE PostTypeId = 1
+    GROUP BY tag
+),
+TagDiff AS (
+    SELECT TagName FROM PopularTags WHERE UsageCount > 100
+    EXCEPT
+    SELECT TagName FROM PopularTags WHERE UsageCount < 10
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END)       AS LastGold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)      AS SilverCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)      AS BronzeCount
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    rq.Id                                     AS QuestionId,
+    rq.Title,
+    u.DisplayName                             AS Author,
+    rq.CommentCount,
+    COALESCE(bs.SilverCount,0)
+    + COALESCE(bs.BronzeCount,0)              AS MedalTotal,
+    CASE WHEN rq.QRank = 1 THEN 'TopByAuthor' ELSE 'Other' END AS RankLabel,
+    td.TagName,
+    LENGTH(rq.Title)
+    - LENGTH(REPLACE(rq.Title,'?',''))        AS QuestionMarkCount,
+    EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.PostId      = rq.Id
+        AND v.VoteTypeId  = 2
+        AND v.CreationDate >= rq.CreationDate - INTERVAL '1 day'
+    )                                          AS RecentUpvoted,
+    CASE
+      WHEN bs.LastGold   IS NOT NULL
+        AND bs.LastGold   >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' THEN 'ActiveGold'
+      WHEN bs.SilverCount > bs.BronzeCount                          THEN 'MoreSilver'
+      ELSE 'OtherMedals'
+    END                                        AS MedalStatus
+FROM RecentQuestions rq
+JOIN Users u
+  ON u.Id = rq.OwnerUserId
+LEFT JOIN BadgeSummary bs
+  ON bs.UserId = rq.OwnerUserId
+JOIN TagDiff td
+  ON td.TagName = ANY(string_to_array(substring(rq.Tags,2,length(rq.Tags)-2), '><'))
+WHERE rq.CommentCount > (
+    SELECT AVG(cnt)
+    FROM (
+      SELECT COUNT(*) AS cnt
+      FROM Comments
+      WHERE PostId = rq.Id
+      GROUP BY PostId
+    ) AS t
+)
+ORDER BY rq.CommentCount DESC, rq.Id;

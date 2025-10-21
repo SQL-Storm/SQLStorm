@@ -1,0 +1,82 @@
+-- {"query": "11099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 563} 
+
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COUNT(v.Id) OVER (PARTITION BY p.Id) AS VoteCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        UserId, 
+        COUNT(Id) AS ActivityCount
+    FROM 
+        Posts
+    WHERE 
+        CreationDate > NOW() - INTERVAL '30 days'
+    GROUP BY 
+        UserId
+),
+TopUsers AS (
+    SELECT 
+        *
+    FROM 
+        UserActivity
+    WHERE 
+        ActivityCount > (SELECT AVG(ActivityCount) FROM UserActivity)
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'') AS Tags
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.PostType, 
+    rp.VoteCount, 
+    pt.Tags,
+    COALESCE(tu.ActivityCount, 0) AS UserActivityCount,
+    CASE 
+        WHEN rp.Score > 10 AND rp.ViewCount > 100 THEN 'Highly Active'
+        WHEN rp.Score > 5 AND rp.ViewCount > 50 THEN 'Moderately Active'
+        ELSE 'Low Activity'
+    END AS ActivityLevel
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.UserId
+LEFT JOIN 
+    PostTags pt ON rp.Id = pt.Id
+ORDER BY 
+    rp.CreationDate DESC, 
+    rp.Score DESC, 
+    rp.ViewCount DESC
+LIMIT 10;

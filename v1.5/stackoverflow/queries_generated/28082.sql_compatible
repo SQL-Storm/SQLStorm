@@ -1,0 +1,60 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.Location,
+        COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsAsked,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY p.OwnerUserId) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+), RankedUsers AS (
+    SELECT 
+        us.*,
+        RANK() OVER (ORDER BY us.Reputation DESC) AS GlobalRank,
+        DENSE_RANK() OVER (PARTITION BY us.Location ORDER BY us.GoldBadges DESC) AS LocalBadgeRank,
+        LEAD(us.Reputation, 1, 0) OVER (ORDER BY us.Reputation DESC) AS NextUserReputation
+    FROM UserStats us
+    WHERE us.GoldBadges > 0 OR us.QuestionsAsked > 10
+), PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Tags,
+        ph.CreationDate AS LastEditDate,
+        COUNT(DISTINCT ph.Id) OVER (PARTITION BY ph.PostId) AS EditCount,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ' | ') WITHIN GROUP (ORDER BY p.Tags) AS ParsedTags,
+        FIRST_VALUE(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS LatestPostScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER () AS TotalCloseEvents
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4,5,6,10)
+    WHERE p.CreationDate > '2015-01-01' AND p.Score > 5
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.GlobalRank,
+    pa.PostId,
+    pa.ParsedTags,
+    pa.LatestPostScore,
+    (ru.Reputation - ru.NextUserReputation) AS ReputationGap,
+    COALESCE(ru.Location, 'Unknown') AS Location,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ru.UserId AND v.VoteTypeId = 2) AS UpvotesGiven,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) AS DownvotesReceived,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId END) OVER () AS TotalClosedPosts,
+    ROUND(ru.AvgAnswerScore * 0.3 + pa.LatestPostScore * 0.7, 2) AS ActivityScore,
+    CASE 
+        WHEN ru.GoldBadges > 5 AND pa.EditCount > 10 THEN 'Power Contributor'
+        WHEN ru.CommentsMade > 100 AND ru.QuestionsAsked > 50 THEN 'Active Participant'
+        ELSE 'Regular User'
+    END AS UserCategory
+FROM RankedUsers ru
+JOIN PostActivity pa ON ru.UserId = pa.OwnerUserId
+LEFT JOIN PostHistory ph ON pa.PostId = ph.PostId AND ph.PostHistoryTypeId = 10
+WHERE ru.Reputation > 1000 OR pa.TotalCloseEvents > 0
+GROUP BY ru.UserId, ru.DisplayName, ru.GlobalRank, pa.PostId, pa.ParsedTags, pa.LatestPostScore, ru.Reputation, ru.NextUserReputation, ru.Location, ru.AvgAnswerScore, pa.EditCount, ru.GoldBadges, ru.CommentsMade, ru.QuestionsAsked, pa.TotalCloseEvents
+HAVING COUNT(pa.PostId) > 1 OR MAX(pa.LatestPostScore) > 20
+ORDER BY ActivityScore DESC, GlobalRank
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

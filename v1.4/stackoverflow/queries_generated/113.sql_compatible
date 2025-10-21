@@ -1,0 +1,97 @@
+WITH
+user_base AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    COALESCE(SUM(p.Score), 0) AS TotalPostScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+),
+latest_activity AS (
+  SELECT
+    COALESCE(p.OwnerUserId, c.UserId, v.UserId) AS UserId,
+    COALESCE(p.CreationDate, c.CreationDate, v.CreationDate) AS EventDate,
+    CASE
+      WHEN p.Id IS NOT NULL THEN 'Post'
+      WHEN c.Id IS NOT NULL THEN 'Comment'
+      WHEN v.Id IS NOT NULL THEN 'Vote'
+    END AS EventType
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id OR v.PostId = c.PostId
+),
+latest_with_rank AS (
+  SELECT
+    la.UserId,
+    la.EventDate,
+    la.EventType,
+    ROW_NUMBER() OVER (PARTITION BY la.UserId ORDER BY la.EventDate DESC) AS rn
+  FROM latest_activity la
+),
+latest_top AS (
+  SELECT
+    UserId,
+    EventDate AS LastActivityDate,
+    EventType AS LastActivityType
+  FROM latest_with_rank
+  WHERE rn = 1
+),
+badge_summary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS CountBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+)
+SELECT
+  ub.Id,
+  ub.DisplayName,
+  ub.Reputation,
+  ub.PostCount,
+  ub.TotalPostScore,
+  lt.LastActivityDate,
+  lt.LastActivityType,
+  COALESCE(bs.CountBadges, 0) AS CountBadges,
+  COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+  COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+  COALESCE(bs.BronzeBadges, 0) AS BronzeBadges
+FROM user_base ub
+LEFT JOIN latest_top lt ON lt.UserId = ub.Id
+LEFT JOIN badge_summary bs ON bs.UserId = ub.Id
+WHERE ub.Reputation > 100
+  AND (ub.PostCount > 0 OR ub.TotalPostScore > 0)
+GROUP BY
+  ub.Id,
+  ub.DisplayName,
+  ub.Reputation,
+  ub.PostCount,
+  ub.TotalPostScore,
+  lt.LastActivityDate,
+  lt.LastActivityType,
+  bs.CountBadges,
+  bs.GoldBadges,
+  bs.SilverBadges,
+  bs.BronzeBadges
+ORDER BY ub.Reputation DESC, ub.Id
+LIMIT 100;

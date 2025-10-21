@@ -1,0 +1,33 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  MAX(p.CreationDate) AS LastActive,
+  STRING_AGG(DISTINCT t.Name, ',') AS TopTags,
+  SUM(v.BountyAmount) AS TotalBountiesGiven,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesCast,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesCast
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      pt.OwnerPostId,
+      tg.Name
+    FROM
+      Posts pt
+      JOIN Tags tg ON CONCAT(',', pt.Tags, ',') LIKE CONCAT('%,', tg.TagName, ',%')
+  ) t ON t.OwnerPostId = p.Id
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation
+ORDER BY
+  TotalBountiesGiven DESC NULLS LAST,
+  u.Reputation DESC
+LIMIT 100;

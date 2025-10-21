@@ -1,0 +1,140 @@
+-- {"query": "25088.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2485} 
+WITH
+    /* User reputation & badge aggregates */
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)               AS NetVotes,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1)                      AS GoldBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2)                      AS SilverBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3)                      AS BronzeBadges,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)             AS RepRank
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+    ),
+
+    /* Top answering users */
+    TopAnswerers AS (
+        SELECT
+            p.OwnerUserId                                            AS UserId,
+            COUNT(*)                                                 AS AnswerCount,
+            AVG(p.Score)                                            AS AvgAnswerScore,
+            MAX(p.CreationDate)                                      AS LastAnswerDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY COUNT(*) DESC)              AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 2       -- Answer
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    /* Tag‑level statistics derived from question tags */
+    TagStats AS (
+        SELECT
+            UNNEST(string_to_array(TRIM(BOTH '><' FROM p.Tags), '><')) AS Tag,
+            COUNT(*)                                                    AS QuestionCount,
+            AVG(p.ViewCount)                                            AS AvgViews,
+            MAX(p.Score)                                                AS MaxScore
+        FROM Posts p
+        WHERE p.PostTypeId = 1               -- Question
+          AND p.Tags IS NOT NULL
+        GROUP BY Tag
+    ),
+
+    /* Close‑reason aggregation from PostHistory */
+    CloseReasonAgg AS (
+        SELECT
+            ph.PostId,
+            COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10)           AS CloseVotes,
+            MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+        GROUP BY ph.PostId
+    ),
+
+    /* Duplicate relationships (PostLinks) */
+    DupLinks AS (
+        SELECT
+            pl.PostId,
+            pl.RelatedPostId,
+            pl.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3          -- Duplicate
+    ),
+
+    /* Combine everything per user */
+    Combined AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            ta.AnswerCount,
+            ta.AvgAnswerScore,
+            cr.CloseVotes,
+            cr.CloseReasonId,
+            CASE
+                WHEN cr.CloseReasonId IS NULL                 THEN 'Open'
+                WHEN cr.CloseReasonId::int = 101               THEN 'Duplicate'
+                ELSE                                           'Closed'
+            END                                            AS CurrentStatus,
+            COALESCE(ts.QuestionCount,0)                  AS TagQuestionCount,
+            COALESCE(ts.AvgViews,0)                       AS TagAvgViews,
+            dl.RelatedPostId                              AS DuplicateOf,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS OverallRank
+        FROM Users u
+        LEFT JOIN UserStats us          ON us.Id = u.Id
+        LEFT JOIN TopAnswerers ta      ON ta.UserId = u.Id AND ta.rn = 1
+        /* most recent question of the user (correlated subquery) */
+        LEFT JOIN LATERAL (
+            SELECT Id FROM Posts
+            WHERE OwnerUserId = u.Id AND PostTypeId = 1
+            ORDER BY CreationDate DESC
+            LIMIT 1
+        ) latest_q ON TRUE
+        LEFT JOIN CloseReasonAgg cr    ON cr.PostId = latest_q.Id
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM TagStats ts
+            WHERE ts.Tag = ANY (
+                SELECT UNNEST(string_to_array(TRIM(BOTH '><' FROM p.Tags), '><'))
+                FROM Posts p
+                WHERE p.Id = latest_q.Id
+            )
+            LIMIT 1
+        ) ts ON TRUE
+        LEFT JOIN DupLinks dl          ON dl.PostId = latest_q.Id AND dl.rn = 1
+        WHERE u.Reputation > 1000
+    )
+
+/* Final result set – top 100 users plus an aggregate summary */
+SELECT *
+FROM Combined
+WHERE OverallRank <= 100
+ORDER BY Reputation DESC
+
+UNION ALL
+
+SELECT
+    NULL                         AS Id,
+    'Aggregate'                  AS DisplayName,
+    SUM(Reputation)              AS Reputation,
+    SUM(GoldBadges)              AS GoldBadges,
+    SUM(SilverBadges)            AS SilverBadges,
+    SUM(BronzeBadges)            AS BronzeBadges,
+    SUM(AnswerCount)             AS AnswerCount,
+    AVG(AvgAnswerScore)          AS AvgAnswerScore,
+    SUM(CloseVotes)              AS CloseVotes,
+    NULL                         AS CloseReasonId,
+    NULL                         AS CurrentStatus,
+    SUM(TagQuestionCount)        AS TagQuestionCount,
+    AVG(TagAvgViews)             AS TagAvgViews,
+    NULL                         AS DuplicateOf,
+    NULL                         AS OverallRank
+FROM Combined;

@@ -1,0 +1,205 @@
+with
+recent_qs as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.lastactivitydate,
+    coalesce(u.displayname, p.ownerdisplayname, '<unknown>') as owner_name,
+    p.owneruserid,
+    regexp_split_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2, 0)), '><') as tag_arr,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    and (p.viewcount is not null and p.viewcount > 0)
+),
+
+answers_and_votes as (
+  select
+    q.id as qid,
+    count(a.id) filter (where a.id is not null) as total_answers,
+    max(a.score) as max_answer_score,
+    cast(avg(a.score) as numeric(10,3)) as avg_answer_score,
+    sum(v_up.cnt) as total_upvotes_on_q_and_answers,
+    sum(v_down.cnt) as total_downvotes_on_q_and_answers,
+    sum(coalesce(v_fav.cnt,0)) as total_favorites_on_q
+  from recent_qs q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join lateral (
+    select count(*) as cnt from votes v where v.postid = q.id and v.votetypeid = 2
+  ) v_up_q on true
+  left join lateral (
+    select count(*) as cnt from votes v where v.postid = q.id and v.votetypeid = 3
+  ) v_down_q on true
+  left join lateral (
+    select count(*) as cnt from votes v where v.postid = q.id and v.votetypeid = 5
+  ) v_fav_q on true
+  left join lateral (
+    select coalesce(sum(case when v.votetypeid=2 then 1 when v.votetypeid=3 then -1 else 0 end),0) as cnt
+    from votes v
+    where v.postid = a.id
+  ) v_on_answers on true
+  left join lateral (
+    select coalesce(sum(case when v.votetypeid=2 then 1 when v.votetypeid=3 then -1 else 0 end),0) as cnt
+    from votes v
+    where v.postid = q.id
+  ) v_on_q on true
+  left join lateral (
+    select coalesce(sum(v1.cnt),0) as cnt from (
+      select count(*) as cnt from votes v1 where v1.postid = q.id and v1.votetypeid = 2
+      union all
+      select count(*) as cnt from votes v2 where v2.postid in (select id from posts where parentid = q.id and posttypeid=2) and v2.votetypeid = 2
+    ) t
+  ) v_up on true
+  left join lateral (
+    select coalesce(sum(v1.cnt),0) as cnt from (
+      select count(*) as cnt from votes v1 where v1.postid = q.id and v1.votetypeid = 3
+      union all
+      select count(*) as cnt from votes v2 where v2.postid in (select id from posts where parentid = q.id and posttypeid=2) and v2.votetypeid = 3
+    ) t
+  ) v_down on true
+  left join lateral (
+    select coalesce(sum(v1.cnt),0) as cnt from (
+      select count(*) as cnt from votes v1 where v1.postid = q.id and v1.votetypeid = 5
+      union all
+      select count(*) as cnt from votes v2 where v2.postid in (select id from posts where parentid = q.id and posttypeid=2) and v2.votetypeid = 5
+    ) t
+  ) v_fav on true
+  group by q.id
+),
+
+user_badge_stats as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 3 when b.class = 2 then 2 else 1 end) as badge_weight,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+
+tag_popularity as (
+  select
+    tag,
+    count(*) as questions_with_tag,
+    avg(q.score)::numeric(10,3) as avg_score,
+    row_number() over (order by count(*) desc, avg(q.score) desc) as tag_rank
+  from recent_qs q
+  cross join lateral unnest(q.tag_arr) as t(tag)
+  group by tag
+),
+
+link_graph as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linktype_name,
+    case when exists (
+      select 1 from postlinks pl2 where pl2.postid = pl.relatedpostid and pl2.relatedpostid = pl.postid
+    ) then true else false end as bidirectional
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+
+recent_closures as (
+  select
+    ph.postid,
+    ph.userid,
+    coalesce(crt.name, 'unknown') as close_reason,
+    ph.creationdate as closed_at,
+    row_number() over (partition by ph.postid order by ph.creationdate asc) as close_seq
+  from posthistory ph
+  left join closereasontypes crt on crt.id = cast(ph.comment as int)
+  where ph.posthistorytypeid = 10
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+
+ranked_questions as (
+  select
+    q.*,
+    av.total_answers,
+    av.max_answer_score,
+    av.avg_answer_score,
+    av.total_upvotes_on_q_and_answers,
+    av.total_downvotes_on_q_and_answers,
+    ub.badge_count,
+    ub.badge_weight,
+    coalesce(tp.tag, '<none>') as primary_tag,
+    tp.tag_rank,
+    lg.linked_count,
+    rc.closed_at,
+    rc.close_reason,
+    dense_rank() over (order by (coalesce(q.score,0) * 0.7 + coalesce(av.avg_answer_score,0) * 0.3 + coalesce(ub.badge_weight,0) * 0.05) desc, q.viewcount desc) as engagement_rank,
+    case
+      when q.favoritecount is null then 0
+      when q.favoritecount > 50 then 'super-popular'
+      when q.favoritecount between 10 and 50 then 'popular'
+      when q.favoritecount between 1 and 9 then 'notable'
+      else 'unfavorited'
+    end as popularity_bucket,
+    substr(coalesce(replace(q.title, '''', ''), '<untitled>') || ' [' || coalesce(tp.tag,'') || ']', 1, 200) as title_preview,
+    (select extract(epoch from min(a.creationdate) - q.creationdate)/60.0
+     from posts a
+     where a.parentid = q.id and a.posttypeid = 2
+    ) as minutes_to_first_answer
+  from recent_qs q
+  left join answers_and_votes av on av.qid = q.id
+  left join user_badge_stats ub on ub.userid = q.owneruserid
+  left join lateral (
+    select t.tag, t.tag_rank
+    from tag_popularity t
+    where t.tag = (select unnest(tag_arr) from (select * from recent_qs rq where rq.id = q.id limit 1) t1)
+    limit 1
+  ) tp on true
+  left join lateral (
+    select count(*) as linked_count
+    from link_graph lg
+    where lg.postid = q.id
+  ) lg on true
+  left join lateral (
+    select ph.closed_at, ph.close_reason
+    from recent_closures ph
+    where ph.postid = q.id
+    order by ph.closed_at asc
+    limit 1
+  ) rc on true
+)
+
+select
+  rq.id,
+  rq.title_preview,
+  rq.owner_name,
+  rq.creationdate,
+  rq.lastactivitydate,
+  rq.primary_tag,
+  rq.tag_rank,
+  rq.score,
+  rq.viewcount,
+  rq.total_answers,
+  rq.max_answer_score,
+  rq.avg_answer_score,
+  rq.total_upvotes_on_q_and_answers,
+  rq.total_downvotes_on_q_and_answers,
+  rq.badge_count,
+  rq.badge_weight,
+  rq.popularity_bucket,
+  rq.minutes_to_first_answer,
+  rq.linked_count,
+  rq.closed_at,
+  rq.close_reason,
+  rq.engagement_rank
+from ranked_questions rq
+where
+  (rq.total_answers > 0 and coalesce(rq.avg_answer_score,0) > 1.5)
+  or (rq.viewcount > 10000 and rq.score >= greatest(1, floor(rq.score/1)))
+  or (rq.badge_weight > 5 and rq.tag_rank <= 100)
+  or (rq.primary_tag ilike '%sql%' and rq.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+order by rq.engagement_rank asc, rq.viewcount desc, rq.creationdate desc
+limit 250;

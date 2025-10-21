@@ -1,0 +1,81 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    INNER JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+UserActivity AS (
+    SELECT 
+        OwnerUserId AS UserId, 
+        COUNT(*) AS TotalPosts, 
+        SUM(Score) AS TotalScore, 
+        SUM(ViewCount) AS TotalViews, 
+        SUM(AnswerCount) AS TotalAnswers, 
+        SUM(CommentCount) AS TotalComments, 
+        MAX(CreationDate) AS LastActivityDate
+    FROM 
+        Posts
+    GROUP BY 
+        OwnerUserId
+),
+BadgeSummary AS (
+    SELECT 
+        b.OwnerUserId AS UserId, 
+        COUNT(*) AS TotalBadges, 
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.OwnerUserId
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.PostTypeId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.AnswerCount, 
+    rp.CommentCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    ua.TotalPosts, 
+    ua.TotalScore, 
+    ua.TotalViews, 
+    ua.TotalAnswers, 
+    ua.TotalComments, 
+    ua.LastActivityDate, 
+    bs.TotalBadges, 
+    bs.GoldBadges, 
+    bs.SilverBadges, 
+    bs.BronzeBadges
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN 
+    BadgeSummary bs ON rp.OwnerUserId = bs.UserId
+WHERE 
+    rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    AND rp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.CreationDate DESC
+LIMIT 10;

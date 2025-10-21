@@ -1,0 +1,155 @@
+WITH
+recent_activity AS (
+  SELECT p.Id AS PostId,
+         p.PostTypeId,
+         p.OwnerUserId,
+         p.CreationDate AS PostCreated,
+         COALESCE(p.Score,0) AS PostScore,
+         p.Title,
+         p.Tags,
+         c.Id   AS CommentId,
+         c.UserId AS CommentUserId,
+         c.CreationDate AS CommentCreated,
+         v.Id AS VoteId,
+         v.VoteTypeId,
+         v.UserId AS VoteUserId,
+         v.CreationDate AS VoteCreated
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id AND c.CreationDate > DATE '2024-10-01' - INTERVAL '180' DAY
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.CreationDate > DATE '2024-10-01' - INTERVAL '180' DAY
+  WHERE p.CreationDate > DATE '2024-10-01' - INTERVAL '2' YEAR
+),
+tags_exploded AS (
+  SELECT r.PostId,
+         r.PostTypeId,
+         r.OwnerUserId,
+         r.PostCreated,
+         r.PostScore,
+         r.Title,
+         TRIM(tag) AS Tag
+  FROM (
+    SELECT *,
+           REGEXP_SPLIT_TO_TABLE(
+             COALESCE(REGEXP_REPLACE(SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags) - 2), '[<>]', ''),''), '><'
+           ) AS tag
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+  ) r
+),
+user_agg AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate AS UserCreated,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+         COUNT(b.Id) AS BadgeCount,
+         MAX(b.Class) FILTER (WHERE b.Class IS NOT NULL) AS HighestBadgeClass,
+         AVG(NULLIF(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+tag_top_answerers AS (
+  SELECT t.Tag,
+         a.OwnerUserId AS UserId,
+         SUM( (COALESCE(p.Score,0)) * 
+              (1 + COALESCE(a.CommentCount,0)/5.0) * 
+              (1 + CASE WHEN p.CreationDate > DATE '2024-10-01' - INTERVAL '365' DAY THEN 0.5 ELSE 0 END)
+            ) OVER (PARTITION BY t.Tag, a.OwnerUserId) AS WeightedScore,
+         ROW_NUMBER() OVER (PARTITION BY t.Tag ORDER BY SUM( (COALESCE(p.Score,0)) * 
+              (1 + COALESCE(a.CommentCount,0)/5.0) * 
+              (1 + CASE WHEN p.CreationDate > DATE '2024-10-01' - INTERVAL '365' DAY THEN 0.5 ELSE 0 END)
+            ) DESC) AS rn
+  FROM tags_exploded t
+  JOIN Posts q ON q.Id = t.PostId AND q.PostTypeId = 1
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount FROM Comments GROUP BY PostId
+  ) aC ON aC.PostId = a.Id
+  LEFT JOIN Posts p ON p.Id = a.Id
+  GROUP BY t.Tag, a.OwnerUserId, a.CommentCount, p.CreationDate, p.Score
+),
+duplicate_pairs AS (
+  SELECT pl.PostId, pl.RelatedPostId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+symmetric_duplicates AS (
+  SELECT dp.PostId, dp.RelatedPostId FROM duplicate_pairs dp
+  UNION
+  SELECT dp.RelatedPostId AS PostId, dp.PostId AS RelatedPostId FROM duplicate_pairs dp
+),
+question_timeseries AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         LEAD(p.CreationDate) OVER (ORDER BY p.CreationDate) AS NextQuestionAt,
+         COUNT(a.Id) FILTER (WHERE a.CreationDate <= p.CreationDate + INTERVAL '7 days') OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswersUpTo7d,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS TotalUpVotes,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS OwnerRecencyRank
+  FROM Posts p
+  LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+final AS (
+  SELECT q.QuestionId,
+         q.Title,
+         u.DisplayName AS OwnerName,
+         u.Reputation,
+         q.CreationDate AS AskedAt,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.CumulativeAnswersUpTo7d,
+         COALESCE(tta.TagList, ARRAY[]::text[]) AS Tags,
+         COALESCE(tpa.UserId, -1) AS TopAnswererUserId,
+         COALESCE(u2.DisplayName, 'unknown') AS TopAnswererName,
+         COALESCE(tpa.WeightedScore,0) AS TopAnswererWeightedScore,
+         (CASE 
+            WHEN q.AnswerCount >= 10 THEN 'high-activity'
+            WHEN q.AnswerCount BETWEEN 3 AND 9 THEN 'medium-activity'
+            WHEN q.AnswerCount BETWEEN 1 AND 2 THEN 'low-activity'
+            ELSE 'no-answers'
+          END) AS ActivityBucket,
+         EXISTS (
+           SELECT 1 FROM symmetric_duplicates sd WHERE sd.PostId = q.QuestionId
+         ) AS IsMarkedDuplicate,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.QuestionId AND c.CreationDate >= q.CreationDate AND c.CreationDate < q.CreationDate + INTERVAL '30 days') AS CommentsFirst30d,
+         (SELECT COUNT(*) FROM Votes vv WHERE vv.PostId = q.QuestionId AND vv.VoteTypeId = 2 AND vv.CreationDate BETWEEN q.CreationDate AND q.CreationDate + INTERVAL '90 days') AS UpvotesFirst90d,
+         (COALESCE(q.Score,0) * 1.5 + COALESCE(q.ViewCount,0)/100.0 + COALESCE(q.CumulativeAnswersUpTo7d,0)*2.0 + COALESCE(tpa.WeightedScore,0)/10.0
+          - GREATEST(0, (SELECT AVG(Score) FROM Posts p2 WHERE p2.OwnerUserId = q.OwnerUserId AND p2.PostTypeId = 1) - COALESCE(q.Score,0))
+         ) AS QualityEstimate
+  FROM question_timeseries q
+  LEFT JOIN (
+    SELECT te.PostId, array_agg(DISTINCT te.Tag ORDER BY te.Tag) AS TagList
+    FROM tags_exploded te
+    GROUP BY te.PostId
+  ) tta ON tta.PostId = q.QuestionId
+  LEFT JOIN LATERAL (
+    SELECT tt.UserId, tt.WeightedScore FROM tag_top_answerers tt
+    WHERE tt.Tag = (SELECT unnest(COALESCE(tta.TagList, ARRAY[''])) LIMIT 1)
+    AND tt.rn = 1
+    ORDER BY tt.WeightedScore DESC
+    LIMIT 1
+  ) tpa ON true
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN Users u2 ON u2.Id = tpa.UserId
+)
+SELECT *
+FROM final
+WHERE
+  (ActivityBucket IN ('high-activity','medium-activity') OR (IsMarkedDuplicate = false AND CommentsFirst30d > 2))
+  AND (QualityEstimate > COALESCE( (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1), 0) * 0.8)
+  AND (TopAnswererWeightedScore IS NULL OR TopAnswererWeightedScore < 10000 OR OwnerRecencyRank > 1)
+ORDER BY QualityEstimate DESC NULLS LAST
+LIMIT 250;

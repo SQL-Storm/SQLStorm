@@ -1,0 +1,111 @@
+WITH
+UserStats AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AS PostsLastYear,
+    COALESCE((SELECT AVG(COALESCE(p.Score,0)) FROM Posts p WHERE p.OwnerUserId = u.Id), 0) AS AvgPostScoreAllTime,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Date > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AS BadgesLastYear,
+    (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastActivityDateAllPosts,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.UserId = u.Id) AS LastEditDate
+  FROM Users u
+),
+DailyActivity AS (
+  SELECT
+    DATE_TRUNC('day', p.CreationDate) AS Day,
+    p.OwnerUserId AS UserId,
+    COUNT(*) AS PostsThatDay,
+    SUM(COALESCE(p.ViewCount,0)) AS ViewsThatDay,
+    SUM(COALESCE(p.Score,0)) AS ScoreThatDay
+  FROM Posts p
+  WHERE p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+  GROUP BY DATE_TRUNC('day', p.CreationDate), p.OwnerUserId
+),
+UserComplexExp AS (
+  SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.PostsLastYear,
+    us.AvgPostScoreAllTime,
+    us.BadgesLastYear,
+    COALESCE((SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = us.Id AND p.Score IS NOT NULL) * 0.6, 0)
+      + COALESCE((SELECT SUM(BountyAmount) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts p2 WHERE p2.OwnerUserId = us.Id) AND v.BountyAmount IS NOT NULL), 0) * 0.4 AS BenchmarkScore
+  FROM UserStats us
+),
+TaggedMetrics AS (
+  SELECT
+    usc.Id,
+    USC.DisplayName,
+    USC.Reputation,
+    CAST(
+      STRING_AGG(t.TagName, ',') OVER (ORDER BY t.TagName)
+      AS VARCHAR(1000)
+    ) AS TagsSummary,
+    (SELECT COUNT(DISTINCT tt.TagName)
+     FROM Posts p
+     CROSS JOIN UNNEST(STRING_TO_ARRAY(p.Tags, ',')) AS tname
+     JOIN Tags tt ON LOWER(tt.TagName) = LOWER(TRIM(tname))
+     WHERE p.OwnerUserId = usc.Id) AS DistinctTagsUsed
+  FROM UserStats usc
+),
+FinalBase AS (
+  SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.PostsLastYear,
+    us.AvgPostScoreAllTime,
+    us.BadgesLastYear,
+    us.LastActivityDateAllPosts,
+    us.LastEditDate,
+    dc.Score AS DailyCompositeScore,
+    dm.TagsSummary,
+    dm.DistinctTagsUsed,
+    CASE
+      WHEN us.LastActivityDateAllPosts IS NULL THEN FALSE
+      WHEN us.Reputation > 1000 AND us.PostsLastYear > 50 THEN TRUE
+      ELSE FALSE
+    END AS IsActiveFlag
+  FROM UserStats us
+  LEFT JOIN DailyActivity dc ON dc.UserId = us.Id
+  LEFT JOIN TaggedMetrics dm ON dm.Id = us.Id
+)
+SELECT
+  Id,
+  DisplayName,
+  Reputation,
+  RepRank,
+  PostsLastYear,
+  AvgPostScoreAllTime,
+  BadgesLastYear,
+  LastActivityDateAllPosts,
+  LastEditDate,
+  DailyCompositeScore,
+  TagsSummary,
+  DistinctTagsUsed,
+  IsActiveFlag
+FROM FinalBase
+UNION ALL
+SELECT
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  NULL AS RepRank,
+  NULL AS PostsLastYear,
+  NULL AS AvgPostScoreAllTime,
+  NULL AS BadgesLastYear,
+  NULL AS LastActivityDateAllPosts,
+  NULL AS LastEditDate,
+  NULL AS DailyCompositeScore,
+  NULL AS TagsSummary,
+  NULL AS DistinctTagsUsed,
+  NULL AS IsActiveFlag
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+GROUP BY u.Id, u.DisplayName, u.Reputation;

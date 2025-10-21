@@ -1,0 +1,89 @@
+WITH user_question_stats AS (
+    SELECT OwnerUserId,
+           COUNT(*) AS question_count,
+           AVG(Score) AS avg_score,
+           MAX(LENGTH(Title)) AS max_title_len,
+           SUM(CASE WHEN Tags IS NOT NULL THEN ARRAY_LENGTH(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'), 1) ELSE 0 END) AS total_tags
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+),
+user_answer_stats AS (
+    SELECT OwnerUserId,
+           COUNT(*) AS answer_count,
+           SUM(CASE WHEN Id IN (SELECT AcceptedAnswerId FROM Posts WHERE AcceptedAnswerId IS NOT NULL) THEN 1 ELSE 0 END) AS accepted_answers,
+           AVG(CASE WHEN Score > 0 THEN Score ELSE NULL END) AS avg_positive_score
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+),
+user_badge_stats AS (
+    SELECT UserId,
+           COUNT(*) AS badge_count,
+           SUM(CASE WHEN Class = 1 THEN 10 WHEN Class = 2 THEN 5 WHEN Class = 3 THEN 1 ELSE 0 END) AS badge_score,
+           STRING_AGG(Name, ', ') AS badge_list
+    FROM Badges
+    GROUP BY UserId
+),
+user_comment_stats AS (
+    SELECT UserId,
+           COUNT(*) AS comment_count,
+           AVG(Score) AS avg_comment_score,
+           MAX(CreationDate) AS last_comment_date
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+ranked_users AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(q.question_count, 0) AS questions,
+           COALESCE(q.avg_score, 0) AS q_avg_score,
+           COALESCE(q.total_tags, 0) AS tags,
+           COALESCE(a.answer_count, 0) AS answers,
+           COALESCE(a.accepted_answers, 0) AS accepts,
+           COALESCE(a.avg_positive_score, 0) AS a_avg_score,
+           COALESCE(b.badge_score, 0) AS bscore,
+           COALESCE(b.badge_list, 'None') AS badges,
+           COALESCE(c.comment_count, 0) AS comments,
+           COALESCE(c.last_comment_date, u.CreationDate) AS last_activity,
+           (u.Reputation + COALESCE(q.question_count, 0) * COALESCE(q.avg_score, 0) + COALESCE(a.accepted_answers, 0) * 100 + COALESCE(b.badge_score, 0) * 2 + COALESCE(c.comment_count, 0) * COALESCE(c.avg_comment_score, 0)) AS complex_score,
+           ROW_NUMBER() OVER (ORDER BY (u.Reputation + COALESCE(q.question_count, 0) * COALESCE(q.avg_score, 0) + COALESCE(a.accepted_answers, 0) * 100 + COALESCE(b.badge_score, 0) * 2 + COALESCE(c.comment_count, 0) * COALESCE(c.avg_comment_score, 0)) DESC) AS rank,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS rep_rank,
+           DENSE_RANK() OVER (ORDER BY COALESCE(a.accepted_answers, 0) DESC) AS accept_rank,
+           UPPER(u.DisplayName) AS upper_name,
+           CASE 
+               WHEN u.AboutMe IS NULL THEN 'No Bio' 
+               ELSE SUBSTRING(u.AboutMe FROM 1 FOR 100) || '...' 
+           END AS bio_preview,
+           CASE WHEN EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Name ILIKE '%sql%') THEN 'SQL Expert' ELSE 'Not Expert' END AS expertise,
+           (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS first_post_date,
+           (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS upvotes_given
+    FROM Users u
+    LEFT JOIN user_question_stats q ON u.Id = q.OwnerUserId
+    LEFT JOIN user_answer_stats a ON u.Id = a.OwnerUserId
+    LEFT JOIN user_badge_stats b ON u.Id = b.UserId
+    LEFT JOIN user_comment_stats c ON u.Id = c.UserId
+    WHERE u.Reputation > 100
+      AND EXISTS (
+          SELECT 1 FROM Posts p 
+          WHERE p.OwnerUserId = u.Id 
+            AND p.PostTypeId = 1 
+            AND p.Score > 10 
+            AND 'sql' = ANY(COALESCE(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), ARRAY[]::VARCHAR[]))
+      )
+),
+top_users AS (
+    SELECT * FROM ranked_users WHERE rank <= 50
+),
+other_users AS (
+    SELECT * FROM ranked_users WHERE rep_rank <= 100 AND accept_rank <= 100
+    EXCEPT
+    SELECT * FROM top_users
+)
+SELECT * FROM top_users
+UNION ALL
+SELECT * FROM other_users
+ORDER BY complex_score DESC, rep_rank ASC
+LIMIT 100;

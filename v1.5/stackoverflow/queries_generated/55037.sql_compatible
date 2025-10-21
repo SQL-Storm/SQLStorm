@@ -1,0 +1,69 @@
+WITH user_stats AS (
+    SELECT u.Id,
+           u.Reputation,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS question_cnt,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS answer_cnt,
+           COALESCE(SUM(p.Score), 0)                                 AS total_score,
+           AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)              AS avg_q_score,
+           AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)              AS avg_a_score,
+           MAX(p.CreationDate)                                      AS last_post_ts
+    FROM   Users u
+    LEFT   JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.Reputation
+),
+badge_counts AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1)                     AS gold,
+           COUNT(*) FILTER (WHERE b.Class = 2)                     AS silver,
+           COUNT(*) FILTER (WHERE b.Class = 3)                     AS bronze,
+           COUNT(*)                                                AS total_badges
+    FROM   Badges b
+    GROUP  BY b.UserId
+),
+vote_stats AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS up_votes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS down_votes
+    FROM   Votes v
+    GROUP  BY v.PostId
+),
+top_tags AS (
+    SELECT t.TagName,
+           t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC)               AS rn
+    FROM   Tags t
+    WHERE  t.IsModeratorOnly = 0
+)
+SELECT u.Id,
+       u.DisplayName,
+       us.Reputation,
+       us.question_cnt,
+       us.answer_cnt,
+       us.total_score,
+       us.avg_q_score,
+       us.avg_a_score,
+       us.last_post_ts,
+       bc.gold,
+       bc.silver,
+       bc.bronze,
+       bc.total_badges,
+       COALESCE(SUM(vs.up_votes), 0)                               AS user_up_votes,
+       COALESCE(SUM(vs.down_votes), 0)                             AS user_down_votes,
+       ARRAY_AGG(DISTINCT tt.TagName) FILTER (WHERE tt.rn <= 5)    AS top_5_tags
+FROM   Users u
+LEFT   JOIN user_stats us      ON us.Id = u.Id
+LEFT   JOIN badge_counts bc   ON bc.UserId = u.Id
+LEFT   JOIN Posts p            ON p.OwnerUserId = u.Id
+LEFT   JOIN vote_stats vs      ON vs.PostId = p.Id
+LEFT   JOIN LATERAL (
+        SELECT replace(replace(tag, '<', ''), '>', '') AS clean_tag
+        FROM   unnest(string_to_array(p.Tags, '><')) AS tag
+       ) AS pt                                          ON true
+LEFT   JOIN Tags t               ON t.TagName = pt.clean_tag
+LEFT   JOIN top_tags tt         ON tt.TagName = t.TagName
+WHERE  u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '5 years'
+GROUP  BY u.Id, u.DisplayName, us.Reputation, us.question_cnt, us.answer_cnt,
+         us.total_score, us.avg_q_score, us.avg_a_score, us.last_post_ts,
+         bc.gold, bc.silver, bc.bronze, bc.total_badges
+ORDER  BY us.total_score DESC NULLS LAST
+LIMIT  100;

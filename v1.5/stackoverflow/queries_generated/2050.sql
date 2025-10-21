@@ -1,0 +1,48 @@
+-- {"query": "2050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 463} 
+
+WITH RecentActiveUsers AS (
+  SELECT DISTINCT U.Id AS UserId, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes
+  FROM Users U
+  JOIN Posts P ON U.Id = P.OwnerUserId
+  WHERE P.LastActivityDate >= (CURRENT_DATE - INTERVAL '30 days')
+),
+TopTags AS (
+  SELECT T.TagName, COUNT(*) AS TagCount
+  FROM Posts P
+  JOIN PostHistory PH ON P.Id = PH.PostId
+  JOIN Tags T ON P.Tags LIKE '%' || T.TagName || '%'
+  WHERE PH.PostHistoryTypeId = 2 -- Initial Body
+  GROUP BY T.TagName
+  ORDER BY TagCount DESC
+  LIMIT 10
+),
+UserBadgeCounts AS (
+  SELECT U.Id AS UserId, COUNT(B.Id) AS BadgeCount
+  FROM Users U
+  LEFT JOIN Badges B ON U.Id = B.UserId
+  GROUP BY U.Id
+),
+HighReputationUsers AS (
+  SELECT U.Id, U.DisplayName, U.Reputation
+  FROM Users U
+  WHERE U.Reputation > (SELECT AVG(Reputation) FROM Users)
+)
+SELECT RAU.DisplayName AS ActiveUserName,
+       COALESCE(TT.TagName, 'No Tags') AS TopTag,
+       COALESCE(UBC.BadgeCount, 0) AS BadgeCount,
+       CASE
+         WHEN HRU.Id IS NOT NULL THEN 'High Reputation'
+         ELSE 'Normal'
+       END AS ReputationStatus,
+       DENSE_RANK() OVER (ORDER BY RAU.Reputation DESC) AS ReputationRank
+FROM RecentActiveUsers RAU
+LEFT JOIN TopTags TT ON RAU.UserId IN (
+  SELECT U.Id
+  FROM Users U
+  JOIN Posts P ON U.Id = P.OwnerUserId
+  WHERE P.Tags LIKE '%' || TT.TagName || '%'
+)
+LEFT JOIN UserBadgeCounts UBC ON RAU.UserId = UBC.UserId
+LEFT JOIN HighReputationUsers HRU ON RAU.UserId = HRU.Id
+WHERE RAU.UpVotes > 0 AND RAU.DownVotes < RAU.UpVotes * 0.2
+ORDER BY ReputationRank, BadgeCount DESC, ActiveUserName;

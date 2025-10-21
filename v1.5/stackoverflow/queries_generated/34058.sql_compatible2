@@ -1,0 +1,113 @@
+WITH RECURSIVE RecursiveUserNetwork AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        1 AS Level
+    FROM Users u
+    WHERE u.Reputation > 5000
+
+    UNION ALL
+
+    SELECT 
+        COALESCE(p.OwnerUserId, c.UserId) AS UserId,
+        u2.DisplayName,
+        u2.Reputation,
+        run.Level + 1 AS Level
+    FROM RecursiveUserNetwork AS run
+    JOIN Posts p ON p.OwnerUserId = run.UserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON c.UserId = run.UserId
+    JOIN Users u2 ON u2.Id = COALESCE(p.OwnerUserId, c.UserId)
+    WHERE run.Level < 3
+), LatestUserBadges AS (
+    SELECT DISTINCT ON (UserId) UserId, Name AS BadgeName, Class, Date
+    FROM Badges
+    ORDER BY UserId, Date DESC
+), QuestionAnswerStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+), PopularTags AS (
+    SELECT 
+        un.UserId,
+        t.TagName,
+        COUNT(*) AS TagUsageCount
+    FROM RecursiveUserNetwork AS un
+    JOIN Posts p ON p.OwnerUserId = un.UserId AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS tagname
+    JOIN Tags t ON t.TagName = tagname
+    GROUP BY un.UserId, t.TagName
+), PostLinkAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title
+), CloseReasonStats AS (
+    SELECT 
+        crt.Name AS CloseReason,
+        COUNT(ph.Id) AS ClosedPostsCount,
+        AVG(EXTRACT(EPOCH FROM (ph2.CreationDate - ph.CreationDate))/3600) AS AvgHoursToReopen
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 11 AND ph2.CreationDate > ph.CreationDate
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY crt.Name
+)
+SELECT 
+    run.UserId,
+    run.DisplayName,
+    run.Reputation,
+    lub.BadgeName,
+    lub.Class AS BadgeClass,
+    qas.QuestionCount,
+    qas.AnswerCount,
+    ROUND(qas.AvgPostScore, 2) AS AveragePostScore,
+    qas.TotalQuestionViews,
+    pt.TagName AS TopTag,
+    pt.TagUsageCount,
+    pla.QuestionId,
+    pla.Title AS QuestionTitle,
+    pla.DuplicateCount,
+    pla.LinkedCount,
+    crs.CloseReason,
+    crs.ClosedPostsCount,
+    ROUND(COALESCE(crs.AvgHoursToReopen, 0), 2) AS AvgHoursToReopen
+FROM RecursiveUserNetwork AS run
+LEFT JOIN LatestUserBadges lub ON lub.UserId = run.UserId
+LEFT JOIN QuestionAnswerStats qas ON qas.UserId = run.UserId
+LEFT JOIN LATERAL (
+    SELECT TagName, TagUsageCount
+    FROM PopularTags pt
+    WHERE pt.UserId = run.UserId
+    ORDER BY TagUsageCount DESC
+    LIMIT 1
+) AS pt ON TRUE
+LEFT JOIN PostLinkAnalysis pla ON pla.QuestionId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = run.UserId AND p.PostTypeId = 1
+    ORDER BY p.ViewCount DESC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN CloseReasonStats crs ON crs.CloseReason = (
+    SELECT crt.Name
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostId = pla.QuestionId AND ph.PostHistoryTypeId = 10
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+)
+WHERE run.Level = 1
+ORDER BY run.Reputation DESC
+LIMIT 100;

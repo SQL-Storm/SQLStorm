@@ -1,0 +1,114 @@
+WITH ActiveUsers AS (
+    SELECT u.Id AS UserId, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+TopPosts AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.Score, p.ViewCount,
+           p.CreationDate AS PostCreationDate,
+           COALESCE(p.AnswerCount, 0) AS AnswerCount,
+           LAG(p.Score) OVER (PARTITION BY COALESCE(p.ParentId, p.Id) ORDER BY p.CreationDate) AS PrevPostScore,
+           FIRST_VALUE(p.Title) OVER (PARTITION BY COALESCE(p.ParentId, p.Id) ORDER BY p.Score DESC) AS HighestScoredTitle
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > 0
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate)
+),
+UserActivityStats AS (
+    SELECT au.UserId,
+           COUNT(DISTINCT tp.PostId) AS PostCount,
+           AVG(tp.Score) AS AvgPostScore,
+           SUM(CASE WHEN tp.ViewCount > 10000 THEN 1 ELSE 0 END) AS HighViewPosts,
+           STRING_AGG(DISTINCT SUBSTRING(tp.HighestScoredTitle FROM 1 FOR 20), '; ') AS TopTitles
+    FROM ActiveUsers au
+    JOIN TopPosts tp ON au.UserId = tp.OwnerUserId
+    GROUP BY au.UserId
+    HAVING COUNT(DISTINCT tp.PostId) > 5
+),
+BadgeInsights AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldCount,
+           COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBadges,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    JOIN ActiveUsers au ON b.UserId = au.UserId
+    GROUP BY b.UserId
+),
+ComplexInteractions AS (
+    SELECT v.PostId,
+           COUNT(v.Id) AS TotalVotes,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS DownVotes,
+           AVG(EXTRACT(EPOCH FROM v.CreationDate)) AS AvgVoteTimestamp
+    FROM Votes v
+    WHERE v.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+      AND v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId
+)
+SELECT 
+    uas.UserId,
+    u.DisplayName,
+    au.Reputation,
+    au.RepRank,
+    uas.PostCount,
+    ROUND(uas.AvgPostScore, 2) AS AvgScore,
+    uas.HighViewPosts,
+    bi.GoldCount,
+    bi.TagBadges,
+    ci.TotalVotes,
+    (ci.UpVotes - ABS(ci.DownVotes)) AS NetPositiveVotes,
+    CASE 
+        WHEN bi.GoldCount > 0 AND uas.HighViewPosts > 10 THEN 'Elite Contributor'
+        WHEN uas.PostCount > 20 THEN 'Active Poster'
+        WHEN bi.TagBadges > 5 THEN 'Tag Specialist'
+        ELSE 'Standard User'
+    END AS UserCategory,
+    COALESCE(uas.TopTitles, 'No Notable Posts') AS NotableTitles,
+    CASE WHEN bi.LatestBadgeDate IS NULL THEN NULL 
+         ELSE bi.LatestBadgeDate - au.CreationDate 
+    END AS TimeToLatestBadge,
+    (SELECT COUNT(DISTINCT c.Id)
+     FROM Comments c
+     WHERE c.UserId = uas.UserId
+       AND LENGTH(c.Text) > 50
+       AND c.Score > 0) AS InsightfulComments,
+    (SELECT STRING_AGG(DISTINCT SUBSTRING(pl.RelatedPostId::text, 1, 5), ', ')
+     FROM PostLinks pl
+     WHERE pl.PostId IN (SELECT PostId FROM TopPosts tp WHERE tp.OwnerUserId = uas.UserId)
+       AND pl.LinkTypeId = 3) AS LinkedDuplicates
+FROM UserActivityStats uas
+JOIN ActiveUsers au ON uas.UserId = au.UserId
+JOIN Users u ON uas.UserId = u.Id
+LEFT OUTER JOIN BadgeInsights bi ON uas.UserId = bi.UserId
+LEFT OUTER JOIN ComplexInteractions ci ON ci.PostId IN (
+    SELECT PostId FROM TopPosts tp WHERE tp.OwnerUserId = uas.UserId
+)
+WHERE au.RepRank <= 100
+  AND (ci.TotalVotes > 10 OR ci.TotalVotes IS NULL)
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(au.Reputation) AS Reputation,
+    COUNT(*) AS RepRank,
+    SUM(uas.PostCount) AS PostCount,
+    AVG(uas.AvgPostScore) AS AvgScore,
+    SUM(uas.HighViewPosts) AS HighViewPosts,
+    SUM(bi.GoldCount) AS GoldCount,
+    SUM(bi.TagBadges) AS TagBadges,
+    SUM(ci.TotalVotes) AS TotalVotes,
+    SUM(ci.UpVotes - ABS(ci.DownVotes)) AS NetPositiveVotes,
+    'Overall Summary' AS UserCategory,
+    NULL AS NotableTitles,
+    NULL AS TimeToLatestBadge,
+    (SELECT COUNT(*) FROM Comments WHERE Score > 0 AND LENGTH(Text) > 50) AS InsightfulComments,
+    NULL AS LinkedDuplicates
+FROM UserActivityStats uas
+JOIN ActiveUsers au ON uas.UserId = au.UserId
+LEFT OUTER JOIN BadgeInsights bi ON uas.UserId = bi.UserId
+LEFT OUTER JOIN ComplexInteractions ci ON ci.PostId IN (
+    SELECT PostId FROM TopPosts tp WHERE tp.OwnerUserId = uas.UserId
+)
+ORDER BY UserId IS NULL, Reputation DESC;

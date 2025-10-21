@@ -1,0 +1,204 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_date,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as score_decile,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'High_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'High_Answer'
+            ELSE 'Other'
+        END as post_category
+    FROM Posts p
+    WHERE p.CreationDate >= '2019-01-01' 
+      AND p.CreationDate < '2023-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        MAX(p.CreationDate) as last_post_date,
+        AVG(p.Score) as avg_score,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags,
+        COALESCE((
+            SELECT p2.Title
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = u.Id 
+              AND p2.PostTypeId = 1 
+              AND p2.CreationDate >= '2022-01-01'
+            ORDER BY p2.CreationDate DESC
+            LIMIT 1
+        ), 'No recent questions') as most_recent_question,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Advanced'
+            ELSE 'Beginner'
+        END as reputation_level
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.CreationDate >= '2018-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((
+            SELECT p.Title
+            FROM Posts p 
+            WHERE p.ExcerptPostId = t.ExcerptPostId 
+              AND p.PostTypeId = 4
+            ORDER BY p.Title
+            LIMIT 1
+        ), '') as excerpt_title,
+        COALESCE((
+            SELECT p.Title 
+            FROM Posts p 
+            WHERE p.WikiPostId = t.WikiPostId 
+              AND p.PostTypeId = 5
+            ORDER BY p.Title
+            LIMIT 1
+        ), '') as wiki_title,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END as tag_popularity
+    FROM Tags t
+    WHERE t.Count > 50
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.prev_score,
+        rp.prev_date,
+        rp.score_rank,
+        rp.score_decile,
+        rp.post_category,
+        DATEDIFF(day, rp.prev_date, rp.CreationDate) as days_since_last_post,
+        CASE 
+            WHEN rp.Score > rp.prev_score THEN 'Improved'
+            WHEN rp.Score < rp.prev_score THEN 'Declined'
+            ELSE 'Same'
+        END as score_trend,
+        CASE 
+            WHEN rp.AnswerCount > 0 THEN (CAST(rp.Score AS FLOAT) / CAST(rp.AnswerCount AS FLOAT)) 
+            ELSE 0 
+        END as score_per_answer,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND rp.Tags != '' THEN 
+                (SELECT COUNT(value) FROM STRING_SPLIT(rp.Tags, '>') WHERE value LIKE '%<%')
+            ELSE 0 
+        END as tag_count,
+        COALESCE(ua.DisplayName, 'Unknown') as owner_name,
+        COALESCE(ua.reputation_level, 'Unknown') as owner_reputation,
+        COALESCE(tt.TagName, 'No Tags') as tag_name
+    FROM RankedPosts rp
+    LEFT JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+    LEFT JOIN (
+        SELECT t.TagName, p.Id 
+        FROM Tags t 
+        INNER JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+        WHERE p.PostTypeId = 1
+    ) tt ON tt.Id = rp.Id
+    WHERE rp.rn = 1
+)
+SELECT 
+    pa.Id,
+    pa.Title,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.prev_score,
+    pa.days_since_last_post,
+    pa.score_trend,
+    pa.score_per_answer,
+    pa.tag_count,
+    pa.owner_name,
+    pa.owner_reputation,
+    pa.tag_name,
+    CASE 
+        WHEN pa.Score > 50 AND pa.ViewCount > 1000 THEN 'Viral'
+        WHEN pa.Score > 20 AND pa.ViewCount > 500 THEN 'Popular'
+        WHEN pa.Score > 5 AND pa.ViewCount > 100 THEN 'Notable'
+        WHEN pa.Score = 0 AND pa.ViewCount = 0 THEN 'Zero'
+        ELSE 'Average'
+    END as performance_category,
+    CONCAT(
+        'Post #', pa.Id, ' by ', pa.owner_name, 
+        ' (Score: ', pa.Score, ', Views: ', pa.ViewCount, 
+        ', Answers: ', pa.AnswerCount, ')'
+    ) as post_summary,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = pa.Id 
+              AND ph.PostHistoryTypeId IN (10, 12, 13, 14, 15, 19, 20)
+              AND ph.CreationDate >= DATEADD(week, -2, cast('2024-10-01 12:34:56' as timestamp))
+        ) THEN 'Recently Active'
+        ELSE 'Stable'
+    END as post_status,
+    COALESCE((
+        SELECT CAST(COUNT(*) AS FLOAT) / COUNT(DISTINCT ph.UserId) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = pa.Id 
+          AND ph.PostHistoryTypeId IN (2, 5, 6, 24)
+    ), 0) as editing_frequency,
+    COALESCE((
+        SELECT AVG(v.BountyAmount) 
+        FROM Votes v 
+        WHERE v.PostId = pa.Id 
+          AND v.VoteTypeId = 8
+    ), 0) as avg_bounty,
+    CASE 
+        WHEN pa.Score > 0 AND pa.AnswerCount = 0 THEN 'Unanswered'
+        WHEN pa.Score > 0 AND pa.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Needs Attention'
+    END as question_status
+FROM PostAnalysis pa
+WHERE pa.OwnerUserId IS NOT NULL
+  AND pa.Score IS NOT NULL
+  AND pa.ViewCount IS NOT NULL
+  AND pa.post_category IN ('High_Question', 'High_Answer')
+  AND pa.days_since_last_post IS NOT NULL
+ORDER BY pa.Score DESC, pa.ViewCount DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

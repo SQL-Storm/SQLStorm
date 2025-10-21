@@ -1,0 +1,99 @@
+WITH 
+  -- Get top 10 users by reputation
+  top_users AS (
+    SELECT Id, Reputation, DisplayName
+    FROM Users
+    ORDER BY Reputation DESC
+    LIMIT 10
+  ),
+  
+  -- Get posts with more than 1000 views
+  popular_posts AS (
+    SELECT Id, ViewCount, OwnerUserId, Title, PostTypeId
+    FROM Posts
+    WHERE ViewCount > 1000
+  ),
+  
+  -- Get number of posts for each user
+  user_post_count AS (
+    SELECT OwnerUserId, COUNT(*) AS post_count
+    FROM Posts
+    GROUP BY OwnerUserId
+  ),
+  
+  -- Get average score for each post type
+  avg_score_by_type AS (
+    SELECT PostTypeId, AVG(Score) AS avg_score
+    FROM Posts
+    GROUP BY PostTypeId
+  ),
+  
+  -- Get number of comments for each post
+  post_comment_count AS (
+    SELECT PostId, COUNT(*) AS comment_count
+    FROM Comments
+    GROUP BY PostId
+  ),
+  
+  -- Get number of votes for each post
+  post_vote_count AS (
+    SELECT PostId, COUNT(*) AS vote_count
+    FROM Votes
+    GROUP BY PostId
+  ),
+  
+  -- Get top 5 tags by count
+  top_tags AS (
+    SELECT TagName, Count
+    FROM Tags
+    ORDER BY Count DESC
+    LIMIT 5
+  )
+  
+SELECT 
+  pu.Id,
+  pu.Reputation,
+  pu.DisplayName,
+  pp.ViewCount,
+  pp.Title,
+  upc.post_count,
+  COALESCE(ascpt.avg_score, 0) AS avg_score,
+  pcc.comment_count,
+  pvc.vote_count,
+  STRING_AGG(tt.TagName, ', ') AS top_tags
+FROM 
+  Users pu
+  LEFT JOIN popular_posts pp ON pu.Id = pp.OwnerUserId
+  LEFT JOIN user_post_count upc ON pu.Id = upc.OwnerUserId
+  LEFT JOIN avg_score_by_type ascpt ON pp.PostTypeId = ascpt.PostTypeId
+  LEFT JOIN post_comment_count pcc ON pp.Id = pcc.PostId
+  LEFT JOIN post_vote_count pvc ON pp.Id = pvc.PostId
+  LEFT JOIN (
+    SELECT 
+      p.Id AS Id,
+      t.TagName AS TagName
+    FROM 
+      Posts p
+      CROSS JOIN LATERAL (
+        SELECT 
+          value AS TagName
+        FROM 
+          string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+      ) AS t
+  ) AS pt ON pp.Id = pt.Id
+  LEFT JOIN top_tags tt ON pt.TagName = tt.TagName
+WHERE 
+  pu.Id IN (SELECT Id FROM top_users)
+GROUP BY 
+  pu.Id,
+  pu.Reputation,
+  pu.DisplayName,
+  pp.Id,
+  pp.ViewCount,
+  pp.Title,
+  upc.post_count,
+  ascpt.avg_score,
+  pcc.comment_count,
+  pvc.vote_count
+ORDER BY 
+  pu.Reputation DESC;

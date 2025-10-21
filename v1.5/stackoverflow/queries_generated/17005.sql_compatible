@@ -1,0 +1,147 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(DATE '2024-10-01', u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) AS MedianPositiveScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < DATE '2024-10-01' - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.Score) AS MaxQuestionScore,
+        STDDEV(p.Score) AS ScoreStdDev,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        DENSE_RANK() OVER (ORDER BY AVG(p.Score) DESC NULLS LAST) AS QualityRank
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+        AND p.Score IS NOT NULL
+        AND t.Count >= 100
+    GROUP BY t.TagName, t.Count
+),
+EditPatterns AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE 0 END) AS HasRollback,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate,
+        EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 3600 AS EditSpanHours
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY ph.PostId
+),
+ComplexQuestions AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        SUBSTRING(q.Title FROM 1 FOR 50) || CASE WHEN LENGTH(q.Title) > 50 THEN '...' ELSE '' END AS TruncatedTitle,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        um.DisplayName AS AskerName,
+        um.Reputation AS AskerReputation,
+        um.AvgPostScore AS AskerAvgScore,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS Status,
+        COALESCE(ep.EditCount, 0) AS EditCount,
+        COALESCE(ep.HasRollback, 0) AS HasRollback,
+        LAG(q.Score, 1) OVER (PARTITION BY um.Id ORDER BY q.CreationDate) AS PrevQuestionScore,
+        LEAD(q.Score, 1) OVER (PARTITION BY um.Id ORDER BY q.CreationDate) AS NextQuestionScore,
+        ROW_NUMBER() OVER (PARTITION BY um.Id ORDER BY q.Score DESC NULLS LAST) AS UserScoreRank,
+        NTILE(4) OVER (ORDER BY q.ViewCount DESC NULLS LAST) AS ViewQuartile
+    FROM Posts q
+    INNER JOIN UserMetrics um ON q.OwnerUserId = um.Id
+    LEFT JOIN EditPatterns ep ON q.Id = ep.PostId
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+        AND (q.Score >= 5 OR q.ViewCount >= 1000)
+)
+SELECT 
+    cq.QuestionId,
+    cq.TruncatedTitle,
+    cq.AskerName,
+    COALESCE(CAST(cq.AskerReputation AS VARCHAR), 'N/A') AS AskerReputation,
+    cq.QuestionScore || ' (' || 
+        CASE 
+            WHEN cq.QuestionScore > COALESCE(cq.PrevQuestionScore, cq.QuestionScore) THEN '↑'
+            WHEN cq.QuestionScore < COALESCE(cq.PrevQuestionScore, cq.QuestionScore) THEN '↓'
+            ELSE '='
+        END || ')' AS ScoreTrend,
+    cq.ViewCount || ' views (Q' || cq.ViewQuartile || ')' AS ViewInfo,
+    cq.Status,
+    COALESCE(
+        (SELECT STRING_AGG(ta.TagName || ' (R' || ta.PopularityRank || ')', ', ' ORDER BY ta.PopularityRank)
+         FROM TagAnalysis ta
+         WHERE POSITION('<' || ta.TagName || '>' IN p.Tags) > 0
+         LIMIT 3),
+        'No popular tags'
+    ) AS TopTags,
+    cq.AnswerCount || ' answers' || 
+        CASE 
+            WHEN a.TopAnswerScore IS NOT NULL THEN ' (best: ' || a.TopAnswerScore || ')'
+            ELSE ''
+        END AS AnswerInfo,
+    CASE 
+        WHEN cq.EditCount > 5 THEN 'Heavily edited (' || cq.EditCount || 'x)'
+        WHEN cq.HasRollback = 1 THEN 'Has rollbacks'
+        WHEN cq.EditCount > 0 THEN 'Edited ' || cq.EditCount || 'x'
+        ELSE 'No edits'
+    END AS EditStatus,
+    COALESCE(
+        (SELECT COUNT(DISTINCT c.UserId) 
+         FROM Comments c 
+         WHERE c.PostId = cq.QuestionId 
+            AND c.UserId IS NOT NULL
+            AND c.UserId NOT IN (cq.QuestionId, a.TopAnswererId)),
+        0
+    ) AS UniqueCommenters,
+    ROUND(
+        cq.QuestionScore::NUMERIC / NULLIF(cq.ViewCount, 0) * 1000,
+        2
+    ) AS ScorePerThousandViews
+FROM ComplexQuestions cq
+INNER JOIN Posts p ON cq.QuestionId = p.Id
+LEFT JOIN LATERAL (
+    SELECT 
+        MAX(ans.Score) AS TopAnswerScore,
+        (ARRAY_AGG(ans.OwnerUserId ORDER BY ans.Score DESC NULLS LAST))[1] AS TopAnswererId
+    FROM Posts ans
+    WHERE ans.ParentId = cq.QuestionId
+        AND ans.PostTypeId = 2
+) a ON TRUE
+WHERE cq.UserScoreRank <= 5
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph2
+        WHERE ph2.PostId = cq.QuestionId
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate > DATE '2024-10-01' - INTERVAL '30 days'
+    )
+ORDER BY 
+    cq.QuestionScore DESC NULLS LAST,
+    cq.ViewCount DESC NULLS LAST,
+    cq.QuestionId
+LIMIT 100;

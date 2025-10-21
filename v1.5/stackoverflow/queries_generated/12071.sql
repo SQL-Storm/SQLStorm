@@ -1,0 +1,120 @@
+-- {"query": "12071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 1055} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.ClosedDate IS NULL
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN 1 END) AS InitialRevisions,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS Edits,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (7, 8, 9) THEN 1 END) AS Rollbacks,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 1 END) AS StatusChanges,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 52 THEN PH.CreationDate END) AS BecameHotQuestion,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 53 THEN PH.CreationDate END) AS RemovedHotQuestion
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+),
+TagUsage AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.ViewCount) AS TotalViews,
+        SUM(P.Score) AS TotalScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostsCreated,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        COUNT(DISTINCT V.Id) AS VotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    TU.TagName,
+    TU.PostCount,
+    TU.TotalViews,
+    TU.TotalScore,
+    PHS.InitialRevisions,
+    PHS.Edits,
+    PHS.Rollbacks,
+    PHS.StatusChanges,
+    PHS.BecameHotQuestion,
+    PHS.RemovedHotQuestion,
+    UA.PostsCreated,
+    UA.CommentsMade,
+    UA.VotesCast,
+    UA.Upvotes,
+    UA.Downvotes,
+    (TU.TotalScore + RP.Score) AS CombinedScore
+FROM 
+    RankedPosts RP
+JOIN 
+    TagUsage TU ON POSITION(TU.TagName IN RP.Tags) > 0
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+WHERE 
+    RP.PostRank <= 10
+ORDER BY 
+    RP.PostRank, TU.TotalScore DESC, RP.Score DESC;

@@ -1,0 +1,140 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(DATE '2024-10-01' - u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(NULLIF(p.Score, 0)), 0) AS AvgNonZeroScore,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1 AND b.TagBased = '0') AS NamedGoldBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.LastAccessDate > (DATE '2024-10-01' - INTERVAL '180 days')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TagExperts AS (
+    SELECT 
+        t.TagName,
+        p.OwnerUserId,
+        COUNT(*) AS TagAnswers,
+        SUM(p.Score) AS TagScore,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC, COUNT(*) DESC) AS TagRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianAnswerScore
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM (
+            SELECT TRIM(x) AS value
+            FROM (
+                SELECT substring(q.Tags, 2, LENGTH(q.Tags) - 2) AS tags
+            ) s
+            CROSS JOIN LATERAL UNNEST(string_to_array(tags, '><')) AS x
+        ) t1
+    ) AS tag_array
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND p.OwnerUserId IS NOT NULL
+        AND t.Count > 100
+    GROUP BY t.TagName, p.OwnerUserId
+),
+EditPatterns AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) AS RollbackCount,
+        AVG(LENGTH(ph.Text)) FILTER (WHERE ph.Text IS NOT NULL) AS AvgEditSize,
+        EXTRACT(HOUR FROM ph.CreationDate) AS EditHour,
+        COUNT(*) AS HourlyEditCount,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate) AS PrevEditTime,
+        ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate) AS TimeBetweenEdits
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.CreationDate > (DATE '2024-10-01' - INTERVAL '365 days')
+    GROUP BY ph.UserId, EXTRACT(HOUR FROM ph.CreationDate), ph.CreationDate
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    UPPER(SUBSTRING(um.Location FROM 1 FOR 3)) || CASE 
+        WHEN LENGTH(um.Location) > 20 THEN '...' 
+        ELSE REPEAT('*', GREATEST(0, 5 - LENGTH(um.Location)))
+    END AS LocationCode,
+    CONCAT(um.YearsActive, ' years') AS Tenure,
+    um.QuestionCount + um.AnswerCount AS TotalPosts,
+    ROUND(CASE WHEN um.QuestionCount = 0 THEN NULL ELSE CAST(um.AnswerCount AS numeric) / um.QuestionCount END, 2) AS AnswerQuestionRatio,
+    um.TotalPostScore,
+    ROUND(um.AvgNonZeroScore, 2) AS AvgNonZeroScore,
+    CONCAT(um.GoldBadges, '/', um.SilverBadges) AS BadgeRatio,
+    COALESCE(um.NamedGoldBadges, 'None') AS EliteBadges,
+    (
+        SELECT STRING_AGG(te.TagName || '(#' || te.TagRank || ')', ', ' ORDER BY te.TagScore DESC)
+        FROM TagExperts te
+        WHERE te.OwnerUserId = um.Id
+            AND te.TagRank <= 10
+        LIMIT 5
+    ) AS TopTagExpertise,
+    COALESCE(ep.TotalEdits, 0) AS EditContributions,
+    COALESCE(ep.MostActiveHour, -1) AS PeakEditHour,
+    COALESCE(ep.AvgEditInterval, INTERVAL '0') AS TypicalEditGap,
+    CASE 
+        WHEN um.Reputation > 100000 THEN 'Legendary'
+        WHEN um.Reputation > 50000 THEN 'Epic'
+        WHEN um.Reputation > 25000 THEN 'Trusted'
+        WHEN um.Reputation > 10000 THEN 'Established'
+        WHEN um.Reputation > 5000 THEN 'Active'
+        ELSE 'Rising'
+    END AS UserTier,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.AcceptedAnswerId IN (
+            SELECT p3.Id 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = um.Id
+        )
+        AND p2.Score > 100
+    ) AS HasHighlyAcceptedAnswer,
+    (
+        SELECT COUNT(DISTINCT v.PostId)
+        FROM Votes v
+        INNER JOIN Posts vp ON v.PostId = vp.Id
+        WHERE v.UserId = um.Id
+            AND v.VoteTypeId = 2
+            AND vp.OwnerUserId != um.Id
+            AND vp.Score < 0
+    ) AS AltruisticUpvotes
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT 
+        UserId,
+        SUM(EditCount + RollbackCount) AS TotalEdits,
+        MODE() WITHIN GROUP (ORDER BY HourlyEditCount DESC) AS MostActiveHour,
+        AVG(TimeBetweenEdits) FILTER (WHERE TimeBetweenEdits < INTERVAL '7 days') AS AvgEditInterval
+    FROM EditPatterns
+    WHERE UserId = um.Id
+    GROUP BY UserId
+) ep ON true
+WHERE um.PostCount > 10
+    AND (um.GoldBadges > 0 OR um.TotalPostScore > 500)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph2
+        WHERE ph2.UserId = um.Id
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate > (DATE '2024-10-01' - INTERVAL '30 days')
+    )
+ORDER BY 
+    um.Reputation DESC,
+    um.TotalPostScore DESC,
+    COALESCE(ep.TotalEdits, 0) DESC
+LIMIT 100;

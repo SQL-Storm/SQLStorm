@@ -1,0 +1,136 @@
+-- {"query": "4031.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1363} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.IsModeratorOnly, 0) as IsModeratorOnly,
+        coalesce(t.IsRequired, 0) as IsRequired,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where not exists (
+        select 1 from Posts p
+        join PostLinks pl on pl.PostId = p.Id
+        where p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    )
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        rh.Level + 1,
+        rh.Path || t.Id
+    from Tags t
+    join Posts p on p.Tags like '%' || t.TagName || '%'
+    join PostLinks pl on pl.RelatedPostId = p.Id
+    join RecursiveTagHierarchy rh on rh.Id = pl.PostId
+    where not t.Id = any(rh.Path)
+),
+UserBadgeVoteStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        bool_or(b.TagBased=1) as HasTagBasedBadge,
+        coalesce(sum(v.VoteTypeId = 2::smallint)::int,0) as UpVotesReceived,
+        coalesce(sum(v.VoteTypeId = 3::smallint)::int,0) as DownVotesReceived,
+        row_number() over (order by count(distinct b.Id) desc, u.Reputation desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    group by u.Id, u.DisplayName
+),
+PostActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        case when p.ClosedDate is not null then 'Closed' else 'Open' end as State,
+        (select count(1) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(1) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as DuplicateCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankInType
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2)
+),
+AcceptedAnswerInfo as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswererName,
+        (select count(1) from Comments c where c.PostId = a.Id) as AnswerCommentCount,
+        (select sum(v.VoteTypeId = 2::smallint)::int from Votes v where v.PostId = a.Id) as UpVotes,
+        (select sum(v.VoteTypeId = 3::smallint)::int from Votes v where v.PostId = a.Id) as DownVotes
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+UserLastActivity as (
+    select
+      u.Id,
+      u.DisplayName,
+      max(ph.CreationDate) as LastPostEditDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    p.Id as QuestionId,
+    p.Title as QuestionTitle,
+    p.Tags as QuestionTags,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerName,
+    p.State,
+    p.CommentCount as QuestionComments,
+    p.DuplicateCount,
+    a.Id as AcceptedAnswerId,
+    a.AnswerScore,
+    a.AnswerCreationDate,
+    a.AnswererName,
+    a.AnswerCommentCount,
+    a.UpVotes as AnswerUpVotes,
+    a.DownVotes as AnswerDownVotes,
+    ub.BadgeCount as QuestionOwnerBadgeCount,
+    ub.HasTagBasedBadge,
+    ub.BadgeRank,
+    ula.LastPostEditDate,
+    coalesce(array_to_string(array_agg(distinct rth.TagName), ' > ') filter (where rth.Level > 0), '(none)') as RelatedTagHierarchyPath
+from PostActivity p
+left join AcceptedAnswerInfo a on a.ParentId = p.Id and p.AcceptedAnswerId = a.Id
+left join UserBadgeVoteStats ub on ub.UserId = p.OwnerUserId
+left join UserLastActivity ula on ula.Id = p.OwnerUserId
+left join RecursiveTagHierarchy rth on rth.Id = any(
+    select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')::int[])
+)
+where p.PostTypeId = 1
+and (p.State = 'Open' or (p.State = 'Closed' and p.ClosedDate > current_date - interval '365 days'))
+and (
+    p.Score > 10 or
+    p.ViewCount > 1000 or
+    exists (
+        select 1 from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 2 and v2.CreationDate > current_date - interval '90 days'
+    )
+)
+group by
+    p.Id, a.Id, a.AnswerScore, a.AnswerCreationDate, a.AnswererName,
+    a.AnswerCommentCount, a.UpVotes, a.DownVotes,
+    p.Title, p.Tags, p.Score, p.ViewCount, p.OwnerUserId, p.OwnerName,
+    p.State, p.CommentCount, p.DuplicateCount,
+    ub.BadgeCount, ub.HasTagBasedBadge, ub.BadgeRank,
+    ula.LastPostEditDate
+order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST
+limit 100;

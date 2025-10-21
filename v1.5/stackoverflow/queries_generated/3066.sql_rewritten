@@ -1,0 +1,185 @@
+-- {"query": "3066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1225} 
+WITH PostStatistics AS (
+    SELECT 
+        p.Id AS PostID,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        u.Reputation,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY p.Id) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) OVER (PARTITION BY p.Id) AS DownVotes,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountTotal,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN am.PostId END) AS AcceptedAnswerId,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN pa.CreationDate END) AS AcceptedAnswerDate
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Posts am ON p.AcceptedAnswerId = am.Id
+    LEFT JOIN 
+        Posts pa ON p.AcceptedAnswerId = pa.Id
+),
+AnswerAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerId,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.OwnerUserId AS QuestionOwnerId
+    FROM 
+        Posts a
+    JOIN 
+        Posts q ON a.ParentId = q.Id
+    WHERE 
+        a.PostTypeId = 2
+),
+BadgeAggregates AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserID,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges
+    FROM 
+        Users u
+    LEFT JOIN
+        BadgeAggregates ub ON u.Id = ub.UserId
+    WHERE
+        u.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+),
+PostTags AS (
+    SELECT
+        p.Id AS PostID,
+        UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS TagName
+    FROM 
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+TagUsage AS (
+    SELECT
+        TagName,
+        COUNT(*) AS UsageCount
+    FROM
+        PostTags
+    GROUP BY
+        TagName
+),
+LatestComments AS (
+    SELECT
+        c.PostId,
+        c.Id AS CommentId,
+        c.CreationDate,
+        c.UserDisplayName,
+        c.Text,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM
+        Comments c
+),
+RecentComments AS (
+    SELECT
+        PostId,
+        CommentId,
+        CreationDate,
+        UserDisplayName,
+        Text
+    FROM
+        LatestComments
+    WHERE
+        rn = 1
+),
+FinalResult AS (
+    SELECT
+        ps.PostID,
+        ps.PostTypeId,
+        ps.CreationDate,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Title,
+        ps.Tags,
+        ps.OwnerUserId,
+        ps.LastActivityDate,
+        us.Reputation,
+        ps.UpVotes,
+        ps.DownVotes,
+        ps.CommentCountTotal,
+        ps.AcceptedAnswerId,
+        ps.AcceptedAnswerDate,
+        aa.AnswerId,
+        aa.AnswerCreationDate,
+        aa.AnswerScore,
+        aa.AnswerOwnerId,
+        aa.QuestionId,
+        aa.QuestionTitle,
+        aa.QuestionTags,
+        aa.QuestionOwnerId,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        tc.CommentId AS MostRecentCommentId,
+        tc.CreationDate AS CommentDate,
+        tc.UserDisplayName AS CommentUser,
+        tc.Text AS CommentText
+    FROM
+        PostStatistics ps
+    LEFT JOIN
+        ActiveUsers us ON ps.OwnerUserId = us.UserID
+    LEFT JOIN
+        AnswerAnswers aa ON ps.PostID = aa.AnswerId
+    LEFT JOIN
+        RecentComments tc ON ps.PostID = tc.PostId
+)
+SELECT
+    *
+FROM
+    FinalResult
+WHERE
+    -- Filtering posts that are questions with more than 5 answers and at least 10 comments
+    PostTypeId = 1
+    AND AnswerCount > 5
+    AND CommentCount > 10
+    -- Posts created more than one year ago
+    AND CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    -- Tag 'sql' included in tags
+    AND 'sql' = ANY (string_to_array(substring(Tags from 2 for char_length(Tags)-2), '><'))
+ORDER BY
+    LastActivityDate DESC
+LIMIT 100;

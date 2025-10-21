@@ -1,0 +1,186 @@
+-- {"query": "3025.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1329} 
+WITH RecentPostEdits AS (
+    SELECT
+        ph.PostId,
+        ARRAY_AGG(DISTINCT th.Name) AS ChangeTypes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(ph.Id) AS EditCount
+    FROM
+        PostHistory ph
+        JOIN PostHistoryTypes th ON ph.PostHistoryTypeId = th.Id
+    WHERE
+        th.Name LIKE '%Edit%'
+    GROUP BY
+        ph.PostId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUsageCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM
+        Tags t
+    WHERE
+        t.IsModeratorOnly = FALSE
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(COALESCE(v.Score, 0)) AS AvgVoteScore
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    GROUP BY
+        u.Id, u.DisplayName
+),
+ActiveQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ac.EditCount,
+        ac.LastEditDate,
+        ac.ChangeTypes
+    FROM
+        Posts p
+        LEFT JOIN RecentPostEdits ac ON p.Id = ac.PostId
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+        AND (p.Score >= 5 OR p.ViewCount >= 100)
+        AND p.AnswerCount > 0
+        AND EXISTS (
+            SELECT 1 FROM Votes v
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        )
+),
+FilteredQuestions AS (
+    SELECT
+        aq.QuestionId,
+        aq.Title,
+        aq.Tags,
+        aq.Score,
+        aq.ViewCount,
+        aq.CreationDate,
+        aq.LastActivityDate,
+        aq.EditCount,
+        aq.LastEditDate,
+        aq.ChangeTypes,
+        unnest(string_to_array(substring(aq.Tags, 2, length(aq.Tags) - 2), '><')) AS TagElement
+    FROM
+        ActiveQuestions aq
+),
+TagSummary AS (
+    SELECT
+        TagElement,
+        COUNT(*) AS AssociatedQuestions,
+        STRING_AGG(DISTINCT Title, ', ' ORDER BY Title) AS SampleQuestions
+    FROM
+        FilteredQuestions
+    GROUP BY
+        TagElement
+),
+MostRecentAnswers AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        MAX(p.CreationDate) AS LastAnswerDate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.ParentId
+),
+VotesPerPost AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 12) AS AcceptedVotes
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+),
+PostWithDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        rp.LastAnswerDate,
+        uv.UserId AS LastEditorId,
+        uv.DisplayName AS LastEditorName,
+        vps.Upvotes,
+        vps.Downvotes,
+        vps.AcceptedVotes
+    FROM
+        Posts p
+        LEFT JOIN MostRecentAnswers rp ON p.Id = rp.QuestionId
+        LEFT JOIN Users uv ON p.LastEditorUserId = uv.Id
+        LEFT JOIN VotesPerPost vps ON p.Id = vps.PostId
+    WHERE
+        p.PostTypeId = 1
+),
+CrossJoinTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+TagQuestionsCount AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT PostId) AS QuestionCount
+    FROM
+        CrossJoinTags
+    GROUP BY
+        Tag
+)
+SELECT
+    pwd.Id AS PostId,
+    pwd.Title,
+    pwd.Score,
+    pwd.ViewCount,
+    pwd.CreationDate,
+    pwd.LastActivityDate,
+    pwd.LastAnswerDate,
+    pwd.LastEditorName,
+    COALESCE(vp.Upvotes, 0) AS Upvotes,
+    COALESCE(vp.Downvotes, 0) AS Downvotes,
+    COALESCE(vp.AcceptedVotes, 0) AS AcceptedVotes,
+    array_agg(DISTINCT t.Tag) FILTER (WHERE t.Tag IS NOT NULL) AS TagsArray,
+    st.TagUsageCount,
+    st.SampleQuestions,
+    uc.QuestionCount AS TagQuestionCount
+FROM
+    PostWithDetails pwd
+    LEFT JOIN VotesPerPost vp ON pwd.Id = vp.PostId
+    LEFT JOIN LATERAL (
+        SELECT
+            unnest(string_to_array(substring(pwd.Tags, 2, length(pwd.Tags) - 2), '><')) AS Tag
+    ) t ON TRUE
+    LEFT JOIN TopTags st ON t.Tag = st.TagName
+    LEFT JOIN TagQuestionsCount uc ON t.Tag = uc.Tag
+GROUP BY
+    pwd.Id, pwd.Title, pwd.Score, pwd.ViewCount, pwd.CreationDate, pwd.LastActivityDate,
+    pwd.LastAnswerDate, pwd.LastEditorName, vp.Upvotes, vp.Downvotes, vp.AcceptedVotes,
+    st.TagUsageCount, st.SampleQuestions
+ORDER BY
+    pwd.LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,64 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswers,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT v.Id) AS VotesGiven,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+    COUNT(DISTINCT ph.Id) AS EditHistoryCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN ph.Id END) AS TitleBodyTagEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ClosureRelatedEdits,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.ViewCount) AS MaxViewCount,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(DISTINCT CASE WHEN p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30' DAY) THEN p.Id END) AS RecentPosts30Days,
+    COUNT(DISTINCT CASE WHEN p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '7' DAY) THEN p.Id END) AS RecentPosts7Days,
+    COUNT(DISTINCT CASE WHEN p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1' DAY) THEN p.Id END) AS RecentPosts1Day,
+    COUNT(DISTINCT pl.Id) AS PostLinksCreated,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateLinks,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS RegularLinks,
+    COUNT(DISTINCT t.Id) AS TagsUsed,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS TagList,
+    COUNT(DISTINCT CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN p.Id END) AS TaggedPosts,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.CommentCount > 0 THEN p.Id END) AS CommentedPosts,
+    COUNT(DISTINCT CASE WHEN p.FavoriteCount > 0 THEN p.Id END) AS FavoritedPosts,
+    COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedPosts,
+    COUNT(DISTINCT CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN p.Id END) AS CommunityOwnedPosts,
+    COUNT(DISTINCT CASE WHEN p.Score >= 100 THEN p.Id END) AS HighScorePosts,
+    COUNT(DISTINCT CASE WHEN p.Score >= 500 THEN p.Id END) AS VeryHighScorePosts,
+    COUNT(DISTINCT CASE WHEN p.Score >= 1000 THEN p.Id END) AS LegendaryScorePosts
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.CreationDate
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE u.Id IN (
+    SELECT Id
+    FROM (
+        SELECT Id
+        FROM Users
+        WHERE Reputation > 1000
+        ORDER BY Reputation DESC
+        LIMIT 1000
+    ) AS sub
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC
+LIMIT 100;

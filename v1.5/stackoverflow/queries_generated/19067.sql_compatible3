@@ -1,0 +1,205 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEvents,
+        SUM(P.ViewCount) AS TotalPostViews,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(U.LastAccessDate) AS UserLastActivityDate
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1
+    LEFT JOIN
+        Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        PostHistory PH ON U.Id = PH.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    WHERE
+        U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Title,
+        P.Tags,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotesReceived,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenEvents,
+        MIN(CASE WHEN V_ACC.VoteTypeId = 1 THEN V_ACC.CreationDate ELSE NULL END) AS AcceptedAnswerVoteDate,
+        STRING_AGG(DISTINCT Tag.TagName, ',') FILTER (WHERE P.Tags IS NOT NULL) AS ParsedTagsList
+    FROM
+        Posts P
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN
+        Votes V_ACC ON P.AcceptedAnswerId = V_ACC.PostId AND V_ACC.VoteTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS TagName
+    ) AS Tag ON P.Tags IS NOT NULL
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Title, P.Tags, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastEditDate
+),
+PostControversy AS (
+    SELECT
+        PM.PostId,
+        PM.OwnerUserId,
+        PM.PostTypeId,
+        PM.PostCreationDate,
+        PM.Title,
+        PM.Tags,
+        PM.PostScore,
+        PM.PostViewCount,
+        PM.EditCount,
+        PM.CloseEvents,
+        PM.ReopenEvents,
+        PM.UpVotesReceived,
+        PM.DownVotesReceived,
+        PM.FavoriteVotesReceived,
+        PM.AcceptedAnswerVoteDate,
+        PM.ParsedTagsList,
+        (CAST(PM.DownVotesReceived AS numeric) / NULLIF(CAST(PM.UpVotesReceived AS numeric), 0)) AS DownvoteRatio,
+        (PM.EditCount * 0.5) + (PM.CloseEvents * 5) + (PM.ReopenEvents * 10) +
+        COALESCE((CAST(PM.DownVotesReceived AS numeric) / NULLIF(CAST(PM.UpVotesReceived AS numeric) + CAST(PM.DownVotesReceived AS numeric), 0)) * 100, 0) AS ControversyScore,
+        EXTRACT(EPOCH FROM (PM.LastEditDate - PM.PostCreationDate)) / 3600 AS TimeToLastEditHours
+    FROM
+        PostMetrics PM
+    WHERE
+        PM.PostTypeId = 1
+),
+AggregatedTagStats AS (
+    SELECT
+        Tag.TagName,
+        COUNT(DISTINCT P.Id) AS TotalQuestionsWithTag,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(P.ViewCount) AS TotalTagViews,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueQuestionOwners
+    FROM
+        Posts P
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS TagName
+    ) AS Tag ON P.Tags IS NOT NULL
+    WHERE
+        P.PostTypeId = 1 AND Tag.TagName IS NOT NULL
+    GROUP BY
+        Tag.TagName
+)
+SELECT
+    UA.DisplayName AS UserDisplayName,
+    UA.Reputation,
+    UA.TotalPosts,
+    UA.TotalComments,
+    UA.TotalPostHistoryEvents AS TotalEditsAndOtherHistory,
+    PC.Title AS ControversialPostTitle,
+    PC.PostCreationDate,
+    PC.PostScore AS ControversialPostScore,
+    PC.EditCount AS PostEditCount,
+    PC.CloseEvents AS PostCloseCount,
+    PC.ReopenEvents AS PostReopenCount,
+    PC.DownVotesReceived AS PostDownVotes,
+    PC.UpVotesReceived AS PostUpVotes,
+    PC.DownvoteRatio,
+    PC.ControversyScore,
+    PC.ParsedTagsList AS PostTags,
+    ATS.TotalQuestionsWithTag AS RelatedTagQuestionCount,
+    ATS.AvgTagScore AS RelatedTagAvgScore,
+    ATS.TotalTagViews AS RelatedTagTotalViews,
+    LAG(PC.ControversyScore, 1, 0) OVER (PARTITION BY UA.UserId ORDER BY PC.PostCreationDate) AS PrevPostControversyScore,
+    RANK() OVER (PARTITION BY PC.PostTypeId ORDER BY PC.ControversyScore DESC, PC.PostCreationDate DESC) AS ControversyRankForPostType,
+    CASE
+        WHEN UA.Reputation > 5000 AND PC.ControversyScore > 20 THEN 'High-Rep User, High-Controversy Post'
+        WHEN UA.Reputation BETWEEN 1000 AND 5000 AND PC.ControversyScore > 10 THEN 'Mid-Rep User, Mid-Controversy Post'
+        WHEN UA.Reputation < 1000 AND PC.ControversyScore > 5 THEN 'Low-Rep User, Moderate-Controversy Post'
+        ELSE 'Other Post Activity'
+    END AS UserPostCategoryClassification,
+    COALESCE(UA.DisplayName, 'Community User') AS DisplayNameWithFallback,
+    (
+        SELECT COUNT(DISTINCT B_INNER.Id)
+        FROM Badges B_INNER
+        WHERE B_INNER.UserId = UA.UserId
+          AND B_INNER.Name IN ('Good Question', 'Great Question', 'Enthusiast', 'Fanatic')
+          AND B_INNER.Class = 1
+    ) AS UserGoldBadgesCountForGoodQuestions,
+    (
+        SELECT
+            COUNT(DISTINCT PH_INNER.UserId)
+        FROM
+            PostHistory PH_INNER
+        LEFT JOIN
+            CloseReasonTypes CRT ON PH_INNER.PostHistoryTypeId = 10 AND PH_INNER.Comment = CAST(CRT.Id AS VARCHAR)
+        WHERE
+            PH_INNER.PostId = PC.PostId
+            AND PH_INNER.PostHistoryTypeId = 10
+            AND (CRT.Name IN ('Duplicate', 'Off-topic') OR PH_INNER.Comment IS NULL)
+    ) AS UniqueClosersForSpecificReasons,
+    (PC.ClosedDate IS NOT NULL AND PC.ReopenEvents > 0 AND (PC.LastEditDate - PC.ClosedDate) < INTERVAL '90 days') AS ReopenedQuicklyAfterCloseFlag,
+    (
+        SELECT AVG(C_AVG.Score) FROM Comments C_AVG WHERE C_AVG.PostId = PC.PostId
+    ) AS AverageCommentScoreOnPost,
+    CONCAT(
+        UPPER(SUBSTRING(COALESCE(UA.DisplayName, 'ANONYMOUS'), 1, 1)),
+        LOWER(SUBSTRING(COALESCE(UA.DisplayName, 'ANONYMOUS'), 2, 3))
+    ) AS DisplayNameAbbreviation
+FROM
+    UserActivity UA
+INNER JOIN
+    PostControversy PC ON UA.UserId = PC.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT
+        TagName,
+        TotalQuestionsWithTag,
+        AvgTagScore,
+        TotalTagViews
+    FROM
+        AggregatedTagStats
+    WHERE
+        PC.Tags LIKE CONCAT('%<', AggregatedTagStats.TagName, '%')
+    ORDER BY
+        AggregatedTagStats.TotalQuestionsWithTag DESC
+    LIMIT 1
+) ATS ON TRUE
+WHERE
+    PC.ControversyScore > 10
+    AND UA.TotalPosts > 10
+    AND UA.Reputation > 500
+    AND (
+        (PC.DownVotesReceived > UA.UpVotes / 10 AND PC.PostScore < 0)
+        OR (PC.EditCount > 5 AND PC.ReopenEvents > 0 AND PC.CloseEvents > 0)
+        OR (PC.TimeToLastEditHours IS NOT NULL AND PC.TimeToLastEditHours < 24 AND PC.ControversyScore > 15)
+    )
+ORDER BY
+    PC.ControversyScore DESC, UA.DisplayName, PC.PostCreationDate
+LIMIT 250;

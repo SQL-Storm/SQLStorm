@@ -1,0 +1,46 @@
+-- {"query": "6044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 605} 
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  pc.CountComments,
+  pv.UpVotes,
+  pv.DownVotes,
+  COALESCE(pt.Name, 'Unknown') AS PostType,
+  STRING_AGG(CASE WHEN v.VoteTypeId IN (2,14,16) THEN 'positive' WHEN v.VoteTypeId IN (3,10,12) THEN 'negative' ELSE 'other' END, ';') WITHIN GROUP (ORDER BY v.CreationDate) AS VotePattern,
+  ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagsArray,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedCount,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+  (SELECT EXISTS (
+        SELECT 1
+        FROM Posts a
+        JOIN Votes vo ON a.Id = vo.PostId
+        WHERE a.OwnerUserId = u.Id AND vo.VoteTypeId = 14
+        LIMIT 1
+      )) AS HasModeratorVotes
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN (SELECT PostId, COUNT(*) AS CountComments FROM Comments WHERE PostId IS NOT NULL GROUP BY PostId) pc ON pc.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN (SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes FROM Votes GROUP BY PostId) pv ON pv.PostId = p.Id
+  LEFT JOIN LATERAL (
+      SELECT t.TagName
+      FROM UNNEST(STRING_TO_ARRAY(p.Tags, '><')) AS t
+      LEFT JOIN Tags tg ON tg.TagName = t.TagName
+      LIMIT 1
+  ) t ON TRUE
+WHERE
+  p.CreationDate >= DATE_TRUNC('year', NOW()) - INTERVAL '1 year'
+  AND p.PostTypeId IN (1, 2)
+  AND (p.Score IS NULL OR p.Score >= 0)
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation, p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, pt.Name, pc.CountComments, pv.UpVotes, pv.DownVotes
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

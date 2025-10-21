@@ -1,0 +1,57 @@
+WITH UserPostStatistics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBountyAmount,
+        AVG(u.Reputation) AS AvgReputation,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (8, 9)
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostHistoryDetails AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 END) AS ReopenCount,
+        STRING_AGG(DISTINCT pht.Name, ', ') FILTER (WHERE ph.Comment IS NOT NULL) AS HistoryComments
+    FROM 
+        PostHistory ph
+    JOIN 
+        PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    GROUP BY 
+        ph.PostId, ph.CreationDate
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.PostCount,
+    ups.CommentCount,
+    ups.TotalBountyAmount,
+    ups.AvgReputation,
+    COALESCE(p.Header, 'No Header') AS PostHeader,
+    COALESCE(p.CloseCount, 0) AS CloseCount,
+    COALESCE(p.ReopenCount, 0) AS ReopenCount,
+    COALESCE(p.HistoryComments, 'No Comments') AS HistoryComments
+FROM 
+    UserPostStatistics ups
+LEFT JOIN 
+    PostHistoryDetails p ON p.PostId = ups.UserId
+INNER JOIN 
+    Posts post ON post.OwnerUserId = ups.UserId
+WHERE 
+    ups.PostCount > 5 
+    AND ups.AvgReputation > 1000
+ORDER BY 
+    ups.PostRank
+OFFSET 10 ROWS FETCH NEXT 10 ROWS ONLY;

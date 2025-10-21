@@ -1,0 +1,325 @@
+with recent_activity as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        p.creationdate,
+        p.lastactivitydate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.favoritecount,
+        p.commentcount,
+        u.displayname as owner_name,
+        u.reputation as owner_rep,
+        coalesce(u.location, 'unknown') as owner_loc,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '365 days'
+),
+tag_expanded as (
+    select
+        ra.*,
+        trim(both from t) as tag
+    from recent_activity ra
+    left join lateral unnest(
+        case
+            when ra.tags is null or length(ra.tags) < 2 then array[cast(null as varchar)]
+            else string_to_array(substr(ra.tags, 2, length(ra.tags)-2), '><')
+        end
+    ) as t on true
+),
+tag_rank as (
+    select
+        te.post_id,
+        te.tag,
+        row_number() over (partition by te.post_id order by coalesce(te.tag, '') asc) as tag_ordinal
+    from tag_expanded te
+),
+owner_baseline as (
+    select
+        ra.owneruserid,
+        count(*) as owner_posts,
+        avg(ra.score) as avg_owner_score,
+        percentile_cont(0.5) within group (order by ra.score) as med_owner_score,
+        sum(ra.viewcount) as owner_views
+    from recent_activity ra
+    where ra.owneruserid is not null
+    group by ra.owneruserid
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid in (10,12) then 1 else 0 end) as deletions_spam,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        count(*) as vote_events
+    from votes v
+    where v.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '365 days'
+    group by v.postid
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        sum(case when c.score > 0 then 1 else 0) as pos_comments,
+        sum(case when c.score < 0 then 1 else 0) as neg_comments
+    from comments c
+    where c.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '365 days'
+    group by c.postid
+),
+close_events as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as ever_closed,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as ever_reopened,
+        max(case when ph.posthistorytypeid in (10,11) then ph.creationdate else null end) as last_close_or_reopen_at,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events_count,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events_count,
+        max(nullif(regexp_replace(coalesce(ph.comment, ''), '[^0-9]', '', 'g'), '')) as last_close_reason_id_text
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as dup_links_out,
+        count(*) filter (where pl.linktypeid = 1) as linked_out,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_dups
+    from postlinks pl
+    where pl.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '365 days'
+    group by pl.postid
+),
+tag_popularity as (
+    select
+        te.tag,
+        count(distinct te.post_id) as posts_with_tag,
+        sum(te.viewcount) as views_with_tag,
+        avg(te.score) as avg_score_with_tag
+    from tag_expanded te
+    where te.tag is not null
+    group by te.tag
+),
+owner_rank as (
+    select
+        u.id as owner_id,
+        u.displayname,
+        u.reputation,
+        dense_rank() over (order by u.reputation desc nulls last) as rep_rank,
+        row_number() over (order by u.creationdate asc) as tenure_rank
+    from users u
+),
+post_scores as (
+    select
+        ra.post_id,
+        ra.posttypeid,
+        ra.owneruserid,
+        ra.title,
+        ra.tags,
+        ra.creationdate,
+        ra.lastactivitydate,
+        ra.score,
+        ra.viewcount,
+        ra.answercount,
+        ra.favoritecount,
+        ra.commentcount,
+        ra.owner_name,
+        ra.owner_rep,
+        ra.owner_loc,
+        ra.is_closed,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(va.vote_events,0) as vote_events,
+        coalesce(ca.comment_count,0) as comments_last_year,
+        coalesce(ca.max_comment_score,0) as max_comment_score,
+        coalesce(ca.pos_comments,0) as pos_comments,
+        coalesce(ca.neg_comments,0) as neg_comments,
+        coalesce(ce.ever_closed,0) as ever_closed,
+        coalesce(ce.ever_reopened,0) as ever_reopened,
+        ce.last_close_or_reopen_at,
+        coalesce(ce.close_events_count,0) as close_events_count,
+        coalesce(ce.reopen_events_count,0) as reopen_events_count,
+        coalesce(dl.dup_links_out,0) as dup_links_out,
+        coalesce(dl.linked_out,0) as linked_out,
+        coalesce(dl.distinct_dups,0) as distinct_dups,
+        case
+            when ra.viewcount = 0 or ra.viewcount is null then null
+            else cast(round( (ra.score::numeric) / nullif(ra.viewcount,0), 6) as numeric)
+        end as score_per_view,
+        case
+            when ra.answercount is null or ra.answercount = 0 then 0
+            else 1
+        end as has_answers,
+        case
+            when ra.posttypeid = 1 and ra.acceptedanswerid is not null then 1
+            else 0
+        end as has_accepted_answer
+    from recent_activity ra
+    left join vote_agg va on va.postid = ra.post_id
+    left join comment_agg ca on ca.postid = ra.post_id
+    left join close_events ce on ce.postid = ra.post_id
+    left join dup_links dl on dl.postid = ra.post_id
+),
+tag_scored as (
+    select
+        ps.*,
+        tr.tag as primary_tag,
+        tp.posts_with_tag,
+        tp.views_with_tag,
+        tp.avg_score_with_tag,
+        row_number() over (partition by ps.post_id order by tr.tag_ordinal) as tag_rownum
+    from post_scores ps
+    left join tag_rank tr on tr.post_id = ps.post_id
+    left join tag_popularity tp on tp.tag = tr.tag
+),
+post_quality as (
+    select
+        ts.*,
+        -- composite quality score with mixed signals and null logic
+        coalesce(
+            0.40 * coalesce(ts.score::numeric,0) +
+            0.20 * coalesce(ts.upvotes - ts.downvotes,0) +
+            0.10 * coalesce(ts.bounty_total::numeric / nullif(ts.viewcount,0), 0) * 100 +
+            0.10 * case when ts.is_closed = 1 then -5 else 0 end +
+            0.05 * coalesce(log10(nullif(ts.viewcount,0)), 0) +
+            0.05 * case when ts.has_answers = 1 then 2 else 0 end +
+            0.10 * coalesce(ts.max_comment_score,0)
+        , 0) as quality_score
+    from tag_scored ts
+    where ts.tag_rownum = 1 or ts.primary_tag is null
+),
+user_mix as (
+    select
+        pq.*,
+        ob.owner_posts,
+        ob.avg_owner_score,
+        ob.med_owner_score,
+        ob.owner_views,
+        ork.rep_rank,
+        ork.tenure_rank,
+        case
+            when pq.owner_rep is null then 'anonymous'
+            when pq.owner_rep >= 100000 then 'legend'
+            when pq.owner_rep >= 10000 then 'expert'
+            when pq.owner_rep >= 1000 then 'regular'
+            else 'newbie'
+        end as rep_bucket
+    from post_quality pq
+    left join owner_baseline ob on ob.owneruserid = pq.owneruserid
+    left join owner_rank ork on ork.owner_id = pq.owneruserid
+),
+question_answer_join as (
+    select
+        q.post_id as question_id,
+        q.title as question_title,
+        q.primary_tag as question_primary_tag,
+        q.quality_score as question_quality,
+        q.viewcount as question_views,
+        a.post_id as answer_id,
+        a.score as answer_score,
+        a.quality_score as answer_quality,
+        a.owner_name as answer_owner,
+        a.owner_rep as answer_owner_rep,
+        a.creationdate as answer_created
+    from user_mix q
+    left join posts qp on qp.id = q.post_id and qp.posttypeid = 1
+    left join posts ap on ap.parentid = qp.id and ap.posttypeid = 2
+    left join user_mix a on a.post_id = api.id
+),
+ranked as (
+    select
+        um.*,
+        dense_rank() over (order by um.quality_score desc nulls last) as quality_rank_desc,
+        dense_rank() over (order by um.quality_score asc nulls last) as quality_rank_asc,
+        row_number() over (
+            partition by coalesce(um.primary_tag, 'no-tag')
+            order by um.quality_score desc nulls last, um.viewcount desc nulls last
+        ) as tag_leader_rank,
+        avg(um.quality_score) over (partition by coalesce(um.rep_bucket, 'unknown')) as avg_quality_by_bucket
+    from user_mix um
+),
+extremes as (
+    select
+        r.*
+    from ranked r
+    where r.quality_rank_desc <= 50
+    union all
+    select
+        r.*
+    from ranked r
+    where r.quality_rank_asc <= 50
+),
+final as (
+    select
+        e.post_id,
+        e.title,
+        e.primary_tag,
+        e.owner_name,
+        e.owner_rep,
+        e.rep_bucket,
+        e.viewcount,
+        e.score,
+        e.upvotes,
+        e.downvotes,
+        e.comments_last_year,
+        e.dup_links_out,
+        e.distinct_dups,
+        e.is_closed,
+        e.ever_closed,
+        e.ever_reopened,
+        e.close_events_count,
+        e.reopen_events_count,
+        e.score_per_view,
+        e.quality_score,
+        e.quality_rank_desc,
+        e.quality_rank_asc,
+        e.tag_leader_rank,
+        e.avg_quality_by_bucket,
+        coalesce(e.primary_tag, 'no-tag') || '|' || coalesce(e.owner_loc, 'unknown') as tag_loc_key,
+        case
+            when e.primary_tag is null then null
+            when e.avg_owner_score is null then null
+            else e.avg_owner_score - coalesce(e.avg_score_with_tag, 0)
+        end as owner_vs_tag_avg_diff,
+        case when e.viewcount > 0 then e.favoritecount::numeric / e.viewcount else null end as favorite_rate
+    from extremes e
+)
+select
+    f.*,
+    qaj.answer_id,
+    qaj.answer_score,
+    qaj.answer_quality,
+    qaj.answer_owner,
+    qaj.answer_owner_rep
+from final f
+left join question_answer_join qaj on qaj.question_id = f.post_id
+where
+    (
+        (f.is_closed = 0 or f.is_closed is null)
+        and (f.ever_closed = 0 or f.ever_reopened = 1)
+    )
+    and coalesce(f.upvotes - f.downvotes, 0) >= -5
+    and (
+        f.primary_tag is null
+        or f.posts_with_tag >= 10
+        or (f.views_with_tag is not null and f.views_with_tag > 1000)
+    )
+    and (
+        f.rep_bucket in ('legend','expert')
+        or (f.rep_bucket = 'regular' and f.quality_score > 0)
+        or f.rep_bucket is null
+    )
+order by
+    f.quality_rank_desc,
+    f.tag_leader_rank nulls last,
+    f.viewcount desc nulls last
+limit 500;

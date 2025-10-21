@@ -1,0 +1,180 @@
+with
+-- top contributors by accepted answers and activity decayed by age
+user_activity as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    count(distinct case when p.posttypeid=2 and exists(select 1 from posts q where q.id=p.parentid and q.acceptedanswerid=p.id) then p.id end) as accepted_answers,
+    count(distinct p.id) filter (where p.posttypeid in (1,2)) as posts_count,
+    max(p.creationdate) as last_post,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(max(p.creationdate), u.creationdate)))/86400.0 as days_since_last_post,
+    -- recency weight: recent activity counts more
+    (count(distinct p.id) * 1.0) / (1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(max(p.creationdate), u.creationdate)))/86400.0) as recency_score
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+-- compute tag popularity with heavy string manipulation and explosion of tag arrays
+question_tags as (
+  select
+    q.id as question_id,
+    q.owneruserid,
+    trim(both '<>' from unnest(string_to_array(substring(q.tags from 2 for char_length(q.tags)-2), '><'))) as tag
+  from posts q
+  where q.posttypeid = 1 and q.tags is not null and q.tags <> ''
+),
+tag_stats as (
+  select
+    t.tag,
+    count(*) as q_count,
+    avg(qp_score) as avg_question_score,
+    sum(case when exists(select 1 from posts a where a.parentid = (select min(q.question_id) from question_tags q where q.tag = t.tag) and a.score >= 5) then 1 else 0 end) as questions_with_high_scoring_answer_dummy
+  from question_tags t
+  join lateral (
+    select p.score as qp_score from posts p where p.id = t.question_id
+  ) s on true
+  group by t.tag
+),
+-- windowed ranking of tags and users
+tag_ranked as (
+  select
+    tag,
+    q_count,
+    avg_question_score,
+    row_number() over (order by q_count desc, avg_question_score desc) as tag_rank,
+    dense_rank() over (order by avg_question_score desc) as avg_score_rank
+  from tag_stats
+),
+user_ranked as (
+  select
+    ua.*,
+    row_number() over (order by accepted_answers desc nulls last, recency_score desc, reputation desc) as user_rank,
+    percentile_disc(0.5) within group (order by accepted_answers) over () as median_accepted_answers
+  from user_activity ua
+),
+-- correlated subquery heavy part: for each top user, compute their best and worst answered tags with null logic
+user_tag_aggregate as (
+  select
+    ur.id as user_id,
+    ur.displayname,
+    tt.tag,
+    count(a.id) as answers_in_tag,
+    avg(a.score) filter (where a.score is not null) as avg_answer_score,
+    sum(case when a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' then 1 else 0 end) as answers_last_year,
+    max(a.creationdate) as last_answer_date
+  from user_ranked ur
+  join posts a on a.owneruserid = ur.id and a.posttypeid = 2
+  left join posts q on q.id = a.parentid and q.posttypeid = 1
+  left join lateral (
+    select trim(both '<>' from unnest(string_to_array(substring(q.tags from 2 for char_length(coalesce(q.tags,''))-2), '><'))) as tag
+  ) tt on q.tags is not null
+  group by ur.id, ur.displayname, tt.tag
+),
+-- pick user favorite tag and worst tag using window functions and null-safe ordering
+user_best_worst_tag as (
+  select
+    uta.user_id,
+    uta.displayname,
+    -- prefer tags with many answers then by avg score; nulls last
+    first_value(uta.tag) over (partition by uta.user_id order by answers_in_tag desc nulls last, avg_answer_score desc nulls last) as best_tag,
+    first_value(uta.avg_answer_score) over (partition by uta.user_id order by avg_answer_score desc nulls last) as best_tag_avg_score,
+    first_value(uta.tag) over (partition by uta.user_id order by answers_in_tag asc nulls last, avg_answer_score asc nulls last) as worst_tag,
+    first_value(uta.avg_answer_score) over (partition by uta.user_id order by avg_answer_score asc nulls last) as worst_tag_avg_score,
+    sum(answers_in_tag) over (partition by uta.user_id) as total_tagged_answers
+  from user_tag_aggregate uta
+),
+-- collect interesting posts with mixed joins, set operators and correlated logic
+interesting_posts as (
+  select p.id as post_id, p.title, p.creationdate, p.score, p.viewcount,
+    p.owneruserid, u.displayname as owner_name,
+    coalesce(p.tags, '') as raw_tags,
+    -- extract first tag as representative
+    (select trim(both '<>' from unnest(string_to_array(substring(p.tags from 2 for char_length(coalesce(p.tags,'')) -2), '><'))) limit 1) as first_tag,
+    -- compute trend: answers growth rate using two correlated counts (last 30 days vs prior 365 days)
+    (select count(*) from posts a where a.parentid = p.id and a.posttypeid = 2 and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')::numeric as answers_30d,
+    (select count(*) from posts a where a.parentid = p.id and a.posttypeid = 2 and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' and a.creationdate < cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')::numeric as answers_prev_year,
+    -- boolean heavy expression mixing nulls and casts
+    case
+      when p.viewcount is null then -1
+      when p.viewcount = 0 then 0
+      else ceil(log(1 + p.viewcount)::numeric)
+    end as view_log,
+    -- complicated score adjustment with null-safe coalesce and multiple operators
+    (coalesce(p.score,0) * greatest(1, least(5, sqrt(coalesce(p.viewcount,1)) / 10)) + coalesce((select sum(v.bountyamount) from votes v where v.postid = p.id and v.votetypeid in (8,9)),0)) as adjusted_score
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.posttypeid = 1 -- questions only
+    and (p.creationdate between cast('2024-10-01 12:34:56' as timestamp) - interval '3 years' and cast('2024-10-01 12:34:56' as timestamp))
+),
+-- union set operator to fetch some high activity comments and link-based related posts
+comment_and_link as (
+  select cast(c.id as bigint) as obj_id, c.postid as related_post_id, 'comment' as obj_type, c.creationdate, c.score, c.text as body
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+  union
+  select cast(pl.id as bigint) as obj_id, pl.relatedpostid as related_post_id, 'link' as obj_type, pl.creationdate, cast(null as integer) as score, cast(null as varchar) as body
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' and pl.linktypeid = 1
+),
+-- final aggregation joining many pieces, including correlated subqueries and windowed filters
+final as (
+  select
+    up.user_rank,
+    up.id as user_id,
+    up.displayname as user_name,
+    up.reputation,
+    up.accepted_answers,
+    up.posts_count,
+    ubt.best_tag,
+    ubt.best_tag_avg_score,
+    ubt.worst_tag,
+    ubt.total_tagged_answers,
+    ip.post_id,
+    ip.title,
+    ip.first_tag,
+    ip.creationdate as question_date,
+    ip.score as question_score,
+    ip.answers_30d,
+    ip.answers_prev_year,
+    ip.view_log,
+    ip.adjusted_score,
+    (select count(*) from votes v where v.postid = ip.post_id and v.votetypeid = 2) as upvotes_count,
+    (select count(*) from votes v where v.postid = ip.post_id and v.votetypeid = 3) as downvotes_count,
+    (select string_agg(distinct tt.tag, ',') from question_tags tt where tt.question_id = ip.post_id) as tags_agg,
+    -- anti-join style correlated check: has accepted answer by this top user?
+    exists(
+      select 1 from posts a
+      where a.parentid = ip.post_id and a.owneruserid = up.id and a.id = (select q.acceptedanswerid from posts q where q.id = ip.post_id)
+    ) as user_has_accepted_answer,
+    -- favorite badges: correlated count with null logic
+    (select count(*) from badges b where b.userid = up.id and b.name ilike '%favorite%' ) as favorite_badges,
+    -- pick a sample related activity item (comments or links) per question using lateral and coalesce
+    coalesce(
+      (select obj_type || ':' || obj_id::text || ':' || coalesce(substr(body,1,60), '') from comment_and_link cl where cl.related_post_id = ip.post_id order by cl.creationdate desc limit 1),
+      'none'
+    ) as recent_related_activity
+  from user_ranked up
+  left join user_best_worst_tag ubt on ubt.user_id = up.id
+  left join lateral (
+    select * from interesting_posts ip where ip.first_tag = ubt.best_tag order by ip.adjusted_score desc limit 5
+  ) ip on true
+  where up.user_rank <= 100
+)
+select
+  f.*,
+  -- provide dense percentile buckets for final sorting and heavy window compute
+  ntile(10) over (order by f.adjusted_score desc nulls last) as decile_by_adjusted_score,
+  rank() over (partition by coalesce(f.first_tag,'<none>') order by f.adjusted_score desc nulls last) as per_tag_rank,
+  -- complicated expression combining null checks, boolean casts and arithmetic
+  case
+    when f.user_has_accepted_answer then
+      (coalesce(f.adjusted_score,0) * 1.25) + (coalesce(f.upvotes_count,0) - coalesce(f.downvotes_count,0)) * 0.5
+    when f.answers_30d > 5 then
+      (coalesce(f.adjusted_score,0) * 1.1) + greatest(f.answers_30d - f.answers_prev_year, 0) * 2
+    else
+      coalesce(f.adjusted_score,0)
+  end as final_rank_score
+from final f
+order by final_rank_score desc nulls last, f.user_rank, f.post_id
+limit 500;

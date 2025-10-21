@@ -1,0 +1,92 @@
+WITH UserPostAgg AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        MAX(p.CreationDate)                     AS LastPostDate,
+        COALESCE((
+            SELECT AVG(p2.Score)
+            FROM Posts p2
+            WHERE p2.OwnerUserId = u.Id
+        ),0)                                     AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)               AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)               AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)               AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagAgg AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))), ', ') AS TagList
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+Combined AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.QuestionScoreSum,
+        upa.AnswerScoreSum,
+        upa.AvgPostScore,
+        COALESCE(uba.GoldBadges, 0) AS GoldBadges,
+        COALESCE(uba.SilverBadges, 0) AS SilverBadges,
+        COALESCE(uba.BronzeBadges, 0) AS BronzeBadges,
+        uba.GoldBadgeNames,
+        uta.TagList,
+        ROW_NUMBER() OVER (ORDER BY upa.Reputation DESC)      AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY upa.Reputation)        AS ReputationPercentile,
+        CASE 
+            WHEN upa.AnswerCount = 0 THEN NULL
+            ELSE ROUND(100.0 * upa.QuestionCount / upa.AnswerCount, 2)
+        END                                                  AS QtoARatio,
+        COALESCE(upa.LastPostDate, TIMESTAMP '1970-01-01')   AS LastActivity
+    FROM UserPostAgg upa
+    LEFT JOIN UserBadgeAgg uba ON uba.UserId = upa.UserId
+    LEFT JOIN UserTagAgg uta   ON uta.UserId = upa.UserId
+)
+SELECT *
+FROM Combined
+WHERE ReputationRank <= 100
+   OR (GoldBadges IS NOT NULL AND GoldBadges > 0)
+   OR (TagList IS NOT NULL AND TagList ILIKE '%sql%')
+ORDER BY ReputationRank
+
+UNION ALL
+
+SELECT
+    NULL                           AS UserId,
+    'Aggregated Totals'            AS DisplayName,
+    SUM(Reputation)                AS Reputation,
+    SUM(QuestionCount)             AS QuestionCount,
+    SUM(AnswerCount)               AS AnswerCount,
+    SUM(QuestionScoreSum)          AS QuestionScoreSum,
+    SUM(AnswerScoreSum)            AS AnswerScoreSum,
+    AVG(AvgPostScore)              AS AvgPostScore,
+    SUM(GoldBadges)                AS GoldBadges,
+    SUM(SilverBadges)              AS SilverBadges,
+    SUM(BronzeBadges)              AS BronzeBadges,
+    NULL                           AS GoldBadgeNames,
+    NULL                           AS TagList,
+    NULL                           AS ReputationRank,
+    NULL                           AS ReputationPercentile,
+    NULL                           AS QtoARatio,
+    MAX(LastActivity)              AS LastActivity
+FROM Combined
+WHERE ReputationRank <= 100;

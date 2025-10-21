@@ -1,0 +1,216 @@
+WITH
+user_activity AS (
+  SELECT
+    u.Id AS user_id,
+    u.Reputation,
+    COALESCE(u.Views,0) AS profile_views,
+    COALESCE(u.UpVotes,0) AS up_votes,
+    COALESCE(u.DownVotes,0) AS down_votes,
+    u.CreationDate,
+    u.LastAccessDate,
+    GREATEST(0, CAST(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) AS numeric)/86400) AS days_active,
+    SUM(CASE WHEN p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') THEN 1 ELSE 0 END) FILTER (WHERE p.PostTypeId IN (1,2)) AS recent_posts_count,
+    SUM(CASE WHEN c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') THEN 1 ELSE 0 END) AS recent_comments_count,
+    SUM(CASE WHEN v.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AND v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS recent_upvotes_received
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY
+    u.Id,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate
+),
+question_posts AS (
+  SELECT
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Title,
+    p.Tags,
+    CASE
+      WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+      ELSE string_to_array(substr(p.Tags, 2, char_length(p.Tags)-2), '><')
+    END AS tag_array,
+    COALESCE(a.ans_count,0) AS answers_count,
+    COALESCE(a.avg_answer_score,0) AS avg_answer_score,
+    COALESCE(a.max_answer_score,0) AS max_answer_score,
+    COALESCE(a.first_answer_lag_days, NULL) AS first_answer_lag_days
+  FROM Posts p
+  LEFT JOIN (
+    SELECT ParentId,
+      COUNT(*) FILTER (WHERE PostTypeId = 2) AS ans_count,
+      AVG(CASE WHEN PostTypeId = 2 THEN Score END) AS avg_answer_score,
+      MAX(CASE WHEN PostTypeId = 2 THEN Score END) AS max_answer_score,
+      NULLIF(MIN(EXTRACT(EPOCH FROM (MIN(CreationDate) OVER (PARTITION BY ParentId) - MIN(CASE WHEN PostTypeId = 1 THEN CreationDate END) OVER (PARTITION BY ParentId)))/86400), NULL) AS first_answer_lag_days
+    FROM Posts
+    WHERE ParentId IS NOT NULL
+    GROUP BY ParentId
+  ) a ON a.ParentId = p.Id
+  WHERE p.PostTypeId = 1
+),
+tag_counts AS (
+  SELECT t.TagName, t.Id AS tag_id, t.Count
+  FROM Tags t
+  ORDER BY t.Count DESC
+  LIMIT 200
+),
+post_tag_pairs AS (
+  SELECT qp.post_id, qp.OwnerUserId, unnest(qp.tag_array) AS tag
+  FROM question_posts qp
+),
+top_post_tags AS (
+  SELECT pt.post_id, pt.OwnerUserId, pt.tag
+  FROM post_tag_pairs pt
+  JOIN tag_counts tc ON tc.TagName = pt.tag
+),
+tag_cooccurrence AS (
+  SELECT
+    t1.tag AS tag_a,
+    t2.tag AS tag_b,
+    COUNT(DISTINCT t1.post_id) AS cooccurrence_count
+  FROM top_post_tags t1
+  JOIN top_post_tags t2 ON t1.post_id = t2.post_id AND t1.tag < t2.tag
+  GROUP BY t1.tag, t2.tag
+),
+recent_badges AS (
+  SELECT b.UserId, COUNT(*) FILTER (WHERE b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')) AS recent_badge_count,
+         SUM(CASE b.Class WHEN 1 THEN 5 WHEN 2 THEN 3 WHEN 3 THEN 1 ELSE 0 END) FILTER (WHERE b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')) AS recent_badge_weight
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_score AS (
+  SELECT
+    ua.user_id,
+    ua.Reputation,
+    ua.profile_views,
+    ua.up_votes,
+    ua.down_votes,
+    ua.days_active,
+    ua.recent_posts_count,
+    ua.recent_comments_count,
+    ua.recent_upvotes_received,
+    COALESCE(rb.recent_badge_count,0) AS recent_badge_count,
+    COALESCE(rb.recent_badge_weight,0) AS recent_badge_weight,
+    (LOG(GREATEST(1, ua.Reputation)) * 0.35
+     + LEAST(100, ua.recent_upvotes_received) * 0.25
+     + LEAST(50, ua.recent_posts_count) * 0.15
+     + LEAST(20, ua.recent_comments_count) * 0.05
+     + COALESCE(rb.recent_badge_weight,0) * 0.2
+    ) AS composite_score
+  FROM user_activity ua
+  LEFT JOIN recent_badges rb ON rb.UserId = ua.user_id
+),
+tag_post_stats AS (
+  SELECT
+    tc.TagName AS tag,
+    COUNT(q.post_id) AS questions_in_tag,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) AS median_question_score,
+    AVG(q.ViewCount) AS avg_views,
+    SUM(q.AnswerCount) AS total_answers,
+    SUM(q.FavoriteCount) AS total_favorites
+  FROM question_posts q
+  JOIN tag_counts tc ON tc.TagName = ANY(q.tag_array)
+  GROUP BY tc.TagName, tc.Id
+),
+tag_top_contributors AS (
+  SELECT
+    tc.TagName AS tag,
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(p.Id) AS posts_in_tag,
+    SUM(p.Score) AS score_in_tag,
+    ROW_NUMBER() OVER (PARTITION BY tc.TagName ORDER BY COUNT(p.Id) DESC, SUM(p.Score) DESC) AS rn
+  FROM Posts p
+  JOIN tag_counts tc ON tc.TagName = ANY(CASE WHEN p.Tags IS NULL THEN ARRAY[] ELSE string_to_array(substr(p.Tags, 2, char_length(p.Tags)-2), '><') END)
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+  GROUP BY tc.TagName, u.Id, u.DisplayName
+),
+tag_top3_contributors AS (
+  SELECT tag, json_agg(json_build_object('user_id', user_id, 'display_name', DisplayName, 'posts', posts_in_tag, 'score', score_in_tag) ORDER BY posts_in_tag DESC, score_in_tag DESC) AS top_contributors
+  FROM tag_top_contributors
+  WHERE rn <= 3
+  GROUP BY tag
+),
+tag_graph_centrality AS (
+  SELECT
+    tag_a AS tag,
+    SUM(cooccurrence_count) AS degree,
+    COUNT(*) AS neighbor_count
+  FROM tag_cooccurrence
+  GROUP BY tag_a
+),
+tag_hotness AS (
+  SELECT
+    tps.tag,
+    tps.questions_in_tag,
+    tps.median_question_score,
+    tps.avg_views,
+    tps.total_answers,
+    COALESCE(tgc.degree,0) AS cooccurrence_degree,
+    COALESCE(ttc.top_contributors, '[]') AS top_contributors,
+    (LN(GREATEST(1,tps.questions_in_tag)) * 0.25
+     + (COALESCE(tps.avg_views,0)/GREATEST(1,LOG(GREATEST(2,tps.questions_in_tag)))) * 0.25
+     + COALESCE(tps.median_question_score,0) * 0.2
+     + (COALESCE(tps.total_answers,0)/GREATEST(1,tps.questions_in_tag)) * 0.15
+     + COALESCE(tgc.degree,0) * 0.15
+    ) AS hotness_score
+  FROM tag_post_stats tps
+  LEFT JOIN tag_graph_centrality tgc ON tgc.tag = tps.tag
+  LEFT JOIN tag_top3_contributors ttc ON ttc.tag = tps.tag
+),
+recent_exemplar_questions AS (
+  SELECT qp.post_id, qp.Title, qp.Score, qp.ViewCount, qp.CreationDate, qp.Tags, qp.OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY UNNEST(qp.tag_array) ORDER BY (qp.Score*0.6 + qp.ViewCount*0.0001 + COALESCE(us.composite_score,0)*0.4) DESC, qp.CreationDate DESC) AS rn,
+    UNNEST(qp.tag_array) AS tag
+  FROM question_posts qp
+  LEFT JOIN user_score us ON us.user_id = qp.OwnerUserId
+),
+post_link_summary AS (
+  SELECT pl.PostId,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS outbound_links,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_links,
+    COUNT(DISTINCT pl.RelatedPostId) AS distinct_related_posts
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+)
+SELECT
+  th.tag,
+  th.hotness_score,
+  th.questions_in_tag,
+  th.median_question_score,
+  th.avg_views,
+  th.total_answers,
+  th.cooccurrence_degree,
+  th.top_contributors,
+  (
+    SELECT json_agg(json_build_object(
+      'post_id', re.post_id,
+      'title', re.Title,
+      'score', re.Score,
+      'views', re.ViewCount,
+      'created', re.CreationDate,
+      'owner_id', re.OwnerUserId,
+      'owner_composite_score', COALESCE(us.composite_score,0),
+      'outbound_links', COALESCE(pls.outbound_links,0),
+      'duplicate_links', COALESCE(pls.duplicate_links,0)
+    ) ORDER BY (re.Score*0.6 + re.ViewCount*0.0001 + COALESCE(us.composite_score,0)*0.4) DESC
+    ) 
+    FROM recent_exemplar_questions re
+    LEFT JOIN user_score us ON us.user_id = re.OwnerUserId
+    LEFT JOIN post_link_summary pls ON pls.PostId = re.post_id
+    WHERE re.tag = th.tag AND re.rn <= 5
+  ) AS exemplars
+FROM tag_hotness th
+ORDER BY th.hotness_score DESC
+LIMIT 50;

@@ -1,0 +1,273 @@
+-- {"query": "8074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2693} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_guess,
+        count(*) over () as total_users_window
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+question_posts as (
+    select
+        p.id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.closeddate,
+        p.favoritecount,
+        p.commentcount
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select
+        p.id,
+        p.parentid as question_id,
+        p.owneruserid,
+        p.creationdate,
+        p.score
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select
+        ru.user_id,
+        min(q.creationdate) as first_q_date,
+        max(q.creationdate) as last_q_date,
+        count(q.id) as q_count,
+        sum(coalesce(q.viewcount,0)) as q_views,
+        sum(coalesce(q.score,0)) as q_score,
+        count(a.id) as a_count,
+        sum(coalesce(a.score,0)) as a_score,
+        count(distinct c.id) as c_count
+    from recent_users ru
+    left join question_posts q on q.owneruserid = ru.user_id
+    left join answer_posts a on a.owneruserid = ru.user_id
+    left join comments c on c.userid = ru.user_id
+    group by ru.user_id
+),
+q_vote_agg as (
+    select
+        v.postid as post_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+    from votes v
+    group by v.postid
+),
+q_close_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_close_date,
+        count(*) as close_events,
+        max(case when ph.comment ~ '^[0-9]+$' then ph.comment::int end) filter (where ph.posthistorytypeid = 10) as any_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)
+    group by ph.postid
+),
+q_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_dupe_targets
+    from postlinks pl
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        q.id as post_id,
+        unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2, 0)), '><')) as tag
+    from question_posts q
+),
+tag_rank as (
+    select
+        t.tag,
+        count(*) as tag_q_count,
+        row_number() over (order by count(*) desc, tag) as tag_rank_global
+    from tag_expansion t
+    group by t.tag
+),
+user_tag_profile as (
+    select
+        q.owneruserid as user_id,
+        t.tag,
+        count(*) as tagged_q_count,
+        avg(coalesce(q.score,0))::numeric as avg_q_score_for_tag
+    from question_posts q
+    join tag_expansion t on t.post_id = q.id
+    group by q.owneruserid, t.tag
+),
+accepted_answer_rates as (
+    select
+        q.owneruserid as user_id,
+        count(*) as questions_total,
+        sum(case when q.acceptedanswerid is not null then 1 else 0 end) as questions_with_accepted
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_latency as (
+    select
+        q.id as question_id,
+        min(a.creationdate) as first_answer_date,
+        q.creationdate as question_date,
+        extract(epoch from (min(a.creationdate) - q.creationdate))/3600.0 as hours_to_first_answer
+    from question_posts q
+    left join answer_posts a on a.question_id = q.id
+    group by q.id, q.creationdate
+),
+q_quality_score as (
+    select
+        q.id as post_id,
+        q.owneruserid as user_id,
+        coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes,
+        coalesce(v.favorites,0) as favs,
+        coalesce(q.viewcount,0) as views,
+        coalesce(q.score,0) as post_score,
+        coalesce(l.linked_count,0) as linked_count,
+        coalesce(l.duplicate_count,0) as duplicate_count,
+        coalesce(al.hours_to_first_answer, 24*30) as hours_to_first_answer,
+        (coalesce(v.upvotes,0)*3 + coalesce(v.favorites,0)*2 + coalesce(q.viewcount,0)/100.0 - coalesce(v.downvotes,0)*4 - coalesce(l.duplicate_count,0)*5) as raw_quality_score
+    from question_posts q
+    left join q_vote_agg v on v.post_id = q.id
+    left join q_links l on l.postid = q.id
+    left join answer_latency al on al.question_id = q.id
+),
+user_quality_agg as (
+    select
+        qq.user_id,
+        count(*) as q_count,
+        avg(qq.raw_quality_score)::numeric as avg_quality,
+        percentile_cont(0.5) within group (order by qq.raw_quality_score) as median_quality,
+        min(qq.raw_quality_score) as min_quality,
+        max(qq.raw_quality_score) as max_quality
+    from q_quality_score qq
+    group by qq.user_id
+),
+recent_hot_candidates as (
+    select
+        q.id,
+        q.owneruserid as user_id,
+        q.creationdate,
+        qq.raw_quality_score,
+        rank() over (order by qq.raw_quality_score desc, q.viewcount desc) as hot_rank
+    from question_posts q
+    join q_quality_score qq on qq.post_id = q.id
+    where q.creationdate >= (select max(creationdate) - interval '30 days' from posts)
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        sum(case when b.tagbased then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+null_safety_usernames as (
+    select
+        u.id as user_id,
+        coalesce(nullif(trim(u.displayname), ''), '[user-' || u.id::varchar || ']') as safe_name
+    from users u
+),
+closed_reason_lookup as (
+    select
+        ph.postid,
+        string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+    from posthistory ph
+    join closeréasontypes crt on crt.id = (case when ph.comment ~ '^[0-9]+$' then ph.comment::int else null end)
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+dupe_edges as (
+    select
+        pl.postid as duplicate_of,
+        pl.relatedpostid as target_id
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+dupe_clusters as (
+    select
+        d.duplicate_of,
+        min(d.target_id) over () as cluster_seed,
+        count(*) over () as cluster_edges
+    from dupe_edges d
+)
+select
+    ru.user_id,
+    ns.safe_name as display_name,
+    ru.country_guess,
+    ru.reputation,
+    ua.q_count as questions,
+    ua.a_count as answers,
+    ua.c_count as comments,
+    coalesce(uqa.avg_quality, 0)::numeric(12,2) as avg_q_quality,
+    coalesce(uqa.median_quality, 0)::numeric(12,2) as median_q_quality,
+    coalesce(uqa.min_quality, 0)::numeric(12,2) as min_q_quality,
+    coalesce(uqa.max_quality, 0)::numeric(12,2) as max_q_quality,
+    coalesce(ar.questions_total,0) as questions_total,
+    coalesce(ar.questions_with_accepted,0) as questions_with_accepted,
+    case when coalesce(ar.questions_total,0) > 0
+         then round(100.0 * coalesce(ar.questions_with_accepted,0) / nullif(ar.questions_total,0), 2)
+         else 0 end as accepted_rate_pct,
+    coalesce(ub.gold,0) as gold_badges,
+    coalesce(ub.silver,0) as silver_badges,
+    coalesce(ub.bronze,0) as bronze_badges,
+    coalesce(ub.tag_badges,0) as tag_badges,
+    count(distinct rhc.id) filter (where rhc.hot_rank <= 100) as recent_hot_q_top100,
+    sum(case when q.closeddate is not null then 1 else 0 end) as closed_q,
+    string_agg(distinct coalesce(crl.close_reasons, 'None'), ' | ') filter (where q.closeddate is not null) as close_reason_samples,
+    min(ua.first_q_date) as first_q_date,
+    max(ua.last_q_date) as last_q_date,
+    case
+        when ua.q_count = 0 and ua.a_count = 0 and ua.c_count = 0 then 'Passive'
+        when ua.q_count > ua.a_count and ua.q_count >= 5 then 'Question-heavy'
+        when ua.a_count > ua.q_count and ua.a_count >= 5 then 'Answer-heavy'
+        else 'Mixed'
+    end as activity_profile,
+    -- correlated subquery for top tag
+    (
+        select ut.tag
+        from user_tag_profile ut
+        where ut.user_id = ru.user_id
+        order by ut.tagged_q_count desc, ut.avg_q_score_for_tag desc, ut.tag
+        limit 1
+    ) as top_tag,
+    -- windowed rank by recent hotness
+    dense_rank() over (order by coalesce(uqa.avg_quality,0) desc, ru.reputation desc) as user_quality_rank
+from recent_users ru
+join null_safety_usernames ns on ns.user_id = ru.user_id
+left join user_activity ua on ua.user_id = ru.user_id
+left join user_quality_agg uqa on uqa.user_id = ru.user_id
+left join accepted_answer_rates ar on ar.user_id = ru.user_id
+left join user_badges ub on ub.user_id = ru.user_id
+left join question_posts q on q.owneruserid = ru.user_id
+left join recent_hot_candidates rhc on rhc.id = q.id
+left join closed_reason_lookup crl on crl.postid = q.id
+where coalesce(ru.displayname, '') not ilike any (array['%bot%','%spam%'])
+group by
+    ru.user_id, ns.safe_name, ru.country_guess, ru.reputation,
+    ua.q_count, ua.a_count, ua.c_count,
+    uqa.avg_quality, uqa.median_quality, uqa.min_quality, uqa.max_quality,
+    ar.questions_total, ar.questions_with_accepted,
+    ub.gold, ub.silver, ub.bronze, ub.tag_badges
+having
+    (ua.q_count + ua.a_count + ua.c_count) >= 1
+qualify
+    coalesce(uqa.avg_quality,0) >= (
+        select avg(avg_quality) from user_quality_agg
+    )
+order by
+    user_quality_rank,
+    ru.reputation desc,
+    ru.user_id
+limit 250;

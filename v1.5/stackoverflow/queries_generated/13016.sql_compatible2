@@ -1,0 +1,72 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        SUM(p.Score) AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank,
+        AVG(EXTRACT(DAY FROM (ph.CreationDate - p.CreationDate))) AS AvgEditTime
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        PostHistory AS ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE
+        u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM
+        Tags AS t
+    LEFT JOIN
+        Posts AS p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+    HAVING
+        COUNT(p.Id) > 10
+),
+CommentedAnswers AS (
+    SELECT
+        p.Id AS AnswerId,
+        COUNT(c.Id) AS CommentCount
+    FROM
+        Posts AS p
+    LEFT JOIN
+        Comments AS c ON p.Id = c.PostId
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.Id
+    HAVING
+        COUNT(c.Id) > 2
+)
+SELECT
+    ua.DisplayName,
+    ua.PostsCount,
+    ua.TotalScore,
+    tt.TagName,
+    tt.QuestionCount,
+    ca.AnswerId,
+    ca.CommentCount,
+    COALESCE(CAST(EXTRACT(DAY FROM (cast('2024-10-01' as date) - CAST(ua.AvgEditTime AS DATE))) AS INTEGER), 0) AS AvgEditDays
+FROM
+    UserActivity AS ua
+CROSS JOIN
+    TopTags AS tt
+LEFT JOIN
+    CommentedAnswers AS ca ON ua.Id = ca.AnswerId
+WHERE
+    ua.ScoreRank <= 10
+    AND tt.TagRank <= 5
+ORDER BY
+    ua.TotalScore DESC,
+    tt.QuestionCount DESC,
+    ca.CommentCount DESC;

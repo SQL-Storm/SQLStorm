@@ -1,0 +1,112 @@
+-- {"query": "47022.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 50468, "output_tokens": 44509} 
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        1 as level,
+        ARRAY[t.TagName] as tag_path,
+        t.Id as tag_id
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.TagName,
+        t2.Count,
+        th.level + 1,
+        th.tag_path || t2.TagName,
+        t2.Id
+    FROM tag_hierarchy th
+    JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    JOIN Posts p2 ON p2.Id = p1.Id
+    JOIN Tags t2 ON p2.Tags LIKE '%<' || t2.TagName || '>%'
+    WHERE th.level < 3 
+        AND t2.TagName != ALL(th.tag_path)
+        AND t2.Count > 1000
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        string_agg(DISTINCT substring(p.Tags, 2, position('>' in substring(p.Tags, 2))-1), ', ') as primary_tags,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(p.Score) as total_score,
+        AVG(p.Score)::numeric(10,2) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN 1 ELSE 0 END) as great_answers,
+        STDDEV(p.Score)::numeric(10,2) as score_volatility
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    WHERE u.Reputation > 5000
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as month,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT p.OwnerUserId) as active_users,
+        AVG(p.Score) as avg_score,
+        SUM(CASE WHEN p.Score >= 100 THEN 1 ELSE 0 END) as viral_posts,
+        AVG(p.ViewCount) as avg_views,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN p.Id END) as closed_or_deleted,
+        SUM(p.FavoriteCount) as total_favorites,
+        AVG(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate))/3600)::numeric(10,2) as avg_lifetime_hours
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+badge_achievements AS (
+    SELECT 
+        b.Name as badge_name,
+        b.Class,
+        COUNT(DISTINCT b.UserId) as recipients,
+        AVG(u.Reputation)::numeric(10,0) as avg_recipient_reputation,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY u.Reputation) as q1_reputation,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY u.Reputation) as q3_reputation,
+        MODE() WITHIN GROUP (ORDER BY DATE_PART('hour', b.Date)) as most_common_hour,
+        COUNT(DISTINCT CASE WHEN u.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year' THEN u.Id END) as new_user_recipients
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+    WHERE b.TagBased = 0
+    GROUP BY b.Name, b.Class
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.total_posts,
+    ue.avg_score,
+    ue.accepted_answers,
+    ue.great_answers,
+    ue.score_volatility,
+    COALESCE(th.TagName, 'N/A') as related_tag,
+    COALESCE(th.level, 0) as tag_depth,
+    tp.month,
+    tp.post_count as monthly_posts,
+    tp.viral_posts,
+    tp.avg_lifetime_hours,
+    ba.badge_name,
+    ba.recipients as badge_recipients,
+    ba.avg_recipient_reputation,
+    ba.most_common_hour as badge_award_hour,
+    DENSE_RANK() OVER (ORDER BY ue.total_score DESC) as score_rank,
+    DENSE_RANK() OVER (PARTITION BY th.TagName ORDER BY ue.avg_score DESC) as tag_rank,
+    LAG(tp.post_count, 1) OVER (ORDER BY tp.month) as prev_month_posts,
+    LEAD(tp.post_count, 1) OVER (ORDER BY tp.month) as next_month_posts,
+    100.0 * ue.accepted_answers / NULLIF(ue.answers, 0) as acceptance_rate,
+    NTILE(10) OVER (ORDER BY ue.Reputation) as reputation_decile,
+    FIRST_VALUE(ba.badge_name) OVER (PARTITION BY ue.UserId ORDER BY ba.Class, ba.recipients DESC) as rarest_badge
+FROM user_expertise ue
+CROSS JOIN LATERAL (SELECT * FROM tag_hierarchy LIMIT 5) th
+CROSS JOIN LATERAL (SELECT * FROM temporal_patterns ORDER BY month DESC LIMIT 12) tp
+CROSS JOIN LATERAL (SELECT * FROM badge_achievements WHERE Class = 1 ORDER BY recipients LIMIT 10) ba
+WHERE ue.total_posts > 50
+ORDER BY ue.total_score DESC, tp.month DESC, ba.recipients
+LIMIT 1000;

@@ -1,0 +1,99 @@
+-- {"query": "50087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1079} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.CreationDate AS PostCreationDate,
+        p.Tags,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        v.VoteTypeId
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId AND b.Date > (CURRENT_DATE - INTERVAL '3 year')
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId AND v.CreationDate > (CURRENT_DATE - INTERVAL '3 year')
+    WHERE
+        u.CreationDate < (CURRENT_DATE - INTERVAL '5 year')
+        AND u.Reputation > 15000
+        AND p.CommunityOwnedDate IS NULL
+),
+QuestionStats AS (
+    SELECT
+        q.PostId AS QuestionId,
+        q.UserId AS QuestionOwnerId,
+        q.DisplayName AS QuestionOwnerName,
+        q.Reputation AS QuestionOwnerReputation,
+        q.Score AS QuestionScore,
+        q.Tags,
+        COUNT(DISTINCT a.PostId) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NetVoteCount,
+        (
+            SELECT AVG(ans.Score)
+            FROM Posts ans
+            WHERE ans.ParentId = q.PostId AND ans.PostTypeId = 2
+        ) AS AvgAnswerScore
+    FROM
+        UserActivity q
+    LEFT JOIN
+        Posts a ON q.PostId = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+        Votes v ON q.PostId = v.PostId
+    WHERE
+        q.PostTypeId = 1 -- Questions
+        AND q.Tags LIKE '%<performance>%'
+    GROUP BY
+        q.PostId, q.UserId, q.DisplayName, q.Reputation, q.Score, q.Tags
+    HAVING
+        COUNT(DISTINCT a.PostId) > 5 AND SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+),
+AnswererEngagement AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        qs.Tags,
+        COUNT(DISTINCT ua.PostId) AS AnswersToPerfQuestions,
+        SUM(ua.Score) AS TotalAnswerScore,
+        AVG(EXTRACT(EPOCH FROM (ua.PostCreationDate - p_q.CreationDate))) / 3600.0 AS AvgAnswerTimeHours,
+        SUM(CASE WHEN ua.BadgeClass = 1 AND ua.BadgeName LIKE '%sql%' THEN 1 ELSE 0 END) AS GoldSqlBadges,
+        SUM(CASE WHEN ua.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN ua.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven
+    FROM
+        UserActivity ua
+    JOIN
+        QuestionStats qs ON ua.ParentId = qs.QuestionId
+    JOIN
+        Posts p_q ON qs.QuestionId = p_q.Id
+    WHERE
+        ua.PostTypeId = 2 -- Answers
+    GROUP BY
+        ua.UserId, ua.DisplayName, ua.Reputation, qs.Tags
+)
+SELECT
+    ae.DisplayName,
+    ae.Reputation,
+    ae.AnswersToPerfQuestions,
+    ae.TotalAnswerScore,
+    ae.AvgAnswerTimeHours,
+    ae.GoldSqlBadges,
+    ae.UpvotesGiven,
+    ae.DownvotesGiven,
+    (ae.TotalAnswerScore * 0.4 + ae.AnswersToPerfQuestions * 10 + ae.GoldSqlBadges * 100 - ae.AvgAnswerTimeHours * 2) AS EngagementScore,
+    RANK() OVER (PARTITION BY SUBSTRING(ae.Tags FROM '<([^>]+)>') ORDER BY (ae.TotalAnswerScore * 0.4 + ae.AnswersToPerfQuestions * 10 + ae.GoldSqlBadges * 100) DESC) AS RankPerTag
+FROM
+    AnswererEngagement ae
+WHERE
+    ae.AvgAnswerTimeHours < 72 AND ae.TotalAnswerScore > (SELECT AVG(TotalAnswerScore) FROM AnswererEngagement)
+ORDER BY
+    EngagementScore DESC, ae.Reputation DESC
+LIMIT 100;

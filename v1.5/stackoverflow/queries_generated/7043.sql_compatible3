@@ -1,0 +1,197 @@
+WITH
+RecentUsers AS (
+  SELECT u.Id, u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users AS u
+  WHERE u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    AND u.Reputation >= 50
+),
+QuestionStats AS (
+  SELECT p.Id,
+         p.OwnerUserId,
+         p.Title,
+         p.CreationDate,
+         COALESCE(p.ViewCount,0) AS ViewCount,
+         COALESCE(p.Score,0) AS Score,
+         COALESCE(p.AnswerCount,0) AS AnswerCount,
+         COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+         REGEXP_SPLIT_TO_TABLE(SUBSTRING(COALESCE(p.Tags,'') FROM 2 FOR NULLIF(LENGTH(COALESCE(p.Tags,'')) - 2, 0)), '><') AS Tag
+  FROM Posts AS p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+),
+QuestionTagAgg AS (
+  SELECT qs.Id,
+         qs.OwnerUserId,
+         qs.Title,
+         qs.CreationDate,
+         qs.ViewCount,
+         qs.Score,
+         qs.AnswerCount,
+         qs.FavoriteCount,
+         STRING_AGG(DISTINCT qs.Tag, ',' ORDER BY qs.Tag) AS TagsCsv,
+         COUNT(DISTINCT qs.Tag) AS TagCount,
+         MAX(LENGTH(qs.Tag)) AS MaxTagLen,
+         MIN(LENGTH(qs.Tag)) AS MinTagLen
+  FROM QuestionStats AS qs
+  GROUP BY qs.Id, qs.OwnerUserId, qs.Title, qs.CreationDate, qs.ViewCount, qs.Score, qs.AnswerCount, qs.FavoriteCount
+),
+AnswerEnriched AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId AS AnswerOwner,
+         a.CreationDate AS AnswerDate,
+         a.Score AS AnswerScore,
+         q.Title AS QuestionTitle,
+         q.ViewCount AS QuestionViews,
+         q.Score AS QuestionScore,
+         q.AnswerCount AS QuestionAnswerCount
+  FROM Posts AS a
+  LEFT JOIN Posts AS q ON a.ParentId = q.Id AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+),
+QuestionMetrics AS (
+  SELECT qta.*,
+         COALESCE(aq.AnswersCount, 0) AS ComputedAnswerCount,
+         aq.AvgAnswerScore,
+         RANK() OVER (ORDER BY (qta.ViewCount * 0.001 + qta.Score * 2 + COALESCE(aq.AvgAnswerScore,0) * 1.5 + qta.FavoriteCount * 3) DESC) AS ActivityRank,
+         (qta.TagCount * 1.2 + qta.MaxTagLen * 0.1 - qta.MinTagLen * 0.05) AS ComplexityScore,
+         (
+           SELECT STRING_AGG(DISTINCT ph.UserDisplayName, ' | ' ORDER BY ph.CreationDate DESC)
+           FROM (
+             SELECT ph2.UserDisplayName, ph2.CreationDate
+             FROM PostHistory AS ph2
+             WHERE ph2.PostId = qta.Id
+               AND ph2.UserDisplayName IS NOT NULL
+             ORDER BY ph2.CreationDate DESC
+             LIMIT 3
+           ) AS ph
+         ) AS RecentEditors
+  FROM QuestionTagAgg AS qta
+  LEFT JOIN (
+    SELECT ae.QuestionId,
+           COUNT(*) AS AnswersCount,
+           AVG(COALESCE(ae.AnswerScore,0)) AS AvgAnswerScore
+    FROM AnswerEnriched AS ae
+    GROUP BY ae.QuestionId
+  ) AS aq ON aq.QuestionId = qta.Id
+),
+VoteActivity AS (
+  SELECT v.PostId,
+         v.VoteTypeId,
+         vt.Name AS VoteTypeName,
+         COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS VotesForType,
+         MIN(v.CreationDate) OVER (PARTITION BY v.PostId) AS FirstVoteDate,
+         MAX(v.CreationDate) OVER (PARTITION BY v.PostId) AS LastVoteDate,
+         AVG(COALESCE(v.BountyAmount,0)) OVER (PARTITION BY v.PostId) AS AvgBountyForPost
+  FROM Votes AS v
+  LEFT JOIN VoteTypes AS vt ON vt.Id = v.VoteTypeId
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+),
+UserEngagement AS (
+  SELECT ru.Id AS UserId,
+         ru.DisplayName,
+         ru.Reputation,
+         COALESCE(bc.BadgeCount,0) AS BadgeCount,
+         COALESCE(pc.PostCount,0) AS PostCount,
+         COALESCE(vu.VoteCount,0) AS VoteCount,
+         (ru.Reputation * 0.01 + COALESCE(bc.BadgeCount,0) * 2 + COALESCE(pc.PostCount,0) * 1.5 + COALESCE(vu.VoteCount,0) * 0.5) AS EngagementScore,
+         DENSE_RANK() OVER (ORDER BY (ru.Reputation * 0.01 + COALESCE(bc.BadgeCount,0) * 2 + COALESCE(pc.PostCount,0) * 1.5 + COALESCE(vu.VoteCount,0) * 0.5) DESC) AS EngagementRank
+  FROM RecentUsers AS ru
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS BadgeCount
+    FROM Badges
+    WHERE Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+    GROUP BY UserId
+  ) AS bc ON bc.UserId = ru.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS PostCount
+    FROM Posts
+    WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+    GROUP BY OwnerUserId
+  ) AS pc ON pc.OwnerUserId = ru.Id
+  LEFT JOIN (
+    SELECT v.UserId, COUNT(*) AS VoteCount
+    FROM Votes AS v
+    WHERE v.UserId IS NOT NULL
+      AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY v.UserId
+  ) AS vu ON vu.UserId = ru.Id
+),
+TopTagQuestions AS (
+  SELECT q.Id, q.TagsCsv, q.TagCount, qm.ActivityRank
+  FROM QuestionMetrics AS qm
+  JOIN QuestionTagAgg AS q ON q.Id = qm.Id
+  WHERE qm.ActivityRank <= 5000
+    AND q.TagsCsv ~* '(postgres|sql|performance|query|index)'
+),
+Duplicates AS (
+  SELECT pl.PostId AS DupeSrc, pl.RelatedPostId AS DupeTarget, pl.LinkTypeId
+  FROM PostLinks AS pl
+  WHERE pl.LinkTypeId = 3
+    AND pl.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '10 years'
+),
+FinalSet AS (
+  SELECT q.Id AS QuestionId,
+         LEFT(q.Title, 200) AS ShortTitle,
+         q.TagsCsv,
+         q.TagCount,
+         qm.ComputedAnswerCount,
+         COALESCE(va.VotesForType,0) AS UpVotesCount,
+         COALESCE(va.VotesForType,0) AS DownVotesCount,
+         COALESCE(va.AvgBountyForPost,0) AS AvgBounty,
+         ue.DisplayName AS TopOwner,
+         ue.EngagementScore AS OwnerEngagement,
+         qm.ActivityRank,
+         qm.ComplexityScore,
+         qm.RecentEditors,
+         CASE WHEN d.DupeSrc IS NOT NULL THEN TRUE ELSE FALSE END AS HasDuplicateLink,
+         CONCAT(
+           COALESCE(NULLIF(LEFT(qm.RecentEditors,50),''),'[no editors]'),
+           ' :: ',
+           REPLACE(COALESCE(q.TagsCsv,''),',', ' > ')
+         ) AS Synopsis
+  FROM QuestionTagAgg AS q
+  JOIN QuestionMetrics AS qm ON qm.Id = q.Id
+  LEFT JOIN VoteActivity AS va ON va.PostId = q.Id
+  LEFT JOIN Posts AS p ON p.Id = q.Id
+  LEFT JOIN Users AS u ON u.Id = q.OwnerUserId
+  LEFT JOIN UserEngagement AS ue ON ue.UserId = q.OwnerUserId
+  LEFT JOIN Duplicates AS d ON d.DupeTarget = q.Id OR d.DupeSrc = q.Id
+  WHERE q.TagCount BETWEEN 1 AND 8
+    AND (qm.ActivityRank <= 10000 OR qm.ComputedAnswerCount >= 5)
+)
+SELECT DISTINCT
+       f.QuestionId,
+       f.ShortTitle,
+       f.TagsCsv,
+       f.TagCount,
+       f.ComputedAnswerCount,
+       GREATEST(COALESCE(f.UpVotesCount,0) - COALESCE(f.DownVotesCount,0), 0) AS NetVotes,
+       f.AvgBounty,
+       COALESCE(f.OwnerEngagement,0) AS OwnerEngagementScore,
+       f.ActivityRank,
+       f.ComplexityScore,
+       f.RecentEditors,
+       f.HasDuplicateLink,
+       f.Synopsis,
+       (SELECT MAX(a.Score) FROM Posts AS a WHERE a.ParentId = f.QuestionId AND a.PostTypeId = 2) AS BestAnswerScore,
+       (SELECT MIN(a.CreationDate - q.CreationDate) FROM Posts AS a JOIN Posts AS q ON q.Id = f.QuestionId WHERE a.ParentId = f.QuestionId AND a.PostTypeId = 2) AS TimeToFirstAnswerInterval,
+       COALESCE((
+         SELECT JSON_AGG(x) FROM (
+           SELECT p2.Id, LEFT(p2.Title,120) AS TitleSnippet, p2.ViewCount
+           FROM Posts AS p2
+           WHERE p2.PostTypeId = 1
+             AND p2.AnswerCount = 0
+             AND p2.ViewCount > 10000
+           ORDER BY p2.ViewCount DESC
+           LIMIT 3
+         ) AS x
+       ), '[]'::JSON) AS HotUnansweredSamples
+FROM FinalSet AS f
+ORDER BY f.ActivityRank, f.ComplexityScore DESC
+LIMIT 250;

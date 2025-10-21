@@ -1,0 +1,161 @@
+-- {"query": "12062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 975} 
+
+WITH PostStats AS (
+    SELECT 
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        COUNT(DISTINCT PH.Id) AS EditCount,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (5, 8, 9)
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        P.Id, U.DisplayName
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        COUNT(DISTINCT B.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC, SUM(P.Score) DESC) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+TopPosts AS (
+    SELECT 
+        PS.PostId,
+        PS.PostTypeId,
+        PS.CreationDate,
+        PS.Score,
+        PS.ViewCount,
+        PS.OwnerUserId,
+        PS.OwnerDisplayName,
+        PS.UpVotes,
+        PS.DownVotes,
+        PS.CommentCount,
+        PS.EditCount,
+        PS.PostRank
+    FROM 
+        PostStats PS
+    WHERE 
+        PS.PostRank <= 10
+),
+TopTags AS (
+    SELECT 
+        TS.TagName,
+        TS.PostCount,
+        TS.TotalScore
+    FROM 
+        TagStats TS
+    ORDER BY 
+        TS.TotalScore DESC, TS.PostCount DESC
+    LIMIT 10
+),
+TopUsers AS (
+    SELECT 
+        UA.UserId,
+        UA.DisplayName,
+        UA.PostCount,
+        UA.TotalScore,
+        UA.BadgeCount,
+        UA.UserRank
+    FROM 
+        UserActivity UA
+    WHERE 
+        UA.UserRank <= 10
+)
+SELECT 
+    'Top Posts' AS Section,
+    PostId,
+    PostTypeId,
+    CreationDate,
+    Score,
+    ViewCount,
+    OwnerUserId,
+    OwnerDisplayName,
+    UpVotes,
+    DownVotes,
+    CommentCount,
+    EditCount
+FROM 
+    TopPosts
+UNION ALL
+SELECT 
+    'Top Tags' AS Section,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    TagName,
+    PostCount,
+    TotalScore,
+    NULL,
+    NULL
+FROM 
+    TopTags
+UNION ALL
+SELECT 
+    'Top Users' AS Section,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    UserId,
+    DisplayName,
+    PostCount,
+    TotalScore,
+    BadgeCount,
+    NULL
+FROM 
+    TopUsers
+ORDER BY 
+    Section, 
+    CASE 
+        WHEN Section = 'Top Posts' THEN PostRank 
+        WHEN Section = 'Top Tags' THEN TotalScore 
+        ELSE TotalScore 
+    END DESC;

@@ -1,0 +1,99 @@
+WITH TopActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, COUNT(p.Id) AS PostCount, SUM(p.Score) AS TotalScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) >= 50
+    ORDER BY TotalScore DESC
+    LIMIT 100
+),
+UserTagStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS Tag,
+        COUNT(*) AS TagPostCount,
+        AVG(p.Score) AS AvgScorePerTag
+    FROM Posts p
+    WHERE p.OwnerUserId IN (SELECT UserId FROM TopActiveUsers)
+      AND p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    WHERE b.UserId IN (SELECT UserId FROM TopActiveUsers)
+    GROUP BY b.UserId
+),
+RecentEdits AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS RecentEditCount
+    FROM PostHistory ph
+    WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months'
+      AND ph.UserId IS NOT NULL
+      AND ph.PostHistoryTypeId IN (4, 5, 6)  -- Edits
+      AND ph.UserId IN (SELECT UserId FROM TopActiveUsers)
+    GROUP BY ph.UserId
+),
+VoteStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IN (SELECT UserId FROM TopActiveUsers)
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.PostCount,
+    u.TotalScore,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(ve.UpVotesReceived,0) AS UpVotesReceived,
+    COALESCE(ve.DownVotesReceived,0) AS DownVotesReceived,
+    COALESCE(re.RecentEditCount,0) AS RecentEditCount,
+    COALESCE(
+        JSON_AGG(
+            JSON_BUILD_OBJECT(
+                'Tag', uts.Tag,
+                'TagPostCount', uts.TagPostCount,
+                'AvgScorePerTag', uts.AvgScorePerTag
+            )
+        )
+        FILTER (WHERE uts.Tag IS NOT NULL),
+        '[]'
+    ) AS TopTags
+FROM TopActiveUsers u
+LEFT JOIN UserBadges ub ON u.UserId = ub.UserId
+LEFT JOIN RecentEdits re ON u.UserId = re.UserId
+LEFT JOIN VoteStats ve ON u.UserId = ve.UserId
+LEFT JOIN LATERAL (
+    SELECT uts.Tag, uts.TagPostCount, uts.AvgScorePerTag
+    FROM UserTagStats uts
+    WHERE uts.UserId = u.UserId
+    ORDER BY uts.TagPostCount DESC, uts.AvgScorePerTag DESC
+    LIMIT 5
+) uts ON TRUE
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.PostCount,
+    u.TotalScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ve.UpVotesReceived,
+    ve.DownVotesReceived,
+    re.RecentEditCount
+ORDER BY u.TotalScore DESC
+LIMIT 50;

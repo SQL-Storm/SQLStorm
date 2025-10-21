@@ -1,0 +1,150 @@
+WITH RECURSIVE UserInfluenceTree AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        0 AS depth,
+        ARRAY[u.Id] AS path
+    FROM Users u
+    WHERE u.Reputation > 50000
+    AND u.CreationDate >= DATE '2015-01-01'
+    
+    UNION ALL
+    
+    SELECT 
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        u2.CreationDate,
+        uiter.depth + 1,
+        uiter.path || u2.Id
+    FROM UserInfluenceTree uiter
+    JOIN Comments c1 ON c1.UserId = uiter.Id
+    JOIN Posts p ON p.Id = c1.PostId
+    JOIN Comments c2 ON c2.PostId = p.Id AND c2.UserId <> uiter.Id
+    JOIN Users u2 ON u2.Id = c2.UserId
+    WHERE uiter.depth < 3
+    AND NOT u2.Id = ANY(uiter.path)
+),
+TopQuestionMetrics AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate))/3600.0) AS AvgAnswerTimeHours,
+        MAX(a.Score) AS BestAnswerScore,
+        STRING_AGG(DISTINCT CAST(b.Name AS VARCHAR), ', ' ORDER BY b.Name) AS OwnerBadges
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId AND b.Class IN (1, 2)
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    AND p.Score > 10
+    AND p.ViewCount > 1000
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId
+),
+TagPerformanceMatrix AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        AVG(p.ViewCount) AS AvgViews,
+        AVG(p.AnswerCount) AS AvgAnswers,
+        (COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) * 100.0) / NULLIF(COUNT(DISTINCT p.Id), 0) AS AcceptanceRate,
+        (COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) * 100.0) / NULLIF(COUNT(DISTINCT p.Id), 0) AS CloseRate
+    FROM Tags t
+    JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    AND p.CreationDate >= DATE '2019-01-01'
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+UserEngagementScores AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        (SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) * 100.0) / NULLIF(COUNT(DISTINCT p.Id), 0) AS PositivePostRate,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxPostViews,
+        EXTRACT(DAY FROM (MAX(u.LastAccessDate) - MIN(u.CreationDate))) AS DaysActive,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.CreationDate >= DATE '2018-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+)
+SELECT 
+    tqm.QuestionId,
+    tqm.Title,
+    tqm.Score AS QuestionScore,
+    tqm.ViewCount,
+    tqm.AnswerCount,
+    tqm.UpvoteCount,
+    tqm.DownvoteCount,
+    tqm.CommentCount,
+    tqm.EditCount,
+    ROUND(tqm.AvgAnswerTimeHours, 2) AS AvgAnswerTimeHours,
+    tqm.BestAnswerScore,
+    ues.DisplayName AS AuthorName,
+    ues.Reputation AS AuthorReputation,
+    ues.PostCount AS AuthorPostCount,
+    ues.AvgPostScore AS AuthorAvgScore,
+    ues.ReputationRank AS AuthorRank,
+    tpm.TagName AS PrimaryTag,
+    tpm.AvgScore AS TagAvgScore,
+    ROUND(tpm.AcceptanceRate, 2) AS TagAcceptanceRate,
+    ROUND(tpm.CloseRate, 2) AS TagCloseRate,
+    uit.depth AS InfluenceDepth,
+    COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+    (tqm.Score * 0.3 + tqm.ViewCount * 0.0001 + tqm.AnswerCount * 5 + 
+     tqm.UpvoteCount * 2 - tqm.DownvoteCount * 3 + 
+     COALESCE(tpm.AvgScore, 0) * 0.2) AS CompositeQualityScore
+FROM TopQuestionMetrics tqm
+JOIN UserEngagementScores ues ON ues.Id = tqm.OwnerUserId
+LEFT JOIN UserInfluenceTree uit ON uit.Id = tqm.OwnerUserId
+LEFT JOIN PostLinks pl ON pl.PostId = tqm.QuestionId AND pl.LinkTypeId = 1
+CROSS JOIN LATERAL (
+    SELECT t.TagName, tpm2.AvgScore, tpm2.AcceptanceRate, tpm2.CloseRate
+    FROM Tags t
+    JOIN TagPerformanceMatrix tpm2 ON tpm2.TagName = t.TagName
+    WHERE tqm.Title LIKE '%' || t.TagName || '%'
+    OR EXISTS (
+        SELECT 1
+        FROM Posts p_tags
+        WHERE p_tags.Id = tqm.QuestionId
+          AND p_tags.Tags LIKE '%<' || t.TagName || '>%' 
+    )
+    ORDER BY tpm2.QuestionCount DESC
+    LIMIT 1
+) tpm
+CROSS JOIN LATERAL (SELECT Tags FROM Posts WHERE Id = tqm.QuestionId) p_tags
+WHERE ues.DaysActive > 30
+AND tqm.Score > 15
+GROUP BY tqm.QuestionId, tqm.Title, tqm.Score, tqm.ViewCount, tqm.AnswerCount, 
+         tqm.UpvoteCount, tqm.DownvoteCount, tqm.CommentCount, tqm.EditCount,
+         tqm.AvgAnswerTimeHours, tqm.BestAnswerScore, ues.DisplayName, ues.Reputation,
+         ues.PostCount, ues.AvgPostScore, ues.ReputationRank, tpm.TagName,
+         tpm.AvgScore, tpm.AcceptanceRate, tpm.CloseRate, uit.depth
+ORDER BY CompositeQualityScore DESC, tqm.ViewCount DESC
+LIMIT 500;

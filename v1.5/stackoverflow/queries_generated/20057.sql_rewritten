@@ -1,0 +1,101 @@
+-- {"query": "20057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1547} 
+WITH UserAnswerStats AS (
+    -- Calculate detailed statistics for each user's answers, including their most frequent primary tag
+    SELECT
+        a.OwnerUserId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        SUM(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        MIN(a.CreationDate) AS FirstAnswerDate,
+        -- Use string functions and an advanced aggregate to find the most common tag on questions they answer
+        MODE() WITHIN GROUP (ORDER BY (string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><'))[1]) AS MostFrequentPrimaryTag
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 -- Answers
+      AND a.OwnerUserId IS NOT NULL
+      AND q.PostTypeId = 1 -- Questions
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(a.Id) > 10
+),
+UserGeneralActivity AS (
+    -- Aggregate user activities from various tables (questions, comments, edits, close votes)
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseVoteCount
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id
+)
+-- Main query to synthesize user profiles and rank them
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    EXTRACT(YEAR FROM AGE(u.CreationDate)) AS MembershipYears,
+    COALESCE(uas.AnswerCount, 0) AS AnswerCount,
+    COALESCE(uga.QuestionCount, 0) AS QuestionCount,
+    COALESCE(uga.CommentCount, 0) AS CommentCount,
+    COALESCE(uga.EditCount, 0) AS EditCount,
+    COALESCE(uga.CloseVoteCount, 0) AS CloseVoteCount,
+    COALESCE(uas.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+    uas.MostFrequentPrimaryTag,
+    -- A complex "Power User Score" calculation with logarithm and weighting
+    (u.Reputation * 0.4) + (LN(1 + GREATEST(1, COALESCE(uas.TotalAnswerScore, 0))) * 100) + (COALESCE(uas.AcceptedAnswerCount, 0) * 20) + (COALESCE(uga.EditCount, 0) * 0.2) AS PowerScore,
+    -- Correlated subquery to find the date of the user's last gold badge
+    (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS LastGoldBadgeDate,
+    -- Window function to rank users globally by the calculated PowerScore
+    DENSE_RANK() OVER (ORDER BY (u.Reputation * 0.4) + (LN(1 + GREATEST(1, COALESCE(uas.TotalAnswerScore, 0))) * 100) + (COALESCE(uas.AcceptedAnswerCount, 0) * 20) + (COALESCE(uga.EditCount, 0) * 0.2) DESC) AS GlobalRank,
+    -- Window function to calculate the average reputation for users from the same country (approximated)
+    AVG(u.Reputation) OVER (PARTITION BY SUBSTRING(u.Location FROM '[^,]+$')) AS AvgReputationInCountry,
+    -- Using CASE expression for categorization based on multiple criteria
+    CASE
+        WHEN u.Reputation > 100000 AND COALESCE(uas.AcceptedAnswerCount, 0) > 50 THEN 'Community Pillar'
+        WHEN u.Reputation > 20000 AND COALESCE(uas.AnswerCount, 0) > 100 THEN 'Expert Contributor'
+        WHEN u.Reputation > 5000 THEN 'Valued Contributor'
+        ELSE 'Member'
+    END AS UserTier,
+    CONCAT(LEFT(u.AboutMe, 50), '...') AS AboutMeSnippet
+FROM Users u
+JOIN UserAnswerStats uas ON u.Id = uas.OwnerUserId
+LEFT JOIN UserGeneralActivity uga ON u.Id = uga.UserId
+WHERE u.LastAccessDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year')
+  AND u.Reputation > 1000
+  AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 20
+  AND EXISTS (SELECT 1 FROM Comments c WHERE c.UserId = u.Id AND c.Score > 10)
+
+UNION ALL
+
+-- A contrasting set of users: "dormant giants" (high reputation, but inactive)
+-- This part uses a SET OPERATOR to combine different user profiles
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    EXTRACT(YEAR FROM AGE(u.CreationDate)),
+    (SELECT COUNT(*) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2),
+    (SELECT COUNT(*) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1),
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id),
+    0, 0, 0,
+    'N/A',
+    u.Reputation * 0.5 AS PowerScore,
+    (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1),
+    NULL,
+    NULL,
+    'Dormant Giant' AS UserTier,
+    NULL
+FROM Users u
+WHERE u.Reputation > 50000
+  AND u.LastAccessDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '4 year')
+  AND NOT EXISTS (
+      SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '4 year')
+  )
+
+ORDER BY PowerScore DESC NULLS LAST
+LIMIT 500;

@@ -1,0 +1,87 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)            AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)            AS AnswerCount,
+        SUM(p.Score)                                          AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)          AS AvgQuestionScore,
+        COUNT(b.Id)                                           AS BadgeCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)           AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)           AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    LEFT JOIN Votes   v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopTags AS (
+    SELECT
+        pt.OwnerUserId                AS UserId,
+        t.TagName,
+        COUNT(*)                     AS TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY COUNT(*) DESC) AS rn
+    FROM Posts pt
+    JOIN LATERAL (
+        SELECT tag_raw.tag
+        FROM (
+            SELECT CAST(value AS TEXT) AS tag
+            FROM UNNEST(string_to_array(replace(replace(pt.Tags, '><', '|'), '<', ''), '|')) AS value
+        ) AS tag_raw
+        WHERE pt.Tags IS NOT NULL
+    ) AS tag_raw ON TRUE
+    JOIN Tags t ON t.TagName = tag_raw.tag
+    WHERE pt.PostTypeId = 1
+    GROUP BY pt.OwnerUserId, t.TagName
+),
+
+UserTagSummary AS (
+    SELECT
+        UserId,
+        ARRAY_AGG(TagName ORDER BY TagUsage DESC)  AS Top5TagsArray
+    FROM TopTags
+    WHERE rn <= 5
+    GROUP BY UserId
+),
+
+RecentActivity AS (
+    SELECT
+        u.Id                                    AS UserId,
+        MAX(p.CreationDate)                     AS LastPostDate,
+        MAX(c.CreationDate)                     AS LastCommentDate,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate), TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01')
+        )                                        AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalScore,
+    us.AvgQuestionScore,
+    us.BadgeCount,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    CASE
+        WHEN uts.Top5TagsArray IS NULL THEN NULL
+        ELSE uts.Top5TagsArray
+    END AS Top5Tags,
+    ra.LastActivity,
+    RANK()        OVER (ORDER BY us.Reputation DESC)      AS ReputationRank,
+    PERCENT_RANK() OVER (ORDER BY us.TotalScore DESC)    AS ScorePercentile
+FROM UserStats      us
+LEFT JOIN UserTagSummary   uts ON uts.UserId = us.Id
+LEFT JOIN RecentActivity   ra  ON ra.UserId = us.Id
+WHERE us.Reputation > 1000
+ORDER BY us.Reputation DESC
+LIMIT 100;

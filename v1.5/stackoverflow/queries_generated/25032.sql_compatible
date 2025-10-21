@@ -1,0 +1,115 @@
+WITH UserReputation AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+),
+TagUsage AS (
+    SELECT
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM t.Tags), '><')) AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts t
+    WHERE t.PostTypeId = 1
+    GROUP BY 1
+),
+TopTags AS (
+    SELECT Tag
+    FROM TagUsage
+    ORDER BY TagCount DESC
+    LIMIT 10
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesGiven,
+        COALESCE(COUNT(c.Id),0)                     AS CommentsMade
+    FROM Users u
+    LEFT JOIN Votes v    ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    ur.Id                                   AS UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.CommentsMade,
+    q.Id                                    AS RecentQuestionId,
+    q.Title,
+    q.Score,
+    q.CreationDate,
+    COALESCE(NULLIF(q.Tags,''), '<no tags>') AS Tags,
+    CASE
+        WHEN ARRAY_LENGTH(string_to_array(q.Tags, '><')) > 5 THEN 'Many'
+        ELSE 'Few'
+    END                                      AS TagDensity,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = q.Id
+          AND pl.LinkTypeId = 3
+          AND pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ur.Id)
+    )                                        AS HasDuplicateLinkedToOwnPosts,
+    ROW_NUMBER() OVER (PARTITION BY ur.Id ORDER BY q.CreationDate DESC) AS QuestionRank
+FROM UserReputation ur
+FULL OUTER JOIN UserActivity ua ON ua.Id = ur.Id
+LEFT JOIN RecentQuestions q ON q.OwnerUserId = ur.Id AND q.rn = 1
+WHERE (ur.Reputation > 10000 OR ua.CommentsMade > 500)
+  AND (COALESCE(ur.GoldBadges,0) + COALESCE(ur.SilverBadges,0) + COALESCE(ur.BronzeBadges,0)) > 10
+  AND q.Tags IS NOT NULL
+  AND EXISTS (SELECT 1 FROM TopTags tt WHERE tt.Tag = ANY(string_to_array(q.Tags, '><')))
+ORDER BY ur.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    p.Id,
+    p.Title,
+    p.Score,
+    p.CreationDate,
+    p.Tags,
+    'NoUser'                                 AS TagDensity,
+    FALSE                                    AS HasDuplicateLinkedToOwnPosts,
+    NULL                                     AS QuestionRank
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND p.Score < 0
+  AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '7 days'
+  AND p.Tags IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM Users u WHERE u.Id = p.OwnerUserId)
+ORDER BY 3 DESC
+LIMIT 20;

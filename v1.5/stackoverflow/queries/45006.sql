@@ -1,0 +1,45 @@
+WITH ActiveUserTags AS (
+    SELECT u.Id,
+           u.DisplayName,
+           t.TagName,
+           COUNT(p.Id) AS PostCount,
+           AVG(p.Score) AS AvgPostScore
+    FROM Users AS u
+    JOIN Posts AS p ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT DISTINCT TRIM(BOTH '>< ' FROM UNNEST(string_to_array(substr(Tags, 2, char_length(Tags) - 2), '><'))) AS TagName
+        FROM Posts
+    ) AS t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(p.Id) > 10
+),
+TagPerformance AS (
+    SELECT TagName,
+           MAX(PostCount) AS MaxUserPostCount,
+           AVG(AvgPostScore) AS OverallTagScore,
+           COUNT(DISTINCT Id) AS UniqueActiveUsers
+    FROM ActiveUserTags
+    GROUP BY TagName
+)
+SELECT
+    tp.TagName,
+    tp.MaxUserPostCount,
+    tp.OverallTagScore,
+    tp.UniqueActiveUsers,
+    v.VoteCount,
+    p.ViewCount
+FROM TagPerformance AS tp
+JOIN (
+    SELECT Tags AS TagsAlias, COUNT(v.Id) AS VoteCount
+    FROM Posts AS p
+    JOIN Votes AS v ON p.Id = v.PostId
+    GROUP BY Tags
+) AS v ON tp.TagName = v.TagsAlias
+JOIN (
+    SELECT Tags AS TagsAlias2, SUM(ViewCount) AS ViewCount
+    FROM Posts
+    GROUP BY Tags
+) AS p ON tp.TagName = p.TagsAlias2
+ORDER BY tp.OverallTagScore DESC, tp.UniqueActiveUsers DESC
+LIMIT 50;

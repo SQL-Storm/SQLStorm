@@ -1,0 +1,35 @@
+-- {"query": "2013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 372} 
+
+WITH RecentActiveUsers AS (
+    SELECT Id, DisplayName, Reputation, 
+           ROW_NUMBER() OVER (ORDER BY LastAccessDate DESC) AS RecentUserRank
+    FROM Users
+    WHERE LastAccessDate > NOW() - INTERVAL '1 YEAR'
+),
+TaggedQuestions AS (
+    SELECT p.Id, p.Title, COUNT(DISTINCT string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagCount 
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title
+),
+TopCommenters AS (
+    SELECT c.UserId, u.DisplayName, COUNT(c.Id) AS CommentCount
+    FROM Comments c
+    JOIN Users u ON c.UserId = u.Id
+    GROUP BY c.UserId, u.DisplayName
+    HAVING COUNT(c.Id) > 50
+)
+SELECT u.DisplayName, ta.RecordedTagCount, 
+       COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+       COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes
+FROM Users u
+LEFT JOIN TaggedQuestions tq ON tq.Id = u.Id
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS RecordedTagCount 
+    FROM TaggedQuestions
+    GROUP BY UserId
+) AS ta ON ta.UserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+WHERE u.Id IN (SELECT ra.Id FROM RecentActiveUsers ra WHERE ra.RecentUserRank <= 100)
+GROUP BY u.DisplayName, ta.RecordedTagCount
+ORDER BY UpVotes DESC, DownVotes ASC;

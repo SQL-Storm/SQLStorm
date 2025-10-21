@@ -1,0 +1,110 @@
+-- {"query": "20037.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1328} 
+
+WITH PowerUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    -- Calculate a composite "Power Score" based on reputation and badges
+    (
+      (u.Reputation / 1000.0) +
+      (SELECT COUNT(*) * 20 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) + -- Gold
+      (SELECT COUNT(*) * 5 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)    -- Silver
+    ) AS PowerScore
+  FROM Users u
+  WHERE u.Reputation > 20000 AND u.Id IN (
+    -- Subquery to ensure the user is active with a significant number of posts
+    SELECT OwnerUserId
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+    HAVING COUNT(*) > 100
+  )
+),
+RankedPosts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.CreationDate,
+    -- Use a window function to rank a user's questions and answers by an impact score
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId, p.PostTypeId
+      ORDER BY (p.Score * 5) + COALESCE(p.ViewCount, 0) + (COALESCE(p.FavoriteCount, 0) * 10) DESC, p.CreationDate DESC
+    ) AS PostRank
+  FROM Posts p
+  WHERE
+    p.OwnerUserId IN (SELECT Id FROM PowerUsers)
+    AND p.PostTypeId IN (1, 2) -- Questions and Answers only
+)
+SELECT
+  pu.DisplayName,
+  pu.Reputation,
+  ROUND(pu.PowerScore) AS PowerScore,
+  -- Compare user's reputation to the global average of all users using a window function
+  ROUND(pu.Reputation - AVG(pu.Reputation) OVER ()) AS RepVsGlobalAverage,
+  top_q.Title AS TopQuestionTitle,
+  top_q.Score AS TopQuestionScore,
+  -- Use string manipulation to format the tags of the top question
+  REPLACE(array_to_string(string_to_array(substring(top_q.Tags, 2, length(top_q.Tags)-2), ''><''), ', '), ',', ', ') AS TopQuestionTags,
+  top_a.Score AS TopAnswerScore,
+  -- Correlated subquery to find the number of other users who edited the top question
+  (
+    SELECT COUNT(DISTINCT ph.UserId)
+    FROM PostHistory ph
+    WHERE ph.PostId = top_q.Id
+      AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, or Tags
+      AND ph.UserId <> pu.Id
+  ) AS ExternalEditCount,
+  -- Use NULL logic and joins to determine who answered the top question
+  CASE
+    WHEN top_q.AcceptedAnswerId IS NULL THEN 'Question Not Yet Answered'
+    WHEN aa.OwnerUserId = pu.Id THEN 'Self-Answered'
+    ELSE aa_owner.DisplayName
+  END AS AcceptedAnswerProvider,
+  -- Calculate the time it took for the question to be answered
+  EXTRACT(EPOCH FROM (aa.CreationDate - top_q.CreationDate)) / 3600.0 AS HoursToAcceptedAnswer,
+  -- Use a set operator (EXCEPT) in a subquery to find "niche" tags on the top question
+  -- (tags that are not among the top 50 most popular tags overall)
+  (
+    SELECT string_agg(T.tag, ' | ')
+    FROM (
+      SELECT unnest(string_to_array(substring(top_q.Tags, 2, length(top_q.Tags)-2), ''><'')) AS tag
+      EXCEPT
+      SELECT TagName FROM Tags ORDER BY Count DESC LIMIT 50
+    ) AS T
+  ) AS NicheTags,
+  -- Complex subquery to find the most common reason this user's questions get closed
+  (
+    SELECT crt.Name
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS smallint) = crt.Id
+    WHERE p.OwnerUserId = pu.Id
+      AND ph.PostHistoryTypeId = 10 -- Post Closed
+      AND TRY_CAST(ph.Comment AS smallint) IS NOT NULL
+    GROUP BY crt.Name
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+  ) AS PrimaryCloseReason
+FROM PowerUsers pu
+-- Use LEFT JOINs to connect users to their top-ranked question and answer
+LEFT JOIN RankedPosts top_q ON pu.Id = top_q.OwnerUserId AND top_q.PostTypeId = 1 AND top_q.PostRank = 1
+LEFT JOIN RankedPosts top_a ON pu.Id = top_a.OwnerUserId AND top_q.PostTypeId = 2 AND top_a.PostRank = 1
+-- Join to get the accepted answer's details and owner
+LEFT JOIN Posts aa ON top_q.AcceptedAnswerId = aa.Id
+LEFT JOIN Users aa_owner ON aa.OwnerUserId = aa_owner.Id
+WHERE
+  -- Ensure we only profile users who have both a top question and a top answer in our dataset
+  top_q.Id IS NOT NULL AND top_a.Id IS NOT NULL
+ORDER BY
+  PowerScore DESC,
+  pu.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,114 @@
+-- {"query": "25091.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2757} 
+WITH user_posts AS (
+    SELECT u.Id                             AS user_id,
+           u.DisplayName                    AS display_name,
+           u.Reputation                     AS reputation,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+           SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS question_score,
+           SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS answer_score,
+           MAX(p.CreationDate)              AS last_post_dt
+    FROM   Users u
+    LEFT  JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+user_badges AS (
+    SELECT b.UserId                         AS user_id,
+           COUNT(*)                         AS badge_cnt,
+           MAX(b.Date)                      AS last_badge_dt,
+           STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS gold_badges,
+           STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 2) AS silver_badges,
+           STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS bronze_badges
+    FROM   Badges b
+    GROUP BY b.UserId
+),
+user_tags AS (
+    SELECT up.user_id,
+           t.TagName,
+           COUNT(*)                         AS tag_use_cnt,
+           ROW_NUMBER() OVER (PARTITION BY up.user_id ORDER BY COUNT(*) DESC) AS rn
+    FROM   user_posts up
+    JOIN   Posts p ON p.OwnerUserId = up.user_id AND p.PostTypeId = 1
+    CROSS  JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag
+    JOIN   Tags t ON t.TagName = tag
+    GROUP BY up.user_id, t.TagName
+),
+user_recent_votes AS (
+    SELECT v.UserId                         AS user_id,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes_given,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes_given,
+           COUNT(*) FILTER (WHERE vt.Id = 8)          AS bounties_started
+    FROM   Votes v
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE  v.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+    GROUP BY v.UserId
+),
+user_last_close AS (
+    SELECT ph.UserId                         AS user_id,
+           MAX(ph.CreationDate)              AS last_close_dt
+    FROM   PostHistory ph
+    WHERE  ph.PostHistoryTypeId = 10
+    GROUP BY ph.UserId
+)
+SELECT up.user_id,
+       COALESCE(up.display_name, 'Anonymous')               AS display_name,
+       up.reputation,
+       up.question_cnt,
+       up.answer_cnt,
+       COALESCE(up.question_score,0)                         AS question_score,
+       COALESCE(up.answer_score,0)                           AS answer_score,
+       up.last_post_dt,
+       COALESCE(ub.badge_cnt,0)                              AS badge_cnt,
+       ub.last_badge_dt,
+       ub.gold_badges,
+       ub.silver_badges,
+       ub.bronze_badges,
+       STRING_AGG(ut.TagName, ', ') FILTER (WHERE ut.rn <= 3) AS top_3_tags,
+       COALESCE(rv.up_votes_given,0)                         AS up_votes_30d,
+       COALESCE(rv.down_votes_given,0)                       AS down_votes_30d,
+       COALESCE(rv.bounties_started,0)                       AS bounties_started_30d,
+       lc.last_close_dt,
+       CASE
+           WHEN up.reputation > 20000 THEN 'Legendary'
+           WHEN up.reputation > 10000 THEN 'Expert'
+           WHEN up.reputation > 1000  THEN 'Intermediate'
+           ELSE 'Novice'
+       END                                                   AS reputation_tier
+FROM   user_posts up
+LEFT   JOIN user_badges ub      ON ub.user_id = up.user_id
+LEFT   JOIN user_tags ut        ON ut.user_id = up.user_id
+LEFT   JOIN user_recent_votes rv ON rv.user_id = up.user_id
+LEFT   JOIN user_last_close lc ON lc.user_id = up.user_id
+GROUP  BY up.user_id, up.display_name, up.reputation,
+          up.question_cnt, up.answer_cnt,
+          up.question_score, up.answer_score,
+          up.last_post_dt,
+          ub.badge_cnt, ub.last_badge_dt,
+          ub.gold_badges, ub.silver_badges, ub.bronze_badges,
+          rv.up_votes_given, rv.down_votes_given, rv.bounties_started,
+          lc.last_close_dt
+
+UNION ALL
+
+SELECT -1                                                    AS user_id,
+       'Community'                                           AS display_name,
+       0                                                     AS reputation,
+       SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)    AS question_cnt,
+       SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)    AS answer_cnt,
+       SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS question_score,
+       SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS answer_score,
+       MAX(p.CreationDate)                                  AS last_post_dt,
+       0                                                     AS badge_cnt,
+       NULL                                                  AS last_badge_dt,
+       NULL                                                  AS gold_badges,
+       NULL                                                  AS silver_badges,
+       NULL                                                  AS bronze_badges,
+       NULL                                                  AS top_3_tags,
+       0                                                     AS up_votes_30d,
+       0                                                     AS down_votes_30d,
+       0                                                     AS bounties_started_30d,
+       NULL                                                  AS last_close_dt,
+       'Community'                                           AS reputation_tier
+FROM   Posts p
+WHERE  p.OwnerUserId = -1
+GROUP  BY user_id, display_name, reputation;

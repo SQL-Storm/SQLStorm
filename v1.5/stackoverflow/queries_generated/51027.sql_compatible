@@ -1,0 +1,139 @@
+WITH question_metrics AS (
+  SELECT 
+    p.Id AS question_id,
+    p.CreationDate AS creation_date,
+    p.Score AS question_score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CommentCount,
+    COALESCE(u.Reputation, 0) AS asker_reputation,
+    COUNT(DISTINCT CASE WHEN a.Score > 0 THEN a.Id END) AS positive_answers,
+    AVG(a.Score) AS avg_answer_score,
+    COUNT(DISTINCT v_up.UserId) AS unique_upvoters,
+    SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes,
+    SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS total_downvotes,
+    COUNT(DISTINCT c.Id) AS total_comments,
+    AVG(c.Score) AS avg_comment_score,
+    COUNT(DISTINCT b.Id) AS asker_badges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    ph.revision_count,
+    ph.avg_time_between_edits,
+    pl.link_count,
+    pl.avg_link_score,
+    t.tag_count,
+    t.avg_tag_popularity
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2 AND a.DeletionDate IS NULL
+  LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId IN (1, 2)
+  LEFT JOIN Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = 3
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN (
+    SELECT 
+      PostId,
+      COUNT(*) AS revision_count,
+      AVG(EXTRACT(EPOCH FROM (CreationDate - LAG(CreationDate) OVER (PARTITION BY PostId ORDER BY CreationDate))) / 3600.0) AS avg_time_between_edits
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9)
+    GROUP BY PostId
+  ) ph ON p.Id = ph.PostId
+  LEFT JOIN (
+    SELECT 
+      pl.PostId,
+      COUNT(*) AS link_count,
+      AVG(COALESCE(rp.Score, 0)) AS avg_link_score
+    FROM PostLinks pl
+    LEFT JOIN Posts rp ON pl.RelatedPostId = rp.Id
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+  ) pl ON p.Id = pl.PostId
+  LEFT JOIN (
+    SELECT 
+      p.Id AS post_id,
+      CARDINALITY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tag_count,
+      AVG(tg.Count) AS avg_tag_popularity
+    FROM Posts p
+    LEFT JOIN Tags tg ON string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><') @> ARRAY[tg.TagName]::text[]
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.Id, p.Tags
+  ) t ON p.Id = t.post_id
+  WHERE p.PostTypeId = 1 
+    AND p.DeletionDate IS NULL 
+    AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+    AND p.ViewCount > 100
+    AND p.AnswerCount >= 1
+  GROUP BY p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, 
+           p.CommentCount, u.Reputation, ph.revision_count, ph.avg_time_between_edits, 
+           pl.link_count, pl.avg_link_score, t.tag_count, t.avg_tag_popularity
+),
+engagement_ranking AS (
+  SELECT 
+    question_id,
+    creation_date,
+    question_score,
+    (ViewCount * 0.3 + (COALESCE(total_upvotes, 0) + COALESCE(question_score, 0)) * 2.0 + 
+     COALESCE(FavoriteCount, 0) * 1.5 + COALESCE(avg_answer_score, 0) * 3.0 + 
+     COALESCE(positive_answers, 0) * 2.5 + COALESCE(link_count, 0) * 0.8) AS engagement_score,
+    RANK() OVER (ORDER BY 
+      (ViewCount * 0.3 + (COALESCE(total_upvotes, 0) + COALESCE(question_score, 0)) * 2.0 + 
+       COALESCE(FavoriteCount, 0) * 1.5 + COALESCE(avg_answer_score, 0) * 3.0 + 
+       COALESCE(positive_answers, 0) * 2.5 + COALESCE(link_count, 0) * 0.8) DESC
+    ) AS engagement_rank,
+    NTILE(10) OVER (ORDER BY asker_reputation DESC) AS reputation_quartile
+  FROM question_metrics
+),
+top_performers AS (
+  SELECT 
+    er.*,
+    qm.*,
+    ROW_NUMBER() OVER (PARTITION BY er.reputation_quartile ORDER BY er.engagement_score DESC) AS quartile_rank
+  FROM engagement_ranking er
+  JOIN question_metrics qm ON er.question_id = qm.question_id
+)
+SELECT 
+  tp.question_id,
+  tp.creation_date,
+  p.Title AS title,
+  u.DisplayName AS owner_display_name,
+  tp.asker_reputation,
+  tp.question_score,
+  tp.ViewCount AS view_count,
+  tp.AnswerCount AS answer_count,
+  tp.engagement_score,
+  tp.engagement_rank,
+  tp.reputation_quartile,
+  tp.quartile_rank,
+  tp.positive_answers,
+  tp.avg_answer_score,
+  tp.total_upvotes - COALESCE(tp.total_downvotes, 0) AS net_votes,
+  tp.unique_upvoters,
+  tp.total_comments,
+  tp.asker_badges,
+  tp.gold_badges,
+  tp.silver_badges,
+  tp.bronze_badges,
+  tp.revision_count,
+  tp.avg_time_between_edits,
+  tp.tag_count,
+  tp.avg_tag_popularity,
+  CASE 
+    WHEN tp.engagement_rank <= 10 THEN 'Top Performer'
+    WHEN tp.quartile_rank <= 3 THEN 'Quartile Leader'
+    ELSE 'Average'
+  END AS performance_category,
+  CONCAT(
+    'Q: ', tp.question_score,
+    ' | A: ', tp.avg_answer_score,
+    ' | V: ', tp.ViewCount,
+    ' | F: ', tp.FavoriteCount
+  ) AS score_summary
+FROM top_performers tp
+JOIN Posts p ON tp.question_id = p.Id
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE tp.engagement_rank <= 100
+  AND tp.reputation_quartile <= 5
+ORDER BY tp.engagement_score DESC, tp.reputation_quartile, tp.question_id;

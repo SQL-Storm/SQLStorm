@@ -1,0 +1,186 @@
+WITH
+TopAnswerers AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         COUNT(a.Id) FILTER (WHERE p.AcceptedAnswerId = a.Id) AS AcceptedAnswers,
+         COUNT(a.Id) FILTER (WHERE a.Score >= 10) AS HighScoreAnswers,
+         MIN(a.CreationDate) AS FirstAnswer,
+         MAX(a.LastActivityDate) AS LastActivity,
+         EXTRACT(EPOCH FROM (MAX(a.LastActivityDate) - MIN(a.CreationDate))) AS ActiveSeconds
+  FROM Users u
+  JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  JOIN Posts p ON p.AcceptedAnswerId = a.Id
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(a.Id) >= 25
+  ORDER BY AcceptedAnswers DESC, HighScoreAnswers DESC
+  LIMIT 200
+),
+AnswererTagStats AS (
+  SELECT ta.UserId,
+         REGEXP_SPLIT_TO_TABLE(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><') AS Tag,
+         COUNT(a.Id) AS AnswersInTag,
+         AVG(a.Score) AS AvgAnswerScore,
+         MAX(a.Score) AS MaxAnswerScore
+  FROM TopAnswerers ta
+  JOIN Posts a ON a.OwnerUserId = ta.UserId AND a.PostTypeId = 2
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1 AND q.Tags IS NOT NULL
+  GROUP BY ta.UserId, Tag
+),
+TagPopulation AS (
+  SELECT t.TagName AS Tag,
+         t.Count AS TagCount,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount
+  FROM Tags t
+  LEFT JOIN Posts p ON (p.Tags IS NOT NULL AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0)
+  GROUP BY t.TagName, t.Count
+),
+ControversialQuestions AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.ViewCount,
+         q.Score AS QuestionScore,
+         q.AnswerCount,
+         COUNT(c.Id) AS CommentCount,
+         MAX(a.Score) AS TopAnswerScore,
+         MIN(a.Score) AS LowAnswerScore,
+         (MAX(a.Score) - COALESCE(MIN(a.Score),0)) AS AnswerScoreSpread
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+  GROUP BY q.Id, q.Title, q.CreationDate, q.ViewCount, q.Score, q.AnswerCount
+  HAVING COUNT(a.Id) >= 5 AND COUNT(c.Id) >= 10 AND (MAX(a.Score) - COALESCE(MIN(a.Score),0)) >= 20
+  ORDER BY AnswerScoreSpread DESC, CommentCount DESC
+  LIMIT 200
+),
+ControversialCommenters AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         COUNT(DISTINCT cc.QuestionId) AS ControversialThreadsCommented,
+         COUNT(cc.CommentId) AS TotalCommentsOnControversial
+  FROM Users u
+  JOIN (
+    SELECT c.Id AS CommentId, c.UserId, c.PostId AS QuestionId
+    FROM Comments c
+    WHERE c.PostId IN (SELECT QuestionId FROM ControversialQuestions)
+  ) cc ON cc.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(DISTINCT cc.QuestionId) >= 3
+  ORDER BY ControversialThreadsCommented DESC, TotalCommentsOnControversial DESC
+  LIMIT 100
+),
+LinkMetrics AS (
+  SELECT pl.RelatedPostId AS QuestionId,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS IncomingLinks,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinks,
+         COUNT(*) AS TotalLinks,
+         COUNT(DISTINCT pl.PostId) AS DistinctLinkSources
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.RelatedPostId AND p.PostTypeId = 1
+  GROUP BY pl.RelatedPostId
+  HAVING COUNT(*) >= 10
+),
+AnswererTagProfile AS (
+  SELECT ats.UserId,
+         ats.Tag,
+         ats.AnswersInTag,
+         ats.AvgAnswerScore,
+         ats.MaxAnswerScore,
+         tp.TagCount,
+         tp.QuestionCount,
+         tp.AnswerCount,
+         (ats.AnswersInTag::numeric / NULLIF(tp.AnswerCount,0)) AS ShareOfTagAnswers
+  FROM AnswererTagStats ats
+  LEFT JOIN TagPopulation tp ON tp.Tag = ats.Tag
+  WHERE ats.AnswersInTag >= 5
+),
+UserBadgeScore AS (
+  SELECT b.UserId,
+         u.DisplayName,
+         SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END) AS BadgeWeight,
+         COUNT(*) AS BadgeCount,
+         SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+  FROM Badges b
+  JOIN Users u ON u.Id = b.UserId
+  GROUP BY b.UserId, u.DisplayName
+),
+UserVoteRatios AS (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+         SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS TotalVotesReceived,
+         CASE WHEN SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) = 0 THEN NULL
+              ELSE ROUND( SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)::numeric / NULLIF(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0), 3) END AS UpDownRatio
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+  HAVING SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) >= 50
+),
+ExpertInfluencers AS (
+  SELECT atp.UserId,
+         u.DisplayName,
+         atp.Tag,
+         atp.AnswersInTag,
+         atp.AvgAnswerScore,
+         ubs.BadgeWeight,
+         COALESCE(uvr.UpDownRatio, 0) AS UpDownRatio,
+         atp.ShareOfTagAnswers,
+         ( (COALESCE(ubs.BadgeWeight,0) * 0.25)
+         + (COALESCE(atp.AvgAnswerScore,0) * 0.30)
+         + (COALESCE(atp.ShareOfTagAnswers,0) * 0.30 * 100)
+         + (COALESCE(uvr.UpDownRatio,0) * 0.15) ) AS CompositeScore
+  FROM AnswererTagProfile atp
+  JOIN Users u ON u.Id = atp.UserId
+  LEFT JOIN UserBadgeScore ubs ON ubs.UserId = atp.UserId
+  LEFT JOIN UserVoteRatios uvr ON uvr.UserId = atp.UserId
+),
+TopInfluencerPerTag AS (
+  SELECT DISTINCT ON (Tag) Tag,
+         UserId,
+         DisplayName,
+         AnswersInTag,
+         AvgAnswerScore,
+         BadgeWeight,
+         UpDownRatio,
+         ShareOfTagAnswers,
+         CompositeScore
+  FROM ExpertInfluencers
+  ORDER BY Tag, CompositeScore DESC
+)
+SELECT t.Tag,
+       tip.UserId AS InfluencerUserId,
+       tip.DisplayName AS InfluencerName,
+       tip.CompositeScore,
+       tip.AnswersInTag,
+       tip.AvgAnswerScore,
+       tip.BadgeWeight,
+       tip.UpDownRatio,
+       ROUND(tip.ShareOfTagAnswers::numeric,4) AS ShareOfTagAnswers,
+       tp.TagCount,
+       tp.QuestionCount,
+       tp.AnswerCount,
+       lm.IncomingLinks,
+       lm.DuplicateLinks,
+       cq.QuestionId AS ARepresentativeControversialQuestionId,
+       cq.Title AS ControversialQuestionTitle,
+       cq.AnswerScoreSpread,
+       cc.ControversialThreadsCommented,
+       cc.TotalCommentsOnControversial
+FROM TopInfluencerPerTag tip
+LEFT JOIN TagPopulation tp ON tp.Tag = tip.Tag
+LEFT JOIN LinkMetrics lm ON lm.QuestionId = tp.Tag -- adjusted join key
+LEFT JOIN LATERAL (
+  SELECT cq.QuestionId, cq.Title, cq.AnswerScoreSpread
+  FROM ControversialQuestions cq
+  JOIN Posts q ON q.Id = cq.QuestionId
+  WHERE q.Tags IS NOT NULL AND POSITION('<' || tip.Tag || '>' IN q.Tags) > 0
+  ORDER BY cq.AnswerScoreSpread DESC, cq.CommentCount DESC
+  LIMIT 1
+) cq ON true
+LEFT JOIN ControversialCommenters cc ON cc.UserId = tip.UserId
+ORDER BY tip.CompositeScore DESC, tp.TagCount DESC
+LIMIT 250;

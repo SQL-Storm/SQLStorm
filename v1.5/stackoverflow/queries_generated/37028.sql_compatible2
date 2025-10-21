@@ -1,0 +1,230 @@
+WITH
+params AS (
+  SELECT
+    CAST('2024-10-01 12:34:56' AS timestamp) AT TIME ZONE 'UTC' AS now_utc,
+    365 AS days_window,
+    20 AS top_users
+),
+recent_questions AS (
+  SELECT p.*
+  FROM Posts p
+  JOIN params ON true
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (params.now_utc - (params.days_window || ' days')::interval)
+),
+question_tags AS (
+  SELECT
+    q.Id AS QuestionId,
+    TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'))) AS Tag
+  FROM recent_questions q
+),
+user_answer_stats AS (
+  SELECT
+    a.OwnerUserId AS UserId,
+    COUNT(*) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+    AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600) FILTER (WHERE a.PostTypeId = 2) AS AvgHoursAfterQuestion,
+    COUNT(DISTINCT q.Id) AS DistinctQuestionsAnswered
+  FROM Posts a
+  JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+    AND q.CreationDate >= (SELECT now_utc - (days_window || ' days')::interval FROM params)
+    AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+user_badge_score AS (
+  SELECT
+    b.UserId,
+    SUM(
+      (CASE b.Class WHEN 1 THEN 5 WHEN 2 THEN 2 ELSE 1 END)
+      * GREATEST(0.2, 1 - (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - b.Date)) / (86400*365)) )
+    ) AS BadgeScore
+  FROM Badges b
+  JOIN params ON true
+  GROUP BY b.UserId
+),
+user_comment_rate AS (
+  SELECT
+    c.UserId,
+    COUNT(*) AS CommentCount,
+    AVG(c.Score) FILTER (WHERE c.Score IS NOT NULL) AS AvgCommentScore
+  FROM Comments c
+  WHERE c.CreationDate >= (SELECT now_utc - (days_window || ' days')::interval FROM params)
+    AND c.UserId IS NOT NULL
+  GROUP BY c.UserId
+),
+user_votes AS (
+  SELECT
+    v.UserId,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 WHEN vt.Name = 'DownMod' THEN -1 ELSE 0 END) AS VoteBalance,
+    COUNT(*) AS VoteCount
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= (SELECT now_utc - (days_window || ' days')::interval FROM params)
+    AND v.UserId IS NOT NULL
+  GROUP BY v.UserId
+),
+user_profiles AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate))/86400 AS DaysSinceLastAccess,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+  FROM Users u
+),
+tag_popularity AS (
+  SELECT
+    qt.Tag,
+    COUNT(DISTINCT qt.QuestionId) AS QuestionsInWindow,
+    AVG(q.ViewCount) AS AvgQuestionViews,
+    SUM(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 1) AS SumQuestionScores
+  FROM question_tags qt
+  JOIN Posts q ON q.Id = qt.QuestionId
+  LEFT JOIN Posts p ON p.Id = qt.QuestionId
+  GROUP BY qt.Tag
+),
+user_tag_affinity AS (
+  SELECT
+    ua.OwnerUserId AS UserId,
+    jt.Tag,
+    COUNT(*) AS AnswersToTag,
+    AVG(ua.Score) AS AvgAnswerScoreToTag
+  FROM Posts ua
+  JOIN Posts q ON ua.ParentId = q.Id AND q.PostTypeId = 1
+  JOIN LATERAL (
+    SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'))) AS Tag
+  ) jt ON TRUE
+  WHERE ua.PostTypeId = 2
+    AND ua.OwnerUserId IS NOT NULL
+    AND q.CreationDate >= (SELECT now_utc - (days_window || ' days')::interval FROM params)
+  GROUP BY ua.OwnerUserId, jt.Tag
+),
+candidate_users AS (
+  SELECT
+    up.UserId,
+    up.DisplayName,
+    COALESCE(ua.AnswerCount,0) AS AnswerCount,
+    COALESCE(ua.AvgAnswerScore,0) AS AvgAnswerScore,
+    COALESCE(bs.BadgeScore,0) AS BadgeScore,
+    COALESCE(cr.CommentCount,0) AS CommentCount,
+    COALESCE(vs.VoteBalance,0) AS VoteBalance,
+    up.Reputation,
+    up.DaysSinceLastAccess,
+    (COALESCE(ua.AnswerCount,0) * 2.0
+      + COALESCE(bs.BadgeScore,0)
+      + COALESCE(ua.AvgAnswerScore,0) * 1.5
+      + GREATEST(0, (100 - up.DaysSinceLastAccess)) * 0.05
+      + COALESCE(vs.VoteBalance,0) * 0.3
+      + COALESCE(cr.CommentCount,0) * 0.2
+    ) AS CompositeScore
+  FROM user_profiles up
+  LEFT JOIN user_answer_stats ua ON ua.UserId = up.UserId
+  LEFT JOIN user_badge_score bs ON bs.UserId = up.UserId
+  LEFT JOIN user_comment_rate cr ON cr.UserId = up.UserId
+  LEFT JOIN user_votes vs ON vs.UserId = up.UserId
+  WHERE up.Reputation > 0
+),
+top_users AS (
+  SELECT *
+  FROM candidate_users
+  ORDER BY CompositeScore DESC NULLS LAST
+  LIMIT (SELECT top_users FROM params)
+),
+top_users_tag_summary AS (
+  SELECT
+    tu.UserId,
+    tu.DisplayName,
+    uta.Tag,
+    uta.AnswersToTag,
+    uta.AvgAnswerScoreToTag,
+    rank() OVER (PARTITION BY tu.UserId ORDER BY uta.AnswersToTag DESC, uta.AvgAnswerScoreToTag DESC) AS TagRank
+  FROM top_users tu
+  LEFT JOIN user_tag_affinity uta ON uta.UserId = tu.UserId
+)
+SELECT
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.AnswerCount,
+  ROUND(tu.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+  ROUND(tu.BadgeScore::numeric,2) AS BadgeScore,
+  ROUND(tu.CompositeScore::numeric,3) AS CompositeScore,
+  jsonb_build_object(
+    'top_tags',
+    (SELECT jsonb_agg(jsonb_build_object('tag', t.Tag, 'answers', t.AnswersToTag, 'avg_score', ROUND(t.AvgAnswerScoreToTag::numeric,2)))
+     FROM top_users_tag_summary t
+     WHERE t.UserId = tu.UserId AND t.TagRank <= 5
+     ORDER BY t.TagRank)
+  ) AS TagSummary,
+  (SELECT jsonb_agg(bucket) FROM (
+     SELECT jsonb_build_object(
+       'bucket_label', label,
+       'count', cnt
+     ) AS bucket
+     FROM (
+       SELECT
+         CASE
+           WHEN h.hours <= 1 THEN '<=1h'
+           WHEN h.hours <= 6 THEN '1-6h'
+           WHEN h.hours <= 24 THEN '6-24h'
+           WHEN h.hours <= 72 THEN '24-72h'
+           ELSE '>72h'
+         END AS label,
+         COUNT(*) AS cnt
+       FROM (
+         SELECT EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS hours
+         FROM Posts a
+         JOIN Posts q ON a.ParentId = q.Id
+         WHERE a.PostTypeId = 2
+           AND a.OwnerUserId = tu.UserId
+           AND q.CreationDate >= (SELECT now_utc - (days_window || ' days')::interval FROM params)
+       ) h
+       GROUP BY CASE
+         WHEN h.hours <= 1 THEN '<=1h'
+         WHEN h.hours <= 6 THEN '1-6h'
+         WHEN h.hours <= 24 THEN '6-24h'
+         WHEN h.hours <= 72 THEN '24-72h'
+         ELSE '>72h'
+       END
+       ORDER BY
+         MIN(CASE
+           WHEN h.hours <= 1 THEN 0
+           WHEN h.hours <= 6 THEN 1
+           WHEN h.hours <= 24 THEN 2
+           WHEN h.hours <= 72 THEN 3
+           ELSE 4
+         END)
+     ) s
+  ) sub) AS AnswerLatencyHistogram,
+  (SELECT jsonb_agg(row_to_json(x))
+   FROM (
+     SELECT a.Id AS AnswerId, a.CreationDate, a.Score AS AnswerScore,
+       q.Id AS QuestionId, q.Title AS QuestionTitle, q.ViewCount AS QuestionViews, q.Score AS QuestionScore,
+       EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = q.Id) AS QuestionHasLinks,
+       (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentCount
+     FROM Posts a
+     JOIN Posts q ON a.ParentId = q.Id
+     WHERE a.PostTypeId = 2
+       AND a.OwnerUserId = tu.UserId
+     ORDER BY a.CreationDate DESC
+     LIMIT 5
+   ) x
+  ) AS RecentAnswers,
+  (SELECT jsonb_agg(jsonb_build_object('UserId', cu.UserId, 'DisplayName', cu.DisplayName, 'CommentCount', cu.CommentCount) ORDER BY cu.CommentCount DESC)
+   FROM (
+     SELECT c.UserId, u.DisplayName, COUNT(*) AS CommentCount
+     FROM Comments c
+     JOIN Posts a ON c.PostId = a.Id AND a.PostTypeId = 2 AND a.OwnerUserId = tu.UserId
+     LEFT JOIN Users u ON u.Id = c.UserId
+     WHERE c.UserId IS NOT NULL
+     GROUP BY c.UserId, u.DisplayName
+     ORDER BY CommentCount DESC
+     LIMIT 10
+   ) cu
+  ) AS Interactors
+FROM top_users tu
+ORDER BY tu.CompositeScore DESC;

@@ -1,0 +1,256 @@
+WITH UserAggregates AS (
+    -- Aggregates user reputation, vote counts, and badge statistics
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostEventSummary AS (
+    -- Summarizes editing and closing/reopening history for questions
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.Id END) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) AS DeleteEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.Id END) AS UndeleteEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.CreationDate END) AS InitialBodyCreationDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEditDate,
+        -- Correlated subquery to get initial body length
+        (
+            SELECT LENGTH(p_init.Text)
+            FROM PostHistory AS p_init
+            WHERE p_init.PostId = ph.PostId AND p_init.PostHistoryTypeId = 2
+            ORDER BY p_init.CreationDate ASC
+            LIMIT 1
+        ) AS InitialBodyLength,
+        -- Correlated subquery to get last body edit length
+        (
+            SELECT LENGTH(p_last.Text)
+            FROM PostHistory AS p_last
+            WHERE p_last.PostId = ph.PostId AND p_last.PostHistoryTypeId = 5
+            ORDER BY p_last.CreationDate DESC
+            LIMIT 1
+        ) AS LastBodyEditLength
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (2, 4, 5, 6, 8, 9, 10, 11, 12, 13)
+    GROUP BY ph.PostId
+),
+PostTagDetails AS (
+    -- Extracts individual tags from question posts using string_to_array and UNNEST
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag_val) AS TagName
+    FROM Posts AS p
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag_val
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+PostVoteSummary AS (
+    -- Summarizes voting activity for posts
+    SELECT
+        v.PostId,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 AND v.UserId IS NOT NULL THEN v.UserId END) AS FavoriteCountDistinctUsers
+    FROM Votes AS v
+    GROUP BY v.PostId
+),
+BaseQuestionMetrics AS (
+    -- Base CTE to gather common information for questions, including joins and some calculations
+    SELECT
+        P.Id AS QuestionId,
+        P.Title AS QuestionTitle,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount AS ActualFavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.Tags,
+        UA.DisplayName AS OwnerDisplayName,
+        UA.Reputation AS OwnerReputation,
+        UA.GoldBadges AS OwnerGoldBadges,
+        PES.TotalEdits,
+        PES.CloseEvents,
+        PES.ReopenEvents,
+        PES.DeleteEvents,
+        PES.UndeleteEvents,
+        PL.DuplicateLinkCount,
+        PV.TotalVotes AS TotalVotesOnQuestion,
+        PV.UpVotesCount AS QuestionUpVotes,
+        PV.DownVotesCount AS QuestionDownVotes,
+        (PES.LastBodyEditLength - PES.InitialBodyLength) AS BodyLengthChange,
+        -- Correlated subquery to count recent unique commenters
+        (
+            SELECT COUNT(DISTINCT C.UserId)
+            FROM Comments AS C
+            WHERE C.PostId = P.Id AND C.CreationDate > P.LastActivityDate - INTERVAL '30 days'
+        ) AS RecentCommenters,
+        -- Window function: Rank questions by score within their creation year, for owner with high reputation
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM P.CreationDate), UA.UserId
+            ORDER BY P.Score DESC, P.ViewCount DESC
+        ) AS OwnerYearlyScoreRank,
+        -- Complex Calculation: Net engagement score, considering votes, comments, and favorites relative to views
+        ROUND(
+            (CAST(P.Score AS NUMERIC) * 0.5 +
+             COALESCE(P.CommentCount, 0) * 0.75 +
+             COALESCE(PV.FavoriteCountDistinctUsers, 0) * 1.5 +
+             COALESCE(PES.TotalEdits, 0) * 0.1) / NULLIF(P.ViewCount, 0) * 100, 2
+        ) AS NetEngagementRatio,
+        -- String Expression: Calculate approximate number of tags by counting delimiters
+        (CHAR_LENGTH(REPLACE(P.Tags, '><', '')) - LENGTH(P.Tags) + 1) AS NumberOfTags,
+        -- NULL Logic: Determine the overall status of the question
+        COALESCE(
+            CASE
+                WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+                WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+                WHEN P.AnswerCount > 0 THEN 'Answered'
+                ELSE 'Unanswered'
+            END, 'Unknown'
+        ) AS QuestionStatus,
+        -- Correlated Subquery: Check if owner has a badge related to one of the question's tags
+        EXISTS (
+            SELECT 1
+            FROM Badges AS B_corr
+            JOIN PostTagDetails AS PTD_corr ON B_corr.UserId = P.OwnerUserId AND B_corr.Name = PTD_corr.TagName
+            WHERE PTD_corr.PostId = P.Id
+            LIMIT 1
+        ) AS OwnerHasRelatedTagBadge,
+        -- Correlated Subquery: Find the maximum score of any answer to this question
+        (
+            SELECT MAX(A.Score) FROM Posts AS A WHERE A.ParentId = P.Id AND A.PostTypeId = 2
+        ) AS MaxAnswerScore,
+        -- Time since last activity in hours
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - P.LastActivityDate)) / 3600 AS HoursSinceLastActivity
+    FROM
+        Posts AS P
+    LEFT JOIN UserAggregates AS UA ON P.OwnerUserId = UA.UserId
+    LEFT JOIN PostEventSummary AS PES ON P.Id = PES.PostId
+    LEFT JOIN PostVoteSummary AS PV ON P.Id = PV.PostId
+    LEFT JOIN (
+        -- Non-correlated subquery for counting duplicate links
+        SELECT
+            PostId,
+            COUNT(DISTINCT RelatedPostId) AS DuplicateLinkCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) AS PL ON P.Id = PL.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.CreationDate >= TIMESTAMP '2018-01-01'
+        AND P.CreationDate < TIMESTAMP '2023-01-01'
+        AND P.Score >= 50
+        AND P.ViewCount > 1000
+        AND P.OwnerUserId IS NOT NULL
+        AND P.LastEditorUserId IS DISTINCT FROM P.OwnerUserId
+)
+-- First Part of the UNION ALL: Controversial Unresolved Questions
+SELECT
+    QuestionId,
+    QuestionTitle,
+    QuestionCreationDate,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    ActualFavoriteCount,
+    OwnerDisplayName,
+    OwnerReputation,
+    OwnerGoldBadges,
+    TotalEdits,
+    CloseEvents,
+    ReopenEvents,
+    DeleteEvents,
+    UndeleteEvents,
+    DuplicateLinkCount,
+    TotalVotesOnQuestion,
+    QuestionUpVotes,
+    QuestionDownVotes,
+    BodyLengthChange,
+    RecentCommenters,
+    -- Use ROW_NUMBER value as a surrogate for ranking in this branch
+    OwnerYearlyScoreRank,
+    NetEngagementRatio,
+    NumberOfTags,
+    QuestionStatus,
+    OwnerHasRelatedTagBadge,
+    MaxAnswerScore,
+    HoursSinceLastActivity,
+    'Controversial_Unresolved_Recent' AS CategoryLabel
+FROM
+    BaseQuestionMetrics AS bqm
+WHERE
+    bqm.QuestionStatus = 'Unanswered'
+    AND bqm.AnswerCount > 5
+    AND bqm.CloseEvents > 0 AND bqm.ReopenEvents > 0
+    AND (bqm.Tags LIKE '%<sql>%' OR bqm.Tags LIKE '%<postgresql>%' OR bqm.QuestionTitle ILIKE '%database%')
+    AND bqm.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    AND (bqm.MaxAnswerScore IS NULL OR bqm.MaxAnswerScore < bqm.QuestionScore * 0.5)
+
+UNION ALL
+
+-- Second Part of the UNION ALL: Highly Favored & Heavily Edited Older Questions by High-Rep Users
+SELECT
+    QuestionId,
+    QuestionTitle,
+    QuestionCreationDate,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    ActualFavoriteCount,
+    OwnerDisplayName,
+    OwnerReputation,
+    OwnerGoldBadges,
+    TotalEdits,
+    CloseEvents,
+    ReopenEvents,
+    DeleteEvents,
+    UndeleteEvents,
+    DuplicateLinkCount,
+    TotalVotesOnQuestion,
+    QuestionUpVotes,
+    QuestionDownVotes,
+    BodyLengthChange,
+    RecentCommenters,
+    OwnerYearlyScoreRank,
+    NetEngagementRatio,
+    NumberOfTags,
+    QuestionStatus,
+    OwnerHasRelatedTagBadge,
+    MaxAnswerScore,
+    HoursSinceLastActivity,
+    'Highly_Favored_Edited_Older' AS CategoryLabel
+FROM
+    BaseQuestionMetrics AS bqm
+WHERE
+    bqm.QuestionCreationDate < TIMESTAMP '2020-01-01'
+    AND bqm.ActualFavoriteCount >= 10
+    AND bqm.QuestionScore > 200
+    AND bqm.TotalEdits > 5
+    AND bqm.CommunityOwnedDate IS NULL
+    AND bqm.OwnerReputation > 10000
+    AND (bqm.CloseEvents = 0 OR bqm.ReopenEvents > 0)
+    AND (bqm.QuestionStatus = 'Accepted' OR bqm.QuestionStatus = 'Answered')
+
+ORDER BY
+    CategoryLabel DESC,
+    NetEngagementRatio DESC,
+    QuestionScore DESC
+LIMIT 2000;

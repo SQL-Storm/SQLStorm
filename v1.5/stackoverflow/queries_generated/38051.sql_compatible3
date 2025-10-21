@@ -1,0 +1,200 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12' month from users)
+),
+question_posts as (
+  select p.id as post_id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.title, p.tags, p.answercount
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '36' month from posts)
+),
+answer_posts as (
+  select p.id as post_id, p.parentid as question_id, p.owneruserid, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+    and p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '36' month from posts)
+),
+comments_recent as (
+  select c.postid, c.userid, c.score, c.creationdate
+  from comments c
+  where c.creationdate >= (select date_trunc('month', max(creationdate)) - interval '36' month from comments)
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  where v.creationdate >= (select date_trunc('month', max(creationdate)) - interval '36' month from votes)
+  group by v.postid
+),
+link_dupes as (
+  select pl.postid, count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+         count(*) filter (where pl.linktypeid = 1) as linked_marks
+  from postlinks pl
+  where pl.creationdate >= (select date_trunc('month', max(creationdate)) - interval '36' month from postlinks)
+  group by pl.postid
+),
+closed_events as (
+  select ph.postid,
+         min(ph.creationdate) as first_closed_at,
+         count(*) as close_events,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopens
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+tag_expansion as (
+  select q.post_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from question_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+  select tag, count(*) as tag_count
+  from tag_expansion
+  group by tag
+  having count(*) >= 50
+),
+question_enriched as (
+  select q.*,
+         coalesce(va.upvotes,0) as upvotes,
+         coalesce(va.downvotes,0) as downvotes,
+         coalesce(va.favorites,0) as favorites,
+         coalesce(va.bounty_started,0) as bounty_started,
+         coalesce(va.bounty_awarded,0) as bounty_awarded,
+         coalesce(ld.duplicate_marks,0) as duplicate_marks,
+         coalesce(ld.linked_marks,0) as linked_marks,
+         ce.first_closed_at,
+         coalesce(ce.close_events,0) as close_events,
+         coalesce(ce.reopens,0) as reopen_events
+  from question_posts q
+  left join vote_agg va on va.postid = q.post_id
+  left join link_dupes ld on ld.postid = q.post_id
+  left join closed_events ce on ce.postid = q.post_id
+),
+answer_stats as (
+  select a.question_id,
+         count(*) as answers_total,
+         count(*) filter (where a.score > 0) as answers_positive,
+         avg(a.score::numeric) as avg_answer_score,
+         min(a.creationdate) as first_answer_time
+  from answer_posts a
+  group by a.question_id
+),
+comment_stats as (
+  select c.postid,
+         count(*) as comments_total,
+         sum(c.score) as comments_score_sum,
+         max(c.creationdate) as last_comment_time
+  from comments_recent c
+  group by c.postid
+),
+user_quality as (
+  select u.id as user_id,
+         u.reputation,
+         u.displayname,
+         percentile_cont(0.5) within group (order by coalesce(p.score,0)) as median_post_score,
+         avg(coalesce(p.score,0)) as avg_post_score,
+         count(p.id) as total_posts_last_3y
+  from users u
+  left join posts p on p.owneruserid = u.id
+                   and p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '36' month from posts)
+  group by u.id, u.reputation, u.displayname
+),
+tagged_questions as (
+  select qe.*, te.tag
+  from question_enriched qe
+  join tag_expansion te on te.post_id = qe.post_id
+  join top_tags tt on tt.tag = te.tag
+),
+scored as (
+  select
+    tq.post_id as question_id,
+    tq.title,
+    tq.creationdate,
+    tq.owneruserid,
+    tq.score as question_score,
+    tq.viewcount,
+    tq.answercount,
+    tq.upvotes,
+    tq.downvotes,
+    tq.favorites,
+    tq.bounty_started,
+    tq.bounty_awarded,
+    tq.duplicate_marks,
+    tq.linked_marks,
+    tq.first_closed_at,
+    tq.close_events,
+    tq.reopen_events,
+    cs.comments_total,
+    cs.comments_score_sum,
+    asx.answers_total,
+    asx.answers_positive,
+    asx.avg_answer_score,
+    extract(epoch from (asx.first_answer_time - tq.creationdate))/3600.0 as hours_to_first_answer,
+    uq.reputation as owner_reputation,
+    uq.median_post_score as owner_median_post_score,
+    uq.avg_post_score as owner_avg_post_score,
+    tq.tags,
+    tq.tag,
+    (
+      0.35 * coalesce(tq.viewcount,0) +
+      25.0 * coalesce(tq.upvotes,0) -
+      30.0 * coalesce(tq.downvotes,0) +
+      15.0 * coalesce(tq.favorites,0) +
+      20.0 * coalesce(asx.answers_positive,0) +
+      5.0  * coalesce(cs.comments_total,0) -
+      40.0 * coalesce(tq.duplicate_marks,0) -
+      50.0 * case when tq.first_closed_at is not null then 1 else 0 end +
+      0.1  * coalesce(uq.reputation,0) -
+      10.0 * greatest(0, coalesce(extract(epoch from (asx.first_answer_time - tq.creationdate))/3600.0, 0))
+    ) as composite_score
+  from tagged_questions tq
+  left join comment_stats cs on cs.postid = tq.post_id
+  left join answer_stats asx on asx.question_id = tq.post_id
+  left join user_quality uq on uq.user_id = tq.owneruserid
+),
+ranked as (
+  select s.*,
+         row_number() over (partition by s.tag order by s.composite_score desc, s.viewcount desc, s.question_score desc) as rn,
+         dense_rank() over (order by s.composite_score desc) as global_rank,
+         dense_rank() over (partition by date_trunc('month', s.creationdate) order by s.composite_score desc) as month_rank
+  from scored s
+)
+select
+  r.tag,
+  date_trunc('month', r.creationdate) as month_bucket,
+  count(*) as questions_in_bucket,
+  avg(r.composite_score) as avg_composite_score,
+  percentile_cont(0.9) within group (order by r.composite_score) as p90_composite_score,
+  sum(case when r.rn <= 5 then 1 else 0 end) as top5_per_tag_count,
+  json_agg(
+    json_build_object(
+      'question_id', r.question_id,
+      'title', r.title,
+      'owner_userid', r.owneruserid,
+      'owner_reputation', r.owner_reputation,
+      'score', r.question_score,
+      'views', r.viewcount,
+      'answers', r.answercount,
+      'upvotes', r.upvotes,
+      'downvotes', r.downvotes,
+      'favorites', r.favorites,
+      'duplicate_marks', r.duplicate_marks,
+      'closed_at', r.first_closed_at,
+      'hours_to_first_answer', r.hours_to_first_answer,
+      'composite_score', r.composite_score,
+      'global_rank', r.global_rank,
+      'month_rank', r.month_rank
+    )
+    order by r.composite_score desc
+  ) filter (where r.rn <= 5) as top5_questions_per_tag
+from ranked r
+group by r.tag, date_trunc('month', r.creationdate)
+having count(*) >= 10
+order by avg_composite_score desc, questions_in_bucket desc, r.tag asc
+limit 50;

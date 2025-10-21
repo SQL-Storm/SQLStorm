@@ -1,0 +1,144 @@
+WITH UserBaseStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate
+    FROM Users U
+    WHERE U.Reputation > 1000
+      AND U.LastAccessDate >= (TIMESTAMP '1970-01-01 00:00:00' + (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year'))
+      AND U.CreationDate >= (TIMESTAMP '1970-01-01 00:00:00' + (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '10 year'))
+),
+UserActivitySummary AS (
+    SELECT
+        UBS.UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        SUM(P.FavoriteCount) AS TotalQuestionFavorites,
+        COUNT(DISTINCT C.Id) AS TotalCommentsWritten
+    FROM UserBaseStats UBS
+    LEFT JOIN Posts P ON UBS.UserId = P.OwnerUserId
+    LEFT JOIN Comments C ON UBS.UserId = C.UserId
+    GROUP BY UBS.UserId
+),
+UserTagSpecificQuestionMetrics AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT P.Id) AS QuestionsInHotTags,
+        AVG(P.Score) AS AvgScoreHotTagQuestions,
+        MAX(P.ViewCount) AS MaxViewCountHotTagQuestions,
+        SUM(P.FavoriteCount) AS TotalFavoritesHotTagQuestions
+    FROM Posts P
+    JOIN UserBaseStats UBS ON P.OwnerUserId = UBS.UserId
+    CROSS JOIN (SELECT 'javascript' AS TagName UNION ALL
+                SELECT 'python' UNION ALL
+                SELECT 'java' UNION ALL
+                SELECT 'c#' UNION ALL
+                SELECT 'sql' UNION ALL
+                SELECT 'html' UNION ALL
+                SELECT 'css' UNION ALL
+                SELECT 'reactjs' UNION ALL
+                SELECT 'node.js' UNION ALL
+                SELECT 'typescript' UNION ALL
+                SELECT 'php') AS T(TagName)
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= (TIMESTAMP '1970-01-01 00:00:00' + (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 year'))
+      AND EXISTS (
+          SELECT 1
+          FROM unnest(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS TagName
+          WHERE TagName IN ('javascript', 'python', 'java', 'c#', 'sql', 'html', 'css', 'reactjs', 'node.js', 'typescript', 'php')
+      )
+    GROUP BY P.OwnerUserId
+),
+PostHistoryEngagement AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalEditsToOwnQuestions,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 AND CRT.Name IN ('Duplicate', 'Exact Duplicate', 'Needs details or clarity') THEN PH.PostId END) AS QuestionsClosedForClarityOrDuplicate
+    FROM Posts P
+    JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CRT.Id AS TEXT)
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= (TIMESTAMP '1970-01-01 00:00:00' + (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 year'))
+      AND P.OwnerUserId IN (SELECT UserId FROM UserBaseStats)
+    GROUP BY P.OwnerUserId
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges B
+    JOIN UserBaseStats UBS ON B.UserId = UBS.UserId
+    GROUP BY B.UserId
+),
+UserAcceptedAnswerCount AS (
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(A.Id) AS TotalAcceptedAnswers
+    FROM Posts A
+    JOIN Posts Q ON A.Id = Q.AcceptedAnswerId
+    WHERE A.PostTypeId = 2
+    GROUP BY A.OwnerUserId
+),
+UserLinkedPostActivity AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT PL.PostId) AS OtherPostsLinkingToUserContent,
+        COUNT(DISTINCT PL_REL.RelatedPostId) AS UserContentLinkingToOtherPosts
+    FROM Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.RelatedPostId AND PL.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_REL ON P.Id = PL_REL.PostId AND PL_REL.LinkTypeId = 1
+    WHERE P.OwnerUserId IN (SELECT UserId FROM UserBaseStats)
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.Reputation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    COALESCE(UTSQM.QuestionsInHotTags, 0) AS QuestionsInHotTags,
+    COALESCE(UTSQM.AvgScoreHotTagQuestions, 0.0) AS AvgScoreHotTagQuestions,
+    COALESCE(UTSQM.MaxViewCountHotTagQuestions, 0) AS MaxViewCountHotTagQuestions,
+    COALESCE(UTSQM.TotalFavoritesHotTagQuestions, 0) AS TotalFavoritesHotTagQuestions,
+    COALESCE(PHE.TotalEditsToOwnQuestions, 0) AS TotalEditsToOwnQuestions,
+    COALESCE(PHE.QuestionsClosedForClarityOrDuplicate, 0) AS QuestionsClosedForClarityOrDuplicate,
+    COALESCE(UBA.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBA.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UAA.TotalAcceptedAnswers, 0) AS TotalAcceptedAnswers,
+    COALESCE(ULPA.OtherPostsLinkingToUserContent, 0) AS OtherPostsLinkingToUserContent,
+    COALESCE(ULPA.UserContentLinkingToOtherPosts, 0) AS UserContentLinkingToOtherPosts,
+    (
+        UBS.Reputation * 0.05 +
+        UAS.TotalPosts * 0.1 +
+        COALESCE(UTSQM.AvgScoreHotTagQuestions, 0) * 0.5 +
+        COALESCE(UTSQM.TotalFavoritesHotTagQuestions, 0) * 0.2 +
+        COALESCE(PHE.TotalEditsToOwnQuestions, 0) * 0.05 +
+        COALESCE(UBA.GoldBadges, 0) * 10 +
+        COALESCE(UAA.TotalAcceptedAnswers, 0) * 0.7 +
+        COALESCE(ULPA.OtherPostsLinkingToUserContent, 0) * 0.3 -
+        COALESCE(PHE.QuestionsClosedForClarityOrDuplicate, 0) * 2
+    ) AS OverallContributionScore,
+    RANK() OVER (ORDER BY UBS.Reputation DESC, UAS.TotalPosts DESC, COALESCE(UTSQM.AvgScoreHotTagQuestions, 0) DESC) AS ReputationActivityRank,
+    NTILE(5) OVER (ORDER BY (UAS.TotalQuestions + UAS.TotalAnswers) DESC) AS TopActivityQuintile,
+    AVG(COALESCE(UTSQM.AvgScoreHotTagQuestions, 0)) OVER (PARTITION BY (UBS.Reputation / 5000.0)) AS AvgHotTagScoreInReputationBand
+FROM UserBaseStats UBS
+LEFT JOIN UserActivitySummary UAS ON UBS.UserId = UAS.UserId
+LEFT JOIN UserTagSpecificQuestionMetrics UTSQM ON UBS.UserId = UTSQM.UserId
+LEFT JOIN PostHistoryEngagement PHE ON UBS.UserId = PHE.UserId
+LEFT JOIN UserBadgeAchievements UBA ON UBS.UserId = UBA.UserId
+LEFT JOIN UserAcceptedAnswerCount UAA ON UBS.UserId = UAA.UserId
+LEFT JOIN UserLinkedPostActivity ULPA ON UBS.UserId = ULPA.UserId
+WHERE
+    (UAS.TotalPosts > 10 OR UTSQM.QuestionsInHotTags > 0)
+    AND UBS.DisplayName IS NOT NULL
+ORDER BY OverallContributionScore DESC, UBS.Reputation DESC
+LIMIT 500;

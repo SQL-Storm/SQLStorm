@@ -1,0 +1,99 @@
+-- {"query": "24087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3594} 
+
+WITH
+    /*   1. Questions that contain the tag <sql>          */
+    SqlQuestions AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.Title,
+            p.Score,
+            p.CreationDate,
+            p.Tags,
+            p.LastActivityDate,
+            p.AnswerCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags LIKE '%<sql>%'
+    ),
+
+    /*   2. Aggregate vote counts per post               */
+    VoteAgg AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+
+    /*   3. Most recent comment date per post            */
+    LatestComment AS (
+        SELECT
+            c.PostId,
+            MAX(c.CreationDate) AS LastCommented
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+
+    /*   4. Summary per user – using window function      */
+    UserSummary AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+            AVG(p.Score)                                      AS AvgScore,
+            RANK() OVER (PARTITION BY u.Reputation
+                         ORDER BY COUNT(p.Id) DESC)         AS Rank
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /*   5. Set‑operator example: top & bottom users      */
+    TopBottomUsers AS (
+        SELECT Id, DisplayName, Reputation, QuestionCount
+        FROM UserSummary
+        WHERE QuestionCount > 20
+
+        UNION ALL
+
+        SELECT Id, DisplayName, Reputation, QuestionCount
+        FROM UserSummary
+        WHERE QuestionCount < 5
+    )
+
+SELECT
+    tbu.Id                      AS UserId,
+    tbu.DisplayName             AS UserName,
+    tbu.Reputation,
+    sq.Id                       AS PostId,
+    sq.Title,
+    sq.Score,
+    va.UpVotes,
+    va.DownVotes,
+    va.AcceptedVotes,
+    lc.LastCommented,
+    /* Correlated subquery – number of answers for each question */
+    (SELECT COUNT(*) FROM Posts a
+     WHERE a.ParentId = sq.Id
+       AND a.PostTypeId = 2)   AS NumAnswers,
+    CASE
+        WHEN sq.Score < 0          THEN 'Low'
+        WHEN sq.Score BETWEEN 0 AND 5 THEN 'Medium'
+        ELSE                           'High'
+    END                            AS ScoreBand,
+    tbu.Rank
+FROM TopBottomUsers tbu
+JOIN SqlQuestions sq ON sq.OwnerUserId = tbu.Id
+LEFT JOIN VoteAgg va ON va.PostId = sq.Id
+LEFT JOIN LatestComment lc ON lc.PostId = sq.Id
+WHERE (tbu.Reputation IS NOT NULL OR tbu.Reputation IS NULL)      -- null logic
+  AND (sq.AnswerCount IS NULL OR sq.AnswerCount > 0)              -- null logic
+ORDER BY tbu.Rank ASC,
+         va.AcceptedVotes DESC,
+         sq.CreationDate DESC
+LIMIT 50;

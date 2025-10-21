@@ -1,0 +1,134 @@
+WITH recent_questions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.ViewCount,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) AS TagCount,
+        p.AnswerCount
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+answers AS (
+    SELECT
+        pa.Id AS AnswerId,
+        pa.ParentId AS QuestionId,
+        pa.OwnerUserId AS AnswererId,
+        pa.Score AS AnswerScore,
+        pa.CreationDate AS AnswerDate,
+        pa.LastActivityDate,
+        RANK() OVER (PARTITION BY pa.ParentId ORDER BY pa.Score DESC, pa.CreationDate ASC) AS AnswerRank
+    FROM
+        Posts pa
+    WHERE
+        pa.PostTypeId = 2
+        AND pa.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+comment_stats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        MAX(c.Score) AS MaxCommentScore,
+        SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments
+    FROM
+        Comments c
+    WHERE
+        c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    GROUP BY
+        c.PostId
+),
+user_badge_counts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Badges b
+    WHERE
+        b.Date >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY
+        b.UserId
+),
+closed_questions AS (
+    SELECT
+        ph.PostId,
+        cr.Name AS CloseReason,
+        MIN(ph.CreationDate) AS ClosedDate
+    FROM
+        PostHistory ph
+        LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INTEGER) = cr.Id
+    WHERE
+        ph.PostHistoryTypeId = 10
+    GROUP BY
+        ph.PostId, cr.Name
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    COALESCE(rq.OwnerName, '[deleted]') AS OwnerName,
+    rq.CreationDate,
+    rq.Score AS QuestionScore,
+    rq.ViewCount,
+    rq.TagCount,
+    rq.AnswerCount,
+    cs.CommentCount,
+    cs.MaxCommentScore,
+    cs.AnonymousComments,
+    cu.Reputation AS OwnerReputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    cq.CloseReason,
+    cq.ClosedDate,
+    COUNT(DISTINCT a.AnswerId) AS TopAnswersLast90d,
+    MAX(a.AnswerScore) AS MaxAnswerScore,
+    MIN(a.AnswerDate) AS FirstAnswerDate,
+    MAX(a.LastActivityDate) AS LastAnswerActivity,
+    (
+        SELECT COUNT(DISTINCT v.Id)
+        FROM Votes v
+        WHERE v.PostId = rq.QuestionId AND v.VoteTypeId = 2
+    ) AS UpVotes,
+    (
+        SELECT COUNT(DISTINCT v2.Id)
+        FROM Votes v2
+        WHERE v2.PostId = rq.QuestionId AND v2.VoteTypeId = 3
+    ) AS DownVotes,
+    (
+        SELECT STRING_AGG(t2.TagName, ', ')
+        FROM (
+            SELECT UNNEST(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) AS TagName
+        ) tags
+        JOIN Tags t2 ON t2.TagName = tags.TagName
+    ) AS TagNamesList
+FROM
+    recent_questions rq
+    LEFT JOIN comment_stats cs ON rq.QuestionId = cs.PostId
+    LEFT JOIN Users cu ON rq.OwnerUserId = cu.Id
+    LEFT JOIN user_badge_counts ub ON rq.OwnerUserId = ub.UserId
+    LEFT JOIN closed_questions cq ON rq.QuestionId = cq.PostId
+    LEFT JOIN answers a ON rq.QuestionId = a.QuestionId AND a.AnswerRank = 1
+GROUP BY
+    rq.QuestionId, rq.Title, rq.OwnerUserId, rq.OwnerName, rq.CreationDate, rq.Score, rq.ViewCount, rq.TagCount, rq.AnswerCount,
+    cs.CommentCount, cs.MaxCommentScore, cs.AnonymousComments,
+    cu.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    cq.CloseReason, cq.ClosedDate, rq.Tags
+HAVING
+    COALESCE(rq.ViewCount,0) > 100
+    AND (
+        cs.CommentCount IS NULL OR cs.CommentCount > 0
+    )
+ORDER BY
+    rq.Score DESC NULLS LAST,
+    TopAnswersLast90d DESC,
+    rq.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,136 @@
+-- {"query": "9049.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3965} 
+
+WITH
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS QuestionsAsked,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS AnswersGiven,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentComments AS (
+    SELECT
+        PostId,
+        MAX(CreationDate) AS LastComment
+    FROM Comments
+    GROUP BY PostId
+),
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        AVG(p.ViewCount) AS AvgViews
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.PostTypeId = 1
+       AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 100
+),
+RecursivePosts AS (
+    SELECT
+        Id,
+        ParentId,
+        0 AS lvl
+    FROM Posts
+    WHERE ParentId IS NULL
+
+    UNION ALL
+
+    SELECT
+        p.Id,
+        p.ParentId,
+        rp.lvl + 1
+    FROM Posts p
+    JOIN RecursivePosts rp
+      ON p.ParentId = rp.Id
+    WHERE rp.lvl < 5
+),
+CombinedStats AS (
+    SELECT
+        u.Id       AS UserId,
+        u.DisplayName,
+        COALESCE(s.AnswersCount, 0) AS TotalAnswers,
+        COALESCE(v.UpVotes,      0) AS UpVotes,
+        COALESCE(v.DownVotes,    0) AS DownVotes
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            COUNT(*) AS AnswersCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) s
+      ON s.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY UserId
+    ) v
+      ON v.UserId = u.Id
+),
+FinalReport AS (
+    SELECT
+        cs.UserId,
+        cs.DisplayName,
+        us.QuestionsAsked,
+        cs.TotalAnswers,
+        us.RepRank,
+        ra.LastComment,
+        tu.QuestionCount,
+        tu.AvgViews,
+        CASE WHEN tu.QuestionCount > 1000 THEN 'High' ELSE 'Low' END AS PopularTagBucket,
+        (cs.UpVotes - cs.DownVotes) AS NetVotes,
+        COALESCE(
+          (
+            SELECT MAX(rp.lvl)
+            FROM RecursivePosts rp
+            JOIN Posts pp
+              ON pp.Id = rp.Id
+            WHERE pp.OwnerUserId = cs.UserId
+          ), 0
+        ) AS MaxThreadDepth,
+        CONCAT(cs.DisplayName, ' (Rank #', us.RepRank, ')') AS UserTagDisplay,
+        NULLIF(u.WebsiteUrl, '') AS CleanWebsite
+    FROM CombinedStats cs
+    JOIN UserStats us
+      ON us.Id = cs.UserId
+    LEFT JOIN RecentComments ra
+      ON ra.PostId = (
+            SELECT p2.Id
+            FROM Posts p2
+            WHERE p2.OwnerUserId = cs.UserId
+            ORDER BY p2.CreationDate DESC
+            LIMIT 1
+        )
+    LEFT JOIN TagUsage tu
+      ON tu.TagName = (
+            SELECT t2.TagName
+            FROM Tags t2
+            JOIN Posts p3
+              ON p3.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+            WHERE p3.OwnerUserId = cs.UserId
+            GROUP BY t2.TagName
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        )
+    LEFT JOIN Users u
+      ON u.Id = cs.UserId
+)
+SELECT *
+FROM FinalReport
+UNION
+SELECT *
+FROM FinalReport
+ORDER BY RepRank, TotalAnswers DESC
+LIMIT 100
+OFFSET 0;

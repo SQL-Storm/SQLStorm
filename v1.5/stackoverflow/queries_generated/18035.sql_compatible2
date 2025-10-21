@@ -1,0 +1,185 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswererUserId,
+      p.Score,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 -- Answer
+  ),
+  QuestionMetrics AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ClosedDate,
+      COALESCE(
+        (
+          SELECT MAX(ph.CreationDate)
+          FROM PostHistory AS ph
+          WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10, 11) -- Post Closed, Post Reopened
+        ),
+        q.LastActivityDate
+      ) AS LastMajorActivityDate,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.AnswerCount > 100 THEN 'High Answer Count'
+        WHEN q.FavoriteCount > 50 THEN 'Popular'
+        WHEN q.Score < 0 THEN 'Negative Score'
+        ELSE 'Standard'
+      END AS QuestionStatusCategory
+    FROM Posts AS q
+    WHERE q.PostTypeId = 1 -- Question
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+      COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+      MAX(p.CreationDate) AS LastPostCreationDate,
+      AVG(p.Score) AS AvgPostScore,
+      COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  TopAnswerers AS (
+    SELECT
+      ra.AnswererUserId,
+      COUNT(DISTINCT qm.QuestionId) AS QuestionsAnswered,
+      SUM(ra.Score) AS TotalAnswerScoreReceived
+    FROM RankedAnswers AS ra
+    JOIN QuestionMetrics AS qm
+      ON ra.QuestionId = qm.QuestionId
+    WHERE
+      ra.rn = 1
+    GROUP BY
+      ra.AnswererUserId
+    HAVING
+      COUNT(DISTINCT qm.QuestionId) > 5
+  ),
+  RankedTopAnswerForQuestion AS (
+    SELECT
+      qm.QuestionId,
+      ra.AnswererUserId,
+      ra.Score
+    FROM RankedAnswers AS ra
+    JOIN QuestionMetrics AS qm
+      ON ra.QuestionId = qm.QuestionId
+    WHERE ra.rn = 1
+  )
+SELECT
+  qm.QuestionId,
+  qm.QuestionStatusCategory,
+  u_q.DisplayName AS QuestionerDisplayName,
+  u_q.Reputation AS QuestionerReputation,
+  qm.QuestionScore,
+  qm.AnswerCount,
+  qm.FavoriteCount,
+  qm.QuestionCreationDate,
+  qm.ClosedDate,
+  COALESCE(ta.QuestionsAnswered, 0) AS NumberOfTopAnswersProvided,
+  COALESCE(ta.TotalAnswerScoreReceived, 0) AS ScoreFromTopAnswers,
+  CASE
+    WHEN qm.ClosedDate IS NOT NULL
+    AND DATEDIFF(day, qm.ClosedDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) > 30
+    THEN 'Stale Closed Question'
+    WHEN qm.AnswerCount = 0 AND DATEDIFF(day, qm.QuestionCreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) > 365 THEN 'Unanswered Old Question'
+    WHEN qm.LastMajorActivityDate IS NOT NULL AND DATEDIFF(day, qm.LastMajorActivityDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) > 180 THEN 'Inactive Question'
+    ELSE 'Active or Recently Active'
+  END AS QuestionAgeStatus,
+  (
+    SELECT u_c.DisplayName
+    FROM Comments AS c
+    JOIN Users AS u_c
+      ON c.UserId = u_c.Id
+    WHERE c.PostId = qm.QuestionId
+    ORDER BY c.CreationDate DESC
+    LIMIT 1
+  ) AS LastCommenter,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM PostLinks AS pl
+      WHERE pl.PostId = qm.QuestionId AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicates'
+    ELSE 'No Explicit Duplicates'
+  END AS DuplicateStatus,
+  REPLACE(REPLACE(qm.Tags, '><', '|'), '<', '') AS FormattedTags
+FROM QuestionMetrics AS qm
+JOIN Users AS u_q
+  ON qm.QuestionerUserId = u_q.Id
+LEFT JOIN RankedTopAnswerForQuestion AS ra_q
+  ON qm.QuestionId = ra_q.QuestionId
+LEFT JOIN TopAnswerers AS ta
+  ON ra_q.AnswererUserId = ta.AnswererUserId
+WHERE
+  qm.QuestionScore > -10
+  AND qm.AnswerCount > 0
+UNION ALL
+SELECT
+  qm.QuestionId,
+  qm.QuestionStatusCategory,
+  u_q.DisplayName AS QuestionerDisplayName,
+  u_q.Reputation AS QuestionerReputation,
+  qm.QuestionScore,
+  qm.AnswerCount,
+  qm.FavoriteCount,
+  qm.QuestionCreationDate,
+  qm.ClosedDate,
+  COALESCE(ta.QuestionsAnswered, 0) AS NumberOfTopAnswersProvided,
+  COALESCE(ta.TotalAnswerScoreReceived, 0) AS ScoreFromTopAnswers,
+  CASE
+    WHEN qm.ClosedDate IS NOT NULL
+    AND DATEDIFF(day, qm.ClosedDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) > 30
+    THEN 'Stale Closed Question'
+    WHEN qm.AnswerCount = 0 AND DATEDIFF(day, qm.QuestionCreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) > 365 THEN 'Unanswered Old Question'
+    WHEN qm.LastMajorActivityDate IS NOT NULL AND DATEDIFF(day, qm.LastMajorActivityDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) > 180 THEN 'Inactive Question'
+    ELSE 'Active or Recently Active'
+  END AS QuestionAgeStatus,
+  (
+    SELECT u_c.DisplayName
+    FROM Comments AS c
+    JOIN Users AS u_c
+      ON c.UserId = u_c.Id
+    WHERE c.PostId = qm.QuestionId
+    ORDER BY c.CreationDate DESC
+    LIMIT 1
+  ) AS LastCommenter,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM PostLinks AS pl
+      WHERE pl.PostId = qm.QuestionId AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicates'
+    ELSE 'No Explicit Duplicates'
+  END AS DuplicateStatus,
+  REPLACE(REPLACE(qm.Tags, '><', '|'), '<', '') AS FormattedTags
+FROM QuestionMetrics AS qm
+JOIN Users AS u_q
+  ON qm.QuestionerUserId = u_q.Id
+LEFT JOIN RankedTopAnswerForQuestion AS ra_q
+  ON qm.QuestionId = ra_q.QuestionId
+LEFT JOIN TopAnswerers AS ta
+  ON ra_q.AnswererUserId = ta.AnswererUserId
+WHERE
+  qm.QuestionScore <= -10
+  AND qm.AnswerCount = 0
+ORDER BY
+  qm.QuestionScore DESC,
+  qm.QuestionCreationDate ASC;

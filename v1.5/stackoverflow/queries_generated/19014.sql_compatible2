@@ -1,0 +1,271 @@
+WITH RECURSIVE
+    TagParse AS (
+        SELECT
+            P.Id AS PostId,
+            TRIM(REPLACE(REPLACE(LOWER(SPLIT_PART(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><', n)), '<', ''), '>', '')) AS TagName,
+            n AS TagOrder
+        FROM
+            Posts P,
+            GENERATE_SERIES(1, (LENGTH(P.Tags) - LENGTH(REPLACE(P.Tags, '><', ''))) / 2 + 1) AS n
+        WHERE
+            P.Tags IS NOT NULL
+            AND P.PostTypeId = 1
+            AND LENGTH(P.Tags) > 2
+    ),
+    QuestionBase AS (
+        SELECT
+            P.Id AS QuestionId,
+            P.OwnerUserId,
+            COALESCE(U.DisplayName, P.OwnerDisplayName, 'Anonymous Community User') AS OwnerDisplayName,
+            U.Reputation,
+            U.CreationDate AS UserCreationDate,
+            P.CreationDate AS QuestionCreationDate,
+            P.LastActivityDate,
+            P.Title,
+            P.Body,
+            P.Score AS QuestionScore,
+            P.ViewCount,
+            P.AnswerCount,
+            P.CommentCount AS QuestionCommentCount,
+            P.FavoriteCount,
+            P.AcceptedAnswerId,
+            P.LastEditDate,
+            P.ClosedDate,
+            P.CommunityOwnedDate,
+            P.Tags,
+            (P.Score * 0.75 + P.ViewCount * 0.1 / 100 + P.AnswerCount * 0.15 + COALESCE(P.FavoriteCount, 0) * 0.2) AS CalculatedEngagementScore,
+            EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 86400 AS AgeInDays
+        FROM
+            Posts P
+        LEFT JOIN
+            Users U ON P.OwnerUserId = U.Id
+        WHERE
+            P.PostTypeId = 1
+            AND P.CreationDate >= '2020-01-01'
+            AND P.Score > 0
+    ),
+    PostDetailedHistoryAgg AS (
+        SELECT
+            PH.PostId AS QuestionId,
+            (EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate))) / 3600) AS HoursSinceLastSameTypeEdit,
+            MAX(CASE WHEN PHT.Name = 'Post Closed' THEN 1 ELSE 0 END) AS WasClosedOnce,
+            MAX(CASE WHEN PHT.Name = 'Post Reopened' THEN 1 ELSE 0 END) AS WasReopenedOnce,
+            MAX(CASE WHEN PHT.Name = 'Post Deleted' THEN 1 ELSE 0 END) AS WasDeletedOnce,
+            COUNT(DISTINCT CASE WHEN PH.UserId IS NOT NULL AND PH.UserId <> -1 THEN PH.UserId END) AS DistinctHumanEditors,
+            COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS TotalEditEvents,
+            MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditHistoryDate,
+            MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS FirstEditHistoryDate
+        FROM
+            PostHistory PH
+        INNER JOIN
+            PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+        WHERE
+            PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 19, 20)
+        GROUP BY
+            PH.PostId, PH.CreationDate, PH.PostHistoryTypeId
+    ),
+    QuestionVotesAndCommentsAgg AS (
+        SELECT
+            Q.QuestionId,
+            COUNT(DISTINCT C.UserId) AS DistinctCommenters,
+            SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+            SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+            SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END) AS TotalBountyGiven
+        FROM
+            QuestionBase Q
+        LEFT JOIN
+            Comments C ON Q.QuestionId = C.PostId
+        LEFT JOIN
+            Votes V ON Q.QuestionId = V.PostId
+        GROUP BY
+            Q.QuestionId
+    ),
+    UserBadgeGoldTagStatus AS (
+        SELECT
+            B.UserId,
+            B.Name AS BadgeName,
+            TRUE AS HasGoldTagBadge
+        FROM
+            Badges B
+        WHERE
+            B.Class = 1 AND B.TagBased = TRUE
+    ),
+    AnswerQuality AS (
+        SELECT
+            A.Id AS AnswerId,
+            A.ParentId AS QuestionId,
+            A.OwnerUserId AS AnswerOwnerUserId,
+            COALESCE(U.DisplayName, A.OwnerDisplayName, 'Anonymous Answerer') AS AnswerOwnerDisplayName,
+            A.Score AS AnswerScore,
+            A.CreationDate AS AnswerCreationDate,
+            A.Body AS AnswerBody,
+            (A.Score * 0.9 + A.CommentCount * 0.1) AS AnswerQualityScore
+        FROM
+            Posts A
+        LEFT JOIN Users U ON A.OwnerUserId = U.Id
+        WHERE
+            A.PostTypeId = 2
+    )
+SELECT
+    QB.QuestionId AS PostIdentifier,
+    'Question' AS PostType,
+    QB.Title AS PostTitleSnippet,
+    QB.OwnerDisplayName AS OwnerIdentifier,
+    QB.Reputation AS OwnerReputation,
+    QB.QuestionCreationDate AS CreationTimestamp,
+    QB.LastActivityDate AS LastActivityTimestamp,
+    QB.QuestionScore AS TotalScore,
+    QB.ViewCount,
+    QB.AnswerCount AS RelatedPostCount,
+    QVC.TotalUpVotes,
+    QVC.TotalDownVotes,
+    QVC.TotalBountyGiven,
+    QB.FavoriteCount,
+    PDHA.DistinctHumanEditors,
+    ROUND(QB.CalculatedEngagementScore, 2) AS FinalEngagementScore,
+    (
+        SELECT
+            COUNT(DISTINCT UBGTS.BadgeName)
+        FROM
+            UserBadgeGoldTagStatus UBGTS
+        INNER JOIN
+            TagParse TP ON TP.PostId = QB.QuestionId
+        WHERE
+            UBGTS.UserId = QB.OwnerUserId
+            AND UBGTS.BadgeName = TP.TagName
+    ) AS OwnerGoldTagBadgesOnPostTags,
+    DENSE_RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM QB.QuestionCreationDate), FLOOR(QB.Reputation / 10000)
+        ORDER BY QB.CalculatedEngagementScore DESC, QB.ViewCount DESC
+    ) AS RankByEngagementInYearAndRepBand,
+    CASE
+        WHEN PDHA.WasClosedOnce = 1 AND PDHA.WasReopenedOnce = 1 THEN 'Closed_Reopened_Hot'
+        WHEN QB.ClosedDate IS NOT NULL AND QB.CommunityOwnedDate IS NULL THEN 'Closed_But_Not_Community'
+        WHEN QB.AgeInDays > 365 AND QB.ViewCount > 100000 THEN 'Evergreen_HighView'
+        ELSE 'Standard'
+    END AS PostStatusClassification,
+    COALESCE(
+        (SELECT TP.TagName FROM TagParse TP WHERE TP.PostId = QB.QuestionId AND TP.TagOrder = 1 LIMIT 1),
+        'untagged'
+    ) AS PrimaryTag,
+    CASE
+        WHEN QVC.TotalDownVotes > 0 THEN ROUND(QVC.TotalUpVotes / QVC.TotalDownVotes, 2)
+        WHEN QVC.TotalUpVotes = 0 AND QVC.TotalDownVotes = 0 THEN 0.00
+        ELSE 9999.99
+    END AS UpvoteToDownvoteRatio,
+    (
+        SELECT
+            AVG(AQ.AnswerScore)
+        FROM
+            AnswerQuality AQ
+        WHERE
+            AQ.QuestionId = QB.QuestionId
+    ) AS AvgAnswerScore,
+    (EXTRACT(EPOCH FROM (PDHA.FirstEditHistoryDate - QB.QuestionCreationDate)) / 3600) AS HoursToFirstEdit,
+    CASE
+        WHEN QB.Title LIKE '%performance%' OR QB.Body LIKE '%optimiza%query%' THEN 'Performance_Related'
+        WHEN QB.Title LIKE '%security%' OR QB.Body LIKE '%vulnerab%' THEN 'Security_Related'
+        ELSE 'General_Topic'
+    END AS ContentTopic,
+    (QB.Reputation * 0.1 + QB.CalculatedEngagementScore * 0.5 + QVC.TotalUpVotes * 0.05 - QVC.TotalDownVotes * 0.1) AS UserPostInfluenceMetric
+FROM
+    QuestionBase QB
+LEFT JOIN
+    QuestionVotesAndCommentsAgg QVC ON QB.QuestionId = QVC.QuestionId
+LEFT JOIN
+    PostDetailedHistoryAgg PDHA ON QB.QuestionId = PDHA.QuestionId
+WHERE
+    QB.ViewCount > 1000
+    AND QB.AnswerCount > 0
+    AND QB.Reputation > 1000
+    AND QB.AgeInDays >= 90
+    AND (PDHA.DistinctHumanEditors > 1 OR QB.CommentCount > 5)
+    AND (
+        QB.Tags LIKE '%<sql>%' OR QB.Tags LIKE '%<database>%' OR QB.Tags LIKE '%<performance>%'
+    )
+GROUP BY
+    QB.QuestionId, QB.Title, QB.OwnerDisplayName, QB.Reputation, QB.QuestionCreationDate, QB.LastActivityDate,
+    QB.QuestionScore, QB.ViewCount, QB.AnswerCount, QVC.TotalUpVotes, QVC.TotalDownVotes, QVC.TotalBountyGiven,
+    QB.FavoriteCount, PDHA.DistinctHumanEditors, QB.CalculatedEngagementScore, QB.ClosedDate, QB.CommunityOwnedDate,
+    QB.AgeInDays, PDHA.WasClosedOnce, PDHA.WasReopenedOnce, PDHA.FirstEditHistoryDate, QB.Body, QB.Tags
+HAVING
+    COUNT(DISTINCT PDHA.TotalEditEvents) >= 1
+    AND QVC.TotalUpVotes > QVC.TotalDownVotes * 2
+ORDER BY
+    UserPostInfluenceMetric DESC, FinalEngagementScore DESC
+LIMIT 500
+UNION ALL
+SELECT
+    AQ.AnswerId AS PostIdentifier,
+    'Answer' AS PostType,
+    LEFT(AQ.AnswerBody, 250) AS PostTitleSnippet,
+    AQ.AnswerOwnerDisplayName AS OwnerIdentifier,
+    U.Reputation AS OwnerReputation,
+    AQ.AnswerCreationDate AS CreationTimestamp,
+    A.LastActivityDate AS LastActivityTimestamp,
+    AQ.AnswerScore AS TotalScore,
+    NULL AS ViewCount,
+    NULL AS RelatedPostCount,
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    NULL AS TotalBountyGiven,
+    NULL AS FavoriteCount,
+    COUNT(DISTINCT C.UserId) AS DistinctHumanEditors,
+    ROUND(AQ.AnswerQualityScore, 2) AS FinalEngagementScore,
+    (
+        SELECT
+            COUNT(DISTINCT B.Id)
+        FROM
+            Badges B
+        WHERE
+            B.UserId = AQ.AnswerOwnerUserId
+            AND B.Class = 1
+    ) AS OwnerGoldBadges,
+    DENSE_RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM AQ.AnswerCreationDate), FLOOR((SELECT COALESCE(MAX(ViewCount), 0) FROM Posts WHERE Id = QB_Parent.QuestionId) / 10000)
+        ORDER BY AQ.AnswerQualityScore DESC, AQ.AnswerScore DESC
+    ) AS RankByQualityInYearAndViewBand,
+    'Answer_Classification' AS PostStatusClassification,
+    COALESCE(
+        (SELECT TP.TagName FROM TagParse TP WHERE TP.PostId = QB_Parent.QuestionId AND TP.TagOrder = 1 LIMIT 1),
+        'untagged_parent'
+    ) AS PrimaryTag,
+    CASE
+        WHEN SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) / SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 2)
+        WHEN SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) = 0 AND SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) = 0 THEN 0.00
+        ELSE 9999.99
+    END AS UpvoteToDownvoteRatio,
+    NULL AS AvgAnswerScore,
+    (EXTRACT(EPOCH FROM (A.CreationDate - QB_Parent.CreationDate)) / 86400) AS DaysToAnswerQuestion,
+    CASE
+        WHEN AQ.AnswerBody LIKE '%example%' OR AQ.AnswerBody LIKE '%code%' THEN 'Code_Example_Present'
+        WHEN AQ.AnswerBody LIKE '%solution%' THEN 'Solution_Oriented'
+        ELSE 'Descriptive'
+    END AS ContentTopic,
+    (U.Reputation * 0.05 + AQ.AnswerQualityScore * 0.8) AS AnswerInfluenceMetric
+FROM
+    AnswerQuality AQ
+INNER JOIN
+    Posts A ON AQ.AnswerId = A.Id
+LEFT JOIN
+    Users U ON AQ.AnswerOwnerUserId = U.Id
+INNER JOIN
+    (SELECT QB_Parent.QuestionId, QB_Parent.ViewCount, QB_Parent.QuestionId AS Dummy FROM QuestionBase QB_Parent) AS QB_Parent
+        ON AQ.QuestionId = QB_Parent.QuestionId
+LEFT JOIN
+    Votes V ON AQ.AnswerId = V.PostId
+LEFT JOIN
+    Comments C ON AQ.AnswerId = C.PostId
+WHERE
+    AQ.AnswerScore > 20
+    AND QB_Parent.ViewCount > 5000
+    AND QB_Parent.QuestionScore > 10
+    AND AQ.AnswerCreationDate >= '2020-01-01'
+GROUP BY
+    AQ.AnswerId, AQ.AnswerBody, AQ.AnswerOwnerDisplayName, U.Reputation, AQ.AnswerCreationDate, A.LastActivityDate,
+    AQ.AnswerScore, AQ.AnswerQualityScore, AQ.AnswerOwnerUserId, QB_Parent.ViewCount, QB_Parent.QuestionId, QB_Parent.CreationDate
+HAVING
+    COUNT(DISTINCT C.UserId) > 1 OR SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10
+ORDER BY
+    AnswerInfluenceMetric DESC, FinalEngagementScore DESC
+LIMIT 500;

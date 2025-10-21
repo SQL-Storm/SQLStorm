@@ -1,0 +1,81 @@
+-- {"query": "2043.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 513} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes - U.DownVotes AS NetVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        U.CreationDate > '2020-01-01'
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+    HAVING 
+        COUNT(DISTINCT P.Id) > 5
+), 
+
+TopPosters AS (
+    SELECT 
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        ARRAY_LENGTH(string_to_array(P.Tags, '><'), 1) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS ScoreRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1
+        AND P.CreationDate > '2020-01-01'
+),
+
+HighScorePosts AS (
+    SELECT 
+        PostId,
+        OwnerUserId,
+        Score,
+        ViewCount,
+        TagCount
+    FROM 
+        TopPosters
+    WHERE 
+        ScoreRank <= 3
+        AND TagCount > 3
+),
+
+MergedData AS (
+    SELECT 
+        A.UserId,
+        A.DisplayName,
+        A.NetVotes,
+        A.TotalPosts,
+        ISNULL(SUM(H.Score * H.ViewCount), 0) AS WeightedViewScore
+    FROM 
+        ActiveUsers A
+    LEFT JOIN 
+        HighScorePosts H ON A.UserId = H.OwnerUserId
+    GROUP BY 
+        A.UserId, A.DisplayName, A.NetVotes, A.TotalPosts
+)
+
+SELECT 
+    M.UserId,
+    M.DisplayName,
+    M.NetVotes,
+    M.TotalPosts,
+    M.WeightedViewScore,
+    B.Name AS BadgeName,
+    COUNT(B.Id) AS BadgeCount
+FROM 
+    MergedData M
+LEFT JOIN 
+    Badges B ON M.UserId = B.UserId AND B.Class = 1
+GROUP BY 
+    M.UserId, M.DisplayName, M.NetVotes, M.TotalPosts, M.WeightedViewScore, B.Name
+ORDER BY 
+    M.WeightedViewScore DESC, M.NetVotes DESC;

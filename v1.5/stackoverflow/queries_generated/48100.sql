@@ -1,0 +1,115 @@
+-- {"query": "48100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1172} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.CreationDate) AS LatestPostCreationDate,
+        AVG(p.Score) AS AveragePostScore,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0 -- Exclude the community user and other potential system users
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        pt.Name AS PostType,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(DISTINCT pc.Id) AS TotalPostComments,
+        COUNT(DISTINCT pv.Id) AS TotalPostVotes,
+        SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotes,
+        SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotes
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments pc ON p.Id = pc.PostId
+    LEFT JOIN Votes pv ON p.Id = pv.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY
+        p.Id,
+        p.Title,
+        pt.Name,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        AVG(p.Score) AS AverageQuestionScoreForTag,
+        AVG(p.ViewCount) AS AverageQuestionViewCountForTag,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionsWithTag
+    FROM Tags t
+    JOIN Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1 -- Only consider questions
+    GROUP BY
+        t.TagName,
+        t.Count
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    ua.TotalBadges,
+    ua.LatestPostCreationDate,
+    ua.AveragePostScore,
+    ua.TotalClosedPosts,
+    pe.PostId,
+    pe.Title AS PostTitle,
+    pe.PostType,
+    pe.PostCreationDate,
+    pe.PostScore,
+    pe.PostViewCount,
+    pe.AnswerCount,
+    pe.CommentCount,
+    pe.FavoriteCount,
+    pe.PostUpVotes,
+    pe.PostDownVotes,
+    tp.TagName,
+    tp.TagUsageCount,
+    tp.QuestionsWithTag,
+    tp.AverageQuestionScoreForTag,
+    tp.AverageQuestionViewCountForTag,
+    tp.ClosedQuestionsWithTag
+FROM UserActivity ua
+JOIN PostEngagement pe ON ua.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = pe.PostId) -- Re-join to associate user with specific posts for filtering
+LEFT JOIN TagPopularity tp ON tp.TagName IN (SELECT unnest(string_to_array(substring(pe.Tags, 2, length(pe.Tags)-2), '><')) FROM Posts WHERE Id = pe.PostId) -- Associate tags with posts
+ORDER BY
+    ua.Reputation DESC,
+    pe.PostScore DESC,
+    tp.TagUsageCount DESC
+LIMIT 1000;

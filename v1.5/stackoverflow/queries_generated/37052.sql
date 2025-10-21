@@ -1,0 +1,226 @@
+-- {"query": "37052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2500} 
+WITH
+-- recent activity: last 90 days
+recent_posts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.CreationDate >= now() - interval '90 days'
+),
+-- questions and answers split
+questions AS (
+  SELECT * FROM recent_posts WHERE PostTypeId = 1
+),
+answers AS (
+  SELECT * FROM recent_posts WHERE PostTypeId = 2
+),
+-- compute per-question aggregated metrics
+q_metrics AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.Tags,
+    -- accepted and fastest answer stats
+    q.AcceptedAnswerId,
+    -- total answers in window (joined from answers table)
+    COALESCE(a_counts.TotalAnswers, 0) AS TotalAnswersInWindow,
+    -- median answer score (approx via percentile_cont)
+    COALESCE(a_stats.MedianAnswerScore, 0) AS MedianAnswerScore,
+    COALESCE(a_stats.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(a_stats.MinAnswerScore, 0) AS MinAnswerScore,
+    -- time to first answer and to accepted answer (in seconds)
+    COALESCE(EXTRACT(EPOCH FROM (first_answer.FirstAnswerAt - q.CreationDate)), NULL) AS TimeToFirstAnswerSec,
+    COALESCE(EXTRACT(EPOCH FROM (acc_answer.AcceptedAnswerAt - q.CreationDate)), NULL) AS TimeToAcceptedAnswerSec,
+    -- distinct answerers and percent new users (users with Reputation < 50 treated as new)
+    COALESCE(a_counts.DistinctAnswerers, 0) AS DistinctAnswerers,
+    COALESCE(a_counts.LowRepAnswerers, 0) AS LowRepAnswerers,
+    CASE WHEN COALESCE(a_counts.DistinctAnswerers,0) = 0 THEN 0
+         ELSE COALESCE(a_counts.LowRepAnswerers,0)::numeric / a_counts.DistinctAnswerers END AS PctLowRepAnswerers,
+    -- comment activity on question
+    COALESCE(qc.CommentCount,0) AS QuestionCommentCount,
+    -- answer comment density (total comments on answers / total answers)
+    CASE WHEN COALESCE(a_counts.TotalAnswers,0) = 0 THEN 0 ELSE COALESCE(ac.TotalCommentsOnAnswers,0)::numeric / a_counts.TotalAnswers END AS AvgCommentsPerAnswer,
+    -- engagement score (composite)
+    -- weights: views (0.1 per 1000), question score (2), favorites (3), answers (4), distinct answerers (2), comments (1)
+    (
+      (COALESCE(q.ViewCount,0)::numeric / 1000.0) * 0.1
+      + COALESCE(q.Score,0) * 2
+      + COALESCE(q.FavoriteCount,0) * 3
+      + COALESCE(a_counts.TotalAnswers,0) * 4
+      + COALESCE(a_counts.DistinctAnswerers,0) * 2
+      + COALESCE(qc.CommentCount,0) * 1
+    ) AS EngagementScore
+  FROM questions q
+  LEFT JOIN (
+    SELECT
+      ParentId AS QuestionId,
+      COUNT(*) FILTER (WHERE CreationDate >= now() - interval '90 days') AS TotalAnswers,
+      COUNT(DISTINCT OwnerUserId) FILTER (WHERE OwnerUserId IS NOT NULL) AS DistinctAnswerers,
+      COUNT(DISTINCT CASE WHEN u.Reputation < 50 THEN a.OwnerUserId END) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS LowRepAnswerers
+    FROM answers a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    GROUP BY ParentId
+  ) a_counts ON a_counts.QuestionId = q.Id
+  LEFT JOIN (
+    SELECT
+      ParentId AS QuestionId,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS MedianAnswerScore,
+      MAX(Score) AS MaxAnswerScore,
+      MIN(Score) AS MinAnswerScore
+    FROM answers
+    GROUP BY ParentId
+  ) a_stats ON a_stats.QuestionId = q.Id
+  LEFT JOIN (
+    SELECT ParentId AS QuestionId, MIN(CreationDate) AS FirstAnswerAt
+    FROM answers
+    GROUP BY ParentId
+  ) first_answer ON first_answer.QuestionId = q.Id
+  LEFT JOIN (
+    SELECT p.Id AS QuestionId, a.CreationDate AS AcceptedAnswerAt
+    FROM Posts p
+    JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE p.PostTypeId = 1
+  ) acc_answer ON acc_answer.QuestionId = q.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    WHERE PostId IN (SELECT Id FROM questions)
+    GROUP BY PostId
+  ) qc ON qc.PostId = q.Id
+  LEFT JOIN (
+    SELECT a.ParentId AS QuestionId, COUNT(c.Id) AS TotalCommentsOnAnswers
+    FROM answers a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    GROUP BY a.ParentId
+  ) ac ON ac.QuestionId = q.Id
+),
+-- heavy tag parsing: explode tags (format: <tag1><tag2>...)
+tag_exploded AS (
+  SELECT
+    qm.*,
+    unnest(string_to_array(substring(coalesce(qm.Tags,''), 2, GREATEST(length(coalesce(qm.Tags,'')) - 2,0)), '><')) AS Tag
+  FROM q_metrics qm
+),
+-- join tag popularity and tag owner badges counts
+tag_stats AS (
+  SELECT
+    te.*,
+    t.Count AS TagGlobalCount,
+    COALESCE(tb.BadgeCount,0) AS TagBadgeCount
+  FROM tag_exploded te
+  LEFT JOIN Tags t ON lower(t.TagName) = lower(te.Tag)
+  LEFT JOIN (
+    SELECT TagName, COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.TagBased = 1
+    GROUP BY TagName
+  ) tb ON lower(tb.TagName) = lower(te.Tag)
+),
+-- correlate with linked posts (duplicates and linked-to)
+link_agg AS (
+  SELECT
+    pl.PostId AS QuestionId,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS OutboundLinks,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinks,
+    COUNT(DISTINCT pl.RelatedPostId) AS DistinctRelatedPosts,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  WHERE pl.PostId IN (SELECT Id FROM questions)
+  GROUP BY pl.PostId
+),
+-- votes heat: up/down counts for questions and their answers
+vote_agg AS (
+  SELECT
+    q.Id AS QuestionId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS QUpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS QDownVotes,
+    COALESCE(a_votes.AnswerUpVotes,0) AS TotalAnswerUpVotes,
+    COALESCE(a_votes.AnswerDownVotes,0) AS TotalAnswerDownVotes
+  FROM questions q
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  LEFT JOIN (
+    SELECT a.ParentId AS QuestionId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS AnswerUpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS AnswerDownVotes
+    FROM answers a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    GROUP BY a.ParentId
+  ) a_votes ON a_votes.QuestionId = q.Id
+  GROUP BY q.Id, a_votes.AnswerUpVotes, a_votes.AnswerDownVotes
+),
+-- final ranking: combine metrics, and produce windowed analytics across tags
+final_rank AS (
+  SELECT
+    ts.QuestionId,
+    ts.Title,
+    ts.OwnerUserId,
+    ts.CreationDate,
+    ts.QuestionScore,
+    ts.ViewCount,
+    ts.TotalAnswersInWindow,
+    ts.DistinctAnswerers,
+    ts.PctLowRepAnswerers,
+    ts.MedianAnswerScore,
+    ts.MaxAnswerScore,
+    ts.TimeToFirstAnswerSec,
+    ts.TimeToAcceptedAnswerSec,
+    ts.QuestionCommentCount,
+    ts.AvgCommentsPerAnswer,
+    ts.Tag,
+    ts.TagGlobalCount,
+    ts.TagBadgeCount,
+    COALESCE(la.OutboundLinks,0) AS OutboundLinks,
+    COALESCE(la.DuplicateLinks,0) AS DuplicateLinks,
+    COALESCE(vg.QUpVotes,0) AS QUpVotes,
+    COALESCE(vg.QDownVotes,0) AS QDownVotes,
+    COALESCE(vg.TotalAnswerUpVotes,0) AS TotalAnswerUpVotes,
+    COALESCE(vg.TotalAnswerDownVotes,0) AS TotalAnswerDownVotes,
+    ts.EngagementScore,
+    -- composite popularity index (normalized-ish)
+    (
+      least(1, (ts.EngagementScore / nullif((SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY EngagementScore) FROM q_metrics),0)))
+      * 0.5
+      + least(1, GREATEST(ts.MedianAnswerScore,0) / GREATEST(NULLIF((SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY MedianAnswerScore) FROM q_metrics),0),1)) * 0.2
+      + least(1, COALESCE(vg.QUpVotes,0)::numeric / GREATEST( (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY (QUpVotes::numeric)) FROM vote_agg),1)) * 0.2
+      + least(1, COALESCE(ts.TagBadgeCount,0)::numeric / GREATEST((SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY TagBadgeCount) FROM tag_stats),1)) * 0.1
+    ) AS PopularityIndex
+  FROM tag_stats ts
+  LEFT JOIN link_agg la ON la.QuestionId = ts.QuestionId
+  LEFT JOIN vote_agg vg ON vg.QuestionId = ts.QuestionId
+)
+SELECT
+  fr.QuestionId,
+  fr.Title,
+  fr.Tag,
+  fr.TagGlobalCount,
+  fr.TagBadgeCount,
+  fr.EngagementScore,
+  round(fr.PopularityIndex::numeric,4) AS PopularityIndex,
+  fr.TotalAnswersInWindow,
+  fr.DistinctAnswerers,
+  round(fr.PctLowRepAnswerers::numeric,3) AS PctLowRepAnswerers,
+  fr.MedianAnswerScore,
+  fr.MaxAnswerScore,
+  round(fr.TimeToFirstAnswerSec,0) AS TimeToFirstAnswerSec,
+  round(fr.TimeToAcceptedAnswerSec,0) AS TimeToAcceptedAnswerSec,
+  fr.OutboundLinks,
+  fr.DuplicateLinks,
+  fr.QUpVotes,
+  fr.QDownVotes,
+  fr.TotalAnswerUpVotes,
+  fr.TotalAnswerDownVotes,
+  fr.QuestionCommentCount,
+  fr.AvgCommentsPerAnswer,
+  -- rank within tag by PopularityIndex
+  dense_rank() OVER (PARTITION BY lower(fr.Tag) ORDER BY fr.PopularityIndex DESC) AS TagRank,
+  -- global rank
+  dense_rank() OVER (ORDER BY fr.PopularityIndex DESC) AS GlobalRank
+FROM final_rank fr
+WHERE fr.EngagementScore > 0
+ORDER BY PopularityIndex DESC, EngagementScore DESC
+LIMIT 200;

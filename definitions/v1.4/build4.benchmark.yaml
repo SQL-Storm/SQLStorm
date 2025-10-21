@@ -1,9 +1,9 @@
-title: SQLStorm v1.0 Build4 Benchmark (Executable)
+title: SQLStorm v1.4 Build4 Benchmark (Executable)
 repetitions: 1
 warmup: 1
 timeout: 1
 fetch_result: false
-output: results/v1.1/build4
+output: results/v1.4/build4
 systems:
   - title: Umbra
     dbms: umbra

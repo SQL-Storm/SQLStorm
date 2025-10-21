@@ -1,0 +1,114 @@
+WITH RECURSIVE UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        b.Name AS BadgeName,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+),
+TopBadges AS (
+    SELECT UserId, BadgeName, Class
+    FROM UserBadgeStats
+    WHERE BadgeRank <= 3
+),
+PostsWithStats AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        u.DisplayName AS OwnerName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END),0) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, pt.Name, p.Score, p.ViewCount, p.CreationDate, p.Title, u.DisplayName
+),
+DuplicateLinks AS (
+    SELECT 
+        pl.PostId, 
+        COUNT(DISTINCT pl.RelatedPostId) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+TopUsersQuestions AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionsAsked,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(COALESCE(pl.DuplicateCount,0)) AS TotalDuplicates,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN DuplicateLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COALESCE(AVG(p.Score),0) AS AvgPostScore,
+        COUNT(DISTINCT p.Id) AS PostCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName, t.Count
+    ORDER BY t.Count DESC
+    LIMIT 10
+)
+SELECT 
+    u.DisplayName AS User,
+    u.Reputation,
+    ts.QuestionsAsked,
+    ROUND(ts.AvgQuestionScore,2) AS AvgQuestionScore,
+    ts.TotalDuplicates,
+    ts.BadgeCount,
+    /* Standard SQL: emulate ARRAY_AGG(DISTINCT ... ORDER BY ...) with STRING_AGG and proper grouping in outer query */
+    (
+        SELECT STRING_AGG(DISTINCT tb.BadgeName, ',')
+        ORDER BY tb.Class
+        FROM TopBadges tb
+        WHERE tb.UserId = u.Id
+    ) AS TopBadges,
+    pt.Name AS PostTypeName,
+    p.Title AS RecentTopPostTitle,
+    p.Score AS RecentTopPostScore,
+    p.ViewCount AS RecentTopPostViews,
+    tt.TagName AS PopularTag,
+    tt.PostCount AS TagUsageCount,
+    ROUND(tt.AvgPostScore,2) AS TagAvgPostScore
+FROM Users u
+INNER JOIN TopUsersQuestions ts ON u.Id = ts.UserId
+LEFT JOIN UserBadgeStats tb ON u.Id = tb.UserId AND tb.BadgeRank <= 3
+LEFT JOIN PostsWithStats p ON p.OwnerUserId = u.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    AND p.Score = (
+        SELECT MAX(Score) FROM Posts WHERE OwnerUserId = u.Id
+    )
+LEFT JOIN TopTags tt ON POSITION('<' IN CONCAT('<', tt.TagName, '>')) > 0
+WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '3 months')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, ts.QuestionsAsked, ts.AvgQuestionScore,
+    ts.TotalDuplicates, ts.BadgeCount, pt.Name, p.Title, p.Score, p.ViewCount,
+    tt.TagName, tt.Count, tt.AvgPostScore
+ORDER BY u.Reputation DESC
+LIMIT 20;

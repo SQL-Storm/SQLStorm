@@ -1,0 +1,99 @@
+-- {"query": "21008.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1061} 
+WITH question_stats AS (
+    SELECT 
+        p.Id AS question_id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        u.Reputation AS owner_reputation,
+        COALESCE(b.class, 0) AS badge_class,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS recency_rank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_question_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS avg_owner_score
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, MAX(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS class
+        FROM Badges 
+        WHERE Name LIKE '%Editor%' OR Name LIKE '%Guru%'
+        GROUP BY UserId
+    ) b ON p.OwnerUserId = b.UserId
+    WHERE p.PostTypeId = 1 
+        AND p.DeletionDate IS NULL
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+),
+high_activity_users AS (
+    SELECT OwnerUserId, COUNT(*) AS total_questions
+    FROM question_stats
+    GROUP BY OwnerUserId
+    HAVING COUNT(*) >= 5
+),
+accepted_answers AS (
+    SELECT 
+        parent.AcceptedAnswerId,
+        child.Score AS answer_score,
+        child.CreationDate AS answer_date,
+        child.OwnerUserId AS answer_owner,
+        (parent.ViewCount * 0.1 + child.Score * 10 + parent.AnswerCount * 5) AS engagement_score
+    FROM Posts parent
+    INNER JOIN Posts child ON parent.AcceptedAnswerId = child.Id
+    WHERE parent.PostTypeId = 1 AND child.PostTypeId = 2
+)
+SELECT 
+    qs.question_id,
+    qs.owner_reputation,
+    qs.question_score,
+    qs.answer_count,
+    COALESCE(aa.answer_score, 0) AS best_answer_score,
+    CASE 
+        WHEN qs.answer_count = 0 THEN 'No Answers'
+        WHEN aa.answer_score IS NULL THEN 'Accepted but Low Score'
+        WHEN aa.answer_score > qs.question_score * 0.8 THEN 'High Quality Accepted'
+        ELSE 'Average'
+    END AS answer_quality_category,
+    (qs.question_score - COALESCE(qs.prev_question_score, 0)) AS score_improvement,
+    GREATEST(0, (qs.question_score / NULLIF(qs.avg_owner_score, 0)) - 1) * 100 AS relative_performance_pct,
+    SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2) AS primary_tag,
+    CASE 
+        WHEN qs.badge_class = 1 THEN 'Gold Editor'
+        WHEN qs.recency_rank <= 3 THEN 'Recent Active'
+        WHEN qs.view_count > 10000 THEN 'Viral Question'
+        ELSE 'Standard'
+    END AS user_profile,
+    (SELECT STRING_AGG(v.Name, ', ') 
+     FROM Votes v 
+     INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id 
+     WHERE v.PostId = qs.question_id 
+       AND v.CreationDate >= qs.creation_date 
+       AND v.CreationDate <= qs.creation_date + INTERVAL '30 days'
+    ) AS vote_types_summary,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qs.question_id AND c.Score > 0),
+        0
+    ) AS positive_comments_count
+FROM question_stats qs
+INNER JOIN Posts p ON qs.question_id = p.Id
+LEFT JOIN accepted_answers aa ON qs.question_id = aa.AcceptedAnswerId
+INNER JOIN high_activity_users hau ON qs.OwnerUserId = hau.OwnerUserId
+WHERE (qs.question_score > 10 OR qs.view_count > 5000)
+    AND (qs.answer_count > 0 OR qs.comment_count > 5)
+    AND (qs.owner_reputation IS NOT NULL AND qs.owner_reputation > 100)
+    AND NOT (p.Title ILIKE '%homework%' OR p.Title ILIKE '%test%')
+    AND (
+        (qs.score_improvement > 5 AND qs.recency_rank <= 2)
+        OR 
+        (EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = qs.question_id AND pl.LinkTypeId = 3))
+        OR
+        (qs.engagement_score > 50 FROM (SELECT SUM(COALESCE(aa.engagement_score, 0)) FROM accepted_answers aa WHERE aa.answer_owner = qs.owneruserid))
+    )
+ORDER BY 
+    CASE 
+        WHEN aa.answer_score IS NOT NULL THEN aa.answer_score * LOG(qs.view_count + 1)
+        ELSE qs.view_count 
+    END DESC,
+    qs.creation_date DESC
+LIMIT 100;

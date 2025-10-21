@@ -1,0 +1,192 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.CreationDate DESC
+    ) AS rn_type
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+TopQuestions AS (
+  SELECT
+    r.Id AS PostId,
+    r.Title AS QuestionTitle,
+    r.CreationDate AS CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.Tags,
+    r.LastActivityDate,
+    r.AcceptedAnswerId,
+    r.ParentId,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.Body,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = r.Id) AS CommentCountTotal,
+    (SELECT STRING_AGG(CONCAT_WS(':', c2.UserDisplayName, c2.Text), ' | ')
+     FROM Comments c2
+     WHERE c2.PostId = r.Id) AS ComposerNotes
+  FROM RankedPosts r
+  WHERE r.PostTypeId = 1 AND r.rn_type = 1
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Views, 0) AS Views,
+    COALESCE(u.UpVotes, 0) AS UpVotes,
+    COALESCE(u.DownVotes, 0) AS DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    COALESCE(b.GoldCount, 0) AS GoldBadges,
+    COALESCE(b.SilverCount, 0) AS SilverBadges,
+    COALESCE(b.BronzeCount, 0) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+TagCommerce AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    p.OwnerUserId AS PostOwner
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+),
+CrossLinks AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.RelatedPostId <> pl.PostId
+),
+WindowedStats AS (
+  SELECT
+    tp.PostId,
+    tp.QuestionTitle,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.OwnerUserId,
+    LAG(tp.Score) OVER (ORDER BY tp.CreationDate DESC) AS PrevScore,
+    LEAD(tp.Score) OVER (ORDER BY tp.CreationDate DESC) AS NextScore,
+    ROW_NUMBER() OVER (ORDER BY tp.CreationDate DESC) AS wn
+  FROM TopQuestions tp
+),
+Final AS (
+  SELECT
+    ws.PostId,
+    ws.QuestionTitle,
+    ws.CreationDate,
+    ws.Score,
+    ws.ViewCount,
+    ws.OwnerUserId,
+    uw.DisplayName AS OwnerDisplayName,
+    ws.PrevScore,
+    ws.NextScore,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    wb.GoldBadges,
+    wb.SilverBadges,
+    wb.BronzeBadges,
+    cc.CommentCountTotal,
+    cc.ComposerNotes,
+    STRING_AGG(DISTINCT tt.TagName, ',') AS AllTags,
+    cl.Name AS LinkedToTag
+  FROM WindowedStats ws
+  LEFT JOIN Users uw ON ws.OwnerUserId = uw.Id
+  LEFT JOIN UserStats u ON ws.OwnerUserId = u.UserId
+  LEFT JOIN (
+    SELECT UserId, GoldCount AS GoldBadges, SilverCount AS SilverBadges, BronzeCount AS BronzeBadges
+    FROM (
+      SELECT UserId,
+             SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+             SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+             SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+      FROM Badges
+      GROUP BY UserId
+    ) b
+  ) wb ON wb.UserId = ws.OwnerUserId
+  LEFT JOIN (
+    SELECT cc.PostId, COUNT(*) AS CommentCountTotal, STRING_AGG(CONCAT_WS(':', c.UserDisplayName, c.Text), ' | ') AS ComposerNotes
+    FROM Comments c
+    GROUP BY cc.PostId
+  ) cc ON cc.PostId = ws.PostId
+  LEFT JOIN (
+    SELECT p.Id, t.TagName
+    FROM Posts p
+    JOIN Tags t ON t.Id = p.Id
+  ) tt ON tt.Id = ws.PostId
+  LEFT JOIN CrossLinks cl ON cl.PostId = ws.PostId
+  GROUP BY
+    ws.PostId, ws.QuestionTitle, ws.CreationDate, ws.Score, ws.ViewCount, ws.OwnerUserId,
+    uw.DisplayName, ws.PrevScore, ws.NextScore, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+    u.Location, u.WebsiteUrl, u.AboutMe, wb.GoldBadges, wb.SilverBadges, wb.BronzeBadges,
+    cc.CommentCountTotal, cc.ComposerNotes, cl.Name
+)
+SELECT
+  Final.PostId,
+  Final.QuestionTitle,
+  Final.CreationDate,
+  Final.Score,
+  Final.ViewCount,
+  Final.OwnerUserId,
+  Final.OwnerDisplayName,
+  Final.PrevScore,
+  Final.NextScore,
+  Final.Reputation,
+  Final.Views,
+  Final.UpVotes,
+  Final.DownVotes,
+  Final.Location,
+  Final.WebsiteUrl,
+  Final.AboutMe,
+  Final.GoldBadges,
+  Final.SilverBadges,
+  Final.BronzeBadges,
+  Final.CommentCountTotal,
+  Final.ComposerNotes,
+  Final.AllTags,
+  Final.LinkedToTag
+FROM Final
+ORDER BY Final.CreationDate DESC
+FETCH FIRST 100 ROWS ONLY;

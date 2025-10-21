@@ -1,0 +1,167 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(t.TagName AS VARCHAR(1000)) AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.Count > 10000
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        CAST(th.TagPath || ' -> ' || t2.TagName AS VARCHAR(1000)),
+        th.Level + 1
+    FROM Tags t2
+    CROSS JOIN TagHierarchy th
+    INNER JOIN Posts p1 ON POSITION(CONCAT('<', th.TagName, '>') IN p1.Tags) > 0
+    INNER JOIN Posts p2 ON POSITION(CONCAT('<', t2.TagName, '>') IN p2.Tags) > 0
+        AND p1.Id = p2.ParentId
+    WHERE th.Level < 3 
+        AND t2.Count > 1000
+        AND t2.Id != th.Id
+),
+UserActivityMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV(p.Score) AS ScoreStdDev,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate)))/86400 AS ActiveDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 
+        AND u.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+PostEngagement AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC) AS YearlyRankRaw,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC NULLS LAST) AS ViewRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1 
+        AND p.Score > 0
+        AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CommentCount, p.FavoriteCount, p.CreationDate, p.Tags, p.OwnerUserId
+),
+TagCorrelations AS (
+    SELECT 
+        t1.TagName AS Tag1,
+        t2.TagName AS Tag2,
+        COUNT(DISTINCT p.Id) AS CoOccurrences,
+        AVG(p.Score) AS AvgCombinedScore,
+        CORR(p.Score, p.ViewCount) AS ScoreViewCorrelation
+    FROM Tags t1
+    CROSS JOIN Tags t2
+    INNER JOIN Posts p ON p.Tags LIKE CONCAT('%<', t1.TagName, '>%') 
+        AND p.Tags LIKE CONCAT('%<', t2.TagName, '>%' )
+    WHERE t1.Id < t2.Id 
+        AND t1.Count > 5000 
+        AND t2.Count > 5000
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.TotalPosts,
+    uam.Questions,
+    uam.Answers,
+    ROUND(uam.AvgPostScore, 2) AS AvgPostScore,
+    uam.TotalViews,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    ROUND(uam.MedianScore, 2) AS MedianScore,
+    ROUND(uam.ScoreStdDev, 2) AS ScoreStdDev,
+    uam.ActiveDays,
+    pe.Title AS TopPost,
+    pe.Score AS TopPostScore,
+    pe.ViewCount AS TopPostViews,
+    pe.YearlyRank,
+    pe.UniqueVoters,
+    pe.EditCount,
+    th.TagPath AS RelatedTagPath,
+    tc.Tag1,
+    tc.Tag2,
+    tc.CoOccurrences,
+    ROUND(tc.AvgCombinedScore, 2) AS TagComboAvgScore,
+    ROUND(tc.ScoreViewCorrelation, 4) AS TagCorrelation,
+    ROUND(uam.Reputation / NULLIF(uam.TotalPosts, 0), 2) AS RepPerPost,
+    ROUND(uam.TotalViews / NULLIF(uam.TotalPosts, 0), 0) AS ViewsPerPost,
+    CASE 
+        WHEN uam.Answers > uam.Questions * 2 THEN 'Answer Specialist'
+        WHEN uam.Questions > uam.Answers * 2 THEN 'Question Specialist'
+        ELSE 'Balanced Contributor'
+    END AS ContributorType,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY pe.Score) OVER (PARTITION BY SUBSTRING(pe.Tags, '\\<(.*?)\\>')) AS Tag90thPercentile
+FROM UserActivityMetrics uam
+CROSS JOIN LATERAL (
+    SELECT * FROM PostEngagement pe2
+    WHERE pe2.Id IN (
+        SELECT p.Id FROM Posts p 
+        WHERE p.OwnerUserId = uam.UserId 
+        ORDER BY p.Score DESC 
+        LIMIT 1
+    )
+) pe
+LEFT JOIN LATERAL (
+    SELECT * FROM TagHierarchy th2
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p3 
+        WHERE p3.OwnerUserId = uam.UserId 
+            AND POSITION(CONCAT('<', th2.TagName, '>') IN p3.Tags) > 0
+    )
+    LIMIT 1
+) th ON true
+LEFT JOIN LATERAL (
+    SELECT * FROM TagCorrelations tc2
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p4 
+        WHERE p4.OwnerUserId = uam.UserId 
+            AND POSITION(CONCAT('<', tc2.Tag1, '>') IN p4.Tags) > 0
+    )
+    ORDER BY tc2.AvgCombinedScore DESC
+    LIMIT 1
+) tc ON true
+WHERE uam.Reputation > 5000
+    AND pe.YearlyRank <= 100
+ORDER BY uam.Reputation DESC, pe.Score DESC
+LIMIT 500;

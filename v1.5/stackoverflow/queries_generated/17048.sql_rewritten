@@ -1,0 +1,161 @@
+-- {"query": "17048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 114415, "output_tokens": 112406} 
+WITH user_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) AS join_year,
+        COALESCE(u.Location, 'Unknown') AS location,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS avg_post_score,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) AS gold_badges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS activity_percentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+post_analysis AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Open'
+            ELSE 'Unanswered'
+        END AS status,
+        ARRAY_LENGTH(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) AS tag_count,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS user_post_rank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_score,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC NULLS LAST 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS user_best_post_title
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND p.Score IS NOT NULL
+),
+comment_activity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS comment_count,
+        AVG(LENGTH(c.Text)) AS avg_comment_length,
+        MAX(c.CreationDate) AS last_comment_date,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS high_score_comments
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+        AND c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY c.UserId
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS edited_posts,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS edit_actions,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 END) AS rollback_actions,
+        STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 THEN 'Close:' || COALESCE(ph.Comment, 'N/A')
+                WHEN ph.PostHistoryTypeId = 11 THEN 'Reopen'
+                ELSE NULL
+            END, 
+            ' | ' 
+            ORDER BY ph.CreationDate
+        ) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS moderation_history
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    um.location,
+    um.reputation_rank,
+    ROUND(um.activity_percentile::numeric * 100, 2) AS activity_percentile,
+    um.total_posts,
+    COALESCE(um.questions, 0) + COALESCE(um.answers, 0) AS q_and_a_total,
+    ROUND(um.avg_post_score::numeric, 2) AS avg_post_score,
+    CASE 
+        WHEN um.gold_badges IS NOT NULL THEN SUBSTRING(um.gold_badges, 1, 50) || '...'
+        ELSE 'No Gold Badges'
+    END AS gold_badge_preview,
+    COALESCE(ca.comment_count, 0) AS comments_last_year,
+    ROUND(COALESCE(ca.avg_comment_length, 0), 1) AS avg_comment_length,
+    COALESCE(ep.edited_posts, 0) AS posts_edited,
+    COALESCE(ep.edit_actions, 0) + COALESCE(ep.rollback_actions, 0) AS total_edit_actions,
+    COUNT(DISTINCT pa.post_id) AS quality_questions,
+    AVG(pa.Score) FILTER (WHERE pa.user_post_rank <= 5) AS top5_avg_score,
+    MAX(pa.user_best_post_title) AS best_post_title,
+    COUNT(DISTINCT pl.RelatedPostId) AS linked_posts,
+    (
+        SELECT COUNT(DISTINCT v.PostId) 
+        FROM Votes v
+        INNER JOIN Posts vp ON v.PostId = vp.Id
+        WHERE vp.OwnerUserId = um.Id
+            AND v.VoteTypeId = 2
+            AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    ) AS recent_upvoted_posts,
+    CASE 
+        WHEN um.join_year < EXTRACT(YEAR FROM cast('2024-10-01' as date)) - 3 THEN 'Veteran'
+        WHEN um.join_year = EXTRACT(YEAR FROM cast('2024-10-01' as date)) THEN 'Newcomer'
+        ELSE 'Regular'
+    END AS user_tenure,
+    COALESCE(
+        (
+            SELECT STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.Count DESC)
+            FROM (
+                SELECT UNNEST(string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><')) AS tag_name
+                FROM Posts p2
+                WHERE p2.OwnerUserId = um.Id
+                    AND p2.Tags IS NOT NULL
+                LIMIT 100
+            ) tag_list
+            INNER JOIN Tags t ON t.TagName = tag_list.tag_name
+            LIMIT 5
+        ), 
+        'No Tags'
+    ) AS top_5_tags
+FROM user_metrics um
+LEFT JOIN comment_activity ca ON um.Id = ca.UserId
+LEFT JOIN edit_patterns ep ON um.Id = ep.UserId
+LEFT JOIN post_analysis pa ON um.Id = pa.OwnerUserId AND pa.user_post_rank <= 10
+LEFT JOIN PostLinks pl ON EXISTS (
+    SELECT 1 FROM Posts linked_post 
+    WHERE linked_post.Id = pl.PostId 
+        AND linked_post.OwnerUserId = um.Id
+)
+WHERE um.Reputation > 1000
+    AND um.total_posts > 0
+    AND (um.questions > 0 OR um.answers > 0)
+    AND um.DisplayName IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph_del 
+        WHERE ph_del.UserId = um.Id 
+            AND ph_del.PostHistoryTypeId = 12 
+            AND ph_del.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'
+    )
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.location, um.reputation_rank,
+    um.activity_percentile, um.total_posts, um.questions, um.answers,
+    um.avg_post_score, um.gold_badges, um.join_year,
+    ca.comment_count, ca.avg_comment_length,
+    ep.edited_posts, ep.edit_actions, ep.rollback_actions
+HAVING COUNT(DISTINCT pa.post_id) > 0
+    OR COALESCE(ca.comment_count, 0) > 10
+ORDER BY 
+    um.reputation_rank ASC,
+    COALESCE(ca.comment_count, 0) DESC,
+    um.total_posts DESC
+LIMIT 100;

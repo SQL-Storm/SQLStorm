@@ -1,0 +1,82 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvotesReceived,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON p.OwnerUserId = u.Id AND p.CreationDate BETWEEN TIMESTAMP '2022-01-01 00:00:00' AND TIMESTAMP '2023-01-01 00:00:00'
+    LEFT JOIN 
+        Comments c ON c.UserId = u.Id AND c.CreationDate BETWEEN TIMESTAMP '2022-01-01 00:00:00' AND TIMESTAMP '2023-01-01 00:00:00'
+    LEFT JOIN 
+        Votes v ON v.UserId = u.Id AND v.CreationDate BETWEEN TIMESTAMP '2022-01-01 00:00:00' AND TIMESTAMP '2023-01-01 00:00:00'
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+    HAVING 
+        COUNT(p.Id) > 50 OR COUNT(c.Id) > 100
+),
+PostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.AnswerCount) AS MaxAnswersPerQuestion,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 5) AS PostEdits,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (5, 6, 7)
+    LEFT JOIN 
+        PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    WHERE 
+        p.PostTypeId IN (1, 2)
+    GROUP BY 
+        p.OwnerUserId
+),
+TagEngagement AS (
+    SELECT 
+        pt.UserId,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC) AS TopTags,
+        COUNT(DISTINCT t.Id) AS UniqueTagsUsed
+    FROM 
+        Posts p
+    JOIN 
+        PostTypes pt ON p.PostTypeId = pt.Id
+    JOIN 
+        Tags t ON t.TagName IN (
+            SELECT TRIM(value)
+            FROM UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '><', ','), '<>', ''), ',')) AS value
+        )
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        pt.UserId
+)
+SELECT 
+    au.*,
+    ps.AvgPostScore,
+    ps.MaxAnswersPerQuestion,
+    ps.PostEdits,
+    ps.LinkedPosts,
+    te.TopTags,
+    te.UniqueTagsUsed,
+    RANK() OVER (ORDER BY (au.UpvotesDelivered - au.DownvotesDelivered) DESC) AS EngagementRank
+FROM 
+    ActiveUsers au
+JOIN 
+    PostStats ps ON ps.OwnerUserId = au.Id
+LEFT JOIN 
+    TagEngagement te ON te.UserId = au.Id
+ORDER BY 
+    EngagementRank
+LIMIT 100;

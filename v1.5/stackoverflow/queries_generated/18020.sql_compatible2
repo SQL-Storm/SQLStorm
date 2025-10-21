@@ -1,0 +1,116 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        AVG(CAST(p.AnswerCount AS DECIMAL(10, 2))) AS AvgAnswerCountForQuestions,
+        MAX(p.FavoriteCount) AS MaxFavoriteCountForUserPosts,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY DATE_TRUNC('year', u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostQuality AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Score,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        CASE
+            WHEN p.PostTypeId = 1 THEN COALESCE(p.AnswerCount, 0)
+            ELSE 0
+        END AS AnswerCountForQuestions,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRankByUser,
+        (p.Score + p.CommentCount * 5 + p.FavoriteCount * 2) AS WeightedScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT pl.PostId) AS PostsWithTag,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinks,
+        AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgPostScoreForTag,
+        MAX(p.ViewCount) AS MaxPostViewCountForTag
+    FROM Tags t
+    LEFT JOIN Posts p ON t.Id = CAST(
+        SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2) AS INTEGER
+    )
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT pl.PostId) > 10
+)
+SELECT
+    ua.DisplayName AS UserDisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    ua.ReputationRank,
+    ua.YearlyReputationRank,
+    pq.PostTypeName,
+    pq.Score AS PostScore,
+    pq.CommentCount AS PostCommentCount,
+    pq.FavoriteCount AS PostFavoriteCount,
+    pq.PostCreationDate,
+    pq.AnswerCountForQuestions,
+    pq.IsClosed AS PostIsClosed,
+    pq.PostRankByUser,
+    pq.WeightedScore AS PostWeightedScore,
+    ts.TagName,
+    ts.PostsWithTag,
+    ts.DuplicateLinks AS TagDuplicateLinks,
+    ts.AvgPostScoreForTag,
+    ts.MaxPostViewCountForTag,
+    CASE
+        WHEN ua.TotalUpVotesReceived > ua.TotalDownVotesReceived * 2 THEN 'Highly Valued'
+        WHEN ua.TotalUpVotesReceived > 100 THEN 'Active Contributor'
+        ELSE 'Standard User'
+    END AS UserValueCategory,
+    COALESCE(ua.TotalPosts, 0) + COALESCE(ua.TotalComments, 0) AS TotalUserContributions,
+    LENGTH(ua.DisplayName) AS DisplayNameLength,
+    LEFT(UPPER(ua.DisplayName), 1) AS FirstLetterOfDisplayName,
+    CASE
+        WHEN ua.UserCreationDate < DATE '2010-01-01' THEN 'Early Adopter'
+        WHEN ua.UserCreationDate < DATE '2015-01-01' THEN 'Established User'
+        ELSE 'Newer User'
+    END AS UserVintage,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 3) AS BronzeBadges
+FROM UserActivity ua
+LEFT JOIN PostQuality pq ON ua.UserId = pq.OwnerUserId AND pq.PostRankByUser <= 5
+LEFT JOIN TagStats ts ON ts.TagName IN (
+        SELECT TagName
+        FROM Tags
+        WHERE Id IN (
+            SELECT DISTINCT TagId
+            FROM Posts
+            WHERE OwnerUserId = ua.UserId AND PostTypeId = 1
+        )
+    )
+WHERE ua.Reputation > 1000
+  AND ua.TotalPosts > 10
+  AND ua.UserCreationDate < DATE '2024-10-01' - INTERVAL '1 year'
+ORDER BY ua.Reputation DESC, ua.UserCreationDate ASC
+LIMIT 100;

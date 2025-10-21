@@ -1,0 +1,63 @@
+-- {"query": "59046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 626} 
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    COUNT(c.Id) as CommentCount,
+    COUNT(v.Id) as VoteCount,
+    COUNT(ph.Id) as HistoryCount,
+    COUNT(pl.Id) as LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END as PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Unanswered'
+    END as PostStatus,
+    MAX(ph.CreationDate) as LastActivity,
+    EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / 86400 as AgeInDays
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT PostId, UNNEST(string_to_array(Tags, '<>')) as TagName
+    FROM Posts 
+    WHERE Tags IS NOT NULL AND Tags != ''
+) t ON p.Id = t.PostId
+WHERE p.CreationDate >= '2023-01-01' 
+    AND p.CreationDate <= '2023-12-31'
+    AND p.ViewCount > 100
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND u.Reputation > 1000
+GROUP BY 
+    p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+    u.DisplayName, u.Reputation, p.PostTypeId, p.ClosedDate, 
+    p.CommunityOwnedDate, p.AnswerCount, p.Tags
+HAVING 
+    COUNT(c.Id) > 5 
+    AND COUNT(v.Id) > 10
+    AND COUNT(ph.Id) > 2
+ORDER BY 
+    p.ViewCount DESC, 
+    p.Score DESC,
+    COUNT(v.Id) DESC,
+    MAX(ph.CreationDate) DESC
+LIMIT 10000;

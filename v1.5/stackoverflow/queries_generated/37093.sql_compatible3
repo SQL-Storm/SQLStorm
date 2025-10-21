@@ -1,0 +1,195 @@
+WITH
+QuestionBase AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.Tags, '') AS RawTags,
+    CASE
+      WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[]
+      ELSE regexp_split_to_array(substring(p.Tags from 2 for character_length(p.Tags)-2), '><')
+    END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    AND p.ViewCount IS NOT NULL
+),
+TagAggregates AS (
+  SELECT
+    unnest(TagArray) AS Tag,
+    SUM(ViewCount) AS TotalViews,
+    COUNT(*) AS QuestionCount,
+    AVG(Score) AS AvgScore
+  FROM QuestionBase
+  GROUP BY unnest(TagArray)
+  ORDER BY TotalViews DESC
+  LIMIT 50
+),
+QWithUsers AS (
+  SELECT
+    q.*,
+    u.Reputation AS OwnerRep,
+    u.CreationDate AS OwnerCreation,
+    u.Views AS OwnerProfileViews,
+    array_to_string(ta.TagsTop, ',') AS MatchingTopTags
+  FROM (
+    SELECT qb.*,
+           (SELECT array_agg(t ORDER BY t) FROM (
+              SELECT t
+              FROM unnest(qb.TagArray) t
+              WHERE t IN (SELECT Tag FROM TagAggregates)
+           ) AS sub(t)
+           ) AS TagsTop
+    FROM QuestionBase qb
+  ) q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  WHERE TagsTop IS NOT NULL
+),
+AnswerStats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.Score IS NOT NULL) AS AnswersCount,
+    MAX(a.Score) AS MaxAnswerScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+    SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted,
+    MAX(u.Reputation) AS MaxAnswererRep,
+    MIN(a.CreationDate) AS FirstAnswerDate,
+    MAX(a.CreationDate) AS LastAnswerDate
+  FROM Posts a
+  LEFT JOIN Posts p ON a.ParentId = p.Id
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.PostTypeId = 2
+    AND a.ParentId IS NOT NULL
+    AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  GROUP BY a.ParentId
+),
+ActivityWindow AS (
+  SELECT
+    ph.PostId AS QuestionId,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS LastEdit,
+    COUNT(*) FILTER (WHERE ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') AS RecentRevisions,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13)) AS CloseReopenEvents
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+LinkMetrics AS (
+  SELECT
+    p.Id AS QuestionId,
+    COUNT(pl.Id) FILTER (WHERE pl.RelatedPostId = p.Id) AS InboundLinks,
+    COUNT(pl.Id) FILTER (WHERE pl.PostId = p.Id) AS OutboundLinks,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinks
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+OwnerBadgeCounts AS (
+  SELECT
+    b.UserId AS OwnerUserId,
+    COUNT(*) FILTER (WHERE b.Class = 1 AND b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS GoldLastYear,
+    COUNT(*) FILTER (WHERE b.Class = 2 AND b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS SilverLastYear,
+    COUNT(*) FILTER (WHERE b.Class = 3 AND b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS BronzeLastYear
+  FROM Badges b
+  GROUP BY b.UserId
+),
+EnrichedQuestions AS (
+  SELECT
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.OwnerRep,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.TagArray,
+    q.MatchingTopTags,
+    COALESCE(asn.AnswersCount,0) AS AnswersObserved,
+    asn.MaxAnswerScore,
+    asn.MedianAnswerScore,
+    COALESCE(asn.HasAccepted,0) AS HasAcceptedAnswer,
+    COALESCE(asn.MaxAnswererRep,0) AS TopAnswererRep,
+    COALESCE(aw.LastEdit, q.CreationDate) AS LastEdit,
+    COALESCE(aw.RecentRevisions,0) AS RecentRevisions,
+    COALESCE(lm.InboundLinks,0) AS InboundLinks,
+    COALESCE(lm.OutboundLinks,0) AS OutboundLinks,
+    COALESCE(lm.DuplicateLinks,0) AS DuplicateLinks,
+    COALESCE(ob.GoldLastYear,0) AS OwnerGoldLastYear,
+    COALESCE(ob.SilverLastYear,0) AS OwnerSilverLastYear,
+    COALESCE(ob.BronzeLastYear,0) AS OwnerBronzeLastYear,
+    (
+      COALESCE(q.ViewCount,0) * 0.4
+      + GREATEST(COALESCE(q.Score,0),0) * 10
+      + GREATEST(COALESCE(asn.MaxAnswerScore,0),0) * 20
+      + COALESCE(asn.AnswersCount,0) * 15
+      + COALESCE(aw.RecentRevisions,0) * 25
+      + (COALESCE(lm.InboundLinks,0) - COALESCE(lm.OutboundLinks,0)) * 5
+      + (COALESCE(ob.GoldLastYear,0) * 50)
+      - (EXTRACT(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/86400.0) * 0.02
+    ) AS CompositeScore
+  FROM QWithUsers q
+  LEFT JOIN AnswerStats asn ON asn.QuestionId = q.QuestionId
+  LEFT JOIN ActivityWindow aw ON aw.QuestionId = q.QuestionId
+  LEFT JOIN LinkMetrics lm ON lm.QuestionId = q.QuestionId
+  LEFT JOIN OwnerBadgeCounts ob ON ob.OwnerUserId = q.OwnerUserId
+),
+TopCandidates AS (
+  SELECT *
+  FROM EnrichedQuestions
+  ORDER BY CompositeScore DESC NULLS LAST
+  LIMIT 200
+)
+SELECT
+  t.QuestionId,
+  t.Title,
+  t.CreationDate,
+  t.OwnerUserId,
+  t.OwnerRep,
+  t.ViewCount,
+  t.Score,
+  t.AnswersObserved,
+  t.MaxAnswerScore,
+  t.MedianAnswerScore,
+  t.HasAcceptedAnswer,
+  t.TopAnswererRep,
+  t.LastEdit,
+  t.RecentRevisions,
+  t.InboundLinks,
+  t.OutboundLinks,
+  t.DuplicateLinks,
+  t.OwnerGoldLastYear,
+  t.OwnerSilverLastYear,
+  t.OwnerBronzeLastYear,
+  t.CompositeScore,
+  ROW_NUMBER() OVER (PARTITION BY unnest(t.TagArray) ORDER BY t.CompositeScore DESC) AS RankPerTag,
+  DENSE_RANK() OVER (ORDER BY t.CompositeScore DESC) AS GlobalDenseRank,
+  ROW_NUMBER() OVER (ORDER BY t.CompositeScore DESC) AS GlobalRowNum,
+  AVG(t.ViewCount) OVER (ORDER BY t.CompositeScore DESC ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS RollingAvgViewsTop10,
+  AVG(t.Score) OVER (ORDER BY t.CompositeScore DESC ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS RollingAvgScoreTop50,
+  CASE WHEN t.OwnerRep > 0 THEN round((t.TopAnswererRep::numeric / GREATEST(t.OwnerRep,1))::numeric, 3) ELSE NULL END AS AnswererToOwnerRepRatio,
+  tag_cooccurrence.top_cooccurring
+FROM TopCandidates t
+LEFT JOIN LATERAL (
+  SELECT array_agg(tg ORDER BY cnt DESC, tg) AS top_cooccurring
+  FROM (
+    SELECT tg AS tg, COUNT(*) AS cnt
+    FROM (
+      SELECT unnest(tc.TagArray) AS tg
+      FROM TopCandidates tc
+    ) s
+    WHERE tg <> ALL (t.TagArray) AND tg IS NOT NULL
+    GROUP BY tg
+    ORDER BY cnt DESC
+    LIMIT 3
+  ) x
+) tag_cooccurrence ON true
+ORDER BY t.CompositeScore DESC, t.QuestionId
+;

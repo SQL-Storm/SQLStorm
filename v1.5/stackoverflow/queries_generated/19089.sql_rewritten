@@ -1,0 +1,256 @@
+-- {"query": "19089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2998} 
+WITH
+    -- 1. Identify "Core" Users who have an account, reputation, and made at least one post,
+    --    and check their latest activity.
+    CoreUsers AS (
+        SELECT
+            U.Id AS UserId,
+            U.DisplayName,
+            U.Reputation,
+            U.CreationDate AS UserCreationDate,
+            U.LastAccessDate,
+            U.Views,
+            U.UpVotes,
+            U.DownVotes
+        FROM
+            Users AS U
+        WHERE
+            U.AccountId IS NOT NULL
+            AND U.Reputation > 100
+            AND U.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Active within the last year
+    ),
+    -- 2. Find Questions related to 'sql', 'database', 'performance' with a decent answer count,
+    --    and identify their accepted answers if any.
+    RelevantQuestions AS (
+        SELECT
+            Q.Id AS QuestionId,
+            Q.Title AS QuestionTitle,
+            Q.CreationDate AS QuestionCreationDate,
+            Q.Score AS QuestionScore,
+            Q.ViewCount,
+            Q.OwnerUserId AS QuestionOwnerUserId,
+            Q.AcceptedAnswerId,
+            NULLIF(TRIM(REPLACE(REPLACE(LOWER(Q.Tags), '<', ' '), '>', ' ')), '') AS ProcessedTags,
+            Q.AnswerCount
+        FROM
+            Posts AS Q
+        WHERE
+            Q.PostTypeId = 1 -- Questions
+            AND Q.AnswerCount >= 3
+            AND (
+                POSITION('sql' IN LOWER(Q.Tags)) > 0
+                OR POSITION('database' IN LOWER(Q.Tags)) > 0
+                OR POSITION('performance' IN LOWER(Q.Tags)) > 0
+            )
+            AND Q.ClosedDate IS NULL -- Not closed
+    ),
+    -- 3. Extract Answers to these RelevantQuestions, calculate their age, and gather basic stats.
+    QuestionAnswers AS (
+        SELECT
+            A.Id AS AnswerId,
+            A.ParentId AS QuestionId,
+            A.OwnerUserId AS AnswerOwnerUserId,
+            A.CreationDate AS AnswerCreationDate,
+            A.Score AS AnswerScore,
+            A.CommentCount,
+            A.LastActivityDate,
+            (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - A.CreationDate)) / 86400) AS AnswerAgeInDays -- Age in days
+        FROM
+            Posts AS A
+        WHERE
+            A.PostTypeId = 2 -- Answers
+            AND A.OwnerUserId IS NOT NULL
+            AND EXISTS (SELECT 1 FROM RelevantQuestions RQ WHERE RQ.QuestionId = A.ParentId)
+    ),
+    -- 4. Aggregate user's answer contributions and link to their reputation.
+    UserAnswerMetrics AS (
+        SELECT
+            CA.UserId,
+            CA.DisplayName,
+            CA.Reputation,
+            SUM(QA.AnswerScore) AS TotalAnswerScore,
+            COUNT(QA.AnswerId) AS TotalAnswersPosted,
+            AVG(QA.AnswerScore) AS AverageAnswerScore,
+            MAX(QA.AnswerCreationDate) AS LastAnswerDate,
+            MIN(QA.AnswerCreationDate) AS FirstAnswerDate,
+            COUNT(CASE WHEN RQ.AcceptedAnswerId = QA.AnswerId THEN 1 ELSE NULL END) AS AcceptedAnswerCount,
+            -- Correlated subquery: Check if any of their answers were edited by a different user
+            EXISTS (
+                SELECT 1
+                FROM PostHistory PH
+                WHERE PH.PostId = QA.AnswerId
+                    AND PH.PostHistoryTypeId = 5 -- Edit Body
+                    AND PH.UserId IS NOT NULL
+                    AND PH.UserId <> QA.AnswerOwnerUserId
+            ) AS HasExternalEdit
+        FROM
+            CoreUsers AS CA
+        INNER JOIN
+            QuestionAnswers AS QA ON CA.UserId = QA.AnswerOwnerUserId
+        LEFT JOIN
+            RelevantQuestions AS RQ ON QA.QuestionId = RQ.QuestionId
+        GROUP BY
+            CA.UserId, CA.DisplayName, CA.Reputation
+        HAVING
+            COUNT(QA.AnswerId) >= 2 -- At least two answers to relevant questions
+    ),
+    -- 5. Calculate comment engagement for these users.
+    UserCommentEngagement AS (
+        SELECT
+            UAM.UserId,
+            SUM(C.Score) AS TotalCommentScore,
+            COUNT(C.Id) AS TotalCommentsMade,
+            AVG(C.Score) AS AverageCommentScore,
+            MAX(C.CreationDate) AS LastCommentDate,
+            -- Conditional expression for comment activity classification
+            CASE
+                WHEN COUNT(C.Id) > 10 AND SUM(C.Score) > 20 THEN 'Highly Engaged Commenter'
+                WHEN COUNT(C.Id) BETWEEN 3 AND 10 AND SUM(C.Score) > 5 THEN 'Moderately Engaged Commenter'
+                ELSE 'Slightly Engaged Commenter'
+            END AS CommentEngagementLevel
+        FROM
+            UserAnswerMetrics AS UAM
+        LEFT JOIN
+            Comments AS C ON UAM.UserId = C.UserId
+        GROUP BY
+            UAM.UserId
+    ),
+    -- 6. Analyze badges related to answers or general contribution.
+    UserBadgeInsights AS (
+        SELECT
+            UAM.UserId,
+            SUM(CASE WHEN B.Name IN ('Nice Answer', 'Great Answer') THEN 1 ELSE 0 END) AS QualityAnswerBadges,
+            SUM(CASE WHEN B.Name IN ('Pundit', 'Commentator') THEN 1 ELSE 0 END) AS CommentRelatedBadges,
+            MAX(B.Date) AS LatestBadgeDate,
+            COUNT(DISTINCT B.Class) AS DistinctBadgeClassesEarned
+        FROM
+            UserAnswerMetrics AS UAM
+        LEFT JOIN
+            Badges AS B ON UAM.UserId = B.UserId
+        GROUP BY
+            UAM.UserId
+    ),
+    -- 7. Analyze post history for edits, specifically looking at body edits and potential rollbacks.
+    PostEditHistoryAnalysis AS (
+        SELECT
+            PH.PostId,
+            PH.UserId AS EditorUserId,
+            PH.CreationDate AS EditDate,
+            PH.PostHistoryTypeId,
+            PH.Text AS EditedBody,
+            LAG(PH.Text, 1, '') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousBody,
+            LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditDate,
+            ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_edit,
+            -- Calculate content change percentage from previous edit
+            NULLIF(CAST(LENGTH(PH.Text) - LENGTH(LAG(PH.Text, 1, '')) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NUMERIC), 0) / NULLIF(CAST(LENGTH(LAG(PH.Text, 1, '')) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NUMERIC), 0) AS ContentChangeRatio
+        FROM
+            PostHistory AS PH
+        WHERE
+            PH.PostHistoryTypeId IN (2, 5, 8) -- Initial Body, Edit Body, Rollback Body
+            AND PH.PostId IN (SELECT AnswerId FROM QuestionAnswers)
+    ),
+    LatestPostEditSummary AS (
+        SELECT
+            PEHA.PostId,
+            PEHA.EditorUserId,
+            PEHA.EditDate AS LatestEditDate,
+            PEHA.PreviousBody,
+            PEHA.EditedBody,
+            PEHA.ContentChangeRatio
+        FROM
+            PostEditHistoryAnalysis AS PEHA
+        WHERE
+            PEHA.rn_latest_edit = 1
+    ),
+    -- 8. Identify users whose posts are frequently linked to duplicates.
+    DuplicateLinkCheck AS (
+        SELECT
+            P.OwnerUserId AS UserId,
+            COUNT(DISTINCT PL.RelatedPostId) AS NumDuplicateLinksFromUserPosts,
+            ARRAY_AGG(DISTINCT P2.Title) AS DuplicateTitles
+        FROM
+            Posts AS P
+        INNER JOIN
+            PostLinks AS PL ON P.Id = PL.PostId
+        INNER JOIN
+            Posts AS P2 ON PL.RelatedPostId = P2.Id
+        WHERE
+            PL.LinkTypeId = 3 -- Duplicate
+            AND P.OwnerUserId IS NOT NULL
+        GROUP BY
+            P.OwnerUserId
+    ),
+    -- 9. Rank users by their total answer score and compare reputation to previous ranked user.
+    RankedUserPerformance AS (
+        SELECT
+            UAM.UserId,
+            UAM.DisplayName,
+            UAM.Reputation,
+            UAM.TotalAnswerScore,
+            UAM.TotalAnswersPosted,
+            UAM.AverageAnswerScore,
+            RANK() OVER (ORDER BY UAM.TotalAnswerScore DESC, UAM.Reputation DESC) AS AnswerScoreRank,
+            LAG(UAM.Reputation) OVER (ORDER BY UAM.TotalAnswerScore DESC, UAM.Reputation DESC) AS PrevRankReputation,
+            NTILE(5) OVER (ORDER BY UAM.TotalAnswerScore DESC) AS AnswerScoreQuintile
+        FROM
+            UserAnswerMetrics AS UAM
+    )
+-- Final result: Combine all CTEs and perform final calculations/filtering
+SELECT
+    R.DisplayName,
+    R.Reputation,
+    R.TotalAnswersPosted,
+    R.AverageAnswerScore,
+    COALESCE(UCE.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(UCE.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(UBI.QualityAnswerBadges, 0) AS QualityAnswerBadgesEarned,
+    COALESCE(UBI.CommentRelatedBadges, 0) AS CommentRelatedBadgesEarned,
+    UCE.CommentEngagementLevel,
+    R.AnswerScoreRank,
+    R.AnswerScoreQuintile,
+    -- Calculate reputation difference from the user ranked immediately before
+    R.Reputation - COALESCE(R.PrevRankReputation, R.Reputation) AS ReputationDifferenceFromHigherRank,
+    UAM.HasExternalEdit AS AnyAnswerEditedByOthers,
+    COALESCE(DPC.NumDuplicateLinksFromUserPosts, 0) AS PostsLinkedToDuplicates,
+    -- Calculate average content change ratio for their latest edits on answers
+    NULLIF(AVG(CASE WHEN QA.AnswerOwnerUserId = LPE.EditorUserId THEN LPE.ContentChangeRatio ELSE NULL END), 0) AS AvgSelfContentChangeRatioForLatestEdit,
+    -- A complex classification of the user based on multiple factors
+    CASE
+        WHEN R.TotalAnswerScore > 500 AND R.AverageAnswerScore > 15 AND UCE.TotalCommentScore > 100 THEN 'Elite Contributor'
+        WHEN R.TotalAnswersPosted > 10 AND UAM.AcceptedAnswerCount > 0 AND UBI.QualityAnswerBadges > 0 THEN 'Valued Answerer'
+        WHEN UCE.TotalCommentsMade > 20 AND UCE.TotalCommentScore > 30 THEN 'Community Interactor'
+        ELSE 'Active Participant'
+    END AS UserOverallCategory,
+    -- String aggregation of example duplicate titles
+    SUBSTRING(
+        (SELECT STRING_AGG(DT.Title, '; ') FROM (SELECT DISTINCT unnest(DPC.DuplicateTitles) AS Title FROM (SELECT 1) s) DT),
+        1,
+        200
+    ) AS ExampleDuplicateTitlesSample
+FROM
+    RankedUserPerformance AS R
+INNER JOIN
+    UserAnswerMetrics AS UAM ON R.UserId = UAM.UserId
+LEFT JOIN
+    UserCommentEngagement AS UCE ON R.UserId = UCE.UserId
+LEFT JOIN
+    UserBadgeInsights AS UBI ON R.UserId = UBI.UserId
+LEFT JOIN
+    DuplicateLinkCheck AS DPC ON R.UserId = DPC.UserId
+LEFT JOIN
+    QuestionAnswers AS QA ON R.UserId = QA.AnswerOwnerUserId
+LEFT JOIN
+    LatestPostEditSummary AS LPE ON QA.AnswerId = LPE.PostId
+GROUP BY
+    R.UserId, R.DisplayName, R.Reputation, R.TotalAnswersPosted, R.AverageAnswerScore,
+    R.TotalAnswerScore, UCE.TotalCommentScore, UCE.TotalCommentsMade, UBI.QualityAnswerBadges,
+    UBI.CommentRelatedBadges, UCE.CommentEngagementLevel, R.AnswerScoreRank, R.AnswerScoreQuintile,
+    R.PrevRankReputation, UAM.HasExternalEdit, DPC.NumDuplicateLinksFromUserPosts, DPC.DuplicateTitles,
+    UAM.AcceptedAnswerCount
+HAVING
+    R.TotalAnswerScore > 50 -- Minimum aggregate score threshold
+    AND COALESCE(UBI.QualityAnswerBadges, 0) + COALESCE(UBI.CommentRelatedBadges, 0) >= 1 -- At least one relevant badge
+    AND R.ReputationDifferenceFromHigherRank IS NOT NULL -- Exclude the top-ranked if no previous exists
+ORDER BY
+    R.AnswerScoreRank ASC, R.Reputation DESC, COALESCE(UCE.TotalCommentScore, 0) DESC
+LIMIT 50;

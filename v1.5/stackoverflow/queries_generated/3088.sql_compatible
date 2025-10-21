@@ -1,0 +1,78 @@
+WITH PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        u.Reputation AS OwnerReputation,
+        u.Location AS OwnerLocation,
+        ARRAY_LENGTH(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'), 1) AS TagCount,
+        COALESCE(vt.Name, 'Unknown') AS VoteTypeName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= DATE '2020-01-01'
+        AND p.CreationDate <= DATE '2023-10-01'
+        AND (p.Tags IS NOT NULL AND p.Tags <> '')
+        AND (u.Location IS NOT NULL AND u.Location <> '')
+)
+SELECT
+    ps1.PostId,
+    ps1.PostTypeId,
+    ps1.Title,
+    ps1.OwnerLocation,
+    ps1.OwnerReputation,
+    ps1.TagCount,
+    ps1.ViewCount,
+    ps1.Score AS PostScore,
+    ps1.AnswerCount,
+    ps1.CommentCount,
+    ps1.FavoriteCount,
+    ps1.LastActivityDate,
+    ps1.VoteTypeName,
+    ps1.VoteCount,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = ps1.PostId AND p2.PostTypeId = 2) AS RelatedAnswerCount,
+    CASE WHEN ps1.PostTypeId = 1 AND EXISTS (
+        SELECT 1 FROM Posts p3 WHERE p3.ParentId = ps1.PostId AND p3.Score > 10
+    ) THEN TRUE ELSE FALSE END AS HasHighlyVotedAnswers,
+    ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagsArray
+FROM
+    PostStats ps1
+    LEFT JOIN PostLinks pl ON ps1.PostId = pl.PostId AND pl.LinkTypeId = 3
+    LEFT JOIN Tags t ON substring(ps1.Tags FROM '([^>]+)' FOR 1) = t.TagName
+WHERE
+    ps1.PostRank = 1
+GROUP BY
+    ps1.PostId,
+    ps1.PostTypeId,
+    ps1.Title,
+    ps1.OwnerLocation,
+    ps1.OwnerReputation,
+    ps1.TagCount,
+    ps1.ViewCount,
+    ps1.Score,
+    ps1.AnswerCount,
+    ps1.CommentCount,
+    ps1.FavoriteCount,
+    ps1.LastActivityDate,
+    ps1.VoteTypeName,
+    ps1.VoteCount,
+    ps1.CreationDate
+ORDER BY
+    ps1.CreationDate DESC
+LIMIT 100;

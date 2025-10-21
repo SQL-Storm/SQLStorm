@@ -1,0 +1,159 @@
+-- {"query": "37100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1900} 
+WITH
+-- compute per-question aggregates and tag expansion
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.Tags,
+         -- explode tags into rows: tags stored like '<tag1><tag2>'
+         regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+-- latest activity and edit metadata
+QuestionActivity AS (
+  SELECT q.QuestionId,
+         max(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS LastEditDate,
+         max(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10)) AS LastCloseVoteDate,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId = 24) AS SuggestedEditsApplied
+  FROM QuestionBase q
+  LEFT JOIN PostHistory ph ON ph.PostId = q.QuestionId
+  GROUP BY q.QuestionId
+),
+-- compute accepted answer info and best answer score distribution
+AnswerStats AS (
+  SELECT q.QuestionId,
+         sum(case when a.Id IS NOT NULL then 1 else 0 end) AS TotalAnswers,
+         sum(case when a.Score > 0 then 1 else 0 end) AS PositiveAnswerCount,
+         avg(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         max(a.Score) AS MaxAnswerScore,
+         min(a.Score) AS MinAnswerScore,
+         -- accepted answer id and its score, if exists
+         (SELECT a2.Id FROM Posts a2 WHERE a2.ParentId = q.QuestionId AND a2.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = q.QuestionId) LIMIT 1) AS AcceptedAnswerId,
+         (SELECT a3.Score FROM Posts a3 WHERE a3.ParentId = q.QuestionId AND a3.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = q.QuestionId) LIMIT 1) AS AcceptedAnswerScore
+  FROM QuestionBase q
+  LEFT JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+  GROUP BY q.QuestionId
+),
+-- vote breakdown per question and its answers
+VoteBreakdown AS (
+  SELECT qb.QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) FILTER (WHERE v.PostId = qb.QuestionId) AS Q_UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) FILTER (WHERE v.PostId = qb.QuestionId) AS Q_DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) FILTER (WHERE v.PostId = qb.QuestionId) AS Q_Favorites,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) FILTER (WHERE a.PostTypeId = 2) AS A_UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) FILTER (WHERE a.PostTypeId = 2) AS A_DownVotes,
+         count(v.Id) AS TotalVotesReferenced
+  FROM QuestionBase qb
+  LEFT JOIN Votes v ON v.PostId = qb.QuestionId OR v.PostId IN (SELECT a.Id FROM Posts a WHERE a.ParentId = qb.QuestionId AND a.PostTypeId = 2)
+  LEFT JOIN Posts a ON a.Id = v.PostId
+  GROUP BY qb.QuestionId
+),
+-- user reputation and activity window
+OwnerStats AS (
+  SELECT u.Id AS OwnerUserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         u.LastAccessDate,
+         u.Views AS UserViews,
+         count(b.Id) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS BadgesLastYear,
+         sum(case when b.Class = 1 then 1 else 0 end) AS GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) AS SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+-- tag-level aggregates across questions
+TagAggregates AS (
+  SELECT Tag,
+         count(distinct qb.QuestionId) AS QuestionsWithTag,
+         avg(qb.Score) AS AvgQuestionScore,
+         avg(qs.AvgAnswerScore) AS AvgAnswerScorePerQuestion,
+         sum(qb.ViewCount) AS TotalViews,
+         sum(qb.AnswerCount) AS TotalAnswers
+  FROM QuestionBase qb
+  LEFT JOIN AnswerStats qs ON qs.QuestionId = qb.QuestionId
+  GROUP BY Tag
+),
+-- find interesting triads: questions Q that link to another question R which in turn is a duplicate of S,
+-- and compute combined metrics to stress joins, aggregates and self-joins
+LinkTriads AS (
+  SELECT p1.Id AS Q1,
+         p2.Id AS Q2,
+         p3.Id AS Q3,
+         lt1.Name AS LinkType_Q1_Q2,
+         lt2.Name AS LinkType_Q2_Q3,
+         p1.CreationDate AS Q1Created,
+         p2.CreationDate AS Q2Created,
+         p3.CreationDate AS Q3Created,
+         p1.Score AS Q1Score,
+         p2.Score AS Q2Score,
+         p3.Score AS Q3Score
+  FROM PostLinks l1
+  JOIN Posts p1 ON p1.Id = l1.PostId AND p1.PostTypeId = 1
+  JOIN Posts p2 ON p2.Id = l1.RelatedPostId AND p2.PostTypeId = 1
+  JOIN LinkTypes lt1 ON lt1.Id = l1.LinkTypeId
+  JOIN PostLinks l2 ON l2.PostId = p2.Id
+  JOIN Posts p3 ON p3.Id = l2.RelatedPostId AND p3.PostTypeId = 1
+  JOIN LinkTypes lt2 ON lt2.Id = l2.LinkTypeId
+  WHERE lt1.Name = 'Linked' AND lt2.Name = 'Duplicate'
+),
+-- final selection: combine everything, window functions, lateral joins, complex filters for benchmarking
+FinalSelection AS (
+  SELECT qb.QuestionId,
+         qb.Title,
+         qb.Tag,
+         qa.TotalAnswers,
+         qa.AvgAnswerScore,
+         va.Q_UpVotes,
+         va.Q_DownVotes,
+         va.Q_Favorites,
+         qs.DisplayName AS OwnerName,
+         os.Reputation,
+         os.BadgesLastYear,
+         ta.QuestionsWithTag,
+         ta.AvgQuestionScore,
+         ta.AvgAnswerScorePerQuestion,
+         la.Q2 AS LinkedQuestionId,
+         la.Q3 AS DuplicateTargetId,
+         la.LinkType_Q1_Q2,
+         la.LinkType_Q2_Q3,
+         -- fancy scoring function combining multiple facets
+         (coalesce(qb.Score,0) * 2
+          + coalesce(qa.AvgAnswerScore,0) * 3
+          + coalesce(va.Q_UpVotes,0)
+          + coalesce(os.Reputation,0)/100
+          + coalesce(ta.QuestionsWithTag,0)/5
+          - coalesce(va.Q_DownVotes,0) * 2) AS CompositeScore,
+         row_number() OVER (PARTITION BY qb.Tag ORDER BY (coalesce(qb.Score,0) + coalesce(qa.AvgAnswerScore,0)) DESC) AS TagRank,
+         dense_rank() OVER (ORDER BY (coalesce(qb.Score,0) + coalesce(qa.AvgAnswerScore,0)) DESC) AS GlobalRank
+  FROM QuestionBase qb
+  LEFT JOIN AnswerStats qa ON qa.QuestionId = qb.QuestionId
+  LEFT JOIN VoteBreakdown va ON va.QuestionId = qb.QuestionId
+  LEFT JOIN OwnerStats os ON os.OwnerUserId = qb.OwnerUserId
+  LEFT JOIN TagAggregates ta ON ta.Tag = qb.Tag
+  LEFT JOIN LATERAL (
+    SELECT lt.Q2, lt.Q3, lt.LinkType_Q1_Q2, lt.LinkType_Q2_Q3
+    FROM LinkTriads lt
+    WHERE lt.Q1 = qb.QuestionId
+    ORDER BY lt.Q2 DESC
+    LIMIT 1
+  ) la ON true
+  LEFT JOIN Users qs ON qs.Id = qb.OwnerUserId
+)
+SELECT *
+FROM FinalSelection
+WHERE CompositeScore IS NOT NULL
+  AND TagRank <= 5
+  AND GlobalRank <= 1000
+ORDER BY CompositeScore DESC, Tag, QuestionId
+LIMIT 500;

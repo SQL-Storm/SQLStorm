@@ -1,0 +1,67 @@
+SELECT 
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    p.CreationDate,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) AS AgeInSeconds,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    array_length(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><'), 1) AS TagCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(vot.upvote_count, 0) AS UpvoteCount,
+    COALESCE(vot.downvote_count, 0) AS DownvoteCount,
+    COALESCE(uc.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    b.Name AS BadgeName,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts,
+    ARRAY_AGG(DISTINCT CASE WHEN t.TagName IS NOT NULL THEN t.TagName END) AS TagNames,
+    COUNT(DISTINCT gh.Id) AS HistoryEventCount
+FROM 
+    Posts p
+JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Badges b ON b.UserId = u.Id
+LEFT JOIN 
+    (
+        SELECT 
+            PostId, 
+            COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS upvote_count,
+            COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS downvote_count
+        FROM 
+            Votes
+        GROUP BY 
+            PostId
+    ) vot ON p.Id = vot.PostId
+LEFT JOIN 
+    (
+        SELECT 
+            OwnerUserId, 
+            Reputation
+        FROM 
+            Users
+    ) uc ON p.OwnerUserId = uc.OwnerUserId
+LEFT JOIN 
+    Comments c ON c.PostId = p.Id
+LEFT JOIN 
+    PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN 
+    Tags t ON p.Tags LIKE '%<%' AND p.Tags LIKE '%>' AND p.Tags ~ ('<(' || t.TagName || ')>%')
+LEFT JOIN 
+    PostHistory gh ON gh.PostId = p.Id
+WHERE 
+    p.PostTypeId IN (1, 2)
+GROUP BY 
+    p.PostTypeId, p.Title, p.CreationDate, p.Body, p.Score, p.ViewCount, p.TagCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+    p.Id, pt.Name, u.DisplayName, u.CreationDate, u.LastAccessDate, b.Name, uc.Reputation
+ORDER BY 
+    p.CreationDate DESC
+LIMIT 100;

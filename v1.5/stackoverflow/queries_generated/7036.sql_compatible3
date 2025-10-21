@@ -1,0 +1,211 @@
+with
+QuestionTags as (
+  select p.Id as QuestionId,
+         trim(tag) as Tag
+  from Posts p
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(p.Tags,'') from 2 for greatest(length(coalesce(p.Tags,'')) - 2, 0)), '><') as tag
+  ) t
+  where p.PostTypeId = 1
+),
+UserStats as (
+  select u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+         count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+         count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+         count(distinct p.Id) as QuestionsAsked,
+         count(distinct a.Id) as AnswersGiven,
+         nullif(md5(coalesce(u.DisplayName,'')), '') as NameHash,
+         row_number() over (order by u.Reputation desc nulls last, u.LastAccessDate desc) as ReputationRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+  left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostMetrics as (
+  select p.Id,
+         p.PostTypeId,
+         p.ParentId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         p.Title,
+         p.OwnerUserId,
+         p.AcceptedAnswerId,
+         coalesce(p.AnswerCount,0) as AnswerCount,
+         coalesce(p.CommentCount,0) as CommentCount,
+         (length(coalesce(p.Body,'')) + length(coalesce(regexp_replace(coalesce(p.Body,''),'[^<>]','','g')))) as BodyComplexity,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0 as AgeDays,
+         case when extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) = 0 then p.Score else p.Score / (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0) end as ScorePerDay,
+         (coalesce(p.ViewCount,0) * 0.4 + coalesce(p.Score,0) * 5 + coalesce(p.FavoriteCount,0) * 10 + coalesce(p.CommentCount,0) * 2) as PopularityIndex
+  from Posts p
+),
+AnswerQuality as (
+  select q.Id as QuestionId,
+         count(a.Id) as TotalAnswers,
+         sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAccepted,
+         avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+         max(a.Score) as MaxAnswerScore,
+         min(a.Score) as MinAnswerScore,
+         max(a.CreationDate) filter (where a.OwnerUserId is not null) as LatestAnswerDate,
+         sum(case when a.Score >= 0 then 1 else 0 end) as NonNegAnswers
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id
+),
+TopCommenterPerQuestion as (
+  select c.PostId as QuestionId,
+         c.UserId,
+         count(*) as CommentsByUser,
+         row_number() over (partition by c.PostId order by count(*) desc, max(c.CreationDate) desc) as rn
+  from Comments c
+  join Posts p on p.Id = c.PostId
+  where p.PostTypeId = 1
+  group by c.PostId, c.UserId
+),
+TagStats as (
+  select qt.Tag,
+         count(distinct qt.QuestionId) as QuestionCount,
+         avg(pm.PopularityIndex) as AvgPopularity,
+         max(pm.PopularityIndex) as MaxPopularity,
+         sum(case when pm.PopularityIndex > 100 then 1 else 0 end) as HotQuestions,
+         percentile_cont(0.5) within group (order by pm.PopularityIndex) as MedianPopularity
+  from QuestionTags qt
+  join PostMetrics pm on pm.Id = qt.QuestionId
+  group by qt.Tag
+),
+EnrichedQuestions as (
+  select pm.*,
+         aq.TotalAnswers,
+         aq.HasAccepted,
+         aq.AvgAnswerScore,
+         ts.Tag,
+         ts.QuestionCount as TagQuestionCount,
+         ts.AvgPopularity as TagAvgPopularity,
+         tc.UserId as TopCommenterUserId,
+         us.DisplayName as TopCommenterName,
+         us.Reputation as TopCommenterReputation,
+         row_number() over (partition by ts.Tag order by pm.PopularityIndex desc, pm.Score desc, pm.ViewCount desc) as TagRank
+  from PostMetrics pm
+  left join AnswerQuality aq on aq.QuestionId = pm.Id
+  left join QuestionTags qt on qt.QuestionId = pm.Id
+  left join TagStats ts on ts.Tag = qt.Tag
+  left join TopCommenterPerQuestion tc on tc.QuestionId = pm.Id and tc.rn = 1
+  left join Users us on us.Id = tc.UserId
+  where pm.PostTypeId = 1
+),
+TopTrending as (
+  select *
+  from EnrichedQuestions
+  where (PopularityIndex > 50 and (AnswerCount = 0 or HasAccepted = 0))
+    or (PopularityIndex > 200 and AgeDays < 30)
+    or (TagQuestionCount > 100 and TagAvgPopularity > 20)
+  order by PopularityIndex desc nulls last, AgeDays asc nulls last
+  limit 100
+),
+SimilarQuestions as (
+  select t.Id as TrendingId,
+         s.Id as SimilarId,
+         s.Title as SimilarTitle,
+         s.PopularityIndex as SimilarPopularity,
+         s.ScorePerDay as SimilarScorePerDay,
+         (
+           select count(*)::int
+           from QuestionTags qt1
+           join QuestionTags qt2 on qt1.Tag = qt2.Tag
+           where qt1.QuestionId = t.Id and qt2.QuestionId = s.Id
+         ) as SharedTags,
+         (
+           (select count(*)::float
+            from QuestionTags qt1
+            join QuestionTags qt2 on qt1.Tag = qt2.Tag
+            where qt1.QuestionId = t.Id and qt2.QuestionId = s.Id)
+           /
+           greatest(1.0,
+             (select count(distinct Tag)::float from QuestionTags where QuestionId = t.Id)
+             + (select count(distinct Tag)::float from QuestionTags where QuestionId = s.Id)
+             - (select count(distinct Tag)::float
+                from QuestionTags qt1
+                join QuestionTags qt2 on qt1.Tag = qt2.Tag
+                where qt1.QuestionId = t.Id and qt2.QuestionId = s.Id)
+           )
+         ) as TagSimilarity
+  from TopTrending t
+  join PostMetrics s on s.PostTypeId = 1 and s.Id <> t.Id
+  where s.CreationDate > t.CreationDate - interval '365 days'
+),
+TopSimilar as (
+  select *,
+         row_number() over (partition by TrendingId order by TagSimilarity desc, SimilarPopularity desc, SharedTags desc) as rn
+  from SimilarQuestions
+),
+TopSimilarFiltered as (
+  select TrendingId, SimilarId, SimilarTitle, SimilarPopularity, TagSimilarity
+  from TopSimilar
+  where rn <= 3 and TagSimilarity > 0
+)
+select
+  tt.Id as QuestionId,
+  coalesce(nullif(tt.Title,''), '<no title>') as Title,
+  tt.Tags,
+  tt.CreationDate,
+  tt.AgeDays,
+  tt.Score,
+  tt.ViewCount,
+  tt.AnswerCount,
+  tt.HasAccepted,
+  tt.AvgAnswerScore,
+  tt.BodyComplexity,
+  tt.PopularityIndex,
+  tt.ScorePerDay,
+  tt.Tag,
+  tt.TagQuestionCount,
+  tt.TagAvgPopularity,
+  tt.TopCommenterUserId,
+  tt.TopCommenterName,
+  tt.TopCommenterReputation,
+  us.DisplayName as OwnerName,
+  us.Reputation as OwnerReputation,
+  us.ReputationRank as OwnerReputationRank,
+  percentile_rank() over (partition by tt.Tag order by tt.PopularityIndex) as TagPercentileRank,
+  (
+   select least(99999,
+         extract(epoch from min(a.CreationDate - q.CreationDate))/3600.0)
+   from Posts a
+   join Posts q on q.Id = tt.Id
+   where a.ParentId = tt.Id and a.PostTypeId = 2 and a.Id = tt.AcceptedAnswerId
+  ) as AcceptedAnswerHours,
+  coalesce(
+    (select string_agg(COALESCE(similar.SimilarId::text, '') || ':' || round(similar.TagSimilarity::numeric,3)::text, ';' order by similar.TagSimilarity desc)
+     from TopSimilarFiltered similar
+     where similar.TrendingId = tt.Id
+    ), '<none>') as SimilarSummary,
+  exists (
+    select 1
+    from PostLinks pl
+    where pl.PostId = tt.Id
+      and pl.LinkTypeId = 3
+  ) as IsMarkedDuplicate,
+  case
+    when tt.PopularityIndex is null then 'unknown'
+    when tt.PopularityIndex > 1000 then 'viral'
+    when tt.PopularityIndex > 200 then 'hot'
+    when tt.PopularityIndex > 50 then 'trending'
+    else 'normal'
+  end as PopularityCategory
+from TopTrending tt
+left join Users us on us.Id = tt.OwnerUserId
+where not exists (
+  select 1 from UserStats u2
+  where u2.Id = tt.OwnerUserId
+    and u2.Reputation < (select coalesce(percentile_cont(0.05) within group (order by Reputation),0) from UserStats where QuestionsAsked > 0)
+)
+order by tt.PopularityIndex desc nulls last, tt.AgeDays asc
+limit 50;

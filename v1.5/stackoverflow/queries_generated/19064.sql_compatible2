@@ -1,0 +1,199 @@
+WITH UserInteractionLog AS (
+    SELECT
+        C.UserId,
+        C.PostId,
+        C.CreationDate AS InteractionDate,
+        'Comment' AS InteractionType,
+        C.Score AS InteractionValue,
+        C.Text AS InteractionDetail
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    UNION ALL
+    SELECT
+        V.UserId,
+        V.PostId,
+        V.CreationDate AS InteractionDate,
+        VT.Name AS InteractionType,
+        V.BountyAmount AS InteractionValue,
+        NULL AS InteractionDetail
+    FROM Votes V
+    INNER JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+    WHERE V.UserId IS NOT NULL
+    UNION ALL
+    SELECT
+        PH.UserId,
+        PH.PostId,
+        PH.CreationDate AS InteractionDate,
+        PHT.Name AS InteractionType,
+        NULL AS InteractionValue,
+        PH.Comment AS InteractionDetail
+    FROM PostHistory PH
+    INNER JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.UserId IS NOT NULL
+),
+UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Earth') AS UserLocation,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsPosted,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT UIL.PostId) AS TotalUniqueInteractedPosts,
+        COUNT(UIL.InteractionType) AS TotalInteractions,
+        SUM(CASE WHEN UIL.InteractionType = 'Upvote' THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN UIL.InteractionType = 'Downvote' THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN V_Bounty.VoteTypeId = 8 THEN V_Bounty.BountyAmount ELSE 0 END) AS TotalBountyGiven,
+        AVG(P.Score) AS AvgScorePerOwnedPost,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalViewsOnOwnedPosts,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - U.CreationDate)) AS AccountAgeDays,
+        MAX(CASE WHEN PH_CloseReopen.PostHistoryTypeId IN (10, 11) THEN PH_CloseReopen.CreationDate ELSE NULL END) AS LastCloseReopenActivityDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN UserInteractionLog UIL ON U.Id = UIL.UserId
+    LEFT JOIN Votes V_Bounty ON U.Id = V_Bounty.UserId AND V_Bounty.VoteTypeId = 8
+    LEFT JOIN PostHistory PH_CloseReopen ON U.Id = PH_CloseReopen.UserId AND PH_CloseReopen.PostHistoryTypeId IN (10, 11)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location
+),
+PostHistoricalEvents AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS HistoryEventUserId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS EventDate,
+        PH.Comment AS EventComment,
+        PH.Text AS EventText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_event,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate) AS PreviousUserEventDate
+    FROM PostHistory PH
+    INNER JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (2, 5, 6, 10, 11, 12, 13)
+),
+PostComprehensiveMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        COALESCE(P.Title, SUBSTRING(P.Body, 1, 75) || '...') AS PostTitleExcerpt,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(P.CommentCount, 0) AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerVoteCount,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = P.Id) AS UniqueCommenters,
+        (SELECT MAX(PHE.EventDate) FROM PostHistoricalEvents PHE WHERE PHE.PostId = P.Id AND PHE.PostHistoryTypeId IN (5, 6)) AS LastEditDateByAnyone,
+        (SELECT MAX(PHE.EventDate) FROM PostHistoricalEvents PHE WHERE PHE.PostId = P.Id AND PHE.PostHistoryTypeId = 10) AS LatestClosedEventDate,
+        (SELECT MAX(PHE.EventDate) FROM PostHistoricalEvents PHE WHERE PHE.PostId = P.Id AND PHE.PostHistoryTypeId = 11) AS LatestReopenedEventDate,
+        ( SELECT COUNT(DISTINCT PHE_Edits.HistoryEventUserId)
+          FROM PostHistoricalEvents PHE_Edits
+          WHERE PHE_Edits.PostId = P.Id
+            AND PHE_Edits.PostHistoryTypeId IN (5,6)
+            AND PHE_Edits.EventDate > P.CreationDate + INTERVAL '1 hour'
+        ) AS UniqueEditorsAfterFirstHour
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.Title, P.Body, P.CreationDate, P.LastActivityDate, P.Score,
+        P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, P.Tags
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'))) AS TagName,
+        COUNT(PostId) AS TagPostCount,
+        AVG(PostScore) AS AvgTagPostScore,
+        AVG(PostViewCount) AS AvgTagPostViewCount
+    FROM PostComprehensiveMetrics
+    WHERE Tags IS NOT NULL AND LENGTH(Tags) > 2
+    GROUP BY TagName
+    HAVING COUNT(PostId) > 50
+)
+SELECT
+    UES.UserId,
+    UES.UserName,
+    UES.Reputation,
+    UES.AccountAgeDays,
+    RANK() OVER (ORDER BY UES.Reputation DESC, UES.TotalPostsOwned DESC) AS UserOverallRank,
+    NTILE(10) OVER (ORDER BY UES.TotalInteractions DESC) AS UserActivityDecile,
+    PCM.PostId,
+    PCM.PostTitleExcerpt,
+    PCM.PostTypeName,
+    PCM.PostCreationDate,
+    PCM.PostScore,
+    PCM.PostViewCount,
+    PCM.PostAnswerCount,
+    PCM.PostCommentCount,
+    PCM.PostFavoriteCount,
+    PCM.UpvoteCount,
+    PCM.DownvoteCount,
+    PCM.AcceptedAnswerVoteCount,
+    PCM.UniqueCommenters,
+    PCM.LastEditDateByAnyone,
+    (PCM.LastActivityDate - PCM.PostCreationDate) AS TimeToFirstActivityDuration,
+    CASE
+        WHEN PCM.ClosedDate IS NOT NULL AND (PCM.LatestReopenedEventDate IS NULL OR PCM.LatestReopenedEventDate < PCM.ClosedDate) THEN 'Permanently Closed'
+        WHEN PCM.ClosedDate IS NOT NULL AND PCM.LatestReopenedEventDate IS NOT NULL AND PCM.LatestReopenedEventDate > PCM.ClosedDate THEN 'Reopened'
+        WHEN PCM.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS DerivedPostStatus,
+    COALESCE(NULLIF(PCM.PostViewCount, 0), 1.0) / COALESCE(NULLIF(PCM.PostScore, 0), 1.0) AS ViewsPerScoreRatio,
+    (COALESCE(PCM.PostAnswerCount, 0) * 0.7 + COALESCE(PCM.PostCommentCount, 0) * 0.3 + COALESCE(PCM.PostFavoriteCount, 0) * 0.5) AS EngagementWeightedScore,
+    PHE_Latest.HistoryEventUserId AS LatestPostActionUser,
+    PHE_Latest.EventDate AS LatestPostActionEventDate,
+    EXTRACT(EPOCH FROM (PHE_Latest.EventDate - PHE_Latest.PreviousUserEventDate)) / 3600.0 AS HoursSincePreviousUserEvent,
+    TPM.TagName,
+    TPM.TagPostCount,
+    TPM.AvgTagPostScore,
+    TPM.AvgTagPostViewCount,
+    RANK() OVER (PARTITION BY UES.UserId ORDER BY PCM.PostScore DESC, PCM.PostViewCount DESC) AS UserSpecificPostRank,
+    LAG(PCM.PostCreationDate) OVER (PARTITION BY UES.UserId ORDER BY PCM.PostCreationDate) AS PreviousPostOfUserCreationDate,
+    SUM(PCM.UpvoteCount) OVER (PARTITION BY TPM.TagName ORDER BY PCM.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingUpvotesForTag,
+    AVG(PCM.PostScore) OVER (PARTITION BY EXTRACT(MONTH FROM PCM.PostCreationDate), EXTRACT(YEAR FROM PCM.PostCreationDate)) AS MonthlyAvgPostScoreGlobal,
+    PCM.UniqueEditorsAfterFirstHour,
+    (
+        SELECT SUM(PH_Correlated.PostHistoryTypeId)
+        FROM PostHistory PH_Correlated
+        WHERE PH_Correlated.PostId = PCM.PostId
+        AND PH_Correlated.CreationDate BETWEEN PCM.PostCreationDate AND (PCM.PostCreationDate + INTERVAL '30 days')
+        AND PH_Correlated.PostHistoryTypeId IN (10, 12, 19)
+    ) AS CriticalHistoryEventsInFirstMonth
+FROM UserEngagementSummary UES
+INNER JOIN PostComprehensiveMetrics PCM ON UES.UserId = PCM.OwnerUserId
+LEFT JOIN PostHistoricalEvents PHE_Latest ON PCM.PostId = PHE_Latest.PostId AND PHE_Latest.rn_latest_event = 1
+LEFT JOIN TagPerformanceMetrics TPM ON EXISTS (
+    SELECT 1 FROM UNNEST(string_to_array(SUBSTRING(PCM.Tags, 2, LENGTH(PCM.Tags) - 2), '><')) AS PostTag
+    WHERE LOWER(PostTag) = LOWER(TPM.TagName)
+)
+WHERE
+    UES.Reputation > 10000
+    AND UES.AccountAgeDays > 365 * 2
+    AND PCM.PostViewCount > 5000
+    AND PCM.PostScore > 100
+    AND PCM.PostCreationDate >= DATE '2023-01-01'
+    AND (LOWER(PCM.PostTitleExcerpt) LIKE '%performance%' OR LOWER(PCM.Tags) LIKE '%<benchmark%>%')
+    AND CASE
+            WHEN PCM.DerivedPostStatus = 'Active' THEN true
+            WHEN PCM.DerivedPostStatus = 'Reopened' THEN true
+            ELSE false
+        END
+    AND UES.UserActivityDecile >= 8
+    AND (PHE_Latest.HistoryEventUserId IS NULL OR UES.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Id = PHE_Latest.HistoryEventUserId))
+ORDER BY
+    UES.Reputation DESC,
+    PCM.PostScore DESC,
+    PCM.LastActivityDate DESC
+LIMIT 1000;

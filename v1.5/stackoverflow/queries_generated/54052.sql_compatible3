@@ -1,0 +1,54 @@
+WITH post_stats AS (
+    SELECT
+        p.Id,
+        DATE_TRUNC('MONTH', p.CreationDate) AS month,
+        CASE WHEN pt.Id = 1 THEN 1 ELSE 0 END AS is_question,
+        CASE WHEN pt.Id = 2 THEN 1 ELSE 0 END AS is_answer,
+        p.Score,
+        p.ViewCount,
+        CASE
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+            ELSE array_length(
+                regexp_split_to_array(
+                    substring(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2),
+                    '\\s*>\\s*<'
+                ),
+                1
+            )
+        END AS tag_count
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+vote_counts AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        COUNT(*) AS total_votes
+    FROM Votes
+    GROUP BY PostId
+),
+comment_counts AS (
+    SELECT PostId, COUNT(*) AS comment_count
+    FROM Comments
+    GROUP BY PostId
+)
+SELECT
+    ps.month,
+    COUNT(DISTINCT CASE WHEN ps.is_question = 1 THEN ps.Id END) AS questions,
+    COUNT(DISTINCT CASE WHEN ps.is_answer = 1 THEN ps.Id END) AS answers,
+    COUNT(DISTINCT ps.Id) AS total_posts,
+    COALESCE(SUM(vc.total_votes), 0) AS total_votes,
+    COALESCE(SUM(vc.upvotes), 0) AS total_upvotes,
+    COALESCE(SUM(vc.downvotes), 0) AS total_downvotes,
+    AVG(ps.Score) AS avg_score,
+    AVG(ps.tag_count) FILTER (WHERE ps.is_question = 1) AS avg_tags_per_question,
+    MAX(ps.ViewCount) AS max_views,
+    MAX(ps.Score) AS max_score,
+    MIN(ps.Score) AS min_score,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT ps.Id) DESC) AS rank
+FROM post_stats ps
+LEFT JOIN vote_counts vc ON vc.PostId = ps.Id
+LEFT JOIN comment_counts cc ON cc.PostId = ps.Id
+GROUP BY ps.month
+ORDER BY ps.month;

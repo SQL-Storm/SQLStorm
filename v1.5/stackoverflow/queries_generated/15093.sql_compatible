@@ -1,0 +1,66 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (PARTITION BY SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2) ORDER BY p.ViewCount DESC) AS TagPopularityRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    AND u.Reputation > 1000
+    AND p.CreationDate > DATE '2015-01-01'
+),
+TagAnalytics AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        COUNT(DISTINCT tag_unnested) AS UniqueTagCount,
+        MAX(Score) AS MaxPostScore,
+        AVG(COALESCE(ViewCount, 0)) AS AvgViewCount
+    FROM RankedUserPosts
+    CROSS JOIN LATERAL (
+        SELECT value AS tag_unnested
+        FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2), '><'))) AS t(tag_unnested)
+    WHERE ScoreRank <= 3
+    GROUP BY UserId, DisplayName
+)
+SELECT 
+    rup.UserId,
+    rup.DisplayName,
+    ta.UniqueTagCount,
+    ta.MaxPostScore,
+    ta.AvgViewCount,
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rup.Score) AS MedianPostScore,
+    CASE 
+        WHEN ta.UniqueTagCount > 10 THEN 'Expert'
+        WHEN ta.UniqueTagCount > 5 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ExpertiseLevel
+FROM RankedUserPosts rup
+JOIN TagAnalytics ta ON rup.UserId = ta.UserId
+LEFT JOIN Votes v ON rup.PostId = v.PostId
+WHERE rup.ScoreRank = 1
+AND rup.TagPopularityRank <= 5
+AND (
+    EXISTS (
+        SELECT 1 
+        FROM Badges b 
+        WHERE b.UserId = rup.UserId 
+        AND b.Class = 1
+    )
+    OR ta.MaxPostScore > 100
+)
+GROUP BY 
+    rup.UserId, 
+    rup.DisplayName, 
+    ta.UniqueTagCount, 
+    ta.MaxPostScore, 
+    ta.AvgViewCount
+HAVING COUNT(DISTINCT v.Id) > 10
+ORDER BY ta.MaxPostScore DESC, ta.UniqueTagCount DESC
+LIMIT 100;

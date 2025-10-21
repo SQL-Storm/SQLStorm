@@ -1,0 +1,145 @@
+-- {"query": "20079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1368} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        COUNT(DISTINCT q.Id) AS QuestionsAsked,
+        COUNT(DISTINCT a.Id) AS AnswersProvided,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsWritten,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven
+    FROM
+        Users u
+    LEFT JOIN
+        Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1)
+        AND u.CreationDate < (CURRENT_DATE - INTERVAL '3 year')
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    HAVING
+        COUNT(DISTINCT a.Id) > COUNT(DISTINCT q.Id)
+),
+UserBadgeRanks AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate,
+        MIN(Date) AS FirstBadgeDate
+    FROM
+        Badges
+    GROUP BY
+        UserId
+),
+UserEngagementMetrics AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCreationDate,
+        COALESCE(uas.Location, 'Unknown') AS Location,
+        uas.QuestionsAsked,
+        uas.AnswersProvided,
+        uas.CommentsWritten,
+        uas.EditsMade,
+        COALESCE(ubr.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubr.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubr.BronzeBadges, 0) AS BronzeBadges,
+        (EXTRACT(EPOCH FROM (COALESCE(ubr.LastBadgeDate, uas.UserCreationDate) - ubr.FirstBadgeDate)) / 86400.0) AS BadgeEarningSpanDays,
+        (uas.AnswersProvided::decimal / NULLIF(uas.QuestionsAsked, 0)) AS AnswerQuestionRatio,
+        (uas.Reputation::decimal / NULLIF(EXTRACT(EPOCH FROM (CURRENT_DATE - uas.UserCreationDate)) / 86400.0, 0)) AS DailyReputationGain,
+        RANK() OVER (PARTITION BY SUBSTRING(uas.Location, POSITION(',' IN uas.Location) + 1) ORDER BY uas.Reputation DESC) AS RankInLocation,
+        NTILE(100) OVER (ORDER BY uas.Reputation DESC) AS ReputationPercentile,
+        LAG(uas.DisplayName, 1, 'Nobody') OVER (ORDER BY uas.UserCreationDate) AS PreviousUserByCreationDate
+    FROM
+        UserActivitySummary uas
+    JOIN
+        UserBadgeRanks ubr ON uas.UserId = ubr.UserId
+    WHERE
+        ubr.GoldBadges > 0
+        AND uas.Location LIKE '%, %'
+),
+CombinedAnalysis AS (
+    SELECT
+        uem.*,
+        p.Title AS LastQuestionTitle,
+        p.Tags AS LastQuestionTags,
+        p.Score AS LastQuestionScore,
+        p.ViewCount AS LastQuestionViewCount
+    FROM
+        UserEngagementMetrics uem
+    OUTER APPLY (
+        SELECT
+            p_sub.Title,
+            p_sub.Tags,
+            p_sub.Score,
+            p_sub.ViewCount
+        FROM
+            Posts p_sub
+        WHERE
+            p_sub.OwnerUserId = uem.UserId
+            AND p_sub.PostTypeId = 1
+        ORDER BY
+            p_sub.CreationDate DESC
+        LIMIT 1
+    ) p
+)
+(
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        Location,
+        AnswerQuestionRatio,
+        DailyReputationGain,
+        RankInLocation,
+        ReputationPercentile,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        LastQuestionTitle,
+        'High A/Q Ratio' AS Category
+    FROM
+        CombinedAnalysis
+    WHERE
+        AnswerQuestionRatio > 10
+        AND ReputationPercentile > 90
+        AND EditsMade > (SELECT AVG(EditsMade) FROM UserActivitySummary)
+)
+UNION ALL
+(
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        Location,
+        AnswerQuestionRatio,
+        DailyReputationGain,
+        RankInLocation,
+        ReputationPercentile,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        LastQuestionTitle,
+        'Veteran User' AS Category
+    FROM
+        CombinedAnalysis
+    WHERE
+        UserCreationDate < (CURRENT_DATE - INTERVAL '10 year')
+        AND BadgeEarningSpanDays > 365 * 5
+        AND CommentsWritten > 1000
+)
+ORDER BY
+    Category, Reputation DESC, GoldBadges DESC
+LIMIT 500;

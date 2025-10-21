@@ -1,0 +1,52 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM 
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.Reputation
+), 
+TagPopularity AS (
+    SELECT 
+        x.TagName,
+        COUNT(*) AS TagFrequency,
+        AVG(p.Score) AS AvgTagScore
+    FROM (
+        SELECT 
+            TRIM(BOTH '><' FROM t.value) AS TagName
+        FROM Posts
+        CROSS JOIN (
+            SELECT value
+            FROM STRING_SPLIT(REPLACE(REPLACE(Tags, '><', '>|<'), '><', '>|<'), '|') AS t(value)
+        ) AS t
+        WHERE PostTypeId = 1
+    ) AS x
+    GROUP BY 
+        x.TagName
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    us.PostCount,
+    us.VoteCount,
+    us.AvgPostScore,
+    tp.TagName,
+    tp.TagFrequency,
+    tp.AvgTagScore
+FROM 
+    UserStats us
+JOIN 
+    TagPopularity tp ON tp.TagFrequency > 50
+ORDER BY 
+    us.Reputation DESC, 
+    us.PostCount DESC
+LIMIT 100;

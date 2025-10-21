@@ -1,0 +1,115 @@
+WITH
+RecentActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)     AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)     AS AnswersPosted,
+        COUNT(DISTINCT c.Id)                                        AS CommentsMade,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8)         AS TotalBountiesOffered
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+       AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v    ON v.UserId = u.Id
+                       AND v.VoteTypeId = 8
+    GROUP BY
+        u.Id,
+        u.DisplayName
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC NULLS LAST) AS rn
+    FROM Tags t
+),
+BadgeRank AS (
+    SELECT
+        b.UserId,
+        b.Name       AS BadgeName,
+        DENSE_RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class) AS BadgeClassRank
+    FROM Badges b
+),
+QAMetrics AS (
+    SELECT
+        q.Id       AS QuestionId,
+        COUNT(a.Id)                                               AS AnswerCount,
+        MAX(a.Score)                                             AS MaxAnswerScore,
+        AVG(a.Score) FILTER (WHERE a.Score > 0)                  AS AvgPositiveAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a
+        ON a.ParentId   = q.Id
+       AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+)
+
+SELECT
+    ra.Id                                    AS UserId,
+    ra.DisplayName,
+    ra.QuestionsPosted,
+    ra.AnswersPosted,
+    ra.CommentsMade,
+    COALESCE(ra.TotalBountiesOffered, 0)     AS TotalBountiesOffered,
+    tt.TagName                               AS TopTag,
+    br.BadgeName                             AS TopBadge,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.AvgPositiveAnswerScore,
+    CASE
+        WHEN qa.AnswerCount = 0 THEN 'No answers'
+        ELSE 'Has answers'
+    END                                      AS AnswerStatus,
+    (
+      SELECT c2.Text
+      FROM Comments c2
+      WHERE c2.PostId = qa.QuestionId
+      ORDER BY c2.CreationDate DESC
+      LIMIT 1
+    )                                        AS LastCommentText,
+    CONCAT(ra.DisplayName, '_', COALESCE(ra.QuestionsPosted,0) + COALESCE(ra.AnswersPosted,0)) AS SyntheticLabel
+FROM RecentActivity ra
+LEFT JOIN TopTags tt
+    ON tt.rn = 1
+LEFT JOIN BadgeRank br
+    ON br.UserId = ra.Id
+   AND br.BadgeClassRank = 1
+LEFT JOIN QAMetrics qa
+    ON qa.QuestionId = (
+         SELECT p2.Id
+         FROM Posts p2
+         WHERE p2.OwnerUserId = ra.Id
+           AND p2.PostTypeId   = 1
+         ORDER BY p2.CreationDate DESC
+         LIMIT 1
+       )
+WHERE ra.QuestionsPosted > (
+    SELECT AVG(QuestionsPosted) FROM RecentActivity
+)
+
+UNION ALL
+
+SELECT
+    ra.Id,
+    ra.DisplayName,
+    ra.QuestionsPosted,
+    ra.AnswersPosted,
+    ra.CommentsMade,
+    COALESCE(ra.TotalBountiesOffered, 0),
+    tt.TagName,
+    '<union_section>'                       AS TopBadge,
+    0                                       AS AnswerCount,
+    0                                       AS MaxAnswerScore,
+    NULL AS AvgPositiveAnswerScore,
+    'Union branch'                          AS AnswerStatus,
+    NULL AS LastCommentText,
+    CONCAT('union_', ra.Id)                 AS SyntheticLabel
+FROM RecentActivity ra
+JOIN TopTags tt
+    ON tt.rn <= 3
+
+ORDER BY
+    UserId,
+    TopTag DESC;

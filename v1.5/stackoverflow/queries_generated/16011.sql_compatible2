@@ -1,0 +1,132 @@
+WITH user_activity_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT p.Id) AS total_posts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS avg_question_score,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = parent.AcceptedAnswerId THEN 1 ELSE 0 END), 0) AS accepted_answers,
+    ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS year_rank
+  FROM Users u
+  LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT OUTER JOIN Posts parent ON p.ParentId = parent.Id
+  WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+    AND (u.Location IS NULL OR LOWER(u.Location) NOT LIKE '%test%')
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+  HAVING COUNT(DISTINCT p.Id) > 0
+),
+badge_complexity AS (
+  SELECT 
+    b.UserId,
+    STRING_AGG(DISTINCT b.Name, '|' ORDER BY b.Name) AS badge_names,
+    SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END) AS badge_score,
+    COUNT(*) FILTER (WHERE b.TagBased = 1) AS tag_badges,
+    DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS badge_rank
+  FROM Badges b
+  WHERE b.Date >= TIMESTAMP '2016-01-01'
+  GROUP BY b.UserId
+),
+post_engagement_stats AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+      WHEN p.AnswerCount > 0 THEN 'Has Answers'
+      ELSE 'Unanswered'
+    END AS post_status,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+    LEAD(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_views,
+    ROUND(CASE WHEN p.CreationDate IS NOT NULL THEN p.Score / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0) ELSE NULL END, 4) AS score_velocity,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 2) AS high_score_comments,
+    EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS is_duplicate
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2023-12-31'
+    AND (p.Body IS NOT NULL AND LENGTH(p.Body) > 100)
+),
+voting_patterns AS (
+  SELECT 
+    v.PostId,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.UserId END) AS upvote_users,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.UserId END) AS downvote_users,
+    COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS favorite_count,
+    MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS max_bounty,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.CreationDate) AS median_vote_date
+  FROM Votes v
+  WHERE v.VoteTypeId IN (2, 3, 5, 8)
+  GROUP BY v.PostId
+),
+tag_analysis AS (
+  SELECT 
+    t.TagName,
+    t.Count AS tag_usage_count,
+    COUNT(DISTINCT p.OwnerUserId) AS unique_contributors,
+    AVG(p.Score) AS avg_tag_score,
+    NTILE(10) OVER (ORDER BY t.Count DESC) AS popularity_decile
+  FROM Tags t
+  INNER JOIN Posts p ON CONCAT('<', t.TagName, '>') = ANY(STRING_TO_ARRAY(p.Tags, '><'))
+  WHERE t.Count > 50
+    AND p.PostTypeId = 1
+    AND t.IsModeratorOnly = 0
+  GROUP BY t.TagName, t.Count
+)
+SELECT 
+  uam.DisplayName,
+  COALESCE(SUBSTRING(uam.DisplayName FROM 1 FOR 10) || '...', 'Anonymous') AS short_name,
+  uam.Reputation,
+  uam.total_posts,
+  uam.question_count,
+  uam.answer_count,
+  ROUND(COALESCE(uam.avg_question_score, 0), 2) AS avg_q_score,
+  uam.accepted_answers,
+  uam.year_rank,
+  bc.badge_score,
+  bc.tag_badges,
+  bc.badge_rank,
+  ROUND(AVG(pes.score_velocity), 6) AS avg_score_velocity,
+  SUM(COALESCE(vp.upvote_users, 0)) AS total_upvote_users,
+  SUM(COALESCE(vp.downvote_users, 0)) AS total_downvote_users,
+  MAX(vp.max_bounty) AS highest_bounty,
+  COUNT(DISTINCT CASE WHEN pes.is_duplicate THEN pes.post_id END) AS duplicate_posts,
+  STRING_AGG(DISTINCT pes.post_status, ', ') AS post_statuses,
+  CASE 
+    WHEN uam.Reputation > 10000 AND bc.badge_score > 50 THEN 'Elite'
+    WHEN uam.Reputation > 5000 OR bc.badge_score > 20 THEN 'Advanced'
+    WHEN uam.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS user_tier,
+  (uam.Reputation::numeric / NULLIF(uam.total_posts, 0)) AS reputation_per_post,
+  ROW_NUMBER() OVER (ORDER BY uam.Reputation DESC, bc.badge_score DESC NULLS LAST) AS overall_rank
+FROM user_activity_metrics uam
+LEFT JOIN badge_complexity bc ON uam.Id = bc.UserId
+LEFT JOIN post_engagement_stats pes ON uam.Id = pes.OwnerUserId
+LEFT JOIN voting_patterns vp ON pes.post_id = vp.PostId
+WHERE uam.year_rank <= 100
+  AND (bc.badge_score > 10 OR bc.badge_score IS NULL)
+  AND EXISTS (
+    SELECT 1 
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = uam.Id 
+      AND p2.Score >= 5
+  )
+GROUP BY 
+  uam.Id, uam.DisplayName, uam.Reputation, uam.total_posts, 
+  uam.question_count, uam.answer_count, uam.avg_question_score,
+  uam.accepted_answers, uam.year_rank, bc.badge_score, 
+  bc.tag_badges, bc.badge_rank
+HAVING SUM(COALESCE(vp.upvote_users, 0)) >= 10
+ORDER BY 
+  CASE WHEN uam.Reputation > 5000 THEN 1 ELSE 2 END,
+  uam.Reputation DESC,
+  bc.badge_score DESC NULLS LAST
+LIMIT 500;

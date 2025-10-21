@@ -1,0 +1,128 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AvgQuestionScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+        AND u.Reputation >= 1000
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+UserBadges AS (
+    SELECT 
+        tu.UserId,
+        tu.Reputation,
+        tu.QuestionCount,
+        tu.TotalViews,
+        tu.AvgQuestionScore,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN CAST(b.Class AS INTEGER) = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN CAST(b.TagBased AS INTEGER) = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM TopUsers tu
+    LEFT JOIN Badges b ON tu.UserId = b.UserId
+    GROUP BY tu.UserId, tu.Reputation, tu.QuestionCount, tu.TotalViews, tu.AvgQuestionScore
+),
+PopularTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.Id) AS RecentQuestionCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(p.ViewCount) AS TotalTagViews
+    FROM Tags t
+    JOIN Posts p ON t.TagName = ANY(
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2), 
+            '><'
+        )
+    )
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 10
+)
+SELECT 
+    ub.ReputationBucket,
+    ub.AvgBadgeCount,
+    ub.AvgGoldBadges,
+    ub.AvgTagBasedBadges,
+    pt.TagPopularity,
+    AVG(ub.AvgQuestionScore * pt.AvgTagScore) AS ScoreInteraction,
+    SUM(ub.TotalViews * pt.TotalTagViews) AS ViewInteraction,
+    COUNT(*) AS UserTagCombinations,
+    CORR(ub.AvgQuestionScore, pt.AvgTagScore) AS ScoreCorrelation,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ub.TotalViews) AS P90UserViews,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY pt.TotalTagViews) AS P90TagViews
+FROM (
+    SELECT 
+        CASE 
+            WHEN ub.Reputation < 5000 THEN 'Low'
+            WHEN ub.Reputation < 20000 THEN 'Medium'
+            ELSE 'High'
+        END AS ReputationBucket,
+        AVG(ub.BadgeCount) AS AvgBadgeCount,
+        AVG(ub.GoldBadges) AS AvgGoldBadges,
+        AVG(ub.TagBasedBadges) AS AvgTagBasedBadges,
+        AVG(ub.QuestionCount) AS AvgQuestions,
+        SUM(ub.TotalViews) AS TotalViews,
+        AVG(ub.AvgQuestionScore) AS AvgQuestionScore
+    FROM UserBadges ub
+    GROUP BY CASE 
+        WHEN ub.Reputation < 5000 THEN 'Low'
+        WHEN ub.Reputation < 20000 THEN 'Medium'
+        ELSE 'High'
+    END
+) ub
+CROSS JOIN (
+    SELECT 
+        CASE 
+            WHEN pt.TagUsageCount < 500 THEN 'Emerging'
+            WHEN pt.TagUsageCount < 5000 THEN 'Popular'
+            ELSE 'Dominant'
+        END AS TagPopularity,
+        AVG(pt.RecentQuestionCount) AS AvgRecentQuestions,
+        AVG(pt.AvgTagScore) AS AvgTagScore,
+        SUM(pt.TotalTagViews) AS TotalTagViews
+    FROM PopularTags pt
+    GROUP BY CASE 
+        WHEN pt.TagUsageCount < 500 THEN 'Emerging'
+        WHEN pt.TagUsageCount < 5000 THEN 'Popular'
+        ELSE 'Dominant'
+    END
+) pt
+JOIN Posts p ON p.PostTypeId = 1 
+    AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 months'
+    AND p.ViewCount > 100
+CROSS JOIN LATERAL (
+    SELECT 1 
+    FROM UNNEST(string_to_array(
+        substring(p.Tags, 2, length(p.Tags) - 2), 
+        '><'
+    )) AS tag_name
+    WHERE EXISTS (
+        SELECT 1 FROM PopularTags pt2 
+        WHERE pt2.TagName = tag_name
+    )
+    LIMIT 3
+) tag_match
+JOIN UserBadges ub2 ON p.OwnerUserId = ub2.UserId 
+    AND ub2.QuestionCount >= 3
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId 
+    AND pl.LinkTypeId = 1
+    AND pl.CreationDate >= p.CreationDate
+LEFT JOIN Votes v ON p.Id = v.PostId 
+    AND v.VoteTypeId IN (2, 3)
+    AND v.CreationDate >= p.CreationDate 
+    AND v.CreationDate <= p.CreationDate + INTERVAL '7 days'
+WHERE p.Score >= 0 
+    AND p.AnswerCount >= 1
+    AND (pl.RelatedPostId IS NOT NULL OR v.Id IS NOT NULL)
+GROUP BY ub.ReputationBucket, pt.TagPopularity
+HAVING COUNT(*) >= 5
+ORDER BY ScoreInteraction DESC, ViewInteraction DESC
+LIMIT 50;

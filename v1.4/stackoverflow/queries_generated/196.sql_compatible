@@ -1,0 +1,98 @@
+WITH
+-- badges per user (counts by gold/silver/bronze)
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- posts per user
+UserPosts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    COUNT(*) AS PostCount,
+    SUM(COALESCE(p.Score,0)) AS ScoreSum,
+    AVG(COALESCE(p.Score,0)) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+-- up/down votes cast by user
+UserVotes AS (
+  SELECT
+    v.UserId AS UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesCast,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesCast,
+    SUM(v.BountyAmount) AS BountiesPlaced
+  FROM Votes v
+  GROUP BY v.UserId
+),
+-- most recently edited post per user (correlated subquery via window function)
+RecentEdits AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.Id AS PostId,
+    ph.CreationDate AS EditDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY ph.CreationDate DESC) AS rn
+  FROM Posts p
+  JOIN PostHistory ph ON ph.PostId = p.Id
+  WHERE ph.PostHistoryTypeId IN (4,5) -- edits to title/body
+),
+-- a ranked activity snapshot per user for benchmarking
+UserActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.Id AS PostId,
+    p.LastActivityDate,
+    p.Score,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC, p.Score DESC) AS rank_by_activity
+  FROM Posts p
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COALESCE(ub.TotalBadges, 0) AS TotalBadges,
+  COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+  COALESCE(up.PostCount, 0) AS PostCount,
+  COALESCE(up.ScoreSum, 0) AS ScoreSum,
+  COALESCE(up.AvgScore, 0) AS AvgPostScore,
+  COALESCE(va.LastActivity, NULL) AS LastPostActivityDate,
+  COALESCE(vv.UpvotesCast, 0) AS UpvotesCast,
+  COALESCE(vv.DownvotesCast, 0) AS DownvotesCast,
+  COALESCE(vv.BountiesPlaced, 0) AS BountiesPlaced,
+  -- latest edit by the user (if any)
+  (SELECT ph.EditDate
+     FROM RecentEdits re
+     WHERE re.UserId = u.Id AND re.rn = 1
+     LIMIT 1) AS LastEditDate,
+  -- most recent edited post id for potential follow-up
+  (SELECT re.PostId
+     FROM RecentEdits re
+     WHERE re.UserId = u.Id AND re.rn = 1
+     LIMIT 1) AS LastEditedPostId,
+  -- sum over a subset using a set operator example: union of two tag-related activities
+  COALESCE(
+    (SELECT COUNT(*) FROM PostLinks pl
+     JOIN Posts a ON a.Id = pl.PostId
+     JOIN Posts b ON b.Id = pl.RelatedPostId
+     WHERE pl.LinkTypeId = 1 AND a.OwnerUserId = u.Id),
+    0) +
+  COALESCE(
+    (SELECT COUNT(*) FROM PostLinks pl
+     JOIN Posts a ON a.Id = pl.PostId
+     WHERE pl.LinkTypeId = 3 AND a.OwnerUserId = u.Id),
+    0) AS LinkedAndDuplicateCounts
+FROM Users u
+LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+LEFT JOIN UserPosts up ON up.UserId = u.Id
+LEFT JOIN UserActivity va ON va.UserId = u.Id
+LEFT JOIN UserVotes vv ON vv.UserId = u.Id
+ORDER BY u.Reputation DESC, u.Id
+LIMIT 500;

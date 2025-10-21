@@ -1,0 +1,171 @@
+-- {"query": "17006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 16345, "output_tokens": 16354} 
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) as avg_post_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) as median_positive_score,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) as reputation_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) as question_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as tag,
+        COUNT(*) as tag_use_count,
+        SUM(p.Score) as total_tag_score,
+        STRING_AGG(DISTINCT COALESCE(p.Title, 'Untitled'), ' | ' ORDER BY p.Score DESC) FILTER (WHERE p.Score >= 10) as top_posts
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+),
+recursive_post_chain AS (
+    WITH RECURSIVE post_hierarchy AS (
+        SELECT 
+            p.Id,
+            p.ParentId,
+            p.Score,
+            p.CreationDate,
+            1 as depth,
+            ARRAY[p.Id] as path,
+            p.Id as root_id
+        FROM Posts p
+        WHERE p.ParentId IS NULL 
+            AND p.PostTypeId = 1
+            AND p.Score > 50
+        
+        UNION ALL
+        
+        SELECT 
+            p2.Id,
+            p2.ParentId,
+            p2.Score,
+            p2.CreationDate,
+            ph.depth + 1,
+            ph.path || p2.Id,
+            ph.root_id
+        FROM Posts p2
+        INNER JOIN post_hierarchy ph ON p2.ParentId = ph.Id
+        WHERE ph.depth < 5
+            AND NOT (p2.Id = ANY(ph.path))
+    )
+    SELECT * FROM post_hierarchy
+),
+badge_correlation AS (
+    SELECT 
+        b1.UserId,
+        b1.Name as badge1,
+        b2.Name as badge2,
+        b1.Date as badge1_date,
+        b2.Date as badge2_date,
+        ABS(EXTRACT(EPOCH FROM (b2.Date - b1.Date))/86400) as days_between,
+        CASE 
+            WHEN b1.Class < b2.Class THEN 'Upgraded'
+            WHEN b1.Class > b2.Class THEN 'Downgraded'
+            ELSE 'Same Level'
+        END as class_transition
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b1.UserId = b2.UserId
+        AND b1.Id < b2.Id
+        AND SUBSTRING(b1.Name, 1, POSITION(' ' IN b1.Name || ' ') - 1) = 
+            SUBSTRING(b2.Name, 1, POSITION(' ' IN b2.Name || ' ') - 1)
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.post_count,
+    COALESCE(ua.avg_post_score, 0) as avg_post_score,
+    ua.median_positive_score,
+    ua.reputation_rank,
+    CASE 
+        WHEN ua.reputation_rank <= 10 THEN '⭐ Top 10'
+        WHEN ua.reputation_rank <= 100 THEN '🥈 Top 100'
+        WHEN ua.reputation_rank <= 1000 THEN '🥉 Top 1000'
+        ELSE '👤 Regular'
+    END as user_tier,
+    COALESCE(te.tag, 'no-tags') as primary_tag,
+    COALESCE(te.tag_use_count, 0) as tag_uses,
+    COALESCE(te.total_tag_score, 0) as tag_score,
+    LEFT(COALESCE(NULLIF(TRIM(te.top_posts), ''), 'No high-scoring posts'), 100) as top_post_titles,
+    COALESCE(pc.max_depth, 0) as max_answer_chain_depth,
+    COALESCE(pc.total_chain_score, 0) as total_chain_score,
+    COALESCE(bc.badge_pairs, 0) as related_badge_pairs,
+    COALESCE(bc.avg_days_between, 0) as avg_badge_interval,
+    COALESCE(recent_edits.edit_count, 0) as recent_edit_count,
+    CASE 
+        WHEN recent_votes.controversial_ratio > 0.4 THEN 'Controversial'
+        WHEN recent_votes.upvote_ratio > 0.8 THEN 'Well-received'
+        WHEN recent_votes.upvote_ratio < 0.2 THEN 'Poorly-received'
+        ELSE 'Mixed'
+    END as content_reception,
+    COALESCE(cm.comment_engagement, 0) as comment_engagement_score
+FROM user_activity ua
+LEFT JOIN LATERAL (
+    SELECT 
+        tag,
+        tag_use_count,
+        total_tag_score,
+        top_posts
+    FROM tag_expertise
+    WHERE OwnerUserId = ua.Id
+    ORDER BY total_tag_score DESC NULLS LAST, tag_use_count DESC
+    LIMIT 1
+) te ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        MAX(depth) as max_depth,
+        SUM(Score) as total_chain_score
+    FROM recursive_post_chain
+    WHERE root_id IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.Id)
+) pc ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) as badge_pairs,
+        AVG(days_between) as avg_days_between
+    FROM badge_correlation
+    WHERE UserId = ua.Id
+) bc ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) as edit_count
+    FROM PostHistory
+    WHERE UserId = ua.Id
+        AND PostHistoryTypeId IN (4, 5, 6)
+        AND CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'
+) recent_edits ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COALESCE(SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END)::FLOAT / 
+                 NULLIF(COUNT(*), 0), 0) as upvote_ratio,
+        COALESCE(SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END)::FLOAT / 
+                 NULLIF(SUM(CASE WHEN VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0), 0) as controversial_ratio
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE p.OwnerUserId = ua.Id
+        AND v.VoteTypeId IN (2, 3)
+) recent_votes ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        LOG(1 + COUNT(DISTINCT c.Id)) * 
+        (1 + COALESCE(AVG(c.Score), 0)) as comment_engagement
+    FROM Comments c
+    WHERE c.UserId = ua.Id
+        OR c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.Id)
+) cm ON true
+WHERE ua.question_count > 0 
+    OR ua.answer_count > 0
+ORDER BY 
+    ua.reputation_rank,
+    COALESCE(te.total_tag_score, 0) DESC,
+    ua.post_count DESC
+LIMIT 100;

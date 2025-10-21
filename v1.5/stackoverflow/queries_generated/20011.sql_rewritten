@@ -1,0 +1,135 @@
+-- {"query": "20011.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1517} 
+WITH UserMetrics AS (
+    -- CTE 1: Aggregate user-level statistics like badge counts and reputation.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT MIN(b2.Date) FROM Badges b2 WHERE b2.UserId = u.Id) AS FirstBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 1000
+        AND u.Id > 0 -- Exclude community user
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0
+),
+PostDetails AS (
+    -- CTE 2: Gather details for questions and answers, including calculating body length and time-to-edit.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        LENGTH(p.Body) AS BodyLength,
+        EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)) / 60.0 AS MinsToFirstEdit
+    FROM
+        Posts p
+    WHERE
+        p.CreationDate > '2020-01-01'
+        AND p.DeletionDate IS NULL
+        AND p.OwnerUserId IN (SELECT UserId FROM UserMetrics)
+),
+UserActivitySummary AS (
+    -- CTE 3: Use window functions to analyze user post activity patterns.
+    SELECT
+        OwnerUserId,
+        COUNT(PostId) OVER (PARTITION BY OwnerUserId) AS TotalPosts,
+        SUM(Score) OVER (PARTITION BY OwnerUserId) AS TotalScore,
+        AVG(Score) OVER (PARTITION BY OwnerUserId) AS AvgPostScore,
+        -- Find the user's highest-scoring post's title
+        FIRST_VALUE(Title) OVER (PARTITION BY OwnerUserId ORDER BY Score DESC, CreationDate DESC) AS BestPostTitle,
+        -- Calculate time between consecutive posts by the same user
+        EXTRACT(EPOCH FROM (CreationDate - LAG(CreationDate, 1, CreationDate) OVER (PARTITION BY OwnerUserId ORDER BY CreationDate))) / 3600.0 AS HoursBetweenPosts,
+        PostId
+    FROM
+        PostDetails
+    WHERE PostTypeId IN (1, 2) -- Questions and Answers
+)
+-- Final SELECT combining all the data
+SELECT
+    um.DisplayName,
+    um.Reputation,
+    um.GoldBadges,
+    uas.TotalPosts,
+    uas.AvgPostScore,
+    pd.Title AS PostTitle,
+    pd.Score AS PostScore,
+    pd.BodyLength,
+    COALESCE(pd.AnswerCount, 0) AS AnswerCount,
+    -- Complicated user engagement score calculation
+    LOG(um.Reputation + 1) * (uas.AvgPostScore + (um.GoldBadges * 10)) AS EngagementScore,
+    -- Rank users within their reputation decile based on engagement score
+    DENSE_RANK() OVER (PARTITION BY FLOOR(um.Reputation / 10000) ORDER BY LOG(um.Reputation + 1) * (uas.AvgPostScore + (um.GoldBadges * 10)) DESC) AS RankInReputationTier,
+    -- Correlated subquery to find the number of comments on the user's highest-scoring post
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = (
+        SELECT uas_inner.PostId FROM UserActivitySummary uas_inner WHERE uas_inner.OwnerUserId = um.UserId ORDER BY uas_inner.TotalScore DESC LIMIT 1
+    )) AS CommentsOnBestPost,
+    -- String manipulation on tags
+    'Tags: ' || REPLACE(SUBSTRING(pd.Tags, 2, LENGTH(pd.Tags) - 2), '><', ', ') AS FormattedTags,
+    -- Case statement for user category based on activity
+    CASE
+        WHEN uas.AvgPostScore > 20 AND um.GoldBadges > 5 THEN 'Top Tier Contributor'
+        WHEN uas.TotalPosts < 10 THEN 'New Contributor'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    uas.HoursBetweenPosts
+FROM
+    UserMetrics um
+JOIN
+    UserActivitySummary uas ON um.UserId = uas.OwnerUserId
+JOIN
+    PostDetails pd ON uas.PostId = pd.PostId
+WHERE
+    pd.PostTypeId = 1 -- Only analyze questions in the final result set
+    AND uas.HoursBetweenPosts < 72 -- Filter for users who post somewhat frequently
+    AND (pd.FavoriteCount > 10 OR pd.Score > 25)
+    AND pd.Tags LIKE '%<sql>%'
+UNION ALL
+-- A second part to the query to find users with many highly-scored comments
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1),
+    NULL,
+    AVG(c.Score),
+    'Comment Specialist',
+    SUM(c.Score),
+    NULL,
+    0.0,
+    NULL, -- No rank for this part of the query
+    COUNT(c.Id),
+    NULL,
+    'Comment Specialist',
+    NULL
+FROM
+    Users u
+JOIN
+    Comments c ON u.Id = c.UserId
+WHERE
+    u.Id IN (
+        SELECT UserId FROM Comments WHERE Score > 10 GROUP BY UserId HAVING COUNT(*) > 50
+    )
+    AND u.Reputation < 10000 -- Look for specialists who might not be high-rep overall
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation
+ORDER BY
+    EngagementScore DESC NULLS LAST, Reputation DESC
+LIMIT 200;

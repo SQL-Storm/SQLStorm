@@ -1,0 +1,76 @@
+WITH
+  user_base AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName AS UserName,
+           COALESCE(u.Location, 'Unknown') AS Location,
+           u.Reputation,
+           u.AccountId
+    FROM Users u
+    WHERE u.AccountId IS NOT NULL
+  ),
+  per_user_posts AS (
+    SELECT
+      ub.UserId,
+      ub.UserName,
+      post_row.PostId,
+      post_row.Title,
+      post_row.Score,
+      post_row.CreationDate,
+      pt.Name AS PostTypeName,
+      post_row.Tags,
+      post_row.CommentCount,
+      CASE
+        WHEN post_row.Title IS NULL THEN NULL
+        WHEN LENGTH(post_row.Title) > 50 THEN SUBSTR(post_row.Title, 1, 50) || '...'
+        ELSE post_row.Title
+      END AS TitleSnippet
+    FROM user_base ub
+    LEFT JOIN LATERAL (
+      SELECT s.PostId, s.Title, s.Score, s.CreationDate, s.PostTypeId, s.CommentCount, s.rn
+      FROM (
+        SELECT p.Id AS PostId, p.Title, COALESCE(p.Score, 0) AS Score, p.CreationDate, p.PostTypeId,
+               (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+               ROW_NUMBER() OVER (ORDER BY COALESCE(p.Score, 0) DESC, p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.OwnerUserId = ub.UserId
+          AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+      ) s
+      WHERE s.rn <= 3
+    ) post_row ON TRUE
+    LEFT JOIN PostTypes pt ON pt.Id = post_row.PostTypeId
+  ),
+  positive AS (
+    SELECT * FROM per_user_posts WHERE COALESCE(Score, 0) > 0
+  ),
+  nonpositive AS (
+    SELECT * FROM per_user_posts WHERE COALESCE(Score, 0) <= 0
+  )
+SELECT
+  'Positive' AS SetLabel,
+  UserId,
+  UserName,
+  PostId,
+  Title,
+  TitleSnippet,
+  Score,
+  CreationDate,
+  PostTypeName,
+  Tags,
+  COALESCE(CommentCount, 0) AS CommentCount
+FROM positive
+UNION ALL
+SELECT
+  'NonPositive' AS SetLabel,
+  UserId,
+  UserName,
+  PostId,
+  Title,
+  TitleSnippet,
+  Score,
+  CreationDate,
+  PostTypeName,
+  Tags,
+  COALESCE(CommentCount, 0) AS CommentCount
+FROM nonpositive
+ORDER BY SetLabel, UserName, Score DESC
+LIMIT 100;

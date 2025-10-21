@@ -1,0 +1,33 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(p.Id) AS PostCount,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  AVG(p.Score) AS AvgPostScore,
+  MAX(p.CreationDate) AS MostRecentPostDate,
+  STRING_AGG(DISTINCT t.Name, ',') AS TagsUsed,
+  COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+  COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesGiven,
+  COALESCE(SUM(CASE WHEN b.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS BadgesEarned,
+  MIN(CASE WHEN b.Class = 1 THEN b.Date END) AS FirstGoldBadgeDate
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT t2.Id, t2.Name
+    FROM Tags t2
+  ) t ON t.Id IN (
+    SELECT CAST(x AS INTEGER)
+    FROM UNNEST(string_to_array(REPLACE(p.Tags, '<', ''), '>') ) AS x
+  )
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE
+  u.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years'
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  u.Reputation DESC, MostRecentPostDate DESC
+LIMIT 100;

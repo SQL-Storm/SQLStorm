@@ -1,0 +1,113 @@
+-- {"query": "55064.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1271} 
+
+WITH 
+-- 1. Aggregate basic user activity
+user_activity AS (
+    SELECT 
+        u.Id                                            AS user_id,
+        u.DisplayName                                   AS display_name,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)     AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)     AS answer_cnt,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS total_score,
+        MAX(p.LastActivityDate)                         AS last_activity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+-- 2. Gather badge information per user as JSON
+user_badges AS (
+    SELECT 
+        b.UserId,
+        jsonb_agg(
+            jsonb_build_object(
+                'name',  b.Name,
+                'class', b.Class,
+                'date',  b.Date,
+                'tag',   CASE WHEN b.TagBased = 1 THEN 'tag' ELSE 'named' END
+            )
+            ORDER BY b.Date DESC
+        ) AS badges_json
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Most recent edit (posthistory) per user
+user_last_edit AS (
+    SELECT 
+        ph.UserId,
+        MAX(ph.CreationDate) AS last_edit_ts,
+        jsonb_agg(
+            jsonb_build_object(
+                'post_id', ph.PostId,
+                'type_id', ph.PostHistoryTypeId,
+                'summary', LEFT(COALESCE(ph.Comment, ''), 100)
+            )
+            ORDER BY ph.CreationDate DESC
+            LIMIT 5
+        ) AS recent_edits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)   -- edit title/body/tags
+    GROUP BY ph.UserId
+),
+
+-- 4. Top tags used by a user (derived from posts' Tags column)
+user_top_tags AS (
+    SELECT 
+        p.OwnerUserId                             AS user_id,
+        tag,
+        COUNT(*)                                   AS tag_usage
+    FROM Posts p,
+    LATERAL (
+        SELECT unnest(string_to_array(
+                TRIM(BOTH '<>' FROM p.Tags), 
+                '><'
+            )) AS tag
+    ) AS t
+    WHERE p.PostTypeId = 1                -- only questions
+    GROUP BY p.OwnerUserId, tag
+),
+
+-- 5. Rank users by total_score with window function
+ranked_users AS (
+    SELECT 
+        ua.*,
+        RANK() OVER (ORDER BY ua.total_score DESC) AS score_rank
+    FROM user_activity ua
+)
+
+SELECT
+    ru.user_id,
+    ru.display_name,
+    ru.Reputation,
+    ru.question_cnt,
+    ru.answer_cnt,
+    ru.total_score,
+    ru.last_activity,
+    ru.score_rank,
+    COALESCE(ub.badges_json, '[]'::jsonb)          AS badges,
+    le.last_edit_ts,
+    COALESCE(le.recent_edits, '[]'::jsonb)        AS recent_edits,
+    tt.tag,
+    tt.tag_usage
+FROM ranked_users ru
+LEFT JOIN user_badges ub      ON ub.UserId = ru.user_id
+LEFT JOIN user_last_edit le  ON le.UserId = ru.user_id
+LEFT JOIN (
+    SELECT 
+        user_id,
+        jsonb_agg(
+            jsonb_build_object(
+                'tag', tag,
+                'usage', tag_usage
+            )
+            ORDER BY tag_usage DESC
+            LIMIT 3
+        ) AS tag
+    FROM user_top_tags
+    GROUP BY user_id
+) tt ON tt.user_id = ru.user_id
+WHERE ru.score_rank <= 100
+ORDER BY ru.total_score DESC;

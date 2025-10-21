@@ -1,0 +1,136 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+QuestionAnswerQuality AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate as QuestionDate,
+        q.OwnerUserId as QuestionOwner,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= TIMESTAMP '2019-01-01'
+        AND q.AnswerCount > 0
+        AND q.Score >= 5
+),
+TagPopularity AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count as TagUsageCount,
+        COUNT(DISTINCT p.Id) as PostsWithTag,
+        AVG(p.Score) as AvgScoreForTag,
+        AVG(p.ViewCount) as AvgViewsForTag,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueContributors,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as QuestionsWithAcceptedAnswers
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2018-01-01'
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 100
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) as Favorites,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) as BountyStarts,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as TotalBountyAmount,
+        MIN(v.CreationDate) as FirstVoteDate,
+        MAX(v.CreationDate) as LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY v.PostId
+),
+EditingActivity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) as TotalEdits,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) as EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN 1 END) as RollbackCount,
+        MIN(ph.CreationDate) as FirstEditDate,
+        MAX(ph.CreationDate) as LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+        AND ph.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY ph.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.AvgPostScore,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    uem.BronzeBadges,
+    COUNT(DISTINCT qaq.QuestionId) as QuestionsInvolved,
+    AVG(qaq.QuestionScore) as AvgQuestionScore,
+    SUM(CASE WHEN qaq.IsAccepted = 1 AND qaq.AnswerOwner = uem.Id THEN 1 ELSE 0 END) as AcceptedAnswers,
+    AVG(CASE WHEN qaq.AnswerOwner = uem.Id THEN qaq.AnswerScore END) as AvgAnswerScore,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName) as TopTags,
+    AVG(vp.UpVotes) as AvgUpVotesPerPost,
+    AVG(vp.DownVotes) as AvgDownVotesPerPost,
+    SUM(vp.TotalBountyAmount) as TotalBountyEarned,
+    AVG(ea.TotalEdits) as AvgEditsPerPost,
+    ROUND(AVG(EXTRACT(EPOCH FROM (vp.LastVoteDate - qaq.QuestionDate))/86400.0), 2) as AvgDaysToLastVote
+FROM UserEngagementMetrics uem
+LEFT JOIN QuestionAnswerQuality qaq ON (uem.Id = qaq.QuestionOwner OR uem.Id = qaq.AnswerOwner)
+LEFT JOIN VotingPatterns vp ON qaq.QuestionId = vp.PostId
+LEFT JOIN EditingActivity ea ON qaq.QuestionId = ea.PostId
+LEFT JOIN Posts p ON (p.Id = qaq.QuestionId AND p.OwnerUserId = uem.Id)
+LEFT JOIN TagPopularity tp ON p.Tags LIKE '%' || '<' || tp.TagName || '>' || '%' AND tp.PostsWithTag >= 200
+WHERE uem.Reputation > 1000
+GROUP BY 
+    uem.Id,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.AvgPostScore,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    uem.BronzeBadges
+HAVING COUNT(DISTINCT qaq.QuestionId) > 3
+ORDER BY 
+    uem.Reputation DESC,
+    AcceptedAnswers DESC,
+    uem.AvgPostScore DESC
+LIMIT 100;

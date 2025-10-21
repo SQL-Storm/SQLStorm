@@ -1,0 +1,162 @@
+-- {"query": "4094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1558} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over(partition by u.Id order by b.Date desc, b.Class asc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class is not null
+),
+TopBadges as (
+    select UserId, BadgeName, BadgeClass
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+), 
+PostsWithScoreStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        max(ph.CreationDate) as LastEditDate,
+        dense_rank() over(partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Title, p.Tags, p.Score, p.ViewCount
+),
+FilteredTopPosts as (
+    select * from PostsWithScoreStats
+    where ScoreRank <= 50 and Score > (select avg(Score) from Posts where PostTypeId = PostsWithScoreStats.PostTypeId)
+),
+QuestionAnswerAggregation as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwner,
+        q.ViewCount as QuestionViews,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        rank() over(partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.Score > 10
+),
+DistinctTags as (
+    select distinct unnest(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,'')) - 2), '><')) as Tag, p.Id as PostId
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) over(partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as PostsCount,
+        count(distinct c.Id) over(partition by u.Id order by c.CreationDate rows between unbounded preceding and current row) as CommentsCount,
+        sum(coalesce(p.Score,0)) over(partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativePostScore,
+        lag(u.Reputation, 1, 0) over(partition by u.Id order by u.CreationDate) as PreviousReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+),
+ClosedDuplicatePosts as (
+    select pl.PostId as OriginalQuestionId, pl.RelatedPostId as DuplicateQuestionId, lt.Name as LinkType, p1.Title as OriginalTitle, p2.Title as DuplicateTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+),
+UserLastPosts as (
+    select 
+        p.OwnerUserId,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    group by p.OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.CreationDate,
+    ts.BadgeName,
+    ts.BadgeClass,
+    fa.QuestionId,
+    fa.QuestionTitle,
+    fa.QuestionScore,
+    fa.AnswerId,
+    fa.AnswerScore,
+    fa.IsAccepted,
+    d.Tag,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.CumulativePostScore,
+    ua.PreviousReputation,
+    cdp.OriginalTitle,
+    cdp.DuplicateTitle,
+    ulp.LastPostDate,
+    case 
+        when u.WebsiteUrl is null or u.WebsiteUrl = '' then 'NoWebsite' 
+        when position('http' in lower(u.WebsiteUrl)) = 1 then 'HasWebsite' 
+        else 'OtherWebsiteFormat' 
+    end as WebsiteStatus,
+    case 
+        when fa.AnswerScore is null then 'NoAnswer' 
+        when fa.AnswerScore > fa.QuestionScore then 'AnswerBetterThanQuestion' 
+        else 'AnswerNotBetter'
+    end as AnswerQuality
+from Users u
+left join TopBadges ts on ts.UserId = u.Id
+left join (
+    select * from QuestionAnswerAggregation where AnswerRank = 1
+) fa on fa.QuestionOwner = u.Id
+left join DistinctTags d on d.PostId = fa.QuestionId
+left join UserActivityWindows ua on ua.UserId = u.Id
+left join ClosedDuplicatePosts cdp on cdp.OriginalQuestionId = fa.QuestionId
+left join UserLastPosts ulp on ulp.OwnerUserId = u.Id
+where u.Reputation > 1000 and u.LastAccessDate > now() - interval '180 days'
+union
+select 
+    u2.Id,
+    u2.DisplayName,
+    u2.Reputation,
+    u2.Location,
+    u2.CreationDate,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    ua2.PostsCount,
+    ua2.CommentsCount,
+    ua2.CumulativePostScore,
+    ua2.PreviousReputation,
+    null,
+    null,
+    null,
+    null
+from Users u2
+left join UserActivityWindows ua2 on ua2.UserId = u2.Id
+where u2.Reputation > 5000 and u2.Id not in (select UserId from TopBadges)
+order by Reputation desc, QuestionScore desc nulls last, AnswerScore desc nulls last
+limit 100;

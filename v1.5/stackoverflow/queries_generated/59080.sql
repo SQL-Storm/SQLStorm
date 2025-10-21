@@ -1,0 +1,89 @@
+-- {"query": "59080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 1288} 
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerDisplayName,
+    u.Reputation,
+    COUNT(c.Id) as CommentCount,
+    COUNT(v.Id) as VoteCount,
+    COUNT(ph.Id) as HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END as PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+        ELSE 'Open'
+    END as PostStatus,
+    DATEDIFF(day, p.CreationDate, CURRENT_TIMESTAMP) as DaysSinceCreation,
+    COALESCE(p.AnswerCount, 0) as AnswerCount,
+    COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+    (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0) as PositiveAnswersCount,
+    (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score < 0) as NegativeAnswersCount,
+    (SELECT AVG(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as AvgAnswerScore,
+    (SELECT MAX(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as MaxAnswerScore,
+    (SELECT MIN(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as MinAnswerScore,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (2,3)) as UpDownVotes,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 5) as FavoriteCount,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id AND Date >= p.CreationDate) as BadgesSincePost,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id) as TotalPostsByUser,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) as QuestionsByUser,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2) as AnswersByUser,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) as AvgQuestionScore,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = u.Id) as TotalCommentsByUser,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = u.Id AND PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)) as CommentsOnOwnPosts,
+    (SELECT COUNT(*) FROM PostHistory WHERE UserId = u.Id AND PostId = p.Id) as UserPostEdits,
+    (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId IN (1,2,3,4,5,6)) as PostEdits,
+    (SELECT COUNT(*) FROM PostLinks WHERE PostId = p.Id OR RelatedPostId = p.Id) as RelatedLinks,
+    (SELECT COUNT(*) FROM PostLinks WHERE PostId = p.Id AND LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(*) FROM PostLinks WHERE PostId = p.Id AND LinkTypeId = 1) as LinkedPosts,
+    (SELECT STRING_AGG(Name, ', ') FROM (
+        SELECT b.Name FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Date >= p.CreationDate 
+        AND b.Date <= DATEADD(day, 30, p.CreationDate)
+        ORDER BY b.Date
+    ) subquery) as BadgesInFirstMonth,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (8,9)) as BountyVotes,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 8) as BountyStarts,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 9) as BountyCloses,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 10) as Deletions,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 11) as Undeletions,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 12) as SpamVotes
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT PostId, TagName 
+    FROM Posts p2 
+    CROSS JOIN UNNEST(string_to_array(SUBSTRING(p2.Tags, 2, LENGTH(p2.Tags)-2), '><')) as TagName
+) t ON p.Id = t.PostId
+WHERE p.CreationDate >= DATEADD(year, -5, CURRENT_TIMESTAMP)
+    AND p.PostTypeId IN (1,2)
+    AND p.Score >= 0
+    AND u.Reputation > 1000
+GROUP BY 
+    p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+    u.DisplayName, u.Reputation, p.PostTypeId,
+    p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId,
+    p.AnswerCount, p.FavoriteCount
+HAVING 
+    COUNT(c.Id) >= 0
+    AND COUNT(v.Id) >= 0
+    AND COUNT(ph.Id) >= 0
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 1000;

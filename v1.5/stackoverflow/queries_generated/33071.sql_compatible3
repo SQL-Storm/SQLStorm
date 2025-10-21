@@ -1,0 +1,92 @@
+WITH active_question_stats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate AS LastActivity,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT v_up.Id) AS UpVotes,
+        COUNT(DISTINCT v_down.Id) AS DownVotes,
+        ARRAY_AGG(DISTINCT t.TagName) AS Tags
+    FROM
+        Posts p
+        LEFT JOIN Comments c ON c.PostId = p.Id
+        LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+        LEFT JOIN Votes v_up ON v_up.PostId = p.Id AND v_up.VoteTypeId = 2
+        LEFT JOIN Votes v_down ON v_down.PostId = p.Id AND v_down.VoteTypeId = 3
+        LEFT JOIN LATERAL (
+            SELECT TagName
+            FROM unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(TagName)
+        ) AS t ON TRUE
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+        AND p.ClosedDate IS NULL
+    GROUP BY
+        p.Id, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount
+),
+high_activity_days AS (
+    SELECT
+        DATE(p.LastActivityDate) AS Day,
+        COUNT(DISTINCT p.Id) AS QuestionsActive
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY
+        DATE(p.LastActivityDate)
+),
+top_users AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM
+        Users u
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    aqst.QuestionId,
+    aqst.Title,
+    aqst.QuestionCreationDate,
+    aqst.LastActivity,
+    aqst.QuestionScore,
+    aqst.ViewCount,
+    aqst.CommentCount,
+    aqst.AnswerCount,
+    aqst.UpVotes,
+    aqst.DownVotes,
+    aqst.Tags,
+    hd.Day,
+    hd.QuestionsActive,
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.CommentCount AS UserCommentCount,
+    tu.QuestionCount AS UserQuestionCount,
+    tu.AnswerCount AS UserAnswerCount,
+    tu.UpVotesGiven,
+    tu.DownVotesGiven
+FROM
+    active_question_stats aqst
+    LEFT JOIN high_activity_days hd ON DATE(aqst.LastActivity) = hd.Day
+    LEFT JOIN top_users tu ON tu.Id = (
+        SELECT OwnerUserId FROM Posts p WHERE p.Id = aqst.QuestionId LIMIT 1
+    )
+ORDER BY
+    aqst.LastActivity DESC
+LIMIT 100;

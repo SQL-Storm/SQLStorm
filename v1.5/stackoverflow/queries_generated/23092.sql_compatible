@@ -1,0 +1,58 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank,
+           COALESCE((SELECT AVG(p.Score * 1.0) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1), 0) AS AvgQuestionScore
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+UserBadgesCTE AS (
+    SELECT b.UserId, COUNT(*) AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 5
+),
+QuestionAnalytics AS (
+    SELECT p.Id AS PostId, p.Title, p.ViewCount, p.OwnerUserId,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+           COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), 'Untagged') AS CleanTags,
+           CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+                WHEN p.AnswerCount IS NULL OR p.AnswerCount = 0 THEN 'Unanswered'
+                ELSE 'Active' END AS QuestionStatus,
+           LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevViewCount,
+           p.ViewCount - COALESCE(LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) AS ViewGrowth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND (p.Score > 10 OR EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2))
+),
+EditHistoryCTE AS (
+    SELECT ph.PostId, COUNT(*) AS EditCount,
+           MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY ph.PostId
+)
+SELECT tu.DisplayName, tu.Reputation, tu.UserRank, tu.AvgQuestionScore,
+       COALESCE(ub.GoldBadges, 0) AS GoldBadges, COALESCE(ub.BadgeNames, 'No Badges') AS BadgeNames,
+       qa.Title, qa.ViewCount, qa.PositiveComments, qa.CleanTags, qa.QuestionStatus, qa.ViewGrowth,
+       COALESCE(eh.EditCount, 0) AS EditCount, eh.LastEditDate,
+       (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = qa.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM TopUsers tu
+LEFT OUTER JOIN UserBadgesCTE ub ON tu.Id = ub.UserId
+INNER JOIN QuestionAnalytics qa ON tu.Id = qa.OwnerUserId
+LEFT OUTER JOIN EditHistoryCTE eh ON qa.PostId = eh.PostId
+WHERE tu.UserRank <= 50
+  AND (qa.ViewGrowth > 100 OR qa.EditCount > 2)
+  AND qa.CleanTags LIKE '%sql%'
+UNION ALL
+SELECT u.DisplayName, u.Reputation, NULL AS UserRank, 0 AS AvgQuestionScore,
+       0 AS GoldBadges, 'Inactive' AS BadgeNames,
+       NULL AS Title, NULL AS ViewCount, NULL AS PositiveComments, NULL AS CleanTags, 'N/A' AS QuestionStatus, NULL AS ViewGrowth,
+       NULL AS EditCount, NULL AS LastEditDate, NULL AS DuplicateLinks
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation > 500
+  AND u.LastAccessDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+ORDER BY Reputation DESC, GoldBadges DESC NULLS LAST;

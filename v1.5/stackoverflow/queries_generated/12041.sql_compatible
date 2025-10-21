@@ -1,0 +1,84 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS RankByScore,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) - COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS NetVotes,
+        COUNT(C.Id) AS CommentCount,
+        STRING_AGG(DISTINCT T.TagName, ', ' ORDER BY T.Count DESC) AS TagList
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        LATERAL unnest(string_to_array(substr(P.Tags, 2, length(P.Tags) - 2), '><')) AS Tag ON TRUE
+    LEFT JOIN 
+        Tags T ON Tag = T.TagName
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        P.Id, U.DisplayName
+), 
+UserReputation AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.Reputation, U.CreationDate, U.DisplayName
+), 
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        MAX(PH.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.RankByScore,
+    RP.NetVotes,
+    RP.CommentCount,
+    RP.TagList,
+    COALESCE(UR.Reputation, 0) AS OwnerReputation,
+    COALESCE(UR.GoldBadges, 0) AS OwnerGoldBadges,
+    COALESCE(UR.SilverBadges, 0) AS OwnerSilverBadges,
+    COALESCE(UR.BronzeBadges, 0) AS OwnerBronzeBadges,
+    COALESCE(PHS.EditCount, 0) AS EditCount,
+    COALESCE(PHS.LastEditDate, RP.CreationDate) AS LastEditDate
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    UserReputation UR ON RP.OwnerUserId = UR.Id
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+WHERE 
+    RP.RankByScore <= 10
+ORDER BY 
+    RP.PostTypeId, RP.Score DESC, RP.CreationDate;

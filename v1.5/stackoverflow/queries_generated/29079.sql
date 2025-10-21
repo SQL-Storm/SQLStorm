@@ -1,0 +1,197 @@
+-- {"query": "29079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1991} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        PostRank,
+        RepRank,
+        UserTier
+    FROM UserActivityStats
+    WHERE PostRank <= 1000
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                ARRAY_LENGTH(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1)
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL AND LENGTH(p.Body) > 0 THEN 
+                (LENGTH(p.Body) - LENGTH(REPLACE(UPPER(p.Body), 'SELECT', ''))) / LENGTH('SELECT')
+            ELSE 0
+        END as SqlKeywords,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 5 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as ChronologicalId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= '2019-01-01'
+),
+UserPostStats AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.LastPostDate,
+        tu.PostRank,
+        tu.RepRank,
+        tu.UserTier,
+        COUNT(DISTINCT CASE WHEN pc.PostId IS NOT NULL THEN pc.PostId END) as UserQuestionPosts,
+        COUNT(DISTINCT CASE WHEN pc.PostId IS NOT NULL AND pc.ScoreLevel = 'High' THEN pc.PostId END) as HighScoreQuestions,
+        AVG(CAST(pc.Score AS FLOAT)) as AvgScore,
+        MAX(pc.Score) as MaxScore,
+        MIN(pc.Score) as MinScore,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN pc.PostId IS NOT NULL AND pc.ScoreLevel = 'High' THEN pc.PostId END) > 0 
+            THEN (COUNT(DISTINCT CASE WHEN pc.PostId IS NOT NULL AND pc.ScoreLevel = 'High' THEN pc.PostId END) * 100.0) / 
+                 COUNT(DISTINCT CASE WHEN pc.PostId IS NOT NULL THEN pc.PostId END)
+            ELSE 0
+        END as HighScorePercentage
+    FROM TopUsers tu
+    LEFT JOIN PostComplexity pc ON tu.UserId = pc.OwnerUserId
+    GROUP BY 
+        tu.UserId, tu.DisplayName, tu.Reputation, tu.TotalPosts, tu.Questions, tu.Answers, 
+        tu.Comments, tu.Badges, tu.LastPostDate, tu.PostRank, tu.RepRank, tu.UserTier
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.Questions,
+    ups.Answers,
+    ups.Comments,
+    ups.Badges,
+    ups.LastPostDate,
+    ups.PostRank,
+    ups.RepRank,
+    ups.UserTier,
+    ups.UserQuestionPosts,
+    ups.HighScoreQuestions,
+    ROUND(ups.AvgScore, 2) as AvgScore,
+    ups.MaxScore,
+    ups.MinScore,
+    ROUND(ups.HighScorePercentage, 2) as HighScorePercentage,
+    CASE 
+        WHEN ups.Reputation > 100000 AND ups.TotalPosts > 5000 THEN 'Legendary'
+        WHEN ups.Reputation > 50000 AND ups.TotalPosts > 2000 THEN 'Master'
+        WHEN ups.Reputation > 10000 AND ups.TotalPosts > 1000 THEN 'Expert'
+        ELSE 'Contributor'
+    END as UserCategory,
+    DENSE_RANK() OVER (ORDER BY ups.Reputation DESC) as CategoryRepRank,
+    ROW_NUMBER() OVER (ORDER BY ups.AvgScore DESC, ups.TotalPosts DESC) as PerformanceRank,
+    CASE 
+        WHEN ups.UserTier = 'Elite' AND ups.UserCategory = 'Legendary' THEN 'Super Elite'
+        WHEN ups.UserTier = 'Veteran' AND ups.UserCategory IN ('Master', 'Expert') THEN 'High Achiever'
+        WHEN ups.UserTier IN ('Regular', 'Newbie') AND ups.UserCategory = 'Contributor' THEN 'Active Member'
+        ELSE 'Standard Member'
+    END as MemberStatus,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = ups.UserId AND ph.CreationDate >= '2020-01-01') as RecentActivity,
+    CASE 
+        WHEN ups.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average'
+        WHEN ups.Reputation > (SELECT AVG(Reputation) * 0.8 FROM Users) THEN 'Average'
+        ELSE 'Below Average'
+    END as ReputationStatus,
+    (SELECT 
+        STRING_AGG(DISTINCT b.Name, ', ') 
+        FROM Badges b 
+        WHERE b.UserId = ups.UserId 
+        AND b.Date >= '2020-01-01'
+        AND b.Class = 1
+    ) as RecentGoldBadges,
+    (SELECT 
+        STRING_AGG(DISTINCT CONCAT(p.Title, ' (', p.Score, ')'), ' | ')
+        FROM Posts p 
+        JOIN PostComplexity pc ON p.Id = pc.PostId
+        WHERE p.OwnerUserId = ups.UserId
+        AND pc.ScoreRank <= 5
+        AND pc.CreationDate >= '2020-01-01'
+        ORDER BY pc.Score DESC
+    ) as TopPostsLastYear,
+    (ups.Reputation + ups.TotalPosts + ups.Badges + ups.Comments + ups.Answers * 2) as ActivityScore,
+    CASE 
+        WHEN ups.UserTier = 'Elite' AND ups.HighScorePercentage > 50 THEN 'Top Performer'
+        WHEN ups.UserTier IN ('Veteran', 'Regular') AND ups.AvgScore > 5 THEN 'Solid Performer'
+        WHEN ups.UserTier = 'Newbie' AND ups.TotalPosts > 100 THEN 'Active Newcomer'
+        ELSE 'Average Performer'
+    END as PerformanceLabel,
+    -- Complex calculation with NULL handling and multiple conditions
+    COALESCE(
+        (CASE 
+            WHEN ups.Reputation > 100000 THEN 'Godlike'
+            WHEN ups.Reputation > 50000 THEN 'Legendary'
+            WHEN ups.Reputation > 10000 THEN 'Master'
+            WHEN ups.Reputation > 5000 THEN 'Expert'
+            WHEN ups.Reputation > 1000 THEN 'Regular'
+            ELSE 'Beginner'
+        END),
+        'Unknown'
+    ) as ReputationLevel,
+    -- Window function applied with complex partitioning
+    NTILE(10) OVER (ORDER BY ups.TotalPosts DESC) as PostQuantile,
+    -- Set operator combination with outer joins
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 1) as QuestionCount
+FROM UserPostStats ups
+WHERE ups.TotalPosts > 0
+AND (
+    ups.Reputation > 1000 
+    OR ups.TotalPosts > 100 
+    OR ups.Badges > 10
+)
+ORDER BY ups.Reputation DESC, ups.TotalPosts DESC
+LIMIT 5000;

@@ -1,0 +1,205 @@
+-- {"query": "7098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2370} 
+with
+-- recent active questions with parsed tags and basic aggregates
+Questions as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.FavoriteCount,0) as FavoriteCount,
+    -- extract tags into array (Tags stored like '<tag1><tag2>')
+    case when p.Tags is null then array[]::text[] else string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '5 years'
+),
+-- top answer for each question by adjusted score (score + log(views+1))
+TopAnswers as (
+  select distinct on (a.ParentId)
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreation,
+    (a.Score + ln(coalesce(a.ViewCount,0)+1))::numeric(10,4) as AdjustedScore
+  from Posts a
+  where a.PostTypeId = 2
+  order by a.ParentId, (a.Score + ln(coalesce(a.ViewCount,0)+1)) desc, a.CreationDate asc
+),
+-- user stats and recent activity windows
+UserStats as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.LastAccessDate,
+    u.Views as ProfileViews,
+    u.UpVotes,
+    u.DownVotes,
+    -- badges aggregated
+    (select count(*) from Badges b where b.UserId = u.Id) as BadgeCount,
+    (select count(*) filter (where b.Class = 1) from Badges b where b.UserId = u.Id) as GoldBadges,
+    (select count(*) filter (where b.Class = 2) from Badges b where b.UserId = u.Id) as SilverBadges,
+    (select count(*) filter (where b.Class = 3) from Badges b where b.UserId = u.Id) as BronzeBadges
+  from Users u
+),
+-- sentiment-ish calculation on comments for each post (simple heuristic: length and presence of 'thank', 'error', 'help', 'bug')
+CommentSignals as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(case when lower(c.Text) like '%thank%' then 1 else 0 end) as ThanksCount,
+    sum(case when lower(c.Text) ~ 'bug|error|fail|exception' then 1 else 0 end) as BugMentions,
+    avg(char_length(coalesce(c.Text,'')))::int as AvgCommentLen
+  from Comments c
+  where c.CreationDate >= now() - interval '2 years'
+  group by c.PostId
+),
+-- vote aggregates per post with counts of notable vote types
+VoteAgg as (
+  select
+    v.PostId,
+    count(*) as TotalVotes,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+  from Votes v
+  where v.CreationDate >= now() - interval '5 years'
+  group by v.PostId
+),
+-- compute tag popularity over recent questions (explode tag arrays)
+TagExplode as (
+  select
+    q.Id as QuestionId,
+    trim(tg) as TagName
+  from Questions q
+  cross join lateral unnest(q.TagArray) tg
+  where tg is not null and tg <> ''
+),
+TagScores as (
+  select
+    te.TagName,
+    count(distinct te.QuestionId) as QuestionCount,
+    sum(coalesce(q.Score,0)) as TotalQuestionScore,
+    avg(coalesce(q.ViewCount,0))::int as AvgViews
+  from TagExplode te
+  join Questions q on q.Id = te.QuestionId
+  group by te.TagName
+  having count(distinct te.QuestionId) >= 5
+),
+-- heuristics for duplicate linkage and closure pressure
+DuplicateLinks as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name as LinkTypeName,
+    row_number() over (partition by pl.PostId order by pl.CreationDate desc) as rn
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where pl.CreationDate >= now() - interval '3 years'
+),
+RecentHistory as (
+  select
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text
+  from PostHistory ph
+  where ph.CreationDate >= now() - interval '1 year'
+),
+-- final selection combining multiple sources, with window functions and correlated subqueries
+RankedQuestions as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    us.DisplayName as OwnerName,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    coalesce(ta.AnswerId, null) as TopAnswerId,
+    ta.AnswerScore,
+    ta.AdjustedScore as TopAnswerAdjusted,
+    va.TotalVotes,
+    va.UpVotes as VoteUp,
+    va.DownVotes as VoteDown,
+    cs.CommentCount,
+    cs.ThanksCount,
+    cs.BugMentions,
+    -- tag list concatenated and top tag by TagScores
+    (select string_agg(distinct te.TagName, ',' order by count(te.QuestionId) desc) from TagExplode te where te.QuestionId = q.Id) as TagsConcat,
+    (select ts.TagName from TagExplode te join TagScores ts on ts.TagName = te.TagName where te.QuestionId = q.Id order by ts.QuestionCount desc, ts.TotalQuestionScore desc limit 1) as TopTag,
+    -- duplicate/linked count
+    (select count(*) from DuplicateLinks dl where dl.PostId = q.Id and dl.LinkTypeName = 'Duplicate') as DuplicateCount,
+    (select count(*) from PostLinks pl2 where pl2.PostId = q.Id and pl2.CreationDate >= now() - interval '6 months') as RecentLinkCount,
+    -- recent edits and closure signals
+    (select count(*) from RecentHistory rh where rh.PostId = q.Id and rh.PostHistoryTypeId in (10,12,14,35) ) as CloseOrDeletionEvents,
+    (select max(rh.CreationDate) from RecentHistory rh where rh.PostId = q.Id) as LastHistoryDate,
+    -- combined score heuristic for ranking (non-linear)
+    ((coalesce(q.Score,0) * 1.5) + ln(coalesce(q.ViewCount,1)) * 0.7 + coalesce(va.UpVotes,0) * 0.9 - coalesce(va.DownVotes,0) * 1.1 + coalesce(ta.AdjustedScore,0) * 1.2 + ln(GREATEST(coalesce(cs.CommentCount,0),1)) * 0.5 + coalesce(q.FavoriteCount,0) * 0.8)::numeric(12,4) as CompositeScore,
+    row_number() over (partition by coalesce((select ts.TagName from TagExplode te join TagScores ts on ts.TagName = te.TagName where te.QuestionId = q.Id order by ts.QuestionCount desc limit 1), '<<none>>') order by ((coalesce(q.Score,0) * 1.5) + ln(coalesce(q.ViewCount,1)) * 0.7 + coalesce(va.UpVotes,0) * 0.9 - coalesce(va.DownVotes,0) * 1.1 + coalesce(ta.AdjustedScore,0) * 1.2 + ln(GREATEST(coalesce(cs.CommentCount,0),1)) * 0.5 + coalesce(q.FavoriteCount,0) * 0.8) desc) as TagPartitionRank
+  from Questions q
+  left join TopAnswers ta on ta.QuestionId = q.Id
+  left join VoteAgg va on va.PostId = q.Id
+  left join CommentSignals cs on cs.PostId = q.Id
+  left join UserStats us on us.Id = q.OwnerUserId
+)
+select
+  rq.QuestionId,
+  rq.Title,
+  rq.OwnerName,
+  rq.UserCreated,
+  rq.CreationDate as QuestionCreated,
+  rq.QuestionScore,
+  rq.ViewCount,
+  rq.AnswerCount,
+  rq.TopAnswerId,
+  rq.AnswerScore,
+  rq.TopAnswerAdjusted,
+  rq.TotalVotes,
+  rq.VoteUp,
+  rq.VoteDown,
+  rq.CommentCount,
+  rq.ThanksCount,
+  rq.BugMentions,
+  rq.TagsConcat,
+  rq.TopTag,
+  rq.DuplicateCount,
+  rq.RecentLinkCount,
+  rq.CloseOrDeletionEvents,
+  rq.LastHistoryDate,
+  rq.CompositeScore,
+  rq.TagPartitionRank,
+  -- rank across all questions
+  dense_rank() over (order by rq.CompositeScore desc) as GlobalRank,
+  -- percentile within tag partition
+  (100.0 * (1.0 - (rank() over (partition by rq.TopTag order by rq.CompositeScore desc)::numeric / greatest(count(*) over (partition by rq.TopTag),1))))::numeric(5,2) as PercentileInTopTag,
+  -- a complex text expression demonstrating string manipulation and null logic
+  case
+    when rq.CommentCount is null and rq.TotalVotes is null then 'No activity'
+    when rq.CommentCount is null then 'VotesOnly:' || coalesce(rq.TotalVotes::text,'0')
+    else
+      substring(coalesce(rq.Title,'<no title>') from 1 for 120) ||
+      ' [' || coalesce(rq.TopTag,'untagged') || ']' ||
+      ' ~Score:' || coalesce(rq.CompositeScore::text,'0') ||
+      ' /V:' || coalesce(rq.ViewCount::text,'0') ||
+      ' /C:' || coalesce(rq.CommentCount::text,'0')
+  end as HumanSummary
+from RankedQuestions rq
+where rq.CompositeScore is not null
+  and rq.CompositeScore > (
+    select percentile_cont(0.25) within group (order by CompositeScore) from RankedQuestions
+  )
+  and rq.TagPartitionRank <= 50
+order by rq.CompositeScore desc
+limit 200;

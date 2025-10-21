@@ -1,0 +1,75 @@
+-- {"query": "280.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8674} 
+WITH
+PostStats AS (
+  SELECT OwnerUserId,
+         COUNT(*) AS PostCount,
+         SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         AVG(CAST(ISNULL(Score,0) AS float)) AS AvgPostScore,
+         SUM(ISNULL(ViewCount,0)) AS TotalViews
+  FROM Posts
+  GROUP BY OwnerUserId
+),
+BadgeStats AS (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges
+  GROUP BY UserId
+),
+VoteImpact AS (
+  SELECT UserId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+         SUM(ISNULL(BountyAmount,0)) AS TotalBounty
+  FROM Votes
+  GROUP BY UserId
+),
+RecentActivity AS (
+  SELECT OwnerUserId,
+         MAX(LastActivityDate) AS LastActivityDate
+  FROM Posts
+  GROUP BY OwnerUserId
+),
+Combined AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    COALESCE(ra.LastActivityDate, u.CreationDate) AS LastActivityDate,
+    u.Reputation,
+    ISNULL(ps.PostCount, 0) AS PostCount,
+    ISNULL(ps.QuestionCount, 0) AS QuestionCount,
+    ISNULL(ps.AnswerCount, 0) AS AnswerCount,
+    ISNULL(ps.AvgPostScore, 0) AS AvgPostScore,
+    ISNULL(ps.TotalViews, 0) AS TotalViews,
+    ISNULL(bs.GoldBadges, 0) AS GoldBadges,
+    ISNULL(bs.SilverBadges, 0) AS SilverBadges,
+    ISNULL(bs.BronzeBadges, 0) AS BronzeBadges,
+    ISNULL(vt.UpVotesCast, 0) AS UpVotesCast,
+    ISNULL(vt.DownVotesCast, 0) AS DownVotesCast,
+    ISNULL(vt.TotalBounty, 0) AS TotalBounty,
+    (u.Reputation * 0.6
+     + ISNULL(ps.PostCount, 0) * 2.0
+     + ISNULL(bs.GoldBadges, 0) * 1.5
+     + ISNULL(vt.UpVotesCast, 0) * 0.4
+     - ISNULL(vt.DownVotesCast, 0) * 0.2
+     + CASE WHEN COALESCE(ra.LastActivityDate, u.CreationDate) >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp)) THEN 20 ELSE 0 END) AS ActivityScore
+  FROM Users u
+  LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+  LEFT JOIN BadgeStats bs ON bs.UserId = u.Id
+  LEFT JOIN VoteImpact vt ON vt.UserId = u.Id
+  LEFT JOIN RecentActivity ra ON ra.OwnerUserId = u.Id
+)
+, Benchmark AS (
+  SELECT * FROM Combined WHERE ActivityScore > 60
+  UNION ALL
+  SELECT * FROM Combined WHERE GoldBadges >= 5 AND ActivityScore <= 60
+)
+SELECT
+  Id, DisplayName, LastActivityDate, Reputation, PostCount, QuestionCount, AnswerCount, AvgPostScore, TotalViews,
+  GoldBadges, SilverBadges, BronzeBadges, UpVotesCast, DownVotesCast, TotalBounty, ActivityScore,
+  ROW_NUMBER() OVER (ORDER BY ActivityScore DESC, DisplayName) AS Rank
+FROM Benchmark
+ORDER BY ActivityScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

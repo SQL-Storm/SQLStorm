@@ -1,0 +1,119 @@
+WITH
+  parsed_tags AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title AS PostTitle,
+      p.Score AS PostScore,
+      p.CreationDate AS PostCreated,
+      p.ViewCount AS ViewCount,
+      regexp_split_to_array(replace(p.Tags, '<', ''), '><') AS TagsArray,
+      p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ),
+
+  tag_counts AS (
+    SELECT
+      tag AS TagName,
+      COUNT(*) AS QCount
+    FROM parsed_tags
+    CROSS JOIN LATERAL UNNEST(TagsArray) AS tag
+    GROUP BY tag
+  ),
+
+  user_vote_totals AS (
+    SELECT
+      v.UserId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.UserId
+  ),
+
+  user_scores AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(vt.UpVotes, 0) - COALESCE(vt.DownVotes, 0) AS NetVoteScore
+    FROM Users u
+    LEFT JOIN user_vote_totals vt ON vt.UserId = u.Id
+  ),
+
+  duplicate_flag AS (
+    SELECT
+      pl.PostId AS DuplicatePostId,
+      pl.RelatedPostId AS OriginalPostId,
+      ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+  ),
+
+  recent_posts AS (
+    SELECT
+      pt.PostId,
+      pt.PostTitle,
+      pt.PostScore,
+      pt.PostCreated,
+      pt.ViewCount,
+      pt.OwnerUserId,
+      CASE WHEN df.rn = 1 THEN 'Duplicate' ELSE 'Normal' END AS Status,
+      us.NetVoteScore,
+      pt.TagsArray
+    FROM parsed_tags pt
+    LEFT JOIN duplicate_flag df ON df.DuplicatePostId = pt.PostId
+    LEFT JOIN user_scores us ON us.UserId = pt.OwnerUserId
+    WHERE pt.PostCreated > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+  ),
+
+  ranked_posts AS (
+    SELECT
+      rp.*,
+      ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY PostScore DESC) AS Rank
+    FROM recent_posts rp
+  ),
+
+  status_totals AS (
+    SELECT 'Normal' AS Category, COUNT(*) AS Total FROM ranked_posts WHERE Status = 'Normal'
+    UNION ALL
+    SELECT 'Duplicate' AS Category, COUNT(*) AS Total FROM ranked_posts WHERE Status = 'Duplicate'
+  ),
+
+  final_view AS (
+    SELECT
+      u.UserId,
+      u.DisplayName,
+      u.Reputation,
+      rp.PostTitle,
+      rp.PostScore,
+      rp.NetVoteScore,
+      rp.ViewCount,
+      rp.Status,
+      rp.Rank,
+      tc.TagName,
+      tc.QCount
+    FROM Users u
+    LEFT JOIN ranked_posts rp ON rp.OwnerUserId = u.UserId
+    LEFT JOIN tag_counts tc ON tc.TagName = ANY(rp.TagsArray)
+    WHERE rp.PostScore IS NOT NULL
+    ORDER BY u.Reputation DESC, rp.PostScore DESC
+    LIMIT 1000
+  )
+
+SELECT
+  fv.UserId,
+  fv.DisplayName,
+  fv.Reputation,
+  fv.PostTitle,
+  fv.PostScore,
+  fv.NetVoteScore,
+  fv.ViewCount,
+  fv.Status,
+  fv.Rank,
+  fv.TagName,
+  fv.QCount,
+  st.Category,
+  st.Total
+FROM final_view fv
+LEFT JOIN status_totals st ON st.Category = fv.Status
+ORDER BY fv.Reputation DESC, fv.PostScore DESC;

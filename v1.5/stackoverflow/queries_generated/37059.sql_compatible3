@@ -1,0 +1,192 @@
+WITH
+Questions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[]
+         ELSE string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><') END AS TagArray,
+    p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/86400 AS DaysSinceSignup,
+    u.Views AS ProfileViews,
+    u.UpVotes,
+    u.DownVotes,
+    COALESCE(b.BadgeCounts, h.BadgeCounts) AS BadgeCounts
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, jsonb_build_object('gold', COALESCE(SUM((CASE WHEN Class = 1 THEN 1 ELSE 0 END)::int),0), 'silver', COALESCE(SUM((CASE WHEN Class = 2 THEN 1 ELSE 0 END)::int),0), 'bronze', COALESCE(SUM((CASE WHEN Class = 3 THEN 1 ELSE 0 END)::int),0)) AS BadgeCounts
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT Id AS UserId, jsonb_build_object('gold',0,'silver',0,'bronze',0) AS BadgeCounts FROM Users LIMIT 0
+  ) h ON h.UserId = u.Id
+),
+PostEngagement AS (
+  SELECT
+    p.Id AS PostId,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END),0) AS Favorites,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END),0) AS AcceptedCount,
+    MAX(v.CreationDate) AS LastVoteDate,
+    COUNT(c.Id) FILTER (WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') AS RecentComments90d,
+    COUNT(c.Id) AS TotalComments
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+LinkCounts AS (
+  SELECT
+    p.Id AS PostId,
+    COALESCE(SUM(CASE WHEN l.LinkTypeId = 3 AND l.PostId = p.Id THEN 1 ELSE 0 END),0) AS DuplicateOutCount,
+    COALESCE(SUM(CASE WHEN l.LinkTypeId = 3 AND l.RelatedPostId = p.Id THEN 1 ELSE 0 END),0) AS DuplicateInCount,
+    COALESCE(SUM(CASE WHEN l.LinkTypeId = 1 AND l.PostId = p.Id THEN 1 ELSE 0 END),0) AS OutboundLinks,
+    COALESCE(SUM(CASE WHEN l.LinkTypeId = 1 AND l.RelatedPostId = p.Id THEN 1 ELSE 0 END),0) AS InboundLinks
+  FROM Posts p
+  LEFT JOIN PostLinks l ON (l.PostId = p.Id OR l.RelatedPostId = p.Id)
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+TagExplode AS (
+  SELECT q.Id AS PostId, unnest(q.TagArray) AS Tag
+  FROM Questions q
+),
+TopTags AS (
+  SELECT Tag, COUNT(*) AS TagCount
+  FROM TagExplode
+  GROUP BY Tag
+  ORDER BY TagCount DESC
+  LIMIT 100
+),
+TagCooccur AS (
+  SELECT t1.Tag AS TagA, t2.Tag AS TagB, COUNT(*) AS CoCount
+  FROM (
+    SELECT PostId, array_agg(Tag) AS Tags
+    FROM TagExplode
+    WHERE Tag IN (SELECT Tag FROM TopTags)
+    GROUP BY PostId
+  ) te, unnest(Tags) WITH ORDINALITY AS a(Tag, i), unnest(Tags) WITH ORDINALITY AS b(Tag, j)
+  JOIN TopTags tt1 ON tt1.Tag = a.Tag
+  JOIN TopTags tt2 ON tt2.Tag = b.Tag
+  WHERE a.i < b.i
+  GROUP BY t1.Tag, t2.Tag
+  , LATERAL (SELECT a.Tag) t1(Tag)
+  , LATERAL (SELECT b.Tag) t2(Tag)
+),
+QuestionScores AS (
+  SELECT
+    q.*,
+    pe.UpVotes, pe.DownVotes, pe.Favorites, pe.AcceptedCount, pe.RecentComments90d, pe.TotalComments,
+    lc.DuplicateInCount, lc.DuplicateOutCount, lc.InboundLinks, lc.OutboundLinks,
+    us.Reputation AS OwnerReputation,
+    us.DaysSinceSignup,
+    GREATEST(0.0,
+      (COALESCE(pe.UpVotes,0) * 2.0)
+      + (COALESCE(pe.Favorites,0) * 1.5)
+      + (COALESCE(pe.RecentComments90d,0) * 0.8)
+      + (LOG(GREATEST(1,q.ViewCount)) * 1.2)
+      + (COALESCE(q.AnswerCount,0) * 1.1)
+      - (COALESCE(pe.DownVotes,0) * 1.0)
+      + (COALESCE(lc.InboundLinks,0) * 0.5)
+      - (COALESCE(lc.DuplicateOutCount,0) * 0.7)
+      + (LEAST(1.0, GREATEST(0.0, us.Reputation/10000.0)) * 1.0)
+    ) AS RawScore
+  FROM Questions q
+  LEFT JOIN PostEngagement pe ON pe.PostId = q.Id
+  LEFT JOIN LinkCounts lc ON lc.PostId = q.Id
+  LEFT JOIN UserStats us ON us.UserId = q.OwnerUserId
+),
+RankedQuestions AS (
+  SELECT
+    qs.*,
+    ROW_NUMBER() OVER (ORDER BY qs.RawScore DESC NULLS LAST) AS RankByScore,
+    RANK() OVER (PARTITION BY (qs.AnswerCount > 0)::int ORDER BY qs.RawScore DESC) AS RankByAnsweredGroup,
+    PERCENT_RANK() OVER (ORDER BY qs.RawScore) AS PercentRank,
+    NTILE(10) OVER (ORDER BY qs.RawScore DESC) AS Decile
+  FROM QuestionScores qs
+)
+SELECT
+  r.RankByScore,
+  r.Id AS QuestionId,
+  r.Title,
+  r.CreationDate,
+  r.LastActivityDate,
+  r.ViewCount,
+  r.Score,
+  r.AnswerCount,
+  r.FavoriteCount,
+  r.TagArray,
+  r.RawScore,
+  r.Decile,
+  r.PercentRank,
+  r.OwnerUserId,
+  us.Reputation AS OwnerReputation,
+  COALESCE(bc.BadgeCounts, jsonb_build_object('gold',0,'silver',0,'bronze',0)) AS OwnerBadges,
+  pe.UpVotes, pe.DownVotes, pe.Favorites AS VoteFavorites,
+  pe.RecentComments90d,
+  lc.InboundLinks, lc.OutboundLinks, lc.DuplicateInCount, lc.DuplicateOutCount,
+  (
+    SELECT jsonb_agg(jsonb_build_object('AnswerId', a.Id, 'Score', a.Score, 'CreationDate', a.CreationDate, 'OwnerId', a.OwnerUserId) ORDER BY a.Score DESC NULLS LAST)
+    FROM Posts a
+    WHERE a.ParentId = r.Id AND a.PostTypeId = 2
+    LIMIT 3
+  ) AS TopAnswers,
+  (
+    SELECT jsonb_agg(jsonb_build_object(month_label, cnt) ORDER BY month_label)
+    FROM (
+      SELECT to_char(dt, 'YYYY-MM') AS month_label, COUNT(*) AS cnt
+      FROM generate_series(date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '11 months', date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)), interval '1 month') dt
+      LEFT JOIN Posts p2 ON p2.PostTypeId = 1 AND date_trunc('month', COALESCE(p2.LastActivityDate, p2.CreationDate)) = dt AND p2.Id = r.Id
+      GROUP BY dt
+      ORDER BY dt
+    ) t
+  ) AS ActivityByMonth,
+  (
+    SELECT jsonb_agg(jsonb_build_object('Tag', tc.TagB, 'CoCount', tc.CoCount) ORDER BY tc.CoCount DESC) FROM TagCooccur tc WHERE tc.TagA = ANY(r.TagArray) LIMIT 5
+  ) AS TopTagNeighbors,
+  (
+    SELECT
+      SUM(
+        CASE
+          WHEN v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' THEN 3.0
+          WHEN v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' THEN 1.5
+          ELSE 0.5
+        END * CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END
+      )
+    FROM Votes v
+    WHERE v.PostId = r.Id
+  ) AS RecentHotnessScore,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY qs.RawScore) OVER (PARTITION BY r.Decile) AS MedianRawScoreInDecile,
+  (
+    SELECT PERCENT_RANK() OVER (ORDER BY Reputation) FROM Users u2 WHERE u2.Id = r.OwnerUserId
+  ) AS OwnerReputationPercentile
+FROM RankedQuestions r
+LEFT JOIN PostEngagement pe ON pe.PostId = r.Id
+LEFT JOIN LinkCounts lc ON lc.PostId = r.Id
+LEFT JOIN Users us ON us.Id = r.OwnerUserId
+LEFT JOIN (
+  SELECT UserId, jsonb_build_object('gold', COALESCE(SUM((CASE WHEN Class = 1 THEN 1 ELSE 0 END)::int),0), 'silver', COALESCE(SUM((CASE WHEN Class = 2 THEN 1 ELSE 0 END)::int),0), 'bronze', COALESCE(SUM((CASE WHEN Class = 3 THEN 1 ELSE 0 END)::int),0)) AS BadgeCounts
+  FROM Badges
+  GROUP BY UserId
+) bc ON bc.UserId = us.Id
+WHERE r.RankByScore <= 1000
+ORDER BY r.RawScore DESC, r.LastActivityDate DESC
+LIMIT 1000;

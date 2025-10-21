@@ -1,0 +1,134 @@
+-- {"query": "49006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1976} 
+
+WITH PopularTags AS (
+    -- Identify popular tags based on their total post count, significantly above average
+    SELECT
+        TagName
+    FROM Tags
+    WHERE Count > (SELECT AVG(Count) * 5 FROM Tags)
+),
+UserBadgeCounts AS (
+    -- Calculate detailed badge counts for each user, including Gold, Silver, Bronze, and total
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(Id) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+HighlyEngagingQuestions AS (
+    -- Filter for questions that are highly viewed, well-scored, and belong to popular tags.
+    -- Also aggregates initial comment count and total score of all answers for each question.
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.Tags,
+        COUNT(DISTINCT C.Id) AS QuestionCommentCount,
+        SUM(CASE WHEN A.Id IS NOT NULL THEN A.Score ELSE 0 END) AS TotalAnswerScore
+    FROM Posts AS P
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN Posts AS A ON P.Id = A.ParentId AND A.PostTypeId = 2 -- Join to get all answers for the question
+    WHERE P.PostTypeId = 1 -- Only questions
+      AND P.ViewCount > 50000 -- Significant view count threshold
+      AND P.Score > 100 -- High score threshold
+      AND P.CreationDate >= '2021-01-01' -- Filter for relatively recent questions
+      AND EXISTS ( -- Ensure the question contains at least one popular tag
+          SELECT 1
+          FROM PopularTags AS PT
+          WHERE string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><') && ARRAY[PT.TagName]
+      )
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.Tags
+),
+UserQuestionContributions AS (
+    -- Aggregate statistics for users based on their ownership of HighlyEngagingQuestions
+    SELECT
+        HEQ.OwnerUserId AS UserId,
+        COUNT(HEQ.QuestionId) AS NumberOfHighlyEngagingQuestions,
+        SUM(HEQ.QuestionScore) AS SumOfQuestionScores,
+        AVG(HEQ.ViewCount) AS AvgQuestionViewCount,
+        AVG(HEQ.AnswerCount) AS AvgQuestionAnswerCount,
+        SUM(HEQ.QuestionCommentCount) AS SumQuestionCommentCount,
+        SUM(HEQ.TotalAnswerScore) AS SumOfAllAnswerScoresToTheirQuestions
+    FROM HighlyEngagingQuestions AS HEQ
+    GROUP BY HEQ.OwnerUserId
+),
+UserAnswerContributions AS (
+    -- Aggregate statistics for users based on their answers to HighlyEngagingQuestions
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(A.Id) AS NumberOfAnswersToHighlyEngagingQuestions,
+        AVG(A.Score) AS AvgAnswerScoreToHighlyEngagingQuestions,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreOnAnswersGiven -- Sum of scores of comments made on this user's answers
+    FROM Posts AS A
+    LEFT JOIN Comments AS C ON A.Id = C.PostId
+    WHERE A.PostTypeId = 2 -- Only answers
+      AND A.ParentId IN (SELECT QuestionId FROM HighlyEngagingQuestions) -- Answers to highly engaging questions
+    GROUP BY A.OwnerUserId
+),
+QuestionReopenActivity AS (
+    -- Identify questions that have been closed and then reopened, indicating community moderation engagement
+    SELECT
+        PH.PostId AS QuestionId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS ClosedCount, -- Post Closed
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenedCount -- Post Reopened
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (10, 11) -- Specific history types for closed/reopened
+      AND PH.PostId IN (SELECT QuestionId FROM HighlyEngagingQuestions) -- Only for highly engaging questions
+    GROUP BY PH.PostId
+    HAVING COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) > 0 -- Ensure it was actually reopened
+)
+-- Final selection and ranking of users based on a composite score of their contributions
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.UpVotes,
+    U.DownVotes,
+    COALESCE(UBC.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBC.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBC.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(UBC.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UQC.NumberOfHighlyEngagingQuestions, 0) AS QuestionsAskedInPopularTags,
+    COALESCE(UQC.SumOfQuestionScores, 0) AS TotalQuestionScoreOfOwnQuestions,
+    COALESCE(UQC.AvgQuestionViewCount, 0) AS AverageViewCountOfOwnQuestions,
+    COALESCE(UQC.SumQuestionCommentCount, 0) AS TotalCommentsOnOwnQuestions,
+    COALESCE(UQC.SumOfAllAnswerScoresToTheirQuestions, 0) AS TotalAnswerScoreReceivedOnOwnQuestions,
+    COALESCE(UAC.NumberOfAnswersToHighlyEngagingQuestions, 0) AS AnswersToPopularQuestions,
+    COALESCE(UAC.AvgAnswerScoreToHighlyEngagingQuestions, 0) AS AvgAnswerScoreToPopularQuestions,
+    COALESCE(UAC.TotalCommentScoreOnAnswersGiven, 0) AS TotalCommentScoreOnOwnAnswers,
+    COALESCE(SUM(QRA.ReopenedCount), 0) AS TotalQuestionsReopenedOwnedByUser,
+    RANK() OVER ( -- Rank users based on a weighted combination of their reputation and content quality
+        ORDER BY
+            U.Reputation DESC,
+            COALESCE(UBC.GoldBadges, 0) DESC,
+            COALESCE(UQC.NumberOfHighlyEngagingQuestions, 0) DESC,
+            (COALESCE(UAC.AvgAnswerScoreToHighlyEngagingQuestions, 0) * COALESCE(UAC.NumberOfAnswersToHighlyEngagingQuestions, 0)) DESC, -- Weighted answer score
+            U.LastAccessDate DESC,
+            U.UpVotes DESC
+    ) AS UserRank
+FROM Users AS U
+LEFT JOIN UserBadgeCounts AS UBC ON U.Id = UBC.UserId
+LEFT JOIN UserQuestionContributions AS UQC ON U.Id = UQC.UserId
+LEFT JOIN UserAnswerContributions AS UAC ON U.Id = UAC.UserId
+LEFT JOIN HighlyEngagingQuestions AS HEQ_USER_OWNED ON U.Id = HEQ_USER_OWNED.OwnerUserId -- Link users to their highly engaging questions
+LEFT JOIN QuestionReopenActivity AS QRA ON HEQ_USER_OWNED.QuestionId = QRA.QuestionId -- Link those questions to their reopen activity
+WHERE U.Reputation > 10000 -- Filter for highly reputed users
+  AND U.LastAccessDate >= '2023-01-01' -- Ensure recent activity
+  AND (UQC.NumberOfHighlyEngagingQuestions > 0 OR UAC.NumberOfAnswersToHighlyEngagingQuestions > 0) -- Must have contributed to highly engaging content
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes,
+    UBC.GoldBadges, UBC.SilverBadges, UBC.BronzeBadges, UBC.TotalBadges,
+    UQC.NumberOfHighlyEngagingQuestions, UQC.SumOfQuestionScores, UQC.AvgQuestionViewCount,
+    UQC.SumQuestionCommentCount, UQC.SumOfAllAnswerScoresToTheirQuestions,
+    UAC.NumberOfAnswersToHighlyEngagingQuestions, UAC.AvgAnswerScoreToHighlyEngagingQuestions,
+    UAC.TotalCommentScoreOnAnswersGiven
+ORDER BY UserRank
+LIMIT 200;

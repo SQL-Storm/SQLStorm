@@ -1,0 +1,111 @@
+-- {"query": "3067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1001} 
+WITH UserBM AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate,
+        string_agg(b.Name, ', ' ORDER BY b.Date DESC) AS BadgeNames
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+), PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        a.OwnerUserId AS AcceptedAnswerOwner,
+        c.UserId AS CommenterUserId,
+        c.Score AS CommentScore,
+        v.VoteTypeId,
+        v.UserId AS VoterUserId,
+        ht.Name AS PostHistoryType,
+        ph.CreationDate AS HistoryDate
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostHistoryTypes ht ON ph.PostHistoryTypeId = ht.Id
+), LinkCounts AS (
+    SELECT
+        l.PostId,
+        COUNT(l.RelatedPostId) FILTER (WHERE l.LinkTypeId = 1) AS LinkedCount,
+        COUNT(l.RelatedPostId) FILTER (WHERE l.LinkTypeId = 3) AS DuplicateCount
+    FROM PostLinks l
+    GROUP BY l.PostId
+), TagAnalysis AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagFrequency,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueOwners,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS MostRecentQuestion
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+), ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.BadgeNames,
+        ub.BadgeCount,
+        ub.LastBadgeDate
+    FROM Users u
+    LEFT JOIN UserBM ub ON u.Id = ub.UserId
+    WHERE u.LastAccessDate > (CURRENT_TIMESTAMP - INTERVAL '180 days')
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.CreationDate,
+    au.LastAccessDate,
+    au.Views,
+    au.UpVotes,
+    au.DownVotes,
+    CASE WHEN SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10 THEN TRUE ELSE FALSE END AS HighlyUpvotedPosts,
+    CASE WHEN COUNT(DISTINCT p.PostTypeId) > 2 THEN TRUE ELSE FALSE END AS DiversePostTypes,
+    COUNT(DISTINCT p.PostId) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT p.PostId) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    COALESCE(SUM(l.LinkedCount), 0) AS TotalLinkedPosts,
+    COALESCE(SUM(l.DuplicateCount), 0) AS TotalDuplicates,
+    ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE p.PostTypeId = 1) AS QuestionTags,
+    MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1) AS LastQuestionDate,
+    MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 2) AS LastAnswerDate,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS AllTags
+FROM ActiveUsers au
+LEFT JOIN Posts p ON p.OwnerUserId = au.UserId
+LEFT JOIN PostLinks l ON l.PostId = p.Id
+LEFT JOIN Tags t ON t.Id = t.Id -- Dummy join for aggregation
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN TagAnalysis ta ON true
+GROUP BY
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.CreationDate,
+    au.LastAccessDate,
+    au.Views,
+    au.UpVotes,
+    au.DownVotes,
+    ub.BadgeNames,
+    ub.BadgeCount,
+    ub.LastBadgeDate
+HAVING
+    COUNT(p.Id) > 5
+ORDER BY
+au.Reputation DESC, au.LastAccessDate DESC
+LIMIT 100;

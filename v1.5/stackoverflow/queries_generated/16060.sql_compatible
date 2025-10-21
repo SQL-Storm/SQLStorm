@@ -1,0 +1,129 @@
+WITH RECURSIVE user_reputation_tiers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS rep_decile,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Elite'
+            WHEN Reputation >= 25000 THEN 'Expert'
+            WHEN Reputation >= 5000 THEN 'Advanced'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS tier,
+        LAG(Reputation, 1, 0) OVER (PARTITION BY EXTRACT(YEAR FROM CreationDate) ORDER BY Reputation) AS prev_rep_in_year
+    FROM Users
+    WHERE Reputation > 0 AND DisplayName IS NOT NULL
+),
+post_metrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) AS comment_count,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0 AS active_hours,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS has_accepted_answer,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) OVER (PARTITION BY p.Id) AS upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) OVER (PARTITION BY p.Id) AS downvotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC NULLS LAST) AS user_post_rank
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId IN (1, 2) 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+tag_popularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS popularity_percentile,
+        STRING_AGG(DISTINCT SUBSTRING(p.Title, 1, 50), ' | ') OVER (PARTITION BY t.TagName) AS sample_titles
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE t.Count > 100 AND p.PostTypeId = 1
+),
+complex_engagement AS (
+    SELECT 
+        urt.Id AS user_id,
+        urt.DisplayName,
+        urt.tier,
+        urt.rep_decile,
+        COALESCE(AVG(pm.Score) FILTER (WHERE pm.PostTypeId = 1), 0) AS avg_question_score,
+        COALESCE(AVG(pm.Score) FILTER (WHERE pm.PostTypeId = 2), 0) AS avg_answer_score,
+        COUNT(DISTINCT pm.Id) AS total_posts,
+        COUNT(DISTINCT b.Id) AS total_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COALESCE(SUM(pm.ViewCount), 0) AS total_views,
+        COALESCE(MAX(pm.active_hours), 0) AS max_thread_active_hours,
+        CASE 
+            WHEN COUNT(DISTINCT pm.Id) FILTER (WHERE pm.has_accepted_answer = 1) > 0 
+            THEN CAST(COUNT(DISTINCT pm.Id) FILTER (WHERE pm.has_accepted_answer = 1) AS FLOAT) / NULLIF(COUNT(DISTINCT pm.Id) FILTER (WHERE pm.PostTypeId = 1), 0)
+            ELSE 0 
+        END AS acceptance_rate,
+        STRING_AGG(DISTINCT COALESCE(tp.TagName, 'unknown'), ', ' ORDER BY COALESCE(tp.TagName, 'unknown')) AS engaged_tags
+    FROM user_reputation_tiers urt
+    LEFT JOIN post_metrics pm ON urt.Id = pm.OwnerUserId AND pm.user_post_rank <= 100
+    LEFT JOIN Badges b ON urt.Id = b.UserId
+    LEFT JOIN Posts p ON pm.Id = p.Id
+    LEFT JOIN tag_popularity tp ON POSITION('<' || tp.TagName || '>' IN COALESCE(p.Tags, '')) > 0 AND tp.popularity_percentile > 0.75
+    GROUP BY urt.Id, urt.DisplayName, urt.tier, urt.rep_decile
+    HAVING COUNT(DISTINCT pm.Id) >= 5
+)
+SELECT 
+    ce.user_id,
+    ce.DisplayName,
+    ce.tier,
+    ce.rep_decile,
+    ROUND(ce.avg_question_score, 2) AS avg_q_score,
+    ROUND(ce.avg_answer_score, 2) AS avg_a_score,
+    ce.total_posts,
+    ce.total_badges,
+    ce.gold_badges,
+    ce.total_views,
+    ROUND(ce.acceptance_rate, 3) AS accept_rate,
+    ce.engaged_tags,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = ce.user_id 
+       AND c.Score > 5 
+       AND LENGTH(c.Text) > 100) AS high_quality_comments,
+    (SELECT COUNT(DISTINCT ph.PostId)
+     FROM PostHistory ph
+     WHERE ph.UserId = ce.user_id 
+       AND ph.PostHistoryTypeId IN (4, 5, 6)
+       AND ph.CreationDate >= TIMESTAMP '2021-01-01') AS recent_edits,
+    CASE 
+        WHEN ce.avg_answer_score > ce.avg_question_score AND ce.avg_answer_score > 10 THEN 'Answer Specialist'
+        WHEN ce.avg_question_score > ce.avg_answer_score AND ce.avg_question_score > 15 THEN 'Question Master'
+        WHEN ce.gold_badges >= 5 THEN 'Badge Collector'
+        WHEN ce.acceptance_rate > 0.7 THEN 'Solution Provider'
+        ELSE 'Balanced Contributor'
+    END AS contributor_type,
+    DENSE_RANK() OVER (PARTITION BY ce.tier ORDER BY (ce.avg_question_score + ce.avg_answer_score * 1.5 + ce.gold_badges * 100) DESC) AS tier_rank
+FROM complex_engagement ce
+WHERE ce.total_views > 1000 
+    AND (ce.avg_question_score > 2 OR ce.avg_answer_score > 5)
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = ce.user_id 
+          AND p2.Score >= 10 
+          AND p2.CreationDate >= TIMESTAMP '2019-01-01'
+    )
+ORDER BY 
+    CASE ce.tier
+        WHEN 'Elite' THEN 1
+        WHEN 'Expert' THEN 2
+        WHEN 'Advanced' THEN 3
+        WHEN 'Intermediate' THEN 4
+        ELSE 5
+    END,
+    (ce.avg_answer_score * 2 + ce.avg_question_score + ce.gold_badges * 50) DESC NULLS LAST,
+    ce.total_posts DESC
+LIMIT 500;

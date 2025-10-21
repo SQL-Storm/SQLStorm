@@ -1,0 +1,136 @@
+-- {"query": "20087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1528} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.UserId = u.Id) AS LastContributionDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year' AND u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.ParentId = p.Id) AS FirstAnswerDate,
+        (SELECT COUNT(DISTINCT pl.Id) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS TimesCitedAsDuplicate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 -- Questions only
+        AND p.DeletionDate IS NULL
+        AND p.AnswerCount > 0
+),
+RankedUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.GoldBadges,
+        ua.LastContributionDate,
+        (ua.Reputation * 0.4 + ua.TotalScore * 0.2 + ua.TotalQuestionViews * 0.1 + ua.AnswersGiven * 10 + ua.GoldBadges * 100) AS EngagementScore,
+        DENSE_RANK() OVER (ORDER BY (ua.Reputation * 0.4 + ua.TotalScore * 0.2 + ua.TotalQuestionViews * 0.1 + ua.AnswersGiven * 10 + ua.GoldBadges * 100) DESC) AS UserRank
+    FROM
+        UserActivity ua
+    WHERE
+        ua.TotalQuestionViews > 10000 AND ua.QuestionsAsked > 10
+),
+FinalAnalysis AS (
+    SELECT
+        ru.UserRank,
+        ru.UserId,
+        COALESCE(ru.DisplayName, 'Deleted User') AS UserDisplayName,
+        ru.Reputation,
+        ru.EngagementScore,
+        pd.PostId,
+        pd.Title,
+        pd.Score AS QuestionScore,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.TimesCitedAsDuplicate,
+        pd.CreationDate AS QuestionCreationDate,
+        EXTRACT(EPOCH FROM (pd.FirstAnswerDate - pd.CreationDate)) / 60 AS MinsToFirstAnswer,
+        CASE
+            WHEN pd.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            WHEN pd.Score > 10 AND pd.AnswerCount > 2 THEN 'Likely'
+            ELSE 'No'
+        END AS HasGoodAnswer,
+        UPPER(SUBSTRING(pd.Tags FROM 2 FOR POSITION('>' IN pd.Tags) - 2)) AS PrimaryTag,
+        LENGTH(pd.Body) AS BodyLength,
+        ROW_NUMBER() OVER (PARTITION BY ru.UserId ORDER BY pd.Score DESC, pd.ViewCount DESC) AS PostRankInUserPortfolio
+    FROM
+        RankedUsers ru
+    JOIN
+        PostDetails pd ON ru.UserId = pd.OwnerUserId
+    WHERE
+        ru.UserRank <= 50
+
+    UNION ALL
+
+    SELECT
+        999 AS UserRank,
+        b_user.UserId,
+        COALESCE(b_user.DisplayName, 'Deleted User') AS UserDisplayName,
+        b_user.Reputation,
+        0 AS EngagementScore,
+        pd.PostId,
+        pd.Title,
+        pd.Score AS QuestionScore,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.TimesCitedAsDuplicate,
+        pd.CreationDate AS QuestionCreationDate,
+        EXTRACT(EPOCH FROM (pd.FirstAnswerDate - pd.CreationDate)) / 60 AS MinsToFirstAnswer,
+        CASE
+            WHEN pd.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            WHEN pd.Score > 10 AND pd.AnswerCount > 2 THEN 'Likely'
+            ELSE 'No'
+        END AS HasGoodAnswer,
+        UPPER(SUBSTRING(pd.Tags FROM 2 FOR POSITION('>' IN pd.Tags) - 2)) AS PrimaryTag,
+        LENGTH(pd.Body) AS BodyLength,
+        ROW_NUMBER() OVER (PARTITION BY b_user.UserId ORDER BY pd.FavoriteCount DESC, pd.Score DESC) AS PostRankInUserPortfolio
+    FROM
+        (SELECT u.Id as UserId, u.DisplayName, u.Reputation FROM Users u JOIN Badges b ON u.Id = b.UserId WHERE b.Name = 'Fanatic' AND b.Class = 1) b_user
+    JOIN
+        PostDetails pd ON b_user.UserId = pd.OwnerUserId
+    WHERE b_user.UserId NOT IN (SELECT UserId FROM RankedUsers WHERE UserRank <= 50)
+)
+SELECT
+    *
+FROM
+    FinalAnalysis
+WHERE
+    PostRankInUserPortfolio <= 3 AND
+    (MinsToFirstAnswer < 60 OR MinsToFirstAnswer IS NULL) AND
+    (BodyLength > 500 OR PrimaryTag LIKE 'SQL%')
+ORDER BY
+    UserRank,
+    UserDisplayName,
+    PostRankInUserPortfolio;

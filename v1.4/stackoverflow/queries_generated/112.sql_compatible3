@@ -1,0 +1,139 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_by_owner
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.LastActivityDate IS NOT NULL
+      AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '60' DAY)
+),
+OwnerStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+        (SELECT STRING_AGG(bt.Name, ', ' ORDER BY bt.Name)
+         FROM Badges b2
+         JOIN (VALUES (1,'Gold'),(2,'Silver'),(3,'Bronze')) AS bt(Class,Name) ON b2.Class = bt.Class
+         WHERE b2.UserId = u.Id
+        ) AS BadgeSummary
+    FROM Users u
+),
+TopLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS LinkCount,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+VoteActivity AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+),
+Combined AS (
+    SELECT
+        rq.Id,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.Score,
+        rq.ViewCount,
+        rq.CreationDate,
+        rq.LastActivityDate,
+        rq.Tags,
+        os.DisplayName AS OwnerDisplayName,
+        os.Reputation,
+        oa.BadgeCount,
+        oa.BadgeSummary,
+        tl.LinkCount,
+        va.UpVotes,
+        va.DownVotes,
+        va.LastVoteDate
+    FROM RecentQuestions rq
+    LEFT JOIN Users os ON rq.OwnerUserId = os.Id
+    LEFT JOIN OwnerStats oa ON rq.OwnerUserId = oa.UserId
+    LEFT JOIN TopLinks tl ON rq.Id = tl.PostId
+    LEFT JOIN VoteActivity va ON rq.Id = va.PostId
+),
+RecentModeratorNoms AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        0 AS Placeholder
+    FROM Posts p
+    WHERE p.PostTypeId = 6 -- ModeratorNomination
+      AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '14' DAY)
+),
+UnionSet AS (
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        Score,
+        ViewCount,
+        CreationDate,
+        LastActivityDate,
+        'Question' AS PostKind,
+        NULL AS Extra
+    FROM Combined
+    UNION ALL
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        Score,
+        ViewCount,
+        CreationDate,
+        LastActivityDate,
+        'Nomination' AS PostKind,
+        NULL AS Extra
+    FROM RecentModeratorNoms
+)
+SELECT
+    u.Id,
+    u.Title,
+    u.PostKind,
+    u.OwnerUserId,
+    (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = u.OwnerUserId) AS OwnerDisplayName,
+    u.Score,
+    u.ViewCount,
+    u.CreationDate,
+    u.LastActivityDate,
+    (SELECT t1.Name
+     FROM Tags t1
+     WHERE t1.ExcerptPostId = u.Id OR t1.WikiPostId = u.Id
+     ORDER BY t1.Name
+     FETCH FIRST 1 ROW ONLY) AS PrimaryTag,
+    (SELECT SUM(CommentCount) FROM (SELECT c.Id AS cId FROM Comments c WHERE c.PostId = u.Id) AS c) AS CommentCount,
+    COALESCE(u.UpVotes, 0) AS UpVotes,
+    COALESCE(u.DownVotes, 0) AS DownVotes,
+    COALESCE(u.LastVoteDate, u.CreationDate) AS LastVoteOrCreationDate,
+    COALESCE(u.LinkCount, 0) AS LinkCount,
+    u.BadgeCount,
+    u.BadgeSummary
+FROM UnionSet u
+LEFT JOIN VoteActivity va ON u.Id = va.PostId
+LEFT JOIN TopLinks tl ON u.Id = tl.PostId
+LEFT JOIN (SELECT UserId, MAX(LastAccessDate) AS LastAccessDate FROM Users GROUP BY UserId) ua ON ua.UserId = u.OwnerUserId
+ORDER BY u.Score DESC, u.ViewCount DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

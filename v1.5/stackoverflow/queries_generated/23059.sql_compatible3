@@ -1,0 +1,90 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(b.Id) > 5
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        p.OwnerUserId,
+        /* Normalize tags to a delimited array without using vendor-specific syntax */
+        /* Assuming Tags is in the form '<tag1><tag2>...' */
+        (CASE 
+            WHEN p.Tags IS NULL THEN CAST('' AS VARCHAR(1000))
+            ELSE
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(p.Tags, '^<|>$', ''),  -- remove leading/trailing angle brackets if any
+                    '><', ','
+                )
+        END) AS TagArrayRaw,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS QuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 10000
+),
+CorrelatedAnswers AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId,
+        p.Score,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+ComplexJoin AS (
+    SELECT 
+        tq.PostId,
+        tq.Title,
+        tq.ViewCount,
+        tq.OwnerUserId,
+        ubs.DisplayName,
+        ubs.BadgeCount,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        COALESCE(ubs.LatestBadgeDate, CAST(tq.OwnerUserId AS TIMESTAMP)) AS EffectiveBadgeDate,
+        -- Convert the tag string into a comma-delimited list for portability
+        CASE 
+            WHEN tq.TagArrayRaw IS NULL OR tq.TagArrayRaw = '' THEN CAST(NULL AS VARCHAR(1000))
+            ELSE CONCAT_WS(',', STRING_SPLIT(tq.TagArrayRaw, ','))
+        END AS TagArray,
+        ca.AnswerId,
+        ca.Score AS AnswerScore,
+        ca.PositiveComments,
+        RANK() OVER (ORDER BY tq.ViewCount DESC NULLS LAST) AS GlobalRank,
+        CONCAT(ubs.DisplayName, ' - ', tq.Title) AS UserPostString
+    FROM TopQuestions tq
+    INNER JOIN UserBadgeStats ubs ON tq.OwnerUserId = ubs.UserId
+    LEFT OUTER JOIN CorrelatedAnswers ca ON tq.PostId = ca.ParentId
+    WHERE (CASE WHEN tq.TagArrayRaw IS NULL THEN 0 ELSE ARRAY_POSITION(string_to_array(tq.TagArrayRaw, ','), 'sql') END) IS NOT NULL
+      AND (ubs.GoldBadges > 0 OR ubs.SilverBadges > 3)
+      AND tq.QuestionRank = 1
+)
+SELECT * FROM ComplexJoin
+UNION ALL
+SELECT 
+    NULL AS PostId,
+    'Summary' AS Title,
+    SUM(ViewCount) AS ViewCount,
+    NULL AS OwnerUserId,
+    'Total' AS DisplayName,
+    SUM(BadgeCount) AS BadgeCount,
+    SUM(GoldBadges) AS GoldBadges,
+    SUM(SilverBadges) AS SilverBadges,
+    MAX(EffectiveBadgeDate) AS EffectiveBadgeDate,
+    NULL AS TagArray,
+    NULL AS AnswerId,
+    SUM(AnswerScore) AS AnswerScore,
+    SUM(PositiveComments) AS PositiveComments,
+    NULL AS GlobalRank,
+    'Aggregate Stats' AS UserPostString
+FROM ComplexJoin;

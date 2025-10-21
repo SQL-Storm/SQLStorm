@@ -1,0 +1,123 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS question_count,
+        1 AS level
+    FROM Tags t
+    JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        SUM(p.Score) AS total_score_in_tag,
+        AVG(p.Score) AS avg_score_in_tag,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON q.Id = p.ParentId
+    JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+        AND u.Reputation > 5000
+        AND p.Score > 0
+        AND q.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+monthly_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS activity_month,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+        COUNT(DISTINCT p.OwnerUserId) AS active_users,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS avg_views,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) AS p95_score
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+badge_patterns AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS gold_badges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS gold_count,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS silver_count,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS bronze_count,
+        MIN(b.Date) AS first_badge_date,
+        MAX(b.Date) AS last_badge_date
+    FROM Badges b
+    GROUP BY b.UserId
+),
+complex_interactions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT c.UserId) AS unique_commenters,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS unique_editors,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) AS upvoters,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) AS downvoters,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ', ') AS tags_list,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Open'
+        END AS status
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+        AND p.ViewCount > 1000
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.ClosedDate, p.AcceptedAnswerId, p.AnswerCount
+)
+SELECT 
+    ma.activity_month,
+    ma.questions,
+    ma.answers,
+    ma.active_users,
+    ROUND(ma.avg_views, 2) AS avg_views,
+    ma.median_score,
+    ma.p95_score,
+    COUNT(DISTINCT ue.UserId) AS expert_users,
+    AVG(ue.Reputation) AS avg_expert_reputation,
+    COUNT(DISTINCT ci.PostId) AS high_activity_posts,
+    AVG(ci.unique_commenters) AS avg_commenters_per_post,
+    AVG(ci.unique_editors) AS avg_editors_per_post,
+    SUM(bp.gold_count) AS total_gold_badges,
+    SUM(bp.silver_count) AS total_silver_badges,
+    SUM(bp.bronze_count) AS total_bronze_badges,
+    COUNT(DISTINCT th.TagName) AS popular_tags,
+    COALESCE(AVG(ci.upvoters::FLOAT / NULLIF(ci.downvoters, 0)), 0) AS avg_upvote_downvote_ratio,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY ci.ViewCount) AS p75_views,
+    STRING_AGG(DISTINCT ue.TagName, ', ' ORDER BY ue.TagName) FILTER (WHERE ue.tag_rank <= 3) AS top_expertise_areas
+FROM monthly_activity ma
+LEFT JOIN user_expertise ue ON DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) = ma.activity_month
+LEFT JOIN badge_patterns bp ON bp.UserId = ue.UserId
+LEFT JOIN complex_interactions ci ON ma.activity_month >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year' AND ma.activity_month <= CAST('2024-10-01' AS DATE)
+LEFT JOIN tag_hierarchy th ON th.question_count > 100
+WHERE ma.activity_month >= CAST('2024-10-01' AS DATE) - INTERVAL '18 months'
+GROUP BY 
+    ma.activity_month,
+    ma.questions,
+    ma.answers,
+    ma.active_users,
+    ma.avg_views,
+    ma.median_score,
+    ma.p95_score
+ORDER BY ma.activity_month DESC;

@@ -1,0 +1,129 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE pht.Name IN ('Edit Body', 'Edit Title')
+),
+UserQuestionStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN pt.Name = 'Question' THEN p.Id ELSE NULL END) AS TotalQuestions,
+        SUM(CASE WHEN pt.Name = 'Question' THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        AVG(CASE WHEN pt.Name = 'Question' THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.CommentCount) AS TotalCommentsOnPosts
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswerStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN pt.Name = 'Answer' THEN p.Id ELSE NULL END) AS TotalAnswers,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN pt.Name = 'Answer' THEN p.Score ELSE NULL END) AS AvgAnswerScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.ParentId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+ComplexUserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        COALESCE(uqs.TotalQuestions, 0) AS UserTotalQuestions,
+        COALESCE(uqs.TotalQuestionViews, 0) AS UserTotalQuestionViews,
+        COALESCE(uqs.AvgQuestionScore, 0) AS UserAvgQuestionScore,
+        COALESCE(uas.TotalAnswers, 0) AS UserTotalAnswers,
+        COALESCE(uas.TotalAnswerScore, 0) AS UserTotalAnswerScore,
+        COALESCE(uas.AvgAnswerScore, 0) AS UserAvgAnswerScore,
+        COALESCE(uqs.TotalPosts, 0) AS UserTotalPosts,
+        COALESCE(uqs.TotalCommentsOnPosts, 0) AS UserTotalCommentsOnPosts,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        CASE
+            WHEN uqs.TotalQuestions > 0 AND uqs.TotalAnswers > 0 THEN CAST(CAST(uqs.TotalAnswers AS REAL) / uqs.TotalQuestions AS NUMERIC(5,2))
+            ELSE 0.00
+        END AS QuestionAnswerRatio,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS PreviousUserReputation,
+        LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS NextUserReputation,
+        CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+        UPPER(SUBSTRING(COALESCE(u.Location, ''), 1, 3)) AS LocationPrefix
+    FROM Users u
+    LEFT JOIN UserQuestionStats uqs ON u.Id = uqs.OwnerUserId
+    LEFT JOIN UserAnswerStats uas ON u.Id = uas.OwnerUserId
+)
+SELECT
+    cum.UserId,
+    cum.DisplayName,
+    cum.Reputation,
+    cum.UserViews,
+    cum.UserTotalQuestions,
+    cum.UserTotalQuestionViews,
+    cum.UserAvgQuestionScore,
+    cum.UserTotalAnswers,
+    cum.UserTotalAnswerScore,
+    cum.UserAvgAnswerScore,
+    cum.UserTotalPosts,
+    cum.UserTotalCommentsOnPosts,
+    cum.GoldBadges,
+    cum.SilverBadges,
+    cum.BronzeBadges,
+    cum.QuestionAnswerRatio,
+    cum.PreviousUserReputation,
+    cum.NextUserReputation,
+    cum.WebsiteStatus,
+    cum.LocationPrefix,
+    (
+        SELECT COUNT(p.Id)
+        FROM Posts p
+        WHERE p.OwnerUserId = cum.UserId
+        AND p.ClosedDate IS NOT NULL
+        AND p.PostTypeId = 1 -- Only count closed questions
+    ) AS UserClosedQuestions,
+    CASE
+        WHEN cum.UserAvgQuestionScore > 50 THEN 'High Score Questioner'
+        WHEN cum.UserAvgAnswerScore > 10 THEN 'High Score Answerer'
+        ELSE 'Balanced Contributor'
+    END AS ContributionType,
+    rpe.CreationDate AS LatestEditDate,
+    rpe.HistoryTypeName AS LatestEditType
+FROM ComplexUserMetrics cum
+LEFT JOIN RankedPostEdits rpe ON cum.UserId = rpe.UserId AND rpe.rn = 1
+WHERE cum.Reputation > 1000
+UNION ALL
+SELECT
+    NULL AS UserId,
+    'Community User' AS DisplayName,
+    -1 AS Reputation,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = -1) AS UserViews,
+    (SELECT COUNT(*) FROM Posts p JOIN PostTypes pt ON p.PostTypeId = pt.Id WHERE p.OwnerUserId = -1 AND pt.Name = 'Question') AS UserTotalQuestions,
+    (SELECT SUM(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = -1) AS UserTotalQuestionViews,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = -1 AND p.PostTypeId = 1) AS UserAvgQuestionScore,
+    (SELECT COUNT(*) FROM Posts p JOIN PostTypes pt ON p.PostTypeId = pt.Id WHERE p.OwnerUserId = -1 AND pt.Name = 'Answer') AS UserTotalAnswers,
+    (SELECT SUM(p.Score) FROM Posts p WHERE p.OwnerUserId = -1 AND p.PostTypeId = 2) AS UserTotalAnswerScore,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = -1 AND p.PostTypeId = 2) AS UserAvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = -1) AS UserTotalPosts,
+    (SELECT SUM(p.CommentCount) FROM Posts WHERE OwnerUserId = -1) AS UserTotalCommentsOnPosts,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0.00 AS QuestionAnswerRatio,
+    0 AS PreviousUserReputation,
+    0 AS NextUserReputation,
+    'No Website' AS WebsiteStatus,
+    'N/A' AS LocationPrefix,
+    0 AS UserClosedQuestions,
+    'Community Contributor' AS ContributionType,
+    NULL AS LatestEditDate,
+    NULL AS LatestEditType
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Id = -1);

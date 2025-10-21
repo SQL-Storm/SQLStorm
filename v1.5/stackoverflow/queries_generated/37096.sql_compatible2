@@ -1,0 +1,209 @@
+WITH
+RecentAnswers AS (
+  SELECT p.Id AS AnswerId, p.ParentId AS QuestionId, p.OwnerUserId, p.CreationDate
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3' YEAR
+    AND p.OwnerUserId IS NOT NULL
+),
+QuestionTags AS (
+  SELECT q.Id AS QuestionId, q.Tags
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+    AND q.Tags IS NOT NULL
+),
+AnswerWithTags AS (
+  SELECT a.AnswerId, a.OwnerUserId, a.CreationDate,
+         qt.Tags,
+         REGEXP_SPLIT_TO_TABLE(SUBSTRING(qt.Tags FROM 2 FOR CHAR_LENGTH(qt.Tags) - 2), '><') AS Tag
+  FROM RecentAnswers a
+  JOIN QuestionTags qt ON qt.QuestionId = a.QuestionId
+),
+TagUserStats AS (
+  SELECT Tag, OwnerUserId AS UserId,
+         COUNT(*) FILTER (WHERE CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR) AS AnswersLastYear,
+         COUNT(*) AS AnswersLast3Years,
+         MIN(CreationDate) AS FirstAnswerAt,
+         MAX(CreationDate) AS LastAnswerAt,
+         ROW_NUMBER() OVER (PARTITION BY Tag ORDER BY COUNT(*) DESC, MAX(CreationDate) DESC) AS RankByAnswers
+  FROM AnswerWithTags
+  GROUP BY Tag, OwnerUserId
+),
+TopTagContributors AS (
+  SELECT Tag, UserId, AnswersLastYear, AnswersLast3Years, FirstAnswerAt, LastAnswerAt
+  FROM TagUserStats
+  WHERE RankByAnswers <= 50
+),
+UserAggregates AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         COALESCE(b.BadgeGold,0) AS GoldBadges,
+         COALESCE(b.BadgeSilver,0) AS SilverBadges,
+         COALESCE(b.BadgeBronze,0) AS BronzeBadges,
+         COALESCE(pq.QuestionsAsked,0) AS QuestionsAsked,
+         COALESCE(pa.AnswersPosted,0) AS AnswersPosted,
+         COALESCE(pc.TotalComments,0) AS CommentsMade,
+         COALESCE(v.UpVotes,0) AS UpVotesCast,
+         COALESCE(v.DownVotes,0) AS DownVotesCast,
+         COALESCE(AVG(a.Score) FILTER (WHERE a.PostTypeId=2 AND a.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3' YEARS),0) AS AvgAnswerScore3y,
+         tag_top.MostUsedTag
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class=1 THEN 1 ELSE 0 END) AS BadgeGold,
+           SUM(CASE WHEN Class=2 THEN 1 ELSE 0 END) AS BadgeSilver,
+           SUM(CASE WHEN Class=3 THEN 1 ELSE 0 END) AS BadgeBronze
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS QuestionsAsked
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) pq ON pq.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS AnswersPosted
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+  ) pa ON pa.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalComments
+    FROM Comments
+    GROUP BY UserId
+  ) pc ON pc.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN VoteTypeId=2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId=3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId,
+           (ARRAY_AGG(tag ORDER BY cnt DESC))[1] AS MostUsedTag
+    FROM (
+      SELECT p.OwnerUserId,
+             REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS tag,
+             COUNT(*) AS cnt
+      FROM Posts p
+      WHERE p.PostTypeId = 2 AND p.Tags IS NOT NULL
+      GROUP BY p.OwnerUserId, tag
+    ) s
+    GROUP BY OwnerUserId
+  ) tag_top ON tag_top.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+           b.BadgeGold, b.BadgeSilver, b.BadgeBronze,
+           pq.QuestionsAsked, pa.AnswersPosted, pc.TotalComments, v.UpVotes, v.DownVotes, tag_top.MostUsedTag
+),
+TagSummary AS (
+  SELECT t.TagName AS Tag,
+         t.Count AS TotalQuestionsTagged,
+         COALESCE(qHot.HotQuestions,0) AS HotQuestionsLastYear,
+         COALESCE(links.LinkedOut,0) AS LinkedOutCount,
+         COALESCE(links.Duplicates,0) AS DuplicateCount,
+         COALESCE(topcontributors.TopContribCount,0) AS DistinctTopContributors
+  FROM Tags t
+  LEFT JOIN (
+    SELECT REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS Tag, COUNT(*) AS HotQuestions
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR
+      AND p.ViewCount > 10000
+    GROUP BY REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+  ) qHot ON qHot.Tag = t.TagName
+  LEFT JOIN (
+    SELECT REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS Tag,
+           SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedOut,
+           SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS Duplicates
+    FROM PostLinks pl
+    JOIN Posts p ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+  ) links ON links.Tag = t.TagName
+  LEFT JOIN (
+    SELECT Tag, COUNT(DISTINCT UserId) AS TopContribCount
+    FROM TopTagContributors
+    GROUP BY Tag
+  ) topcontributors ON topcontributors.Tag = t.TagName
+),
+BenchmarkPrep AS (
+  SELECT ts.Tag,
+         ts.TotalQuestionsTagged,
+         ts.HotQuestionsLastYear,
+         ts.LinkedOutCount,
+         ts.DuplicateCount,
+         ts.DistinctTopContributors,
+         tc.UserId AS TopUserId,
+         ua.DisplayName AS TopUserName,
+         ua.Reputation AS TopUserRep,
+         ua.GoldBadges,
+         ua.SilverBadges,
+         ua.BronzeBadges,
+         ua.QuestionsAsked,
+         ua.AnswersPosted,
+         ua.CommentsMade,
+         ua.UpVotesCast,
+         ua.DownVotesCast,
+         ua.AvgAnswerScore3y,
+         ua.MostUsedTag,
+         tc.AnswersLastYear,
+         tc.AnswersLast3Years,
+         tc.FirstAnswerAt,
+         tc.LastAnswerAt,
+         (COALESCE(tc.AnswersLast3Years,0) * 3.0
+          + COALESCE(ua.Reputation,0) * 0.01
+          + COALESCE(ua.GoldBadges,0) * 5.0
+          + COALESCE(ua.SilverBadges,0) * 2.0
+          + COALESCE(ua.BronzeBadges,0) * 0.5
+          + COALESCE(ua.AvgAnswerScore3y,0) * 1.5
+         ) AS InfluenceScore
+  FROM TagSummary ts
+  LEFT JOIN TopTagContributors tc ON tc.Tag = ts.Tag
+  LEFT JOIN UserAggregates ua ON ua.UserId = tc.UserId
+),
+RankedResults AS (
+  SELECT *,
+         RANK() OVER (PARTITION BY Tag ORDER BY InfluenceScore DESC NULLS LAST) AS ContributorRank,
+         DENSE_RANK() OVER (ORDER BY TotalQuestionsTagged DESC) AS TagPopularityRank,
+         NTILE(10) OVER (ORDER BY InfluenceScore DESC NULLS LAST) AS InfluenceDecile
+  FROM BenchmarkPrep
+)
+SELECT
+  r.Tag,
+  r.TagPopularityRank,
+  r.TotalQuestionsTagged,
+  r.HotQuestionsLastYear,
+  r.LinkedOutCount,
+  r.DuplicateCount,
+  r.DistinctTopContributors,
+  r.ContributorRank,
+  r.TopUserId,
+  r.TopUserName,
+  r.TopUserRep,
+  r.GoldBadges,
+  r.SilverBadges,
+  r.BronzeBadges,
+  r.QuestionsAsked,
+  r.AnswersPosted,
+  r.CommentsMade,
+  r.UpVotesCast,
+  r.DownVotesCast,
+  ROUND(r.AvgAnswerScore3y, 3) AS AvgAnswerScore3y,
+  r.MostUsedTag AS TopUserMostUsedTag,
+  r.AnswersLastYear,
+  r.AnswersLast3Years,
+  r.FirstAnswerAt,
+  r.LastAnswerAt,
+  ROUND(r.InfluenceScore, 4) AS InfluenceScore,
+  r.InfluenceDecile
+FROM RankedResults r
+WHERE r.ContributorRank <= 10
+  AND r.TotalQuestionsTagged >= 100
+ORDER BY r.TagPopularityRank, r.InfluenceScore DESC
+LIMIT 1000;

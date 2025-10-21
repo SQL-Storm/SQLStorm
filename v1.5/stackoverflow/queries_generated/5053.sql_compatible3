@@ -1,0 +1,137 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopRecentUsers AS (
+    SELECT *
+    FROM RecentActiveUsers
+    WHERE rn <= 100
+),
+UserRecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS score_rank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+      AND p.OwnerUserId IN (SELECT UserId FROM TopRecentUsers)
+),
+TopUserPosts AS (
+    SELECT *
+    FROM UserRecentPosts
+    WHERE score_rank <= 5
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(CASE WHEN c.Score IS NOT NULL THEN c.Score ELSE 0 END) AS AvgCommentScore,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostActivity AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS Edits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS ClosedEvents,
+        SUM(CASE
+            WHEN ph.PostHistoryTypeId = 10 AND
+                 CAST(ph.Comment AS INTEGER) IN (SELECT Id FROM CloseReasonTypes WHERE Name ILIKE '%opinion%')
+                 THEN 1 ELSE 0 END) AS OpinionCloseEvents
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+TagParsing AS (
+    SELECT
+        p.Id AS PostId,
+        REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS TagName
+    FROM Posts p
+    WHERE p.Id IN (SELECT PostId FROM TopUserPosts)
+),
+InterestingTagStats AS (
+    SELECT
+        tp.PostId,
+        COUNT(DISTINCT tp.TagName) AS DistinctTagCount,
+        STRING_AGG(DISTINCT tp.TagName, ', ') AS TagList,
+        MAX(tg.Count) AS MostPopularTagCount,
+        MIN(tg.Count) AS LeastPopularTagCount
+    FROM TagParsing tp
+    LEFT JOIN Tags tg ON tp.TagName = tg.TagName
+    GROUP BY tp.PostId
+)
+SELECT
+    tru.UserId,
+    tru.DisplayName,
+    tru.Reputation,
+    tru.GoldBadges,
+    tru.SilverBadges,
+    tru.BronzeBadges,
+    p.PostId,
+    p.Title,
+    p.PostTypeName,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    COALESCE(cs.CommentCount, 0) AS CommentCount,
+    COALESCE(cs.AvgCommentScore, 0) AS AvgCommentScore,
+    COALESCE(cs.PositiveComments, 0) AS PositiveComments,
+    pa.Edits,
+    pa.LastEditDate,
+    COALESCE(pa.ClosedEvents, 0) AS ClosedEvents,
+    COALESCE(pa.OpinionCloseEvents, 0) AS OpinionCloseEvents,
+    COALESCE(dl.DuplicateCount, 0) AS DuplicateLinks,
+    its.DistinctTagCount,
+    its.TagList,
+    its.MostPopularTagCount,
+    its.LeastPopularTagCount,
+    -- Compound Calculated Score
+    ROUND(
+        (p.Score * 1.2)
+        + (COALESCE(pa.Edits, 0) * 0.7)
+        + (COALESCE(cs.CommentCount, 0) * 0.4)
+        - (COALESCE(pa.ClosedEvents, 0) * 2)
+        + SQRT(p.ViewCount)
+        + COALESCE(its.MostPopularTagCount, 0) * 0.02
+        - COALESCE(dl.DuplicateCount, 0) * 3
+        , 2) AS BenchmarkScore
+FROM TopRecentUsers tru
+LEFT JOIN TopUserPosts p ON tru.UserId = p.OwnerUserId
+LEFT JOIN CommentStats cs ON cs.PostId = p.PostId
+LEFT JOIN PostActivity pa ON pa.PostId = p.PostId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = p.PostId
+LEFT JOIN InterestingTagStats its ON its.PostId = p.PostId
+ORDER BY BenchmarkScore DESC NULLS LAST, tru.UserId, p.CreationDate DESC;

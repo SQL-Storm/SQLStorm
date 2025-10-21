@@ -1,0 +1,149 @@
+-- {"query": "27017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1911} 
+
+WITH
+    BadgeRankings AS (
+        SELECT
+            UserId,
+            COUNT(*) AS BadgeCount,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS Rank
+        FROM
+            Badges
+        GROUP BY
+            UserId
+    ),
+    UserActivity AS (
+        SELECT
+            u.Id AS UserId,
+            COUNT(p.Id) AS PostCount,
+            COUNT(DISTINCT p.Id) AS DistinctPostCount,
+            MAX(p.CreationDate) AS LastPostDate,
+            SUM(p.Score) AS TotalScore,
+            COUNT(DISTINCT a.Id) AS QuestionCount,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore,
+            COUNT(DISTINCT c.Id) AS CommentCount,
+            SUM(v.VoteTypeId = 2) AS UpVoteCount,
+            SUM(v.VoteTypeId = 3) AS DownVoteCount,
+			string_agg(DISTINCT t.tagname, '|') Filter (where p.OwnerUserId IS DISTINCT FROM -1) AS UserTags
+        FROM
+            Users u
+        LEFT JOIN
+            Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN
+            Posts a ON p.AcceptedAnswerId = a.Id
+        LEFT JOIN
+            Comments c ON u.Id = c.UserId
+        LEFT JOIN
+            Votes v ON u.Id = v.UserId
+		LEFT JOIN
+			Posts pt ON pt.Id = p.ParentId
+        LEFT JOIN
+            Tags t ON p.Tags LIKE CONCAT('%><',t.TagName,'><%')
+        WHERE
+            u.Reputation > 1000
+        GROUP BY
+            u.Id
+    ),
+    PostActivity AS (
+		SELECT
+			p.Id AS PostId,
+			COUNT(v.Id) AS VoteCount,
+			COUNT(DISTINCT IFNULL(c.Id,-1)) AS CommentCount,
+			(SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (13,14,15)) AS ModeratorHistoryCount,
+			CASE
+				WHEN t.TagName IS NOT NULL THEN (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.RelatedPostId = t.ExcerptPostId)
+                ELSE 0
+			END AS RelatedPostCount,
+			CASE WHEN p.PostTypeId=1 THEN string_agg(DISTINCT t.TagName, '<>') Filter(where p.Tags LIKE CONCAT('%><',t.TagName,'><%')) ELSE NULL END AS AssociatedTags
+		FROM
+            Posts p
+		LEFT JOIN
+			Votes v ON p.Id = v.PostId
+		LEFT JOIN
+            Comments c ON p.Id = c.PostId
+		LEFT JOIN
+			PostHistory ph ON p.Id = ph.PostId
+		LEFT JOIN
+			PostLinks pl ON p.Id = pl.PostId
+		LEFT JOIN
+			Tags t ON t.Id = pl.RelatedPostId
+			WHERE
+				(p.PostTypeId = 1 OR p.PostTypeId =2 )
+				and p.OwnerUserId is not NULL
+        	and p.CloseDate IS NOT NULL
+		GROUP BY
+			p.Id,t.ExcerptPostId,t.TagName
+    ),
+	HighModerationPosts AS (
+		SELECT
+			PostId,
+			SUM(ModeratorActivity) AS TotalModeratorActivity,
+			MAX(PostHistoryTypeId) AS RecentModeratorActivityId,
+			MAX(ModeratorDate) AS RecentModeratorActivityDate
+		FROM (
+			SELECT
+				ph.PostId,
+				ph.PostHistoryTypeId,
+				DATE(ph.CreationDate + interval '12 hours') AS ModeratorDate,
+				PhiDetailSubquery.UserVotes AS ModeratorActivity
+			FROM
+				PostHistory ph
+			LEFT JOIN
+				(SELECT Id, PostId, JSON_EXTRACT(Text::cdb,'$.UserId[0]','STRING') AS ModeratorUserId, COUNT(*) AS UserVotes FROM PostHistory WHERE PostHistoryTypeId IN (10,11,12,13,14,15,16,19,20,35)) AS PhiDetailSubquery
+			ON
+				ph.Id = PhiDetailSubquery.Id and PhiDetailSubquery.ModeratorUserId is not null
+			WHERE
+				ph.PostHistoryTypeId IN (10,11,12,13,14,15,16,19,20,35)
+		)q
+		GROUP BY
+			PostId
+	)
+SELECT
+	    ua.UserId,
+		ua.PostCount,
+		ua.DistinctPostCount,
+		ua.TotalScore,
+		ua.QuestionCount,
+		ua.QuestionScore,
+		ua.AnswerScore,
+		ua.CommentCount,
+		ua.UpVoteCount,
+		ua.DownVoteCount,
+        br.GoldBadges,
+        br.SilverBadges,
+        br.BronzeBadges,
+		count (DISTINCT pa.PostId) PostActivityCount,
+		count (distinct hmp.PostId) HighModeratedPostCount,
+		MAX(hmp.TotalModeratorActivity) AS TotalModActivCount,
+		MIN(hmp.RecentModeratorActivityDate) AS FirstModerationDate,
+		MAX(hmp.RecentModeratorActivityDate) AS LastModerationDate,
+		string_agg(distinct pa.AssociatedTags, '|') PostActivityTags,
+		string_agg(distinct ua.UserTags, '|') AllUserTags
+FROM
+    UserActivity ua
+LEFT JOIN
+    BadgeRankings br ON ua.UserId = br.UserId
+LEFT JOIN
+    PostActivity pa ON ua.UserId = pa.PostId
+LEFT JOIN
+    HighModerationPosts hmp ON hmp.PostId = ua.UserId
+WHERE
+    ua.LastPostDate > '2023-01-01'
+    AND br.Rank <= 100
+    AND (ua.QuestionScore > 500 OR pa.AssociatedTags LIKE '%database% reception%')
+    AND ua.CommentCount > 10
+GROUP BY
+    ua.UserId,
+	br.GoldBadges,
+    br.SilverBadges,
+    br.BronzeBadges,
+    hmp.RecentModeratorActivityDate,
+    ua.UpVoteCount+ua.DownVoteCount > 20
+ORDER BY
+    ua.TotalScore DESC,
+	ua.PostCount DESC,
+    ua.QuestionCount DESC,
+    ua.UserId ASC;

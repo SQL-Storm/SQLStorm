@@ -1,0 +1,167 @@
+-- {"query": "7045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1828} 
+with
+-- recent active posts with tag parsing and normalized owner info
+RecentPosts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.acceptedanswerid,
+    p.title,
+    p.tags,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    coalesce(u.displayname, p.ownerdisplayname, '<deleted>') as owner_name,
+    coalesce(u.id, -1) as owner_id,
+    -- explode tags into array-like rows using SQL string functions (ANSI-ish)
+    regexp_split_to_table(substring(coalesce(p.tags,''), 2, char_length(coalesce(p.tags,'')) - 2), '><') as tag
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- compute per-question aggregates (answers, avg answer score, top answerer)
+QuestionAggregates as (
+  select
+    q.id as question_id,
+    count(a.id) filter (where a.posttypeid = 2) as answers_count,
+    avg(a.score) filter (where a.posttypeid = 2) as avg_answer_score,
+    max(a.score) filter (where a.posttypeid = 2) as max_answer_score,
+    -- top answerer by score using distinct on window below
+    (select au.owneruserid from posts au where au.parentid = q.id and au.posttypeid = 2 order by au.score desc nulls last limit 1) as top_answerer_id,
+    -- count distinct contributors (owners) including edits in PostHistory
+    (
+      select count(distinct coalesce(ph.userId, p2.ownerUserId)) 
+      from posts p2
+      left join posthistory ph on ph.postid = p2.id
+      where (p2.id = q.id or p2.parentid = q.id)
+    ) as distinct_contributors
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1 and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by q.id
+),
+-- heavy-weight windowed vote and comment stats per post
+PostEngagement as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    -- votes breakdown with conditional aggregation
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(v.id) as total_votes,
+    -- comments quality: weighted by commenter reputation (join in correlated subquery)
+    (
+      select coalesce(sum(c.score * coalesce(u.reputation,0)::numeric),0)
+      from comments c
+      left join users u on u.id = c.userid
+      where c.postid = p.id
+    ) as comment_weighted_score,
+    -- window: running average score per day partitioned by posttype
+    avg(p.score) over (partition by p.posttypeid order by p.creationdate range between interval '30 days' preceding and current row) as rolling_avg_score_30d
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by p.id, p.posttypeid, p.parentid, p.creationdate, p.score, p.viewcount
+),
+-- tag popularity and recency metrics
+TagMetrics as (
+  select
+    rp.tag,
+    count(distinct rp.id) as questions_with_tag,
+    sum(case when rp.posttypeid = 1 then 1 else 0 end) as question_posts,
+    sum(case when rp.posttypeid = 2 then 1 else 0 end) as answer_posts,
+    max(rp.creationdate) as last_activity,
+    -- entropy-ish measure: stddev of scores for posts with this tag
+    stddev_samp(rp.score) as score_stddev,
+    avg(rp.score) as avg_score
+  from RecentPosts rp
+  group by rp.tag
+),
+-- combine posts with aggregates, engagements, tags and links (outer joins to stress planner)
+Combined as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.title,
+    rp.tag,
+    qa.answers_count,
+    qa.avg_answer_score,
+    qa.max_answer_score,
+    qa.top_answerer_id,
+    pe.upvotes,
+    pe.downvotes,
+    pe.favorites,
+    pe.comment_weighted_score,
+    tm.questions_with_tag,
+    tm.avg_score as tag_avg_score,
+    -- compute a composite hotness score with NULL handling and math ops
+    (
+      coalesce(pe.upvotes,0) * 3
+      + coalesce(pe.favorites,0) * 5
+      + coalesce(pe.comment_weighted_score,0) / nullif(greatest(coalesce(pe.total_votes,1),1),0)
+      + coalesce(qa.answers_count,0) * 2
+      + coalesce(tm.questions_with_tag,0) * 0.1
+      - coalesce(pe.downvotes,0) * 2
+      + case when rp.posttypeid = 1 and rp.acceptedanswerid is not null then 10 else 0 end
+    )::numeric(18,4) as hotness_score,
+    -- string expression: normalized title fingerprint
+    lower(regexp_replace(coalesce(rp.title,''), '\s+',' ','g')) as normalized_title,
+    -- link counts via left join subquery
+    coalesce((select count(*) from postlinks pl where pl.postid = rp.id),0) as outgoing_links,
+    coalesce((select count(*) from postlinks pl where pl.relatedpostid = rp.id),0) as incoming_links
+  from RecentPosts rp
+  left join QuestionAggregates qa on qa.question_id = rp.id
+  left join PostEngagement pe on pe.id = rp.id
+  left join TagMetrics tm on tm.tag = rp.tag
+)
+select
+  c.id,
+  c.posttypeid,
+  c.title,
+  c.tag,
+  c.normalized_title,
+  c.answers_count,
+  round(c.avg_answer_score::numeric,2) as avg_answer_score,
+  c.max_answer_score,
+  c.top_answerer_id,
+  c.upvotes,
+  c.downvotes,
+  c.favorites,
+  round(c.comment_weighted_score::numeric,2) as comment_weighted_score,
+  c.questions_with_tag,
+  round(c.tag_avg_score::numeric,2) as tag_avg_score,
+  c.outgoing_links,
+  c.incoming_links,
+  round(c.hotness_score::numeric,4) as hotness_score,
+  -- rank within tag by hotness
+  rank() over (partition by c.tag order by c.hotness_score desc nulls last) as tag_hot_rank,
+  -- dense rank across all tags by hotness
+  dense_rank() over (order by c.hotness_score desc nulls last) as global_hot_rank,
+  -- a complex predicate demonstrating NULL and boolean logic: "trending" label
+  case
+    when c.hotness_score is null then 'unknown'
+    when (c.hotness_score > 50 and (c.questions_with_tag > 10 or c.tag_avg_score > 2.5)) then 'trending'
+    when (c.hotness_score between 10 and 50) and (c.outgoing_links > 0 or c.incoming_links > 0) then 'warming'
+    else 'cold'
+  end as heat_label
+from Combined c
+where
+  -- complicated predicate with string ops, pattern matching, set operators and null logic
+  (
+    (c.normalized_title ilike any (array['%error%','%exception%','%fail%']) and c.hotness_score > 5)
+    or
+    (c.tag in (select tag from TagMetrics where questions_with_tag > 50))
+    or
+    (c.top_answerer_id in (select id from users where reputation > 10000))
+    or
+    (c.normalized_title ~ '\bmemory\b' and c.comment_weighted_score > 0)
+  )
+  and not (c.title is null and c.tag is null)
+order by c.hotness_score desc nulls last, c.questions_with_tag desc
+limit 250;

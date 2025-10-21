@@ -1,0 +1,34 @@
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, u.Reputation, u.CreationDate AS UserCreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, b.Name AS BadgeName, b.Date AS BadgeDate, b.Class AS BadgeClass, b.TagBased AS BadgeTagBased, c.Id AS CommentId, c.Score AS CommentScore, c.CreationDate AS CommentCreationDate, l.Id AS LinkId, l.LinkTypeId, l.CreationDate AS LinkCreationDate, t.TagName, t.Count AS TagCount, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, v.VoteTypeId, v.CreationDate AS VoteCreationDate, v.BountyAmount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN PostLinks l ON p.Id = l.PostId
+  LEFT JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+  LEFT JOIN Votes v ON p.Id = v.PostId
+)
+SELECT 
+  AVG(CASE WHEN PostTypeId = 1 THEN Score END) AS AvgQuestionScore,
+  AVG(CASE WHEN PostTypeId = 2 THEN Score END) AS AvgAnswerScore,
+  AVG(ViewCount) AS AvgViewCount,
+  AVG(AnswerCount) AS AvgAnswerCount,
+  AVG(CommentCount) AS AvgCommentCount,
+  AVG(FavoriteCount) AS AvgFavoriteCount,
+  COUNT(DISTINCT COALESCE(OwnerUserId, NULL)) AS UniqueUserCount,
+  COUNT(DISTINCT COALESCE(BadgeName, NULL)) AS UniqueBadgeCount,
+  COUNT(DISTINCT COALESCE(TagName, NULL)) AS UniqueTagCount,
+  COUNT(DISTINCT COALESCE(VoteTypeId, NULL)) AS UniqueVoteTypeCount,
+  AVG(Reputation) AS AvgUserReputation,
+  AVG(DATE_PART('day', COALESCE(LastAccessDate, cast('2024-10-01' as date)) - UserCreationDate)) AS AvgUserLifetime,
+  AVG(Views) AS AvgUserViews,
+  AVG(UpVotes) AS AvgUserUpVotes,
+  AVG(DownVotes) AS AvgUserDownVotes,
+  AVG(DATE_PART('day', COALESCE(BadgeDate, UserCreationDate) - UserCreationDate)) AS AvgBadgeAgeInDays,
+  COUNT(DISTINCT COALESCE(CommentId, NULL)) AS UniqueCommentCount,
+  AVG(CommentScore) AS AvgCommentScore,
+  COUNT(DISTINCT COALESCE(LinkId, NULL)) AS UniqueLinkCount,
+  AVG(DATE_PART('day', COALESCE(LinkCreationDate, PostCreationDate) - PostCreationDate)) AS AvgLinkAgeInDays,
+  COUNT(DISTINCT CASE WHEN ClosedDate IS NOT NULL THEN 1 END) AS ClosedPostCount,
+  COUNT(DISTINCT CASE WHEN CommunityOwnedDate IS NOT NULL THEN 1 END) AS CommunityOwnedPostCount
+FROM cte;

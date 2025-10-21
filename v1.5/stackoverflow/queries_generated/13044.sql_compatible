@@ -1,0 +1,61 @@
+WITH UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        MAX(P.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC) AS PostRank
+    FROM 
+        Users AS U
+    LEFT JOIN 
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes AS V ON P.Id = V.PostId
+    WHERE 
+        U.Reputation > 1000 AND
+        P.CreationDate >= DATE '2022-01-01'
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+TopQuestions AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.ViewCount,
+        P.Score,
+        COALESCE(U.DisplayName, 'Anonymous') AS Author,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS QuestionRank
+    FROM 
+        Posts AS P
+    LEFT JOIN 
+        Users AS U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND
+        P.Score > 10
+)
+SELECT
+    UA.Id,
+    UA.DisplayName,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalUpvotes,
+    UA.TotalDownvotes,
+    UA.LastPostDate,
+    TQ.Title AS TopQuestion,
+    TQ.ViewCount AS TopQuestionViews,
+    TQ.Score AS TopQuestionScore
+FROM 
+    UserActivity AS UA
+LEFT JOIN 
+    TopQuestions AS TQ ON UA.Id = CAST(TQ.Author AS BIGINT)
+WHERE 
+    UA.PostRank <= 100 AND
+    (TQ.QuestionRank = 1 OR TQ.QuestionRank IS NULL)
+ORDER BY 
+    UA.TotalPosts DESC,
+    TQ.Score DESC;

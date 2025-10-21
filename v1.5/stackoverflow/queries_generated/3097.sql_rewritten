@@ -1,0 +1,70 @@
+-- {"query": "3097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 790} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p2.Id) FILTER (WHERE p2.PostTypeId = 1) AS QuestionCount,
+        COUNT(p3.Id) FILTER (WHERE p3.PostTypeId = 2) AS AnswerCount,
+        AVG(p2.Score) AS AvgQuestionScore,
+        AVG(p3.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalComments
+    FROM Users u
+    LEFT JOIN Posts p1 ON p1.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+    LEFT JOIN Posts p3 ON p3.OwnerUserId = u.Id AND p3.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), PostHistoryCounts AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(ph.Id) AS RevisionCount,
+        COUNT(DISTINCT ph2.UserId) FILTER (WHERE ph2.UserId IS NOT NULL) AS UniqueEditors
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = p.Id AND ph2.UserId IS NOT NULL
+    GROUP BY p.Id
+), TagStatistics AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        AVG(t2.RevisionCount) AS AvgTagRevisionCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    LEFT JOIN PostHistoryCounts t2 ON t2.PostId = p.Id
+    GROUP BY t.TagName, t.Count
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.AvgQuestionScore,
+    up.AvgAnswerScore,
+    up.TotalComments,
+    pcs.RevisionCount,
+    pcs.UniqueEditors,
+    ts.TagName,
+    ts.TagCount,
+    ts.AvgTagRevisionCount,
+    CASE WHEN (up.QuestionCount + up.AnswerCount) > 0 THEN
+        ( (up.QuestionCount::FLOAT / NULLIF((up.QuestionCount + up.AnswerCount), 0)) * 100 )
+    ELSE NULL END AS QuestionAnswerRatio,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.Tags LIKE '%<javascript>%') OVER () AS JavaScriptQuestionsWithTags,
+    string_agg(DISTINCT c.UserDisplayName, ', ') FILTER (WHERE c.Score > 0 AND c.UserDisplayName IS NOT NULL) AS ActiveCommenters,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Posts p_down
+        JOIN Votes v ON v.PostId = p_down.Id
+        WHERE p_down.OwnerUserId = u.Id AND v.VoteTypeId = 3 AND v.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    ) THEN TRUE ELSE FALSE END AS HasRecentDownvote
+FROM UserPostStats up
+LEFT JOIN PostHistoryCounts pcs ON pcs.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = up.UserId
+)
+LEFT JOIN TagStatistics ts ON ts.TagName IN (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1
+)
+LEFT JOIN Posts p ON p.OwnerUserId = up.UserId
+LEFT JOIN Comments c ON c.PostId = p.Id
+WHERE up.QuestionCount + up.AnswerCount > 0
+ORDER BY up.UserId DESC
+LIMIT 100;

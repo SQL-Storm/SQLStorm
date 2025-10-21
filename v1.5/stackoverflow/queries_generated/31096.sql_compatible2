@@ -1,0 +1,52 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(ans.Id) AS AnswerCount,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS Rank
+    FROM 
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN Posts ans ON ans.ParentId = p.Id AND ans.PostTypeId = 2
+        LEFT JOIN Comments c ON c.PostId = p.Id
+        LEFT JOIN (
+            SELECT CAST(value AS VARCHAR) AS TagName
+            FROM (
+                SELECT UNNEST(string_to_array(p.Tags, ',')) AS value
+            ) AS t
+        ) AS t ON true
+    WHERE 
+        p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+        AND p.Score > 0
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName
+),
+TopPosts AS (
+    SELECT * FROM RankedPosts WHERE Rank <= 10
+)
+SELECT 
+    tp.PostId,
+    tp.Title,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.OwnerDisplayName,
+    tp.AnswerCount,
+    tp.CommentCount,
+    tp.Tags,
+    PH.Comment AS ChangeComment,
+    PH.UserDisplayName AS EditedBy,
+    PH.CreationDate AS EditDate
+FROM 
+    TopPosts tp
+    LEFT JOIN PostHistory PH ON tp.PostId = PH.PostId
+WHERE 
+    PH.PostHistoryTypeId IN (4, 5, 6)
+ORDER BY 
+    tp.Score DESC, tp.CreationDate DESC;

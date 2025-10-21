@@ -1,0 +1,87 @@
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    p.PostCount,
+    b.BadgeCount,
+    COALESCE(q.AcceptedAnswerCount, 0) AS AcceptedAnswerCount,
+    COALESCE(a.AnswerScoreSum, 0) AS AnswerScoreSum,
+    t.Tags
+FROM
+    Users u
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS PostCount
+    FROM
+        Posts
+    GROUP BY
+        OwnerUserId
+) AS p ON u.Id = p.OwnerUserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        COUNT(*) AS BadgeCount
+    FROM
+        Badges
+    GROUP BY
+        UserId
+) AS b ON u.Id = b.UserId
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS AcceptedAnswerCount
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 1
+        AND AcceptedAnswerId IS NOT NULL
+    GROUP BY
+        OwnerUserId
+) AS q ON u.Id = q.OwnerUserId
+LEFT JOIN (
+    SELECT
+        ParentId,
+        SUM(Score) AS AnswerScoreSum
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 2
+    GROUP BY
+        ParentId
+) AS a ON u.Id = a.ParentId
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        STRING_AGG(DISTINCT TagName, ', ') AS Tags
+    FROM
+        (
+            SELECT
+                t.TagName,
+                t.OwnerUserId
+            FROM
+                Posts p
+            JOIN (
+                SELECT
+                    TRIM(BOTH '>' FROM Tag) AS TagName,
+                    OwnerUserId
+                FROM
+                    (
+                        SELECT
+                            unnest(string_to_array(substr(Tags, 2, length(Tags) - 2), '><')) AS TagName,
+                            OwnerUserId
+                        FROM
+                            Posts
+                        WHERE
+                            PostTypeId = 1
+                    ) AS inner_tags
+            ) AS t ON p.OwnerUserId = t.OwnerUserId
+        ) AS derived
+    GROUP BY
+        OwnerUserId
+) AS t ON u.Id = t.OwnerUserId
+WHERE
+    u.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+ORDER BY
+    u.Reputation DESC,
+    p.PostCount DESC;

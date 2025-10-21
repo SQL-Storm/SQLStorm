@@ -1,0 +1,76 @@
+-- {"query": "13033.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 648} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastActivity
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+HighScorePosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM 
+        Posts p
+    WHERE 
+        p.Score > 50
+),
+TopUserBadges AS (
+    SELECT 
+        UserId,
+        COUNT(DISTINCT CASE WHEN Class = 1 THEN Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN Class = 2 THEN Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN Class = 3 THEN Id END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalScore,
+    tb.GoldBadges,
+    tb.SilverBadges,
+    tb.BronzeBadges,
+    hsp.Title AS HighestScoredPostTitle,
+    hsp.Score AS HighestScoredPostScore,
+    COALESCE(ph.TotalEdits, 0) AS TotalEdits
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    HighScorePosts hsp ON ua.UserId = hsp.OwnerUserId AND hsp.PostRank = 1
+LEFT JOIN 
+    TopUserBadges tb ON ua.UserId = tb.UserId
+OUTER APPLY (
+    SELECT 
+        COUNT(*) AS TotalEdits
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.UserId = ua.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+) ph
+WHERE 
+    ua.LastActivity > CURRENT_DATE - INTERVAL '6 months'
+    AND (ua.TotalQuestions > 0 OR ua.TotalAnswers > 0)
+ORDER BY 
+    ua.TotalScore DESC
+LIMIT 100;

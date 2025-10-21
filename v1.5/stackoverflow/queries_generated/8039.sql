@@ -1,0 +1,339 @@
+-- {"query": "8039.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3212} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain') as web_domain,
+           row_number() over (partition by coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain') order by u.reputation desc, u.id) as rn_by_domain
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+user_activity as (
+    select u.id as user_id,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+           count(c.id) as comments_made,
+           sum(coalesce(c.score,0)) as comment_score_sum,
+           count(distinct p.id) filter (where p.owneruserid = u.id) as posts_authored
+    from users u
+    left join votes v on v.userid = u.id
+    left join comments c on c.userid = u.id
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+questions as (
+    select p.id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.tags,
+           p.title,
+           p.closeddate,
+           p.acceptedanswerid
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select a.id,
+           a.parentid as question_id,
+           a.owneruserid,
+           a.creationdate,
+           a.score
+    from posts a
+    where a.posttypeid = 2
+),
+q_metrics as (
+    select q.id as question_id,
+           q.owneruserid as asker_id,
+           q.creationdate as q_created,
+           q.score as q_score,
+           q.viewcount,
+           q.answercount,
+           q.tags,
+           q.title,
+           q.closeddate,
+           count(ans.id) as answers_total,
+           count(ans.id) filter (where ans.score > 0) as answers_positive,
+           avg(ans.score) as avg_answer_score,
+           min(ans.creationdate) as first_answer_time,
+           max(ans.creationdate) as last_answer_time
+    from questions q
+    left join answers ans on ans.question_id = q.id
+    group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.tags, q.title, q.closeddate
+),
+q_history as (
+    select ph.postid as question_id,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_count,
+           count(*) filter (where ph.posthistorytypeid = 10) as closes_count,
+           max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_time,
+           bool_or(ph.posthistorytypeid = 50) as was_community_bumped
+    from posthistory ph
+    group by ph.postid
+),
+dup_links as (
+    select pl.postid as dup_question_id,
+           count(*) as dup_mark_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid
+),
+q_votes as (
+    select v.postid as question_id,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    group by v.postid
+),
+tag_explode as (
+    select q.question_id,
+           unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2,0)), '><')) as tag
+    from q_metrics q
+),
+tag_rank as (
+    select te.tag,
+           count(*) as tag_q_count,
+           row_number() over (order by count(*) desc, min(te.tag)) as tag_pop_rank
+    from tag_explode te
+    group by te.tag
+),
+accepted_answerer as (
+    select q.id as question_id,
+           a.owneruserid as accepted_owner_id
+    from questions q
+    join posts a on a.id = q.acceptedanswerid
+),
+user_badges as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           count(*) as total_badges,
+           count(*) filter (where b.tagbased = 1) as tag_badges
+    from badges b
+    group by b.userid
+),
+recent_hot as (
+    select distinct on (q.question_id)
+           q.question_id,
+           ph.creationdate as hot_time
+    from q_metrics q
+    join posthistory ph on ph.postid = q.question_id and ph.posthistorytypeid = 52
+    order by q.question_id, ph.creationdate desc
+),
+q_agg as (
+    select q.question_id,
+           q.asker_id,
+           q.q_created,
+           q.q_score,
+           q.viewcount,
+           q.answercount,
+           q.tags,
+           q.title,
+           q.closeddate,
+           q.answers_total,
+           q.answers_positive,
+           q.avg_answer_score,
+           q.first_answer_time,
+           q.last_answer_time,
+           coalesce(qh.edits_count,0) as edits_count,
+           coalesce(qh.closes_count,0) as closes_count,
+           qh.last_edit_time,
+           coalesce(dl.dup_mark_count,0) as dup_mark_count,
+           coalesce(qv.upvotes,0) as q_upvotes,
+           coalesce(qv.downvotes,0) as q_downvotes,
+           coalesce(qv.bounty_started,0) as bounty_started,
+           coalesce(qv.bounty_awarded,0) as bounty_awarded,
+           rh.hot_time,
+           qh.was_community_bumped
+    from q_metrics q
+    left join q_history qh on qh.question_id = q.question_id
+    left join dup_links dl on dl.dup_question_id = q.question_id
+    left join q_votes qv on qv.question_id = q.question_id
+    left join recent_hot rh on rh.question_id = q.question_id
+),
+domain_peers as (
+    select ru.user_id,
+           ru.web_domain,
+           count(*) over (partition by ru.web_domain) as domain_user_count,
+           avg(nullif(ua.posts_authored,0)) over (partition by ru.web_domain) as avg_posts_by_domain,
+           sum(ua.upvotes_cast) over (partition by ru.web_domain) as total_upvotes_by_domain
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+),
+asker_stats as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           coalesce(ub.total_badges,0) as total_badges,
+           coalesce(ub.gold_badges,0) as gold_badges,
+           coalesce(ub.silver_badges,0) as silver_badges,
+           coalesce(ub.bronze_badges,0) as bronze_badges,
+           coalesce(ub.tag_badges,0) as tag_badges,
+           ua.upvotes_cast,
+           ua.downvotes_cast,
+           ua.comments_made,
+           ua.comment_score_sum,
+           ua.posts_authored,
+           dp.web_domain,
+           dp.domain_user_count,
+           dp.avg_posts_by_domain,
+           dp.total_upvotes_by_domain,
+           ru.rn_by_domain
+    from users u
+    left join user_badges ub on ub.userid = u.id
+    left join user_activity ua on ua.user_id = u.id
+    left join domain_peers dp on dp.user_id = u.id
+    left join recent_users ru on ru.user_id = u.id
+),
+answerer_engagement as (
+    select a.owneruserid as user_id,
+           count(*) as answers_count,
+           avg(a.score) as avg_answer_score,
+           min(a.creationdate) as first_answer_at,
+           max(a.creationdate) as last_answer_at
+    from answers a
+    group by a.owneruserid
+),
+final_rows as (
+    select qa.question_id,
+           qa.title,
+           qa.tags,
+           qa.q_created,
+           qa.viewcount,
+           qa.q_score,
+           qa.answers_total,
+           qa.answers_positive,
+           qa.avg_answer_score as q_avg_answer_score,
+           qa.first_answer_time,
+           qa.last_answer_time,
+           qa.edits_count,
+           qa.closes_count,
+           qa.dup_mark_count,
+           qa.q_upvotes,
+           qa.q_downvotes,
+           qa.bounty_started,
+           qa.bounty_awarded,
+           qa.hot_time,
+           qa.was_community_bumped,
+           asr.user_id as asker_id,
+           asr.displayname as asker_name,
+           asr.reputation as asker_reputation,
+           asr.total_badges,
+           asr.gold_badges,
+           asr.silver_badges,
+           asr.bronze_badges,
+           asr.tag_badges,
+           asr.upvotes_cast as asker_upvotes_cast,
+           asr.downvotes_cast as asker_downvotes_cast,
+           asr.comments_made as asker_comments_made,
+           asr.comment_score_sum as asker_comment_score_sum,
+           asr.posts_authored as asker_posts_authored,
+           asr.web_domain as asker_web_domain,
+           asr.domain_user_count as asker_domain_user_count,
+           asr.avg_posts_by_domain as asker_avg_posts_by_domain,
+           asr.total_upvotes_by_domain as asker_total_upvotes_by_domain,
+           asr.rn_by_domain as asker_rank_in_domain,
+           aa.accepted_owner_id,
+           ae.answers_count as accepted_answerer_answers_count,
+           ae.avg_answer_score as accepted_answerer_avg_score,
+           ae.first_answer_at as accepted_answerer_first_answer_at,
+           ae.last_answer_at as accepted_answerer_last_answer_at,
+           tr.tag,
+           tr.tag_pop_rank,
+           row_number() over (
+               partition by qa.question_id
+               order by coalesce(qa.hot_time, timestamp 'epoch') desc,
+                        qa.viewcount desc,
+                        qa.q_score desc,
+                        tr.tag_pop_rank nulls last
+           ) as rn_per_question
+    from q_agg qa
+    left join asker_stats asr on asr.user_id = qa.asker_id
+    left join accepted_answerer aa on aa.question_id = qa.question_id
+    left join answerer_engagement ae on ae.user_id = aa.accepted_owner_id
+    left join tag_explode te on te.question_id = qa.question_id
+    left join tag_rank tr on tr.tag = te.tag
+    where (qa.closeddate is null or qa.closes_count = 0 or qa.q_score >= 0)
+      and coalesce(qa.viewcount,0) > 0
+      and coalesce(qa.answers_total,0) >= 0
+),
+scored as (
+    select fr.*,
+           (
+             coalesce(fr.q_score,0) * 3
+             + greatest(coalesce(fr.viewcount,0) / nullif(100,0), 0)
+             + coalesce(fr.answers_total,0) * 2
+             + coalesce(fr.answers_positive,0) * 1
+             + case when fr.hot_time is not null then 50 else 0 end
+             + case when fr.was_community_bumped then 5 else 0 end
+             + least(coalesce(fr.q_upvotes,0) - coalesce(fr.q_downvotes,0), 100)
+             + coalesce(fr.bounty_started,0) * 0.1
+             + coalesce(fr.bounty_awarded,0) * 0.2
+             + case when fr.accepted_owner_id is not null then 10 else 0 end
+             + coalesce(100 - nullif(fr.tag_pop_rank,0), 0)
+           )::numeric as composite_score
+    from final_rows fr
+),
+dedup as (
+    select *
+    from scored
+    where rn_per_question = 1
+),
+topk as (
+    select d.*,
+           dense_rank() over (order by d.composite_score desc, d.viewcount desc, d.q_created desc) as global_rank
+    from dedup d
+)
+select
+    t.global_rank,
+    t.question_id,
+    coalesce(t.title, '[no title]') as title,
+    coalesce(t.tags, '[]') as tags,
+    t.q_created,
+    t.viewcount,
+    t.q_score,
+    t.answers_total,
+    t.answers_positive,
+    round(coalesce(t.q_avg_answer_score,0)::numeric, 2) as q_avg_answer_score,
+    t.edits_count,
+    t.closes_count,
+    t.dup_mark_count,
+    t.q_upvotes,
+    t.q_downvotes,
+    t.bounty_started,
+    t.bounty_awarded,
+    t.hot_time,
+    t.was_community_bumped,
+    t.asker_id,
+    coalesce(t.asker_name, format('user-%s', t.asker_id)) as asker_name,
+    coalesce(t.asker_reputation, 0) as asker_reputation,
+    t.total_badges,
+    t.gold_badges,
+    t.silver_badges,
+    t.bronze_badges,
+    t.tag_badges,
+    t.asker_upvotes_cast,
+    t.asker_downvotes_cast,
+    t.asker_comments_made,
+    t.asker_comment_score_sum,
+    t.asker_posts_authored,
+    t.asker_web_domain,
+    t.asker_domain_user_count,
+    round(coalesce(t.asker_avg_posts_by_domain,0)::numeric,2) as asker_avg_posts_by_domain,
+    t.asker_total_upvotes_by_domain,
+    coalesce(t.asker_rank_in_domain, 0) as asker_rank_in_domain,
+    coalesce(t.accepted_owner_id, -1) as accepted_answerer_id,
+    round(coalesce(t.accepted_answerer_avg_score,0)::numeric,2) as accepted_answerer_avg_score,
+    t.accepted_answerer_answers_count,
+    t.accepted_answerer_first_answer_at,
+    t.accepted_answerer_last_answer_at,
+    round(t.composite_score,2) as composite_score
+from topk t
+where t.global_rank <= 200
+order by t.global_rank, t.question_id;

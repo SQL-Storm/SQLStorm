@@ -1,0 +1,214 @@
+-- {"query": "29096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2154} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationLevel,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        DATEDIFF('day', p.CreationDate, CURRENT_TIMESTAMP) as AgeDays,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'None'
+        END as Popularity,
+        p.ViewCount / NULLIF(p.AnswerCount + 1, 0) as ViewsPerAnswer,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PostSequence,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        RANK() OVER (ORDER BY p.AnswerCount DESC) as AnswerRank,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) as CompositeScore,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 12, 13)) THEN 'Modified'
+            ELSE 'Original'
+        END as Status,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered'
+            ELSE 'N/A'
+        END as QuestionStatus
+    FROM Posts p
+    WHERE p.CreationDate > '2020-01-01'
+),
+TagFrequency AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Rare'
+        END as TagPopularity,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexAnalytics AS (
+    SELECT 
+        ps.UserId,
+        ps.DisplayName,
+        ps.Reputation,
+        ps.PostCount,
+        ps.CommentCount,
+        ps.BadgeCount,
+        ps.ReputationLevel,
+        ps.ReputationRank,
+        ps.AvgPostScore,
+        ps.LastPostDate,
+        ps.AllTags,
+        COUNT(DISTINCT pp.PostId) as ActivePosts,
+        SUM(CASE WHEN pp.PostType = 'Question' THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN pp.PostType = 'Answer' THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(pp.Score) as AvgScore,
+        MAX(pp.AgeDays) as MaxPostAge,
+        STRING_AGG(CASE WHEN pp.Score > 10 THEN pp.Title ELSE NULL END, '; ') as HighScoringTitles,
+        STRING_AGG(CASE WHEN pp.PostType = 'Question' THEN pp.Tags ELSE NULL END, ', ') as AllQuestionTags,
+        AVG(pp.ViewCount) as AvgViews,
+        AVG(pp.AnswerCount) as AvgAnswers,
+        SUM(CASE WHEN pp.QuestionStatus = 'Answered' THEN 1 ELSE 0 END) as AnsweredQuestions,
+        COUNT(DISTINCT CASE WHEN pp.Score > 50 THEN pp.PostId ELSE NULL END) as HighScorePosts,
+        CASE 
+            WHEN MAX(CASE WHEN pp.Score > 10 THEN 1 ELSE 0 END) > 0 THEN 
+                'Has High Scoring Posts'
+            ELSE 'No High Scoring Posts'
+        END as ScoringStatus,
+        SUM(CASE WHEN pp.Popularity = 'Popular' THEN 1 ELSE 0 END) as PopularPosts,
+        MAX(pp.CompositeScore) as MaxCompositeScore,
+        RANK() OVER (ORDER BY SUM(pp.Score) DESC) as TotalScoreRank
+    FROM UserStats ps
+    LEFT JOIN PostPerformance pp ON ps.UserId = pp.OwnerUserId
+    GROUP BY ps.UserId, ps.DisplayName, ps.Reputation, ps.PostCount, ps.CommentCount, ps.BadgeCount, ps.ReputationLevel, ps.ReputationRank, ps.AvgPostScore, ps.LastPostDate, ps.AllTags
+),
+FinalAggregates AS (
+    SELECT 
+        COUNT(*) as TotalUsers,
+        COUNT(DISTINCT CASE WHEN ca.ScoringStatus = 'Has High Scoring Posts' THEN ca.UserId ELSE NULL END) as ActiveUsers,
+        AVG(ca.AvgScore) as OverallAvgScore,
+        AVG(ca.PostCount) as AvgPostsPerUser,
+        AVG(ca.AvgComments) as AvgCommentsPerUser,
+        MAX(ca.MaxCompositeScore) as MaxCompositeScore,
+        AVG(ca.AvgViews) as AvgViewsPerPost,
+        AVG(ca.AvgAnswers) as AvgAnswersPerPost,
+        AVG(CAST(ca.AnsweredQuestions AS FLOAT) / NULLIF(ca.QuestionCount, 0)) as AnswerRate
+    FROM ComplexAnalytics ca
+),
+UserMetrics AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.AvgScore,
+        ca.AvgViews,
+        ca.AvgAnswers,
+        ca.ScoringStatus,
+        ca.AnswerRate,
+        ca.TotalScoreRank,
+        ca.MaxCompositeScore,
+        ca.LastPostDate,
+        CASE 
+            WHEN ca.PostCount > 50 AND ca.AvgScore > 20 THEN 'High Performer'
+            WHEN ca.PostCount > 20 AND ca.AvgScore > 10 THEN 'Mid Performer'
+            WHEN ca.PostCount > 5 AND ca.AvgScore > 5 THEN 'Low Performer'
+            ELSE 'New User'
+        END as PerformanceLevel
+    FROM ComplexAnalytics ca
+    WHERE ca.PostCount > 0
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.PostCount,
+    u.AvgScore,
+    u.AvgViews,
+    u.AvgAnswers,
+    u.ScoringStatus,
+    u.AnswerRate,
+    u.PerformanceLevel,
+    u.TotalScoreRank,
+    u.MaxCompositeScore,
+    u.LastPostDate,
+    CASE 
+        WHEN u.MaxCompositeScore > (SELECT MAX(MaxCompositeScore) * 0.8 FROM UserMetrics) THEN 'Top Performer'
+        WHEN u.MaxCompositeScore > (SELECT MAX(MaxCompositeScore) * 0.5 FROM UserMetrics) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as PerformanceCategory,
+    CASE 
+        WHEN u.PostCount > 100 THEN 'Expert'
+        WHEN u.PostCount > 50 THEN 'Advanced'
+        WHEN u.PostCount > 20 THEN 'Intermediate'
+        WHEN u.PostCount > 5 THEN 'Beginner'
+        ELSE 'New'
+    END as ExperienceLevel,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationLadder,
+    PERCENT_RANK() OVER (ORDER BY u.AvgScore DESC) as ScorePercentile,
+    NTILE(10) OVER (ORDER BY u.AvgScore DESC) as ScoreDecile,
+    CASE 
+        WHEN u.AvgScore > 100 THEN 'Superior'
+        WHEN u.AvgScore > 50 THEN 'Excellent'
+        WHEN u.AvgScore > 25 THEN 'Good'
+        WHEN u.AvgScore > 10 THEN 'Fair'
+        ELSE 'Poor'
+    END as ScoreRating
+FROM UserMetrics u
+WHERE u.Reputation > 100
+  AND u.PostCount > 1
+  AND NOT EXISTS (
+    SELECT 1 
+    FROM PostHistory ph 
+    WHERE ph.UserId = u.UserId 
+      AND ph.PostHistoryTypeId IN (10, 12, 13) 
+      AND ph.CreationDate > '2022-01-01'
+  )
+  AND u.DisplayName IS NOT NULL
+  AND u.DisplayName != ''
+  AND (
+    (u.AvgScore > 5 AND u.AvgViews > 10) 
+    OR 
+    (u.PostCount > 20 AND u.AvgScore > 1)
+  )
+ORDER BY u.Reputation DESC, u.MaxCompositeScore DESC
+LIMIT 1000;

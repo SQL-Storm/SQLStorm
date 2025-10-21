@@ -1,0 +1,99 @@
+-- {"query": "12024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 904} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) OVER (PARTITION BY P.Id) AS DownVotes,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        STRING_AGG(T.TagName, ', ' ORDER BY T.Count DESC) AS TagsList
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId,
+    LATERAL 
+        UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'')) WITH ORDINALITY AS T(TagName, ord)
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersGiven,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditBodyDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 6 THEN PH.CreationDate END) AS LastEditTagsDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore,
+        MAX(P.CreationDate) AS LatestPostDate
+    FROM 
+        Tags T
+    JOIN 
+        LATERAL UNNEST(string_to_array(substring(T.TagName, 2, length(T.TagName)-2), ''><'')) WITH ORDINALITY AS P(TagName, ord) ON true
+    GROUP BY 
+        T.TagName
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.TagsList,
+    PHS.TotalEdits,
+    PHS.LastEditBodyDate,
+    PHS.LastEditTagsDate,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    TS.LatestPostDate
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    TagStats TS ON RP.TagsList LIKE '%' || TS.TagName || '%'
+WHERE 
+    RP.PostRank <= 10
+ORDER BY 
+    RP.PostRank, RP.Score DESC, RP.CreationDate;

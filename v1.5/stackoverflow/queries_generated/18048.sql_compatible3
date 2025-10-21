@@ -1,0 +1,120 @@
+WITH UserPostScores AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AverageScore,
+        COUNT(p.Id) AS PostCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.Score IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCommentEngagement AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(c.Score) AS AverageCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL AND c.Score IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteActivity AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS FavoritesGiven,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+RankedUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        ups.TotalScore,
+        ups.AverageScore,
+        ups.PostCount,
+        uce.CommentCount,
+        uce.TotalCommentScore,
+        uce.AverageCommentScore,
+        uva.UpVotesGiven,
+        uva.DownVotesGiven,
+        uva.FavoritesGiven,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, ups.TotalScore DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY ups.PostCount DESC, u.Reputation DESC) AS PostCountRank,
+        DENSE_RANK() OVER (
+            PARTITION BY
+                CASE
+                    WHEN u.CreationDate < TIMESTAMP 'now' - INTERVAL '1 year' THEN 'Old'
+                    ELSE 'New'
+                END
+            ORDER BY u.Views DESC
+        ) AS ViewRankByAge
+    FROM Users u
+    LEFT JOIN UserPostScores ups ON u.Id = ups.OwnerUserId
+    LEFT JOIN UserCommentEngagement uce ON u.Id = uce.UserId
+    LEFT JOIN UserVoteActivity uva ON u.Id = uva.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName NOT LIKE '%community%' AND u.Id > 0
+)
+SELECT
+    ru.DisplayName,
+    ru.Reputation,
+    ru.CreationDate,
+    ru.LastAccessDate,
+    ru.Views,
+    COALESCE(ru.TotalScore, 0) AS TotalPostScore,
+    COALESCE(ru.AverageScore, 0) AS AvgPostScore,
+    COALESCE(ru.PostCount, 0) AS TotalPosts,
+    COALESCE(ru.CommentCount, 0) AS TotalComments,
+    COALESCE(ru.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(ru.AverageCommentScore, 0) AS AvgCommentScore,
+    COALESCE(ru.UpVotesGiven, 0) AS UpVotesCast,
+    COALESCE(ru.DownVotesGiven, 0) AS DownVotesCast,
+    COALESCE(ru.FavoritesGiven, 0) AS FavoritesCast,
+    ru.ReputationRank,
+    ru.PostCountRank,
+    ru.ViewRankByAge,
+    CASE
+        WHEN ru.Reputation > 100000 THEN 'Legendary'
+        WHEN ru.Reputation > 50000 THEN 'Expert'
+        WHEN ru.Reputation > 10000 THEN 'Advanced'
+        WHEN ru.Reputation > 2000 THEN 'Experienced'
+        WHEN ru.Reputation > 500 THEN 'Proficient'
+        ELSE 'Novice'
+    END AS ReputationTier,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.Id AND b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(DISTINCT p_links.RelatedPostId)
+     FROM Posts p_q
+     JOIN PostLinks p_links ON p_q.Id = p_links.PostId
+     JOIN LinkTypes lt ON p_links.LinkTypeId = lt.Id
+     WHERE p_q.OwnerUserId = ru.Id
+       AND lt.Name = 'Duplicate'
+       AND p_links.CreationDate BETWEEN ru.CreationDate AND ru.LastAccessDate
+    ) AS DuplicateLinksCreated,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Posts p_closed
+            WHERE p_closed.OwnerUserId = ru.Id
+              AND p_closed.ClosedDate IS NOT NULL
+              AND p_closed.ClosedDate > ru.LastAccessDate - INTERVAL '90 day'
+        ) THEN 'HasRecentClosedPosts'
+        ELSE 'NoRecentClosedPosts'
+    END AS RecentCloseStatus,
+    UPPER(SUBSTRING(ru.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(ru.DisplayName FROM 2)) AS FormattedDisplayName,
+    CASE WHEN COALESCE(ru.AverageScore, 0) > 5.0 AND COALESCE(ru.TotalPosts, 0) > 100 THEN 'High Performer' ELSE 'Standard Performer' END AS PerformanceCategory
+FROM RankedUsers ru
+WHERE ru.PostCount > 5 OR ru.CommentCount > 10
+ORDER BY ru.ReputationRank, ru.PostCountRank DESC
+LIMIT 100;

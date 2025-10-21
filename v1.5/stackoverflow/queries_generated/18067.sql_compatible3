@@ -1,0 +1,131 @@
+WITH QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ViewCount AS QuestionViewCount,
+        pt.Name AS QuestionType,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+        COUNT(c.Id) AS CommentCountOnQuestion,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END) AS InitialTitleEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 7 THEN 1 ELSE 0 END) AS TitleRollbacks,
+        MAX(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND a.Id = p.AcceptedAnswerId THEN a.Score ELSE 0 END) AS ScoreOfAcceptedAnswer,
+        MAX(a.Id) AS AnyAnswerId
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ViewCount,
+        pt.Name,
+        p.ClosedDate,
+        p.AcceptedAnswerId
+),
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        ua.DisplayName AS AnswerOwnerDisplayName,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.ViewCount AS AnswerViewCount,
+        ROW_NUMBER() OVER(PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankByScore,
+        COUNT(ac.Id) AS CommentCountOnAnswer,
+        SUM(CASE WHEN av.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesOnAnswer,
+        SUM(CASE WHEN av.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesOnAnswer
+    FROM Posts a
+    JOIN Users ua ON a.OwnerUserId = ua.Id
+    LEFT JOIN Comments ac ON a.Id = ac.PostId
+    LEFT JOIN Votes av ON a.Id = av.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        ua.DisplayName,
+        a.CreationDate,
+        a.Score,
+        a.ViewCount
+)
+SELECT
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.OwnerDisplayName AS QuestionOwner,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.QuestionStatus,
+    qd.QuestionType,
+    qd.AnswerCount,
+    qd.FavoriteCount,
+    qd.QuestionViewCount,
+    qd.CommentCountOnQuestion,
+    qd.InitialTitleEdits,
+    qd.TitleEdits,
+    qd.TitleRollbacks,
+    COALESCE(ad.AnswerId, -1) AS BestAnswerId,
+    COALESCE(ad.AnswerScore, 0) AS BestAnswerScore,
+    COALESCE(ad.AnswerOwnerDisplayName, 'Community') AS BestAnswerOwner,
+    COALESCE(ad.AnswerCreationDate, qd.QuestionCreationDate) AS BestAnswerCreationDate,
+    COALESCE(ad.CommentCountOnAnswer, 0) AS CommentsOnBestAnswer,
+    COALESCE(ad.UpvotesOnAnswer, 0) AS UpvotesOnBestAnswer,
+    COALESCE(ad.DownvotesOnAnswer, 0) AS DownvotesOnBestAnswer,
+    CASE WHEN qd.ScoreOfAcceptedAnswer > 0 THEN 'Accepted and Scored Well'
+         WHEN qd.ScoreOfAcceptedAnswer = 0 AND ad.AnswerId IS NOT NULL THEN 'Accepted but Not Scored High'
+         WHEN qd.ScoreOfAcceptedAnswer < 0 THEN 'Accepted but Scored Negatively'
+         ELSE 'No Accepted Answer'
+    END AS AcceptanceScoreCategory,
+    STRING_AGG(DISTINCT CAST(ad.AnswerId AS VARCHAR(20)) ORDER BY ad.AnswerRankByScore ASC SEPARATOR '|') AS AllAnswerIdsOrderedByScore,
+    LENGTH(qd.QuestionTitle) AS QuestionTitleLength,
+    UPPER(SUBSTRING(qd.QuestionTitle, 1, 3)) AS QuestionTitlePrefix,
+    CASE WHEN qd.OwnerUserId IS NULL THEN TRUE ELSE FALSE END AS IsCommunityOwnedQuestion,
+    (qd.QuestionScore + COALESCE(ad.AnswerScore, 0)) AS TotalScoreForQuestionAndBestAnswer,
+    CONCAT(qd.OwnerDisplayName, ' (', qd.OwnerUserId, ')') AS OwnerIdentifier,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM QuestionDetails qd
+LEFT JOIN AnswerDetails ad ON qd.QuestionId = ad.QuestionId AND ad.AnswerRankByScore = 1
+WHERE qd.QuestionTitle NOT LIKE '%[^a-zA-Z0-9 ]%' OR qd.QuestionTitle IS NULL
+GROUP BY
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.OwnerDisplayName,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.QuestionStatus,
+    qd.QuestionType,
+    qd.AnswerCount,
+    qd.FavoriteCount,
+    qd.QuestionViewCount,
+    qd.CommentCountOnQuestion,
+    qd.InitialTitleEdits,
+    qd.TitleEdits,
+    qd.TitleRollbacks,
+    ad.AnswerId,
+    ad.AnswerScore,
+    ad.AnswerOwnerDisplayName,
+    ad.AnswerCreationDate,
+    ad.CommentCountOnAnswer,
+    ad.UpvotesOnAnswer,
+    ad.DownvotesOnAnswer,
+    qd.ScoreOfAcceptedAnswer,
+    qd.OwnerUserId
+HAVING COALESCE(ad.AnswerScore, 0) >= qd.QuestionScore OR qd.QuestionScore > 100
+ORDER BY qd.QuestionCreationDate DESC
+LIMIT 1000;

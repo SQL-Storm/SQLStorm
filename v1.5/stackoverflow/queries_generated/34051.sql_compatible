@@ -1,0 +1,167 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+  UNION ALL
+    SELECT 
+        t.Id, 
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Depth + 1
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE r.Depth < 3
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        COALESCE((SELECT SUM(CAST(v.VoteTypeId = 2 AS INT)) FROM Votes v WHERE v.PostId = p.Id), 0) AS Upvotes,
+        COALESCE((SELECT SUM(CAST(v.VoteTypeId = 3 AS INT)) FROM Votes v WHERE v.PostId = p.Id), 0) AS Downvotes
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+      AND p.Score > 5
+      AND p.ViewCount > 1000
+),
+QuestionTagExplode AS (
+    SELECT
+        tq.*,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(tq.Tags FROM 2 FOR CHAR_LENGTH(tq.Tags) - 2), '><')) AS Tag
+    FROM TopQuestions tq
+),
+QuestionTagRanks AS (
+    SELECT 
+        qte.*,
+        RANK() OVER (PARTITION BY qte.QuestionId ORDER BY qte.Score DESC) AS ScoreRank
+    FROM QuestionTagExplode qte
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.Id) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+),
+AnswerDetails AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id), 0) AS CommentCount,
+        COALESCE((SELECT SUM(CAST(v.VoteTypeId = 2 AS INT)) FROM Votes v WHERE v.PostId = a.Id), 0) AS Upvotes
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+),
+AnswerRankings AS (
+    SELECT
+        ad.*,
+        RANK() OVER (PARTITION BY ad.QuestionId ORDER BY ad.Upvotes DESC, ad.Score DESC) AS AnswerRank
+    FROM AnswerDetails ad
+),
+FinalSelection AS (
+    SELECT 
+        qtr.QuestionId,
+        qtr.Title,
+        qtr.OwnerName,
+        qtr.Reputation AS OwnerReputation,
+        qtr.Score AS QuestionScore,
+        qtr.ViewCount,
+        qtr.AnswerCount,
+        qtr.CommentCount AS QuestionCommentCount,
+        qtr.Upvotes AS QuestionUpvotes,
+        qtr.Downvotes AS QuestionDownvotes,
+        qtr.Tag,
+        ra.LastEditDate,
+        ra.EditCount,
+        ar.AnswerId,
+        ar.Score AS AnswerScore,
+        ar.CommentCount AS AnswerCommentCount,
+        ar.Upvotes AS AnswerUpvotes,
+        ar.CreationDate AS AnswerCreationDate
+    FROM QuestionTagRanks qtr
+    LEFT JOIN RecentActivity ra ON ra.PostId = qtr.QuestionId
+    LEFT JOIN AnswerRankings ar ON ar.QuestionId = qtr.QuestionId AND ar.AnswerRank = 1
+    WHERE qtr.ScoreRank = 1
+      AND qtr.Tag NOT IN ('discussion', 'meta', 'support')
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    fs.QuestionId,
+    fs.Title,
+    fs.OwnerName,
+    fs.OwnerReputation,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.QuestionCommentCount,
+    fs.QuestionUpvotes,
+    fs.QuestionDownvotes,
+    fs.Tag,
+    fs.LastEditDate,
+    fs.EditCount,
+    fs.AnswerId,
+    fs.AnswerScore,
+    fs.AnswerCommentCount,
+    fs.AnswerUpvotes,
+    fs.AnswerCreationDate,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.BadgesEarned,
+    uas.LastPostDate,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges
+FROM FinalSelection fs
+LEFT JOIN UserActivitySummary uas ON uas.DisplayName = fs.OwnerName
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = (
+    SELECT Id FROM Users WHERE DisplayName = fs.OwnerName LIMIT 1
+)
+ORDER BY fs.QuestionScore DESC, fs.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,171 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        CAST(t.TagName AS VARCHAR(4000)) AS Path,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        CONCAT(parent.Path, '>', child.TagName),
+        parent.Depth + 1
+    FROM Tags child
+    JOIN TagHierarchy parent ON child.TagName LIKE CONCAT(parent.TagName, '-%')
+    WHERE child.IsModeratorOnly = 0
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0)) AS NetScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTagsByScore AS (
+    SELECT
+        th.TagName,
+        th.Depth,
+        SUM(p.Score) AS TagScore,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.ViewCount) AS AvgViews,
+        ROW_NUMBER() OVER (PARTITION BY th.Depth ORDER BY SUM(p.Score) DESC) AS RankWithinDepth
+    FROM TagHierarchy th
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', th.TagName, '>%')
+    WHERE p.PostTypeId = 1          -- only questions
+      AND p.CreationDate >= DATE '2020-01-01'
+    GROUP BY th.TagName, th.Depth
+),
+TagCorrelation AS (
+    SELECT
+        t1.TagName AS TagA,
+        t2.TagName AS TagB,
+        COUNT(DISTINCT pl.PostId) AS CoOccurrence,
+        COUNT(DISTINCT pl.PostId) * 1.0 /
+        NULLIF(
+            (SELECT COUNT(*) FROM Posts p1 WHERE p1.Tags LIKE CONCAT('%<', t1.TagName, '>%') AND p1.PostTypeId = 1),
+            0
+        ) AS SupportA,
+        COUNT(DISTINCT pl.PostId) * 1.0 /
+        NULLIF(
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.Tags LIKE CONCAT('%<', t2.TagName, '>%') AND p2.PostTypeId = 1),
+            0
+        ) AS SupportB,
+        (COUNT(DISTINCT pl.PostId) * 1.0) /
+        NULLIF(
+            (SELECT COUNT(*) FROM Posts p3
+             WHERE (p3.Tags LIKE CONCAT('%<', t1.TagName, '>%')
+                OR p3.Tags LIKE CONCAT('%<', t2.TagName, '>%'))
+               AND p3.PostTypeId = 1),
+            0
+        ) AS Jaccard
+    FROM Tags t1
+    JOIN Tags t2 ON t1.Id < t2.Id
+    JOIN PostLinks pl ON pl.LinkTypeId = 1                     -- linked posts
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.Tags LIKE CONCAT('%<', t1.TagName, '>%')
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.Tags LIKE CONCAT('%<', t2.TagName, '>%')
+    WHERE p1.PostTypeId = 1 AND p2.PostTypeId = 1
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(DISTINCT pl.PostId) > 50
+),
+AggregatedMetrics AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.NetScore,
+        u.BadgeCount,
+        u.CommentCount,
+        u.LastPostDate,
+        COALESCE(SUM(tt.TagScore) OVER (PARTITION BY u.UserId), 0) AS UserTagScore,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationPercentile,
+        NTILE(10) OVER (ORDER BY u.NetScore DESC) AS NetScoreDecile
+    FROM UserActivity u
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(p.Score) AS TagScore
+        FROM Posts p
+        JOIN Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId
+    ) tt ON tt.OwnerUserId = u.UserId
+)
+SELECT
+    am.UserId,
+    am.DisplayName,
+    am.Reputation,
+    am.QuestionCount,
+    am.AnswerCount,
+    am.NetScore,
+    am.BadgeCount,
+    am.CommentCount,
+    am.LastPostDate,
+    am.UserTagScore,
+    am.ReputationPercentile,
+    am.NetScoreDecile,
+    (
+        SELECT JSON_OBJECTAGG(
+            'Tag' VALUE t.TagName,
+            'Depth' VALUE t.Depth,
+            'Score' VALUE t.TagScore,
+            'PostCount' VALUE t.PostCount,
+            'AvgViews' VALUE t.AvgViews,
+            'RankWithinDepth' VALUE t.RankWithinDepth
+        )
+        FROM TopTagsByScore t
+        WHERE t.RankWithinDepth <= 5
+        ORDER BY t.RankWithinDepth
+    ) AS TopTagsByDepth,
+    (
+        SELECT JSON_OBJECTAGG(
+            'CoTag' VALUE c.TagB,
+            'CoOccurrence' VALUE c.CoOccurrence,
+            'Jaccard' VALUE ROUND(CAST(c.Jaccard AS NUMERIC), 4)
+        )
+        FROM TagCorrelation c
+        WHERE c.Jaccard > 0.05
+        ORDER BY c.Jaccard DESC
+    ) AS StrongTagCorrelations
+FROM AggregatedMetrics am
+LEFT JOIN TopTagsByScore t ON t.TagName = ANY (STRING_TO_ARRAY(am.DisplayName, ' '))
+LEFT JOIN TagCorrelation c ON (c.TagA = ANY (STRING_TO_ARRAY(am.DisplayName, ' '))
+                               OR c.TagB = ANY (STRING_TO_ARRAY(am.DisplayName, ' ')))
+WHERE am.Reputation > 1000
+GROUP BY
+    am.UserId,
+    am.DisplayName,
+    am.Reputation,
+    am.QuestionCount,
+    am.AnswerCount,
+    am.NetScore,
+    am.BadgeCount,
+    am.CommentCount,
+    am.LastPostDate,
+    am.UserTagScore,
+    am.ReputationPercentile,
+    am.NetScoreDecile
+ORDER BY am.Reputation DESC
+LIMIT 100;

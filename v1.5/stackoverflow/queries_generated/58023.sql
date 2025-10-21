@@ -1,0 +1,59 @@
+-- {"query": "58023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1144} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        SUM(p.Score) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(p.Id) DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 8)
+    GROUP BY u.Id
+),
+ActiveMonths AS (
+    SELECT 
+        UserId,
+        DATE_TRUNC('month', CreationDate) AS ActiveMonth,
+        COUNT(*) AS MonthlyPosts,
+        RANK() OVER (PARTITION BY UserId ORDER BY COUNT(*) DESC) AS MonthRank
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY UserId, ActiveMonth
+),
+BadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        MAX(Date) AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    us.PostCount,
+    us.CommentCount,
+    us.VoteCount,
+    us.TotalPostScore,
+    am.ActiveMonth AS MostActiveMonth,
+    bs.GoldBadges,
+    bs.LastBadgeDate,
+    ph.CreationDate AS FirstPostHistoryDate,
+    (us.TotalPostScore + us.CommentCount * 2 + COALESCE(SUM(v.BountyAmount), 0)) AS ContributionScore
+FROM Users u
+JOIN UserStats us ON u.Id = us.UserId
+LEFT JOIN ActiveMonths am ON u.Id = am.UserId AND am.MonthRank = 1
+LEFT JOIN BadgeSummary bs ON u.Id = bs.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId = 2
+LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8
+WHERE u.Reputation > 1000
+GROUP BY u.Id, u.DisplayName, us.PostCount, us.CommentCount, us.VoteCount, us.TotalPostScore, am.ActiveMonth, bs.GoldBadges, bs.LastBadgeDate, ph.CreationDate
+HAVING COUNT(DISTINCT p.Id) >= 10
+ORDER BY ContributionScore DESC
+LIMIT 100;

@@ -1,0 +1,68 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id,
+        Posts.Title,
+        Posts.CreationDate,
+        Posts.Score,
+        Posts.ViewCount,
+        Users.DisplayName AS OwnerDisplayName,
+        Users.Reputation,
+        (SELECT COUNT(*) FROM Votes WHERE Votes.PostId = Posts.Id) AS TotalVotes,
+        (SELECT COUNT(*) FROM Comments WHERE Comments.PostId = Posts.Id) AS TotalComments,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostHistory.PostId = Posts.Id) AS TotalEdits,
+        (SELECT COUNT(DISTINCT Tags.TagName)
+         FROM Tags
+         JOIN PostTags ON Tags.Id = PostTags.TagId
+         WHERE PostTags.PostId = Posts.Id) AS TagCount,
+        Posts.OwnerUserId
+    FROM Posts
+    JOIN Users ON Posts.OwnerUserId = Users.Id
+    WHERE Posts.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+      AND Posts.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT 
+        Users.Id AS UserId, 
+        COUNT(DISTINCT Posts.Id) AS PostsCreated, 
+        COUNT(DISTINCT Comments.Id) AS CommentsMade, 
+        SUM(Votes.Score) AS TotalVoteScore
+    FROM Users
+    LEFT JOIN Posts ON Users.Id = Posts.OwnerUserId
+    LEFT JOIN Comments ON Users.Id = Comments.UserId
+    LEFT JOIN Votes ON Users.Id = Votes.UserId
+    GROUP BY Users.Id
+),
+BadgeSummary AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalBadges, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT 
+    RP.Id, 
+    RP.Title, 
+    RP.CreationDate, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.OwnerDisplayName, 
+    RP.Reputation, 
+    RP.TotalVotes, 
+    RP.TotalComments, 
+    RP.TotalEdits, 
+    RP.TagCount, 
+    UA.PostsCreated, 
+    UA.CommentsMade, 
+    UA.TotalVoteScore, 
+    BS.TotalBadges, 
+    BS.GoldBadges, 
+    BS.SilverBadges, 
+    BS.BronzeBadges
+FROM RecentPosts RP
+JOIN UserActivity UA ON RP.OwnerUserId = UA.UserId
+JOIN BadgeSummary BS ON RP.OwnerUserId = BS.UserId
+ORDER BY RP.Score DESC, RP.ViewCount DESC, RP.TotalVotes DESC, UA.TotalVoteScore DESC, BS.TotalBadges DESC
+LIMIT 100;

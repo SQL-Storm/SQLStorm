@@ -1,0 +1,67 @@
+-- {"query": "1012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 575} 
+
+WITH UserStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(P.Id) AS PostCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(V.BountyAmount) AS TotalBounty
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId = 8
+    WHERE U.Reputation > (SELECT AVG(Reputation) FROM Users)
+    GROUP BY U.Id
+),
+PostInfo AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.ViewCount,
+        P.Score,
+        COALESCE(P2.DisplayName, 'Community User') AS OwnerDisplayName,
+        P.PostTypeId,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS RecentActivity
+    FROM Posts P
+    LEFT JOIN Users P2 ON P.OwnerUserId = P2.Id
+    WHERE P.CreationDate >= NOW() - INTERVAL '1 YEAR'
+),
+ClosedPosts AS (
+    SELECT DISTINCT 
+        H.PostId,
+        H.RevisionGUID,
+        H.CreationDate AS CloseDate,
+        CR.Name AS CloseReason
+    FROM PostHistory H
+    JOIN CloseReasonTypes CR ON H.Comment::int = CR.Id
+    WHERE H.PostHistoryTypeId IN (10, 11)
+),
+UserActivity AS (
+    SELECT 
+        S.DisplayName,
+        S.UserId,
+        COUNT(DISTINCT P.Id) AS ActivePosts,
+        SUM(COALESCE(PSV.Score, 0)) AS TotalScore
+    FROM UserStats S
+    JOIN Posts P ON S.UserId = P.OwnerUserId
+    LEFT JOIN Posts PSV ON PSV.AcceptedAnswerId = P.Id
+    GROUP BY S.DisplayName, S.UserId
+)
+SELECT 
+    UA.DisplayName,
+    UA.ActivePosts,
+    UA.TotalScore,
+    PS.Title,
+    PS.ViewCount,
+    PS.Score,
+    PS.CreationDate,
+    COALESCE(CP.CloseDate, 'Not Closed') AS ClosureDate,
+    COALESCE(CP.CloseReason, 'N/A') AS ReasonForClosure
+FROM UserActivity UA
+JOIN PostInfo PS ON UA.UserId = PS.OwnerDisplayName
+LEFT JOIN ClosedPosts CP ON PS.PostId = CP.PostId
+ORDER BY UA.TotalScore DESC, UA.ActivePosts DESC
+FETCH FIRST 100 ROWS ONLY;

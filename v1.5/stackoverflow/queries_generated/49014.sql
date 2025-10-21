@@ -1,0 +1,133 @@
+-- {"query": "49014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1739} 
+
+WITH RecentUserPosts AS (
+    -- Collect all questions and answers from users created within the last 2 years, along with essential details
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId AS UserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        p.Tags
+    FROM Posts AS p
+    WHERE
+        p.PostTypeId IN (1, 2) -- Filter for Questions (1) and Answers (2)
+        AND p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= (CURRENT_DATE - INTERVAL '2 year') -- Activity within the last 2 years
+),
+QuestionAcceptanceTime AS (
+    -- Calculate the time difference (in seconds) between question creation and its accepted answer's creation
+    SELECT
+        q.UserId AS QuestionOwnerId,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS SecondsUntilAcceptedAnswer
+    FROM RecentUserPosts AS q
+    JOIN RecentUserPosts AS a ON q.AcceptedAnswerId = a.PostId
+    WHERE
+        q.PostTypeId = 1 -- Ensure it's a question
+        AND a.PostTypeId = 2 -- Ensure it's an answer
+        AND q.AcceptedAnswerId IS NOT NULL -- Only questions with an accepted answer
+),
+AvgUserQuestionAcceptanceTime AS (
+    -- Compute the average time (in seconds) it takes for a user's questions to get an accepted answer
+    SELECT
+        QuestionOwnerId AS UserId,
+        AVG(SecondsUntilAcceptedAnswer) AS AvgSecondsUntilAcceptedAnswer
+    FROM QuestionAcceptanceTime
+    GROUP BY QuestionOwnerId
+),
+UserDistinctTags AS (
+    -- Count distinct tags contributed by each user through their questions within the period
+    SELECT
+        rp.UserId,
+        COUNT(DISTINCT LOWER(UNNEST(string_to_array(SUBSTRING(rp.Tags, 2, LENGTH(rp.Tags) - 2), '><')))) AS DistinctTagCount
+    FROM RecentUserPosts AS rp
+    WHERE rp.PostTypeId = 1 -- Only consider tags from questions
+        AND rp.Tags IS NOT NULL
+        AND LENGTH(rp.Tags) > 2 -- Ensure tags string is not empty or just "<>"
+    GROUP BY rp.UserId
+),
+UserBadgeSummary AS (
+    -- Summarize the number of Gold, Silver, and Bronze badges earned by each user in the last 2 years
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges AS b
+    WHERE b.Date >= (CURRENT_DATE - INTERVAL '2 year') -- Badges awarded within the last 2 years
+    GROUP BY b.UserId
+),
+UserPostAggregates AS (
+    -- Aggregate total questions, answers, and their respective scores for each user
+    SELECT
+        rp.UserId,
+        COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END) AS TotalQuestions,
+        COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN rp.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN rp.Score ELSE 0 END) AS TotalAnswerScore
+    FROM RecentUserPosts AS rp
+    GROUP BY rp.UserId
+),
+RankedUserPosts AS (
+    -- Rank each user's questions and answers by their score to identify the top performing posts
+    SELECT
+        rp.UserId,
+        rp.PostId,
+        rp.PostTypeId,
+        rp.Title,
+        rp.Body,
+        rp.Score,
+        ROW_NUMBER() OVER (PARTITION BY rp.UserId, rp.PostTypeId ORDER BY rp.Score DESC, rp.CreationDate DESC) AS rn
+    FROM RecentUserPosts AS rp
+),
+TopUserPosts AS (
+    -- Extract the details of the highest-scored question and answer for each user
+    SELECT
+        r.UserId,
+        MAX(CASE WHEN r.PostTypeId = 1 AND r.rn = 1 THEN r.PostId END) AS TopQuestionId,
+        MAX(CASE WHEN r.PostTypeId = 1 AND r.rn = 1 THEN r.Title END) AS TopQuestionTitle,
+        MAX(CASE WHEN r.PostTypeId = 1 AND r.rn = 1 THEN r.Score END) AS TopQuestionScore,
+        MAX(CASE WHEN r.PostTypeId = 2 AND r.rn = 1 THEN r.PostId END) AS TopAnswerId,
+        MAX(CASE WHEN r.PostTypeId = 2 AND r.rn = 1 THEN LEFT(r.Body, 500) END) AS TopAnswerExcerpt, -- Take an excerpt for the answer body
+        MAX(CASE WHEN r.PostTypeId = 2 AND r.rn = 1 THEN r.Score END) AS TopAnswerScore
+    FROM RankedUserPosts AS r
+    WHERE r.rn = 1 -- Only include the top-ranked post for each type
+    GROUP BY r.UserId
+)
+-- Final selection: Combine all aggregated and specific data for the top users
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(upa.TotalQuestions, 0) AS TotalQuestionsPosted,
+    COALESCE(upa.TotalAnswers, 0) AS TotalAnswersPosted,
+    COALESCE(upa.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(upa.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesEarned,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadgesEarned,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadgesEarned,
+    COALESCE(udt.DistinctTagCount, 0) AS DistinctTagsContributed,
+    COALESCE(auqat.AvgSecondsUntilAcceptedAnswer / 3600.0, 0) AS AvgHoursUntilAcceptedAnswer, -- Convert seconds to hours
+    tup.TopQuestionTitle,
+    tup.TopQuestionScore,
+    tup.TopAnswerExcerpt,
+    tup.TopAnswerScore
+FROM Users AS u
+LEFT JOIN UserPostAggregates AS upa ON u.Id = upa.UserId
+LEFT JOIN UserBadgeSummary AS ubs ON u.Id = ubs.UserId
+LEFT JOIN UserDistinctTags AS udt ON u.Id = udt.UserId
+LEFT JOIN AvgUserQuestionAcceptanceTime AS auqat ON u.Id = auqat.UserId
+LEFT JOIN TopUserPosts AS tup ON u.Id = tup.UserId
+WHERE
+    u.CreationDate >= (CURRENT_DATE - INTERVAL '3 year') -- Consider users created in the last 3 years
+    AND (upa.TotalQuestions IS NOT NULL OR upa.TotalAnswers IS NOT NULL) -- Only include users with some activity in the period
+ORDER BY
+    u.Reputation DESC,
+    (COALESCE(upa.TotalQuestionScore, 0) + COALESCE(upa.TotalAnswerScore, 0)) DESC,
+    COALESCE(ubs.GoldBadges, 0) DESC,
+    COALESCE(udt.DistinctTagCount, 0) DESC
+LIMIT 50;

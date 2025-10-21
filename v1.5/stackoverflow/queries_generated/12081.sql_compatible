@@ -1,0 +1,138 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerUserName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.ViewCount) AS ViewQuartile
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(Score) AS TotalScore,
+        AVG(ViewCount) AS AvgViewCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        AVG(P.Score) AS AvgScore,
+        MAX(P.CreationDate) AS LatestPostDate
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+ComplexPredicates AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        LENGTH(P.Body) AS BodyLength,
+        CASE 
+            WHEN P.Score > 100 THEN 'High'
+            WHEN P.Score BETWEEN 50 AND 100 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        COALESCE(U.Reputation, 0) AS UserReputation
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year' 
+        AND (P.Tags LIKE '%sql%' OR P.Tags LIKE '%database%')
+),
+FinalQuery AS (
+    SELECT 
+        RP.Id,
+        RP.PostTypeId,
+        RP.Title,
+        RP.Tags,
+        RP.Score,
+        RP.ViewCount,
+        RP.CreationDate,
+        RP.OwnerUserId,
+        RP.OwnerUserName,
+        RP.UserRank,
+        RP.ScoreRank,
+        RP.ViewQuartile,
+        TU.PostCount AS TopUserPostCount,
+        TU.TotalScore AS TopUserTotalScore,
+        TU.AvgViewCount AS TopUserAvgViewCount,
+        TS.TagName,
+        TS.PostCount AS TagPostCount,
+        TS.AvgScore AS TagAvgScore,
+        TS.LatestPostDate AS TagLatestPostDate,
+        UA.QuestionCount,
+        UA.AnswerCount,
+        UA.UpvoteCount,
+        UA.DownvoteCount,
+        CP.BodyLength,
+        CP.ScoreCategory,
+        CP.UserReputation
+    FROM 
+        RankedPosts RP
+    LEFT JOIN 
+        TopUsers TU ON RP.OwnerUserId = TU.OwnerUserId
+    LEFT JOIN 
+        TagStats TS ON TS.TagName = ANY(STRING_TO_ARRAY(REPLACE(REPLACE(RP.Tags, '><', '>'), '<', '>'), '>'))
+    LEFT JOIN 
+        UserActivity UA ON RP.OwnerUserId = UA.Id
+    LEFT JOIN 
+        ComplexPredicates CP ON RP.Id = CP.Id
+)
+SELECT 
+    *
+FROM 
+    FinalQuery
+WHERE 
+    ScoreRank <= 100
+    AND ViewQuartile = 1
+    AND UserReputation > 1000
+ORDER BY 
+    Score DESC, 
+    ViewCount DESC 
+LIMIT 100;

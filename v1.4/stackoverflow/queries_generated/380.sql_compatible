@@ -1,0 +1,112 @@
+WITH PostTagTokens AS (
+  SELECT p.Id AS PostId,
+         LTRIM(RTRIM(t.value)) AS TagName
+  FROM Posts p
+  JOIN (
+     SELECT value
+     FROM STRING_SPLIT(
+       REPLACE(REPLACE(REPLACE(COALESCE(p.Tags, ''), '><', '|'), '<', ''), '>', ''), 
+       '|'
+     )
+  ) AS t ON 1 = 1
+  WHERE p.Id IS NOT NULL
+  AND LTRIM(RTRIM(t.value)) <> ''
+),
+TopTagParts AS (
+  SELECT p.OwnerUserId AS UserId,
+         pt.TagName,
+         COUNT(*) AS TagCount
+  FROM Posts p
+  JOIN PostTagTokens pt ON pt.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, pt.TagName
+),
+TopTagRanked AS (
+  SELECT UserId, TagName, TagCount,
+         ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS TagRank
+  FROM TopTagParts
+),
+TopTagPivot AS (
+  SELECT UserId,
+         MAX(CASE WHEN TagRank = 1 THEN TagName END) AS TopTag1,
+         MAX(CASE WHEN TagRank = 2 THEN TagName END) AS TopTag2,
+         MAX(CASE WHEN TagRank = 3 THEN TagName END) AS TopTag3
+  FROM TopTagRanked
+  WHERE TagRank <= 3
+  GROUP BY UserId
+),
+UserPostStats AS (
+  SELECT u.Id AS UserId,
+         MAX(p.CreationDate) AS LastPostDate,
+         COUNT(p.Id) AS PostCount,
+         COALESCE(SUM(p.Score), 0) AS TotalScore,
+         COALESCE(SUM(p.ViewCount), 0) AS TotalViews
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+UserBadges AS (
+  SELECT UserId,
+         COUNT(*) AS TotalBadges,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges
+  GROUP BY UserId
+),
+UserComments AS (
+  SELECT UserId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY UserId
+),
+UserVotes AS (
+  SELECT u.Id AS UserId,
+         MAX(CASE WHEN v.VoteTypeId = 3 THEN v.CreationDate END) AS LastDownvoteDate,
+         MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS LastUpvoteDate
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id
+),
+UserStats AS (
+  SELECT
+     u.Id AS UserId,
+     u.DisplayName,
+     u.Reputation,
+     u.LastAccessDate,
+     ups.LastPostDate,
+     ups.PostCount,
+     ups.TotalScore,
+     ups.TotalViews,
+     ub.TotalBadges,
+     ub.GoldBadges,
+     ub.SilverBadges,
+     ub.BronzeBadges,
+     uc.CommentCount,
+     ttp.TopTag1,
+     ttp.TopTag2,
+     ttp.TopTag3,
+     uv.LastDownvoteDate,
+     uv.LastUpvoteDate,
+     CAST((COALESCE(ups.TotalScore, 0)
+           + COALESCE(ups.TotalViews, 0) * 0.5
+           + COALESCE(ups.PostCount, 0) * 2.0) AS DECIMAL(18,6)) AS WeightedActivity,
+     ROW_NUMBER() OVER (
+       ORDER BY (COALESCE(ups.TotalScore, 0)
+           + COALESCE(ups.TotalViews, 0) * 0.5
+           + COALESCE(ups.PostCount, 0) * 2.0) DESC
+     ) AS ActivityRank
+  FROM Users u
+  LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+  LEFT JOIN TopTagPivot ttp ON ttp.UserId = u.Id
+  LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+  LEFT JOIN UserComments uc ON uc.UserId = u.Id
+  LEFT JOIN UserVotes uv ON uv.UserId = u.Id
+)
+SELECT *
+FROM UserStats
+WHERE LastPostDate >= DATEADD(month, -12, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+UNION ALL
+SELECT *
+FROM UserStats
+WHERE LastPostDate < DATEADD(month, -12, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) OR LastPostDate IS NULL
+ORDER BY ActivityRank;

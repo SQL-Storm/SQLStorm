@@ -1,0 +1,78 @@
+WITH active_users AS (
+    SELECT u.Id, u.Reputation, u.Location
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '5 years'
+),
+top_questions AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2) ORDER BY p.ViewCount DESC) as tag_rank
+    FROM Posts p
+    INNER JOIN active_users au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 10000
+      AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1 year'
+),
+tagged_posts AS (
+    SELECT tq.Id as question_id, tq.Title, tq.Tags, tq.Score as q_score,
+           COALESCE(a.Id, -1) as answer_id, a.Score as a_score,
+           COALESCE(a.CreationDate, tq.CreationDate) as activity_date,
+           ROW_NUMBER() OVER (PARTITION BY tq.Id ORDER BY COALESCE(a.Score, 0) DESC, a.CreationDate DESC) as answer_rank
+    FROM top_questions tq
+    LEFT JOIN Posts a ON a.ParentId = tq.Id AND a.PostTypeId = 2 AND a.Score >= 0
+    WHERE tq.tag_rank <= 5
+),
+aggregated_stats AS (
+    SELECT tp.question_id, tp.Title, tp.Tags,
+           COUNT(tp.answer_id) as answer_count,
+           AVG(tp.a_score) as avg_answer_score,
+           SUM(tp.q_score + COALESCE(tp.a_score, 0)) as total_engagement,
+           MAX(tp.activity_date) as last_activity,
+           -- Build tag list in a dialect-compatible way
+           STRING_AGG(DISTINCT
+                      SUBSTR(tp.Tags, 2 + (generate_series(1, array_length(string_to_array(SUBSTRING(tp.Tags, 2, LENGTH(tp.Tags)-2), '><'), 1) - 1) * 3)::text,
+                      LENGTH(string_to_array(SUBSTRING(tp.Tags, 2, LENGTH(tp.Tags)-2), '><')[generate_series(1, array_length(string_to_array(SUBSTRING(tp.Tags, 2, LENGTH(tp.Tags)-2), '><'), 1)]::text) - 1),
+                      ';') as tag_list
+    FROM tagged_posts tp
+    WHERE tp.answer_rank <= 3
+    GROUP BY tp.question_id, tp.Title, tp.Tags
+    HAVING COUNT(tp.answer_id) >= 1
+),
+user_badges AS (
+    SELECT au.Id, COUNT(b.Id) as badge_count,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+           AVG(u.Reputation) OVER (PARTITION BY au.Id) as user_rep
+    FROM active_users au
+    LEFT JOIN Badges b ON b.UserId = au.Id
+    GROUP BY au.Id
+)
+SELECT 
+    qs.Title,
+    qs.tag_list,
+    qs.answer_count,
+    ROUND(qs.avg_answer_score::numeric, 2) as avg_answer_score,
+    qs.total_engagement,
+    au.Reputation as owner_reputation,
+    ub.badge_count,
+    ub.gold_badges,
+    COUNT(DISTINCT c.Id) as total_comments,
+    COUNT(DISTINCT v.Id) as total_votes,
+    AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount > 0) as avg_bounty,
+    COUNT(DISTINCT pl.RelatedPostId) as linked_posts
+FROM aggregated_stats qs
+INNER JOIN Posts p_owner ON p_owner.Id = qs.question_id
+INNER JOIN Users au ON qs.Title IS NOT NULL -- placeholder to preserve original structure
+INNER JOIN user_badges ub ON au.Id = ub.Id
+LEFT JOIN Comments c ON c.PostId = qs.question_id
+LEFT JOIN Votes v ON v.PostId IN (
+    SELECT a.id FROM Posts a
+    WHERE a.ParentId = qs.question_id AND a.PostTypeId = 2
+)
+LEFT JOIN PostLinks pl ON pl.PostId = qs.question_id OR pl.RelatedPostId = qs.question_id
+WHERE SUBSTRING(qs.Tags FROM 1 FOR 1) = '<'
+GROUP BY 
+    qs.question_id, qs.Title, qs.tag_list, qs.answer_count, qs.avg_answer_score, 
+    qs.total_engagement, au.Reputation, ub.badge_count, ub.gold_badges
+HAVING COUNT(DISTINCT c.Id) > 5
+ORDER BY qs.total_engagement DESC, qs.last_activity DESC
+LIMIT 50;

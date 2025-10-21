@@ -1,0 +1,45 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.AcceptedAnswerId) AS AcceptedAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        (SELECT AVG(sub.CommentCount) FROM Posts sub WHERE sub.OwnerUserId = u.Id) AS AvgPostComments
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100000
+      AND p.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2023-12-31'
+      AND b.Class = 1
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 50
+)
+SELECT 
+    us.*,
+    RANK() OVER (ORDER BY (us.Upvotes - us.Downvotes) DESC) AS VoteRank,
+    (
+      SELECT STRING_AGG(tag.tagname, ', ' ORDER BY tag.TagCount DESC)
+      FROM (
+        SELECT t.TagName AS tagname, t.Count AS TagCount
+        FROM Posts p2
+        CROSS APPLY (
+          SELECT value AS tagname
+          FROM STRING_SPLIT(REPLACE(REPLACE(p2.Tags, '<', ''), '>', ''), ',') -- fallback for non-Postgres; adjust per dialect
+        ) AS s
+        JOIN Tags t ON t.TagName = s.tagname
+        WHERE p2.OwnerUserId = us.UserId AND p2.PostTypeId = 1
+        ORDER BY t.Count DESC
+        LIMIT 5
+      ) AS Tags
+    ) AS TopTags
+FROM UserStats us
+ORDER BY us.Reputation DESC
+LIMIT 100;

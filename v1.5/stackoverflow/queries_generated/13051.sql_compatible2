@@ -1,0 +1,51 @@
+WITH ActiveUsers AS (
+  SELECT u.Id,
+         u.DisplayName,
+         COUNT(DISTINCT p.Id) AS PostsCount,
+         SUM(p.Score) AS TotalScore,
+         ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS Rank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+  GROUP BY u.Id, u.DisplayName
+  HAVING SUM(p.Score) > 100
+),
+TopPosts AS (
+  SELECT p.Id,
+         p.Title,
+         p.Score,
+         u.DisplayName AS Owner,
+         COALESCE(COUNT(c.Id), 0) AS CommentCount,
+         STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+  FROM Posts p
+  JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN Tags t ON POSITION(CONCAT('<', t.TagName, '>') IN p.Tags) > 0
+  WHERE p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+  GROUP BY p.Id, u.DisplayName, p.Title, p.Score
+),
+EditorContribution AS (
+  SELECT ph.PostId,
+         ph.UserId,
+         COUNT(*) AS EditsMade
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+  GROUP BY ph.PostId, ph.UserId
+)
+SELECT tp.Title,
+       tp.Owner,
+       tp.Score,
+       tp.CommentCount,
+       tp.Tags,
+       COALESCE(SUM(ec.EditsMade), 0) AS TotalEdits,
+       RANK() OVER (PARTITION BY tp.Owner ORDER BY tp.Score DESC) AS OwnerPostRank,
+       CASE 
+         WHEN LENGTH(tp.Title) > 50 THEN SUBSTR(tp.Title, 1, 47) || '...'
+         ELSE tp.Title
+       END AS ShortTitle
+FROM TopPosts tp
+LEFT JOIN EditorContribution ec ON tp.Id = ec.PostId
+WHERE 1 = 1
+GROUP BY tp.Id, tp.Title, tp.Owner, tp.Score, tp.CommentCount, tp.Tags
+HAVING ROW_NUMBER() OVER (PARTITION BY tp.Owner ORDER BY tp.Score DESC) <= 10
+ORDER BY tp.Score DESC, TotalEdits DESC;

@@ -1,0 +1,80 @@
+-- {"query": "11100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 636} 
+
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '30 days'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, u.DisplayName, u.Reputation
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        t.TagName
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.ExcerptPostId
+    WHERE 
+        t.IsModeratorOnly = 0
+),
+PostActivity AS (
+    SELECT 
+        p.Id,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT vh.Id) AS HistoryCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        PostHistory vh ON p.Id = vh.PostId
+    GROUP BY 
+        p.Id
+)
+SELECT 
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.TotalBountyAmount,
+    STRING_AGG(pt.TagName, ', ') AS Tags,
+    pa.CommentCount,
+    pa.HistoryCount,
+    CASE 
+        WHEN rp.Score > 0 THEN 'Active'
+        WHEN rp.Score = 0 AND rp.ViewCount > 100 THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus
+FROM 
+    RecentPosts rp
+JOIN 
+    PostTags pt ON rp.Id = pt.Id
+JOIN 
+    PostActivity pa ON rp.Id = pa.Id
+GROUP BY 
+    rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.AnswerCount, rp.OwnerDisplayName, rp.Reputation, rp.TotalBountyAmount, pa.CommentCount, pa.HistoryCount
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.CreationDate DESC
+LIMIT 100;

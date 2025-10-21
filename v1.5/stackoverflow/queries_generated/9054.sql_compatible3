@@ -1,0 +1,136 @@
+WITH
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+BadgesCount AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= DATE '2024-10-01' - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+
+TagExplode AS (
+    SELECT
+        p.Id AS QuestionId,
+        unnest(
+            string_to_array(
+                substring(p.Tags FROM 2 FOR length(p.Tags) - 2),
+                '><'
+            )
+        ) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+TagStats AS (
+    SELECT
+        te.TagName,
+        COUNT(*) AS QuestionsWithTag,
+        AVG(COALESCE(p.ViewCount, 0)) AS AvgViewCount,
+        MAX(p.Score) AS MaxScoreForTag
+    FROM TagExplode te
+    JOIN Posts p ON p.Id = te.QuestionId
+    GROUP BY te.TagName
+),
+
+VotesAgg AS (
+    SELECT
+        v.PostId,
+        SUM(
+            CASE
+                WHEN v.VoteTypeId = 2 THEN 1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END
+        ) AS NetVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+CombinedStats AS (
+    SELECT
+        rq.QuestionId,
+        rq.Title,
+        rq.Score,
+        uq.Reputation,
+        COALESCE(bc.BadgeCount, 0) AS RecentBadgeCount,
+        COALESCE(vs.NetVotes, 0) AS NetVotes,
+        ts.QuestionsWithTag,
+        ts.AvgViewCount,
+        ts.MaxScoreForTag,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = rq.QuestionId
+              AND c.CreationDate >= rq.CreationDate
+        ) AS CommentsSincePost
+    FROM (
+        SELECT * FROM RecentQuestions WHERE rn = 1
+    ) rq
+    LEFT JOIN Users uq ON uq.Id = rq.OwnerUserId
+    LEFT JOIN BadgesCount bc ON bc.UserId = rq.OwnerUserId
+    LEFT JOIN VotesAgg vs ON vs.PostId = rq.QuestionId
+    LEFT JOIN TagStats ts ON ts.TagName = (
+        SELECT te.TagName
+        FROM TagExplode te
+        WHERE te.QuestionId = rq.QuestionId
+        ORDER BY te.TagName
+        LIMIT 1
+    )
+),
+
+Filtered AS (
+    SELECT * FROM CombinedStats
+    WHERE Reputation > 5000
+      AND RecentBadgeCount < 5
+
+    EXCEPT
+
+    SELECT * FROM CombinedStats
+    WHERE CommentsSincePost < 2
+
+    UNION
+
+    SELECT * FROM CombinedStats
+    WHERE AvgViewCount > 1000
+)
+
+SELECT
+    fs.QuestionId,
+    fs.Title,
+    fs.Reputation,
+    fs.RecentBadgeCount,
+    fs.NetVotes,
+    fs.QuestionsWithTag,
+    ROUND(fs.AvgViewCount, 1) AS AvgViewCount,
+    fs.MaxScoreForTag,
+    COALESCE(fs.CommentsSincePost, 0) AS CommentsSincePost,
+    DENSE_RANK() OVER (
+        ORDER BY fs.Score DESC, fs.NetVotes DESC
+    ) AS ScoreRank,
+    CONCAT(
+        LEFT(fs.Title, 30),
+        CASE WHEN length(fs.Title) > 30 THEN '…' ELSE '' END
+    ) AS TitleSnip,
+    CASE
+        WHEN fs.AvgViewCount IS NULL THEN 'no views'
+        WHEN fs.AvgViewCount > 2000 THEN 'hot'
+        ELSE 'normal'
+    END AS ViewCategory
+FROM Filtered fs
+ORDER BY ScoreRank, fs.CommentsSincePost DESC
+FETCH FIRST 50 ROWS ONLY;

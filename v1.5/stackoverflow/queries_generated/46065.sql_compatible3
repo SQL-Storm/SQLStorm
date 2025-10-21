@@ -1,0 +1,111 @@
+WITH TopQuestionUsers AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        AVG(p.Score) as AvgScore,
+        SUM(p.ViewCount) as TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+TagPerformance AS (
+    SELECT 
+        unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) as TagName,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+),
+UserBadgeMetrics AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) as TagBasedBadges
+    FROM Badges b
+    WHERE b.Date >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+    GROUP BY b.UserId
+),
+AnswerEngagement AS (
+    SELECT 
+        a.OwnerUserId,
+        a.ParentId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 as HoursToAnswer
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+        AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId, a.ParentId, a.Score, a.CreationDate, q.Score, q.ViewCount, q.AcceptedAnswerId
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) as Favorites,
+        MIN(v.CreationDate) as FirstVoteDate,
+        MAX(v.CreationDate) as LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+    GROUP BY v.PostId
+)
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    tqu.QuestionCount,
+    tqu.AvgScore as AvgQuestionScore,
+    tqu.TotalViews,
+    ubm.GoldBadges,
+    ubm.SilverBadges,
+    ubm.BronzeBadges,
+    ubm.TagBasedBadges,
+    tp.TagName as MostUsedTag,
+    COUNT(DISTINCT ae.ParentId) as QuestionsAnswered,
+    AVG(ae.AnswerScore) as AvgAnswerScore,
+    SUM(ae.IsAccepted) as AcceptedAnswers,
+    AVG(ae.HoursToAnswer) as AvgHoursToAnswer,
+    AVG(ae.CommentCount) as AvgCommentsPerAnswer,
+    AVG(vp.UpVotes) as AvgUpVotesPerPost,
+    AVG(vp.DownVotes) as AvgDownVotesPerPost,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tp.Score) as MedianPostScore,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY tp.ViewCount) as P75ViewCount,
+    COUNT(DISTINCT CASE WHEN tp.AnswerCount >= 5 THEN tp.PostId END) as HighlyAnsweredQuestions,
+    STDDEV(tp.Score) as ScoreStdDev,
+    MAX(tp.Score) as BestPostScore,
+    SUM(CASE WHEN vp.Favorites > 10 THEN 1 ELSE 0 END) as HighlyFavoritedPosts
+FROM Users u
+INNER JOIN TopQuestionUsers tqu ON u.Id = tqu.OwnerUserId
+LEFT JOIN UserBadgeMetrics ubm ON u.Id = ubm.UserId
+LEFT JOIN TagPerformance tp ON u.Id = tp.OwnerUserId
+LEFT JOIN AnswerEngagement ae ON u.Id = ae.OwnerUserId
+LEFT JOIN VotePatterns vp ON tp.PostId = vp.PostId
+WHERE u.Reputation > 1000
+    AND u.CreationDate <= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, tqu.QuestionCount, 
+    tqu.AvgScore, tqu.TotalViews, ubm.GoldBadges, ubm.SilverBadges, 
+    ubm.BronzeBadges, ubm.TagBasedBadges, tp.TagName
+HAVING COUNT(DISTINCT tp.PostId) >= 15
+ORDER BY (ubm.GoldBadges * 3 + ubm.SilverBadges * 2 + ubm.BronzeBadges) DESC, 
+         u.Reputation DESC
+LIMIT 100;

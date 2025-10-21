@@ -1,0 +1,118 @@
+-- {"query": "12032.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 924} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS UserRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastEditBodyDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate END) AS LastEditTagsDate
+    FROM 
+        PostHistory ph
+    GROUP BY 
+        ph.PostId
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.TagName = ANY(string_to_array(p.Tags, '<'))
+    GROUP BY 
+        t.TagName
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS EditedPostCount,
+        COUNT(DISTINCT v.PostId) AS VotedPostCount,
+        COUNT(DISTINCT c.PostId) AS CommentedPostCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerDisplayName,
+    rp.PostRank,
+    tu.DisplayName AS TopUserDisplayName,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.GoldBadgeCount,
+    tu.SilverBadgeCount,
+    tu.BronzeBadgeCount,
+    tu.UserRank,
+    phs.TotalEdits,
+    phs.LastEditBodyDate,
+    phs.LastEditTagsDate,
+    ts.TagName,
+    ts.PostCount,
+    ts.TotalScore,
+    ts.AvgScore,
+    ua.EditedPostCount,
+    ua.VotedPostCount,
+    ua.CommentedPostCount
+FROM 
+    RankedPosts rp
+JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.Id
+LEFT JOIN 
+    PostHistorySummary phs ON rp.Id = phs.PostId
+LEFT JOIN 
+    TagStats ts ON ts.TagName = ANY(string_to_array(rp.Tags, '<'))
+LEFT JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.Id
+WHERE 
+    rp.PostRank <= 10
+    AND tu.UserRank <= 10
+ORDER BY 
+    rp.Score DESC, 
+    rp.CreationDate;

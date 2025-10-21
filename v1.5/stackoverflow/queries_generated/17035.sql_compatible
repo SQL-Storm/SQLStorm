@@ -1,0 +1,154 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate) AS AccountAgeDays,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        CASE 
+            WHEN p.Tags LIKE '%<python>%' THEN 'Python'
+            WHEN p.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+            WHEN p.Tags LIKE '%<java>%' AND p.Tags NOT LIKE '%<javascript>%' THEN 'Java'
+            WHEN p.Tags LIKE '%<sql>%' THEN 'SQL'
+            ELSE 'Other'
+        END AS PrimaryLanguage,
+        LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', '')) AS CodeBlockCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsAnswered,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC NULLS LAST) AS GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+        AND p.OwnerUserId IS NOT NULL
+),
+CommentActivity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        SUM(CASE WHEN c.Text LIKE '%thank%' OR c.Text LIKE '%Thanks%' THEN 1 ELSE 0 END) AS ThankYouComments,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+        AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY c.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountiesStarted,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        COUNT(DISTINCT DATE_TRUNC('day', v.CreationDate)) AS ActiveVotingDays
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.Reputation,
+    um.AccountAgeDays,
+    um.TotalPosts,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.TotalPostScore / NULLIF(um.TotalPosts, 0), 2) AS ScorePerPost,
+    um.MedianPostScore,
+    um.BadgeCount,
+    um.GoldBadges,
+    SUBSTRING(um.GoldBadgeNames FROM 1 FOR 100) AS GoldBadgeSample,
+    COALESCE(ca.CommentCount, 0) AS CommentCount,
+    ROUND(COALESCE(ca.AvgCommentLength, 0), 1) AS AvgCommentLength,
+    COALESCE(ca.ThankYouComments, 0) AS ThankYouComments,
+    COALESCE(vp.UpvotesCast, 0) AS UpvotesCast,
+    COALESCE(vp.DownvotesCast, 0) AS DownvotesCast,
+    CASE 
+        WHEN COALESCE(vp.DownvotesCast, 0) > 0 
+        THEN ROUND(COALESCE(vp.UpvotesCast, 0) / vp.DownvotesCast, 2)
+        ELSE NULL 
+    END AS UpvoteDownvoteRatio,
+    COALESCE(vp.BountiesStarted, 0) AS BountiesStarted,
+    COALESCE(vp.TotalBountyAmount, 0) AS TotalBountyAmount,
+    COALESCE(vp.ActiveVotingDays, 0) AS ActiveVotingDays,
+    (
+        SELECT STRING_AGG(CONCAT(pa2.PrimaryLanguage, ':', language_counts.cnt), ', ' ORDER BY language_counts.cnt DESC)
+        FROM (
+            SELECT pa3.PrimaryLanguage, COUNT(*) AS cnt
+            FROM PostAnalysis pa3
+            WHERE pa3.OwnerUserId = um.Id
+            GROUP BY pa3.PrimaryLanguage
+            LIMIT 3
+        ) AS language_counts
+    ) AS TopLanguages,
+    CASE 
+        WHEN um.TotalPosts >= 100 AND um.AvgPostScore > 10 AND um.GoldBadges > 0 THEN 'Elite Contributor'
+        WHEN um.TotalPosts >= 50 AND um.AvgPostScore > 5 THEN 'Active Contributor'
+        WHEN um.TotalPosts >= 20 THEN 'Regular Contributor'
+        WHEN um.TotalPosts >= 10 THEN 'Occasional Contributor'
+        ELSE 'Lurker'
+    END AS UserCategory,
+    EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = um.Id 
+            AND ph.PostHistoryTypeId IN (10, 12, 14)
+            AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    ) AS RecentModeratorActivity,
+    (
+        SELECT COUNT(DISTINCT p2.Id)
+        FROM Posts p2
+        INNER JOIN Posts answers ON answers.ParentId = p2.Id
+        WHERE p2.OwnerUserId = um.Id
+            AND p2.PostTypeId = 1
+            AND answers.OwnerUserId != um.Id
+            AND answers.Score > 0
+    ) AS QuestionsWithGoodAnswersFromOthers
+FROM UserMetrics um
+LEFT JOIN CommentActivity ca ON um.Id = ca.UserId
+LEFT JOIN VotePatterns vp ON um.Id = vp.UserId
+WHERE um.TotalPosts > 0
+    AND (
+        um.Reputation > 5000
+        OR um.GoldBadges > 0
+        OR EXISTS (
+            SELECT 1 
+            FROM PostAnalysis pa 
+            WHERE pa.OwnerUserId = um.Id 
+                AND pa.GlobalScoreRank <= 1000
+        )
+    )
+ORDER BY 
+    um.Reputation DESC,
+    um.TotalPostScore DESC,
+    um.BadgeCount DESC
+LIMIT 100;

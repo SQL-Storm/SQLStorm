@@ -1,0 +1,72 @@
+WITH question_tags AS (
+    SELECT
+        p.id            AS qid,
+        p.creationdate  AS qdate,
+        p.score         AS qscore,
+        t.tagname,
+        u.reputation    AS qrep,
+        u.id            AS quserid
+    FROM posts p
+    JOIN users u ON u.id = p.owneruserid
+    JOIN LATERAL regexp_split_to_table(p.tags, '(?<!<)>(?!>)') AS tag ON TRUE
+    JOIN tags t ON t.tagname = tag
+    WHERE p.posttypeid = 1
+),
+answers AS (
+    SELECT
+        a.id            AS aid,
+        a.parentid      AS qid,
+        a.creationdate  AS adate,
+        a.score         AS ascore,
+        u.reputation    AS arep,
+        u.id            AS auserid
+    FROM posts a
+    JOIN users u ON u.id = a.owneruserid
+    WHERE a.posttypeid = 2
+),
+q_agg AS (
+    SELECT
+        q.tagname,
+        COUNT(DISTINCT q.qid)                                       AS num_questions,
+        SUM(q.qscore)                                               AS total_qscore,
+        ROUND(AVG(q.qscore)::numeric, 2)                            AS avg_qscore,
+        ROUND(AVG(EXTRACT(EPOCH FROM (a.adate - q.qdate)))/60, 2)   AS avg_min_to_first_answer
+    FROM question_tags q
+    LEFT JOIN answers a ON a.qid = q.qid
+    GROUP BY q.tagname
+),
+top_users AS (
+    SELECT
+        q.tagname,
+        u.id          AS user_id,
+        u.reputation,
+        COUNT(DISTINCT p.id) AS post_cnt
+    FROM question_tags q
+    JOIN posts p ON p.owneruserid = q.quserid AND p.posttypeid = 1
+    JOIN users u ON u.id = p.owneruserid
+    GROUP BY q.tagname, u.id, u.reputation
+),
+final AS (
+    SELECT
+        q.tagname,
+        q.num_questions,
+        q.avg_qscore,
+        q.avg_min_to_first_answer,
+        t.user_id,
+        t.reputation,
+        t.post_cnt,
+        ROW_NUMBER() OVER (PARTITION BY q.tagname ORDER BY t.post_cnt DESC) AS rn
+    FROM q_agg q
+    JOIN top_users t ON t.tagname = q.tagname
+)
+SELECT
+    tagname,
+    num_questions,
+    avg_qscore,
+    avg_min_to_first_answer,
+    user_id,
+    reputation,
+    post_cnt
+FROM final
+WHERE rn <= 3
+ORDER BY num_questions DESC, post_cnt DESC;

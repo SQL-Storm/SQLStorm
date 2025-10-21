@@ -1,0 +1,108 @@
+WITH question_stats AS (
+  SELECT 
+    p.Id AS question_id,
+    p.OwnerUserId,
+    p.CreationDate AS q_created,
+    p.Score AS q_score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount AS q_comment_count,
+    u.Reputation AS user_rep,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.DeletedDate IS NULL
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+),
+answer_stats AS (
+  SELECT 
+    parent.OwnerUserId AS question_owner,
+    ans.Id AS answer_id,
+    ans.CreationDate AS a_created,
+    ans.Score AS a_score,
+    ans.ParentId,
+    ROW_NUMBER() OVER (PARTITION BY ans.ParentId ORDER BY ans.Score DESC) AS answer_rank
+  FROM Posts parent
+  JOIN Posts ans ON ans.ParentId = parent.Id
+  WHERE parent.PostTypeId = 1 
+    AND ans.PostTypeId = 2
+    AND ans.DeletedDate IS NULL
+    AND ans.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+user_activity AS (
+  SELECT 
+    u.Id,
+    COUNT(DISTINCT ph.PostId) AS edits_made,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN ph.PostId END) AS moderation_actions,
+    AVG(EXTRACT(EPOCH FROM (ph.CreationDate - u.CreationDate))/86400) AS avg_days_to_first_edit
+  FROM Users u
+  JOIN PostHistory ph ON ph.UserId = u.Id
+  WHERE ph.CreationDate >= u.CreationDate 
+    AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+  GROUP BY u.Id
+  HAVING COUNT(ph.Id) > 10
+),
+top_tags AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    p.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) as tag_rank
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.WikiPostId
+  WHERE t.Count > 100
+),
+aggregated_stats AS (
+  SELECT 
+    qs.question_id,
+    qs.owneruserid,
+    qs.q_created,
+    qs.q_score,
+    qs.ViewCount AS viewcount,
+    qs.AnswerCount AS answer_count,
+    COALESCE(as1.a_score, 0) AS top_answer_score,
+    qs.user_rep,
+    COALESCE(ua.edits_made, 0) AS total_edits,
+    COALESCE(ua.moderation_actions, 0) AS mod_actions,
+    tt.tagname AS popular_tag,
+    CASE 
+      WHEN qs.AnswerCount > 0 AND COALESCE(as1.a_score, 0) > qs.q_score THEN 'High Quality'
+      WHEN qs.ViewCount > 10000 THEN 'Viral'
+      WHEN qs.user_rep > 10000 THEN 'Expert'
+      ELSE 'Standard'
+    END AS question_category
+  FROM question_stats qs
+  LEFT JOIN answer_stats as1 ON as1.parentid = qs.question_id AND as1.answer_rank = 1
+  LEFT JOIN user_activity ua ON ua.id = qs.owneruserid
+  LEFT JOIN (
+    SELECT DISTINCT ON (p.owneruserid) p.owneruserid, t.tagname
+    FROM Posts p
+    JOIN string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') tags ON true
+    JOIN Tags t ON t.tagname = tags
+    JOIN top_tags tt ON tt.tagname = t.tagname
+    WHERE p.PostTypeId = 1 AND array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) > 0
+    ORDER BY p.owneruserid, tt.tag_rank
+  ) tag_user ON tag_user.owneruserid = qs.owneruserid
+  LEFT JOIN top_tags tt ON tt.tagname = tag_user.tagname
+  WHERE qs.rn <= 50  -- Top 50 questions per user
+)
+SELECT 
+  cat.question_category,
+  COUNT(*) AS question_count,
+  AVG(cat.q_score) AS avg_question_score,
+  AVG(cat.top_answer_score) AS avg_top_answer_score,
+  AVG(cat.viewcount) AS avg_views,
+  SUM(CASE WHEN cat.answer_count >= 3 THEN 1 ELSE 0 END) AS multi_answer_questions,
+  AVG(cat.user_rep) AS avg_user_reputation,
+  AVG(cat.total_edits) AS avg_user_edits,
+  SUM(cat.mod_actions) AS total_moderation_actions,
+  STRING_AGG(DISTINCT COALESCE(cat.popular_tag, ''), ', ') AS associated_tags,
+  PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY cat.viewcount) AS p90_views,
+  COUNT(DISTINCT cat.owneruserid) AS unique_users
+FROM aggregated_stats cat
+WHERE cat.q_created >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+  AND cat.q_score > -5  -- Exclude heavily downvoted
+GROUP BY cat.question_category
+HAVING COUNT(*) >= 10
+ORDER BY avg_question_score DESC;

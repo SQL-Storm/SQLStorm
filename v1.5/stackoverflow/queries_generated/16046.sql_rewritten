@@ -1,0 +1,123 @@
+-- {"query": "16046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 109745, "output_tokens": 102198} 
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+        EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS TenureMonths,
+        CASE 
+            WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 
+                UPPER(SUBSTRING(u.Location, 1, 3))
+            ELSE 'UNK'
+        END AS LocationCode,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+PostQualityScores AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1.5
+            WHEN p.ClosedDate IS NOT NULL THEN 0.5
+            ELSE 1.0
+        END * (p.Score + 1) * LOG(COALESCE(p.ViewCount, 1) + 1) AS QualityMetric,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) OVER (PARTITION BY p.Id) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) OVER (PARTITION BY p.Id) AS DownvoteCount,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore
+    FROM Posts p
+    LEFT OUTER JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '5 years'
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        t.TagName,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(COALESCE(p.ViewCount, 0)) AS AvgTagViews,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY COUNT(*) DESC) AS ExpertiseRank
+    FROM Posts p
+    INNER JOIN Tags t ON t.Id IN (
+        SELECT UNNEST(
+            ARRAY(SELECT CAST(Id AS INT) FROM Tags 
+                  WHERE p.Tags LIKE '%<' || TagName || '>%')
+        )
+    )
+    WHERE p.PostTypeId = 1
+        AND p.Score >= 5
+    GROUP BY p.OwnerUserId, t.TagName
+    HAVING COUNT(*) >= 3
+),
+InteractionPatterns AS (
+    SELECT 
+        c.UserId,
+        c.PostId,
+        COUNT(*) AS CommentFrequency,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        STRING_AGG(DISTINCT SUBSTRING(c.Text, 1, 20), ' | ' ORDER BY SUBSTRING(c.Text, 1, 20)) AS CommentSnippets,
+        MAX(c.Score) AS MaxCommentScore,
+        MIN(c.CreationDate) AS FirstCommentDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+        AND c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+    GROUP BY c.UserId, c.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.LocationCode,
+    uem.TenureMonths,
+    ROUND(pqs.QualityMetric::numeric, 2) AS QualityScore,
+    pqs.UpvoteCount,
+    pqs.DownvoteCount,
+    COALESCE(te.TagName, 'N/A') AS TopTag,
+    COALESCE(te.TagPostCount, 0) AS TagPosts,
+    COALESCE(te.ExpertiseRank, 999) AS TagExpertRank,
+    ip.CommentFrequency,
+    COALESCE(ip.AvgCommentLength, 0) AS AvgCommentLen,
+    CASE 
+        WHEN pqs.UserAvgScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN pqs.UserAvgScore < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+        ELSE 'Average'
+    END AS PerformanceCategory,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uem.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+     FROM PostLinks pl 
+     INNER JOIN Posts p2 ON pl.PostId = p2.Id
+     WHERE p2.OwnerUserId = uem.Id AND pl.LinkTypeId = 1) AS LinkedPosts,
+    EXISTS(
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.UserId = uem.Id 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    ) AS RecentlyEdited,
+    NULLIF(ROUND((pqs.QualityMetric * uem.Reputation / NULLIF(uem.TenureMonths, 0))::numeric, 2), 0) AS EngagementIndex
+FROM UserEngagementMetrics uem
+INNER JOIN PostQualityScores pqs ON uem.Id = pqs.OwnerUserId
+LEFT OUTER JOIN TagExpertise te ON uem.Id = te.OwnerUserId AND te.ExpertiseRank = 1
+LEFT OUTER JOIN InteractionPatterns ip ON uem.Id = ip.UserId AND ip.PostId = pqs.PostId
+WHERE uem.YearlyRepRank <= 100
+    AND pqs.QualityMetric > (
+        SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY QualityMetric)
+        FROM PostQualityScores
+    )
+    AND (pqs.UserPostRank <= 10 OR te.TagPostCount >= 5)
+    AND uem.TenureMonths IS NOT NULL
+ORDER BY 
+    EngagementIndex DESC NULLS LAST,
+    uem.Reputation DESC,
+    pqs.QualityMetric DESC
+LIMIT 500;

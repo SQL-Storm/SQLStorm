@@ -1,0 +1,268 @@
+WITH recent_users AS (
+  SELECT u.Id, u.Reputation, u.CreationDate
+  FROM Users u
+  WHERE u.CreationDate >= (SELECT max(CreationDate) - INTERVAL '180 days' FROM Users)
+),
+tag_counts AS (
+  SELECT t.TagName, t.Count
+  FROM Tags t
+  WHERE t.Count > 0
+),
+question_posts AS (
+  SELECT p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answer_posts AS (
+  SELECT a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+question_activity AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.OwnerUserId,
+    q.CreationDate AS QuestionDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes
+  FROM question_posts q
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  GROUP BY q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount
+),
+accepted_answers AS (
+  SELECT q.Id AS QuestionId, q.AcceptedAnswerId
+  FROM Posts q
+  WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+answers_enriched AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    a.Id AS AnswerId,
+    a.OwnerUserId AS AnswererId,
+    a.Score AS AnswerScore,
+    a.CreationDate AS AnswerDate
+  FROM answer_posts a
+),
+time_to_first_answer AS (
+  SELECT
+    qa.QuestionId,
+    MIN(ae.AnswerDate) AS FirstAnswerDate
+  FROM question_posts qa
+  JOIN answers_enriched ae ON ae.QuestionId = qa.Id
+  GROUP BY qa.QuestionId
+),
+time_to_accepted AS (
+  SELECT
+    aa.QuestionId,
+    ae.AnswerDate AS AcceptedAnswerDate
+  FROM accepted_answers aa
+  JOIN answers_enriched ae ON ae.AnswerId = aa.AcceptedAnswerId
+),
+question_tags AS (
+  SELECT
+    q.Id AS QuestionId,
+    UNNEST(string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><')) AS TagName
+  FROM question_posts q
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+tagged_activity AS (
+  SELECT
+    qt.TagName,
+    qa.QuestionId,
+    qa.OwnerUserId,
+    qa.QuestionDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+  qa.AnswerCount,
+    qa.CommentCount,
+    qa.UpVotes,
+    qa.DownVotes
+  FROM question_activity qa
+  JOIN question_tags qt ON qt.QuestionId = qa.QuestionId
+),
+tag_metrics AS (
+  SELECT
+    ta.TagName,
+    COUNT(*) AS Questions,
+    AVG(ta.QuestionScore) AS AvgQuestionScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ta.QuestionScore) AS MedQuestionScore,
+    AVG(ta.ViewCount) AS AvgViews,
+    AVG(ta.AnswerCount) AS AvgAnswerCount,
+    AVG(ta.UpVotes - ta.DownVotes) AS AvgNetVotes
+  FROM tagged_activity ta
+  GROUP BY ta.TagName
+),
+tag_time_metrics AS (
+  SELECT
+    qt.TagName,
+    AVG(EXTRACT(EPOCH FROM (tffa.FirstAnswerDate - qa.CreationDate)) / 60.0) AS AvgMinsToFirstAnswer,
+    AVG(EXTRACT(EPOCH FROM (tta.AcceptedAnswerDate - qa.CreationDate)) / 60.0) AS AvgMinsToAccepted
+  FROM question_posts qa
+  JOIN question_tags qt ON qt.QuestionId = qa.Id
+  LEFT JOIN time_to_first_answer tffa ON tffa.QuestionId = qa.Id
+  LEFT JOIN time_to_accepted tta ON tta.QuestionId = qa.Id
+  GROUP BY qt.TagName
+),
+user_answer_stats AS (
+  SELECT
+    ae.AnswererId AS UserId,
+    COUNT(*) AS Answers,
+    AVG(ae.AnswerScore) AS AvgAnswerScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ae.AnswerScore) AS MedAnswerScore,
+    COUNT(DISTINCT CASE WHEN ae.AnswerId = aa.AcceptedAnswerId THEN ae.AnswerId END) AS AcceptedAnswers
+  FROM answers_enriched ae
+  LEFT JOIN accepted_answers aa ON aa.AcceptedAnswerId = ae.AnswerId
+  GROUP BY ae.AnswererId
+),
+recent_user_answer_stats AS (
+  SELECT uas.*, ru.Reputation, ru.CreationDate AS UserCreated
+  FROM user_answer_stats uas
+  JOIN recent_users ru ON ru.Id = uas.UserId
+),
+hot_network_bumps AS (
+  SELECT ph.PostId, COUNT(*) AS HotBumps
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (52, 50)
+  GROUP BY ph.PostId
+),
+dup_links AS (
+  SELECT pl.RelatedPostId AS CanonicalId, COUNT(*) AS DupCount
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.RelatedPostId
+),
+tag_ranked AS (
+  SELECT
+    tm.TagName,
+    tm.Questions,
+    tm.AvgQuestionScore,
+    tm.MedQuestionScore,
+    tm.AvgViews,
+    tm.AvgAnswerCount,
+    tm.AvgNetVotes,
+    ttm.AvgMinsToFirstAnswer,
+    ttm.AvgMinsToAccepted,
+    ROW_NUMBER() OVER (ORDER BY tm.Questions DESC, tm.AvgViews DESC) AS PopularityRank
+  FROM tag_metrics tm
+  LEFT JOIN tag_time_metrics ttm ON ttm.TagName = tm.TagName
+),
+question_dim AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    COALESCE(hnb.HotBumps, 0) AS HotEvents,
+    COALESCE(dl.DupCount, 0) AS DuplicateInbound
+  FROM question_posts q
+  LEFT JOIN hot_network_bumps hnb ON hnb.PostId = q.Id
+  LEFT JOIN dup_links dl ON dl.CanonicalId = q.Id
+),
+question_tag_agg AS (
+  SELECT
+    qt.QuestionId,
+    ARRAY_AGG(qt.TagName ORDER BY qt.TagName) AS Tags,
+    MIN(tr.PopularityRank) AS BestTagRank,
+    AVG(tr.AvgMinsToFirstAnswer) AS AvgTagMinsToFirstAnswer,
+    AVG(tr.AvgMinsToAccepted) AS AvgTagMinsToAccepted
+  FROM question_tags qt
+  JOIN tag_ranked tr ON tr.TagName = qt.TagName
+  GROUP BY qt.QuestionId
+),
+question_answer_latency AS (
+  SELECT
+    q.Id AS QuestionId,
+    EXTRACT(EPOCH FROM (tffa.FirstAnswerDate - q.CreationDate)) / 60.0 AS MinsToFirstAnswer,
+    EXTRACT(EPOCH FROM (tta.AcceptedAnswerDate - q.CreationDate)) / 60.0 AS MinsToAccepted
+  FROM question_posts q
+  LEFT JOIN time_to_first_answer tffa ON tffa.QuestionId = q.Id
+  LEFT JOIN time_to_accepted tta ON tta.QuestionId = q.Id
+),
+owner_user_dim AS (
+  SELECT u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.CreationDate
+  FROM Users u
+),
+final_scored_questions AS (
+  SELECT
+    qd.QuestionId,
+    qd.Title,
+    qd.OwnerUserId,
+    oud.Reputation AS OwnerReputation,
+    qd.CreationDate,
+    qd.Score,
+    qd.ViewCount,
+    qd.AnswerCount,
+    qd.HotEvents,
+    qd.DuplicateInbound,
+    qta.Tags,
+    qta.BestTagRank,
+    qal.MinsToFirstAnswer,
+    qal.MinsToAccepted,
+    qta.AvgTagMinsToFirstAnswer,
+    qta.AvgTagMinsToAccepted,
+    (COALESCE(qd.Score, 0) * 3
+      + COALESCE(qd.ViewCount, 0) * 0.01
+      + COALESCE(qd.AnswerCount, 0) * 2
+      + COALESCE(qd.HotEvents, 0) * 5
+      - COALESCE(qd.DuplicateInbound, 0) * 2
+      - COALESCE(qal.MinsToFirstAnswer, 0) * 0.02
+      - COALESCE(qal.MinsToAccepted, 0) * 0.01
+      + GREATEST(0, 1000 - COALESCE(oud.Reputation, 0)) * 0.001
+    ) AS PerfScore
+  FROM question_dim qd
+  LEFT JOIN question_tag_agg qta ON qta.QuestionId = qd.QuestionId
+  LEFT JOIN question_answer_latency qal ON qal.QuestionId = qd.QuestionId
+  LEFT JOIN owner_user_dim oud ON oud.Id = qd.OwnerUserId
+),
+top_recent_answerers AS (
+  SELECT
+    ruas.UserId,
+    ruas.Reputation,
+    ruas.Answers,
+    ruas.AvgAnswerScore,
+    ruas.MedAnswerScore,
+    ruas.AcceptedAnswers,
+    ROW_NUMBER() OVER (ORDER BY ruas.Answers DESC, ruas.AvgAnswerScore DESC) AS AnswererRank
+  FROM recent_user_answer_stats ruas
+)
+SELECT
+  fsq.QuestionId,
+  fsq.Title,
+  fsq.OwnerUserId,
+  fsq.OwnerReputation,
+  fsq.CreationDate,
+  fsq.Score,
+  fsq.ViewCount,
+  fsq.AnswerCount,
+  fsq.HotEvents,
+  fsq.DuplicateInbound,
+  fsq.Tags,
+  fsq.BestTagRank,
+  fsq.MinsToFirstAnswer,
+  fsq.MinsToAccepted,
+  fsq.AvgTagMinsToFirstAnswer,
+  fsq.AvgTagMinsToAccepted,
+  fsq.PerfScore,
+  tra.UserId AS TopRecentAnswererId,
+  tra.Reputation AS TopRecentAnswererReputation,
+  tra.Answers AS TopRecentAnswererAnswers,
+  tra.AvgAnswerScore AS TopRecentAnswererAvgScore,
+  tra.MedAnswerScore AS TopRecentAnswererMedScore,
+  tra.AcceptedAnswers AS TopRecentAnswererAccepted
+FROM final_scored_questions fsq
+CROSS JOIN LATERAL (
+  SELECT *
+  FROM top_recent_answerers
+  WHERE AnswererRank <= 1
+) tra
+WHERE fsq.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM Posts WHERE PostTypeId = 1)
+ORDER BY fsq.PerfScore DESC NULLS LAST, fsq.ViewCount DESC
+LIMIT 250;

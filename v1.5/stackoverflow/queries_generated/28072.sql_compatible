@@ -1,0 +1,67 @@
+WITH UserBadges AS (
+    SELECT 
+        UserId, 
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges 
+    GROUP BY UserId
+), PostStats AS (
+    SELECT 
+        OwnerUserId,
+        PostTypeId,
+        COUNT(*) AS TotalPosts,
+        AVG(Score) FILTER (WHERE Score > 0) AS AvgPositiveScore,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY ViewCount DESC) AS ViewRank,
+        SUM(AnswerCount) FILTER (WHERE PostTypeId = 1) AS TotalAnswersGenerated,
+        CASE 
+            WHEN Score > 100 THEN 'High Impact' 
+            WHEN Score BETWEEN 50 AND 100 THEN 'Medium Impact' 
+            ELSE 'Low Impact' 
+        END AS ImpactCategory
+    FROM Posts 
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId, PostTypeId, ImpactCategory
+), PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        CAST(SUBSTRING(ph.Text FROM 'CloseReasonId":(\\d+)') AS BIGINT) AS CloseReasonId,
+        CASE 
+            WHEN ph.PostHistoryTypeId = 10 THEN 'Closed'
+            WHEN ph.PostHistoryTypeId = 5 THEN 'Edited'
+        END AS HistoryType,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (5, 10)
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(ub.GoldBadges, 0) + COALESCE(ub.SilverBadges, 0) * 0.5 + COALESCE(ub.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    ps.TotalPosts,
+    ps.AvgPositiveScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighQualityComments,
+    STRING_AGG(DISTINCT t.TagName, '; ') FILTER (WHERE t.TagName IS NOT NULL) AS FrequentTags,
+    AVG(EXTRACT(DAY FROM ph.NextEventDate - ph.CreationDate)) FILTER (WHERE ph.HistoryType = 'Closed') AS AvgDaysToClose,
+    (SELECT v.BountyAmount FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 8 ORDER BY v.CreationDate DESC LIMIT 1) AS LatestBounty,
+    ROW_NUMBER() OVER (ORDER BY SUM(ps.TotalAnswersGenerated) DESC) AS AnswerContribRank
+FROM Users u
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistoryAnalysis ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT DISTINCT PostId, UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2), '><')) AS TagName 
+    FROM Posts 
+    WHERE PostTypeId = 1
+) pt ON p.Id = pt.PostId
+LEFT JOIN Tags t ON pt.TagName = t.TagName
+WHERE u.CreationDate BETWEEN TIMESTAMP '2010-01-01' AND TIMESTAMP '2023-12-31'
+    AND (COALESCE(ub.GoldBadges, 0) > 0 OR COALESCE(ps.TotalPosts, 0) > 10)
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > ph.CreationDate + INTERVAL '7 days')
+GROUP BY u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ps.TotalPosts, ps.AvgPositiveScore
+HAVING AVG(ps.AvgPositiveScore) > 5 OR COUNT(ph.PostId) > 3
+ORDER BY WeightedBadgeScore DESC, AnswerContribRank
+LIMIT 100;

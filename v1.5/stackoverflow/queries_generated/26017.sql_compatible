@@ -1,0 +1,70 @@
+WITH QuestionPosts AS (
+  SELECT Id, Title, Tags, Score, ViewCount, CreationDate, AcceptedAnswerId, OwnerUserId
+  FROM Posts
+  WHERE PostTypeId = 1
+),
+AnswerPosts AS (
+  SELECT Id, ParentId, Score, CreationDate
+  FROM Posts
+  WHERE PostTypeId = 2
+),
+TopUsers AS (
+  SELECT UserId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY UserId
+  HAVING SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+UserBadges AS (
+  SELECT UserId, COUNT(DISTINCT Name) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+QuestionTags AS (
+  SELECT Id, Tags
+  FROM QuestionPosts
+  WHERE Tags IS NOT NULL
+),
+TagFrequency AS (
+  SELECT value AS TagName, COUNT(*) AS Frequency
+  FROM QuestionTags
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(Tags, 2, length(Tags)-2), ',')) AS value
+  ) AS s
+  GROUP BY value
+),
+TopTags AS (
+  SELECT TagName, Frequency
+  FROM TagFrequency
+  ORDER BY Frequency DESC
+  LIMIT 10
+)
+SELECT 
+  q.Id, 
+  q.Title, 
+  q.Score, 
+  q.ViewCount, 
+  q.CreationDate, 
+  q.AcceptedAnswerId,
+  a.Id AS AnswerId, 
+  a.Score AS AnswerScore, 
+  a.CreationDate AS AnswerCreationDate,
+  tu.UpVotes, 
+  tu.DownVotes, 
+  ub.BadgeCount,
+  array_agg(DISTINCT t.TagName) AS TopTags
+FROM QuestionPosts q
+LEFT JOIN AnswerPosts a ON q.Id = a.ParentId
+LEFT JOIN TopUsers tu ON q.OwnerUserId = tu.UserId
+LEFT JOIN UserBadges ub ON q.OwnerUserId = ub.UserId
+LEFT JOIN LATERAL (
+  SELECT TagName
+  FROM (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), ',')) AS TagName
+  ) AS s
+) t ON TRUE
+WHERE q.Score > 100 AND q.ViewCount > 1000 AND q.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  AND t.TagName IN (SELECT TagName FROM TopTags)
+GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate, q.AcceptedAnswerId,
+         a.Id, a.Score, a.CreationDate, tu.UpVotes, tu.DownVotes, ub.BadgeCount
+ORDER BY q.Score DESC, q.ViewCount DESC;

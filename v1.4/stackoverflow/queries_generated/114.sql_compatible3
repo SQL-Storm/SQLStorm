@@ -1,0 +1,50 @@
+WITH user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActivityDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+latest_badges AS (
+  SELECT b.UserId, b.Name, b.Date
+  FROM Badges b
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COALESCE(us.QuestionCount, 0) AS QuestionCount,
+  COALESCE(us.AnswerCount, 0) AS AnswerCount,
+  us.AvgPostScore,
+  u.LastAccessDate,
+  (CASE WHEN u.Location IS NULL THEN 'Unknown' ELSE u.Location END) || ' | ' || COALESCE(u.WebsiteUrl, '') AS LocationWebsite,
+  (
+    SELECT COUNT(*) 
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = u.Id 
+      AND p2.PostTypeId = 1
+  ) AS OpenQuestions,
+  (
+    SELECT STRING_AGG(CAST(t.Name AS VARCHAR(100)), ',')
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+      AND t.TagName IS NOT NULL
+  ) AS TagsSummary,
+  DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RankByRep,
+  (
+    SELECT b.Name 
+    FROM Badges b 
+    WHERE b.UserId = u.Id 
+    ORDER BY b.Date DESC
+    LIMIT 1
+  ) AS MostRecentBadge
+FROM Users u
+LEFT JOIN user_stats us ON us.UserId = u.Id
+ORDER BY RankByRep, us.AvgPostScore DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,28 @@
+WITH TopTagUsers AS (
+    SELECT t.TagName,
+           u.Id,
+           u.DisplayName,
+           COUNT(p.Id) AS PostCount,
+           DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY COUNT(p.Id) DESC) AS UserRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%>', t.TagName, '<%')
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, u.Id, u.DisplayName
+)
+SELECT 
+    TagName, 
+    Id AS UserId, 
+    DisplayName, 
+    PostCount,
+    (
+        SELECT AVG(v.Score)
+        FROM Posts p
+        JOIN Votes v ON p.Id = v.PostId
+        WHERE p.OwnerUserId = TopTagUsers.Id
+          AND p.Tags LIKE CONCAT('%>', TopTagUsers.TagName, '<%')
+    ) AS AvgVoteScore
+FROM TopTagUsers
+WHERE UserRank <= 5
+ORDER BY TagName, PostCount DESC
+LIMIT 100;

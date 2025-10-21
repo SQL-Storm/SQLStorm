@@ -1,0 +1,176 @@
+WITH
+RecentUserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    -- Replace non-standard cast or alias handling; adjust to existing column if BioWip is incorrect
+    u.BioWip,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users AS u
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags AS t
+  WHERE t.IsModeratorOnly = 0
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY CAST(p.CreationDate AS DATE) ORDER BY p.Score DESC, p.ViewCount DESC) AS day_rank
+  FROM Posts AS p
+),
+ComplicatedFilters AS (
+  SELECT
+    pa.PostId,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Title,
+    pa.Tags,
+    pa.CreationDate,
+    pa.LastActivityDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.ParentId,
+    pa.AcceptedAnswerId,
+    pa.ContentLicense,
+    CASE
+      WHEN pa.Score > 0 THEN 'positive'
+      WHEN pa.Score = 0 THEN 'neutral'
+      ELSE 'negative'
+    END AS ScoreCategory,
+    CASE
+      WHEN pa.ViewCount > 1000 THEN TRUE
+      ELSE FALSE
+    END AS HighlyViewed,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 3600 AS HoursOld
+  FROM PostActivity AS pa
+),
+Joined AS (
+  SELECT
+    c.PostId,
+    c.PostTypeId,
+    c.OwnerUserId,
+    c.Title,
+    c.Tags,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.ParentId,
+    c.AcceptedAnswerId,
+    c.ContentLicense,
+    c.ScoreCategory,
+    c.HighlyViewed,
+    c.HoursOld,
+    lu.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    b.Name AS BadgeName,
+    bv.Date AS BadgeDate,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM PostActivity AS c
+  LEFT JOIN Users AS lu ON c.OwnerUserId = lu.Id
+  LEFT JOIN Badges AS b ON b.UserId = c.OwnerUserId
+  LEFT JOIN Badges AS bv ON bv.UserId = c.OwnerUserId
+  LEFT JOIN Votes AS v ON v.PostId = c.PostId
+  LEFT JOIN Users AS u ON c.OwnerUserId = u.Id
+  WHERE c.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days'
+    AND (c.Score > 0 OR c.ViewCount > 500)
+),
+Aggregated AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    OwnerUserId,
+    Title,
+    Tags,
+    CreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    ParentId,
+    AcceptedAnswerId,
+    ContentLicense,
+    ScoreCategory,
+    HighlyViewed,
+    HoursOld,
+    OwnerDisplayName,
+    Reputation,
+    COUNT(DISTINCT BadgeName) AS BadgeCount,
+    MAX(BadgeDate) AS LastBadgeDate,
+    SUM(CASE WHEN VoteDate IS NOT NULL THEN 1 ELSE 0 END) AS VoteCount,
+    SUM(CASE WHEN v.BountyAmount IS NOT NULL THEN v.BountyAmount ELSE 0 END) AS TotalBounty
+  FROM Joined
+  GROUP BY
+    PostId, PostTypeId, OwnerUserId, Title, Tags, CreationDate, LastActivityDate,
+    Score, ViewCount, AnswerCount, CommentCount, FavoriteCount, ParentId,
+    AcceptedAnswerId, ContentLicense, ScoreCategory, HighlyViewed, HoursOld,
+    OwnerDisplayName, Reputation
+)
+SELECT
+  a.PostId,
+  a.PostTypeId,
+  a.OwnerUserId,
+  a.OwnerDisplayName,
+  a.Title,
+  a.Tags,
+  a.CreationDate,
+  a.LastActivityDate,
+  a.Score,
+  a.ViewCount,
+  a.AnswerCount,
+  a.CommentCount,
+  a.FavoriteCount,
+  a.ParentId,
+  a.AcceptedAnswerId,
+  a.ContentLicense,
+  a.ScoreCategory,
+  a.HighlyViewed,
+  a.HoursOld,
+  a.Reputation,
+  a.BadgeCount,
+  a.LastBadgeDate,
+  a.VoteCount,
+  a.TotalBounty,
+  CASE
+    WHEN a.PostTypeId = 1 THEN 'Question'
+    WHEN a.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostTypeName
+FROM Aggregated AS a
+ORDER BY a.LastActivityDate DESC, a.ViewCount DESC, a.Score DESC
+LIMIT 100;

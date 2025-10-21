@@ -1,0 +1,147 @@
+-- {"query": "9052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3154} 
+
+WITH
+-- count of answers to each question in the last 30 days
+RecentAnswers AS (
+  SELECT
+    ParentId AS QuestionId,
+    COUNT(*) AS RecentAnswerCount
+  FROM Posts
+  WHERE PostTypeId = 2
+    AND CreationDate >= now() - INTERVAL '30 days'
+  GROUP BY ParentId
+),
+-- badge totals per user by class
+UserBadges AS (
+  SELECT
+    u.Id AS UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b
+    ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+-- rank tags by how many questions they appear on
+TagUsage AS (
+  SELECT
+    t.TagName,
+    COUNT(p.Id) AS UsageCount,
+    ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS RankByPopularity
+  FROM Tags t
+  LEFT JOIN Posts p
+    ON p.PostTypeId = 1
+   AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+  GROUP BY t.TagName
+),
+-- top-5 most popular tags globally
+TopTags AS (
+  SELECT TagName, UsageCount
+  FROM TagUsage
+  WHERE RankByPopularity <= 5
+),
+-- comment statistics per post
+CommentStats AS (
+  SELECT
+    c.PostId,
+    MAX(c.CreationDate) FILTER (WHERE c.Score >= 0) AS LastCommentDate,
+    COUNT(*) FILTER (WHERE c.Score < 0)      AS NegativeComments
+  FROM Comments c
+  GROUP BY c.PostId
+)
+SELECT
+  q.Id                                  AS QuestionId,
+  q.Title,
+  COALESCE(ra.RecentAnswerCount, 0)     AS AnswersLast30Days,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges,
+  tt.TagName                            AS TopTag,
+  tt.UsageCount                         AS TopTagUsage,
+  (SELECT AVG(p.Score) FROM Posts p WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+  CASE
+    WHEN q.Score > (SELECT AVG(p.Score) FROM Posts p WHERE p.PostTypeId = 1)
+      THEN 'AboveAvg'
+    ELSE 'BelowAvg'
+  END                                    AS ScoreCategory,
+  cs.LastCommentDate,
+  cs.NegativeComments,
+  u.Reputation,
+  u.DisplayName,
+  (u.EmailHash IS NULL)                 AS IsEmailHidden,
+  COALESCE(NULLIF(u.WebsiteUrl, ''), 'none') AS WebsiteOrNone,
+  LENGTH(q.Body)                        AS BodyLen,
+  COALESCE(vUp.cnt, 0) - COALESCE(vDn.cnt, 0) AS NetVotes,
+  EXISTS (
+    SELECT 1
+    FROM Votes vx
+    WHERE vx.PostId = q.Id
+      AND vx.VoteTypeId = 2
+      AND vx.CreationDate > q.CreationDate
+  )                                      AS UpvotedAfterPost,
+  substring(q.Tags FROM '\<([^>]+)\>')  AS FirstTag
+FROM Posts q
+JOIN Users u
+  ON u.Id = q.OwnerUserId
+LEFT JOIN RecentAnswers ra
+  ON ra.QuestionId = q.Id
+LEFT JOIN UserBadges ub
+  ON ub.UserId = u.Id
+LEFT JOIN TopTags tt
+  ON tt.TagName = ANY(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><'))
+LEFT JOIN CommentStats cs
+  ON cs.PostId = q.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS cnt
+  FROM Votes
+  WHERE VoteTypeId = 2
+  GROUP BY PostId
+) vUp
+  ON vUp.PostId = q.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS cnt
+  FROM Votes
+  WHERE VoteTypeId = 3
+  GROUP BY PostId
+) vDn
+  ON vDn.PostId = q.Id
+WHERE q.PostTypeId = 1
+  AND (
+    q.CreationDate > now() - INTERVAL '90 days'
+    OR q.ViewCount > (
+      SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY ViewCount)
+      FROM Posts
+      WHERE PostTypeId = 1
+    )
+  )
+
+UNION
+
+-- include some legacy questions in a second set
+SELECT
+  q2.Id,
+  q2.Title,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  'Legacy' AS ScoreCategory,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Posts q2
+WHERE q2.PostTypeId = 1
+  AND q2.CreationDate < now() - INTERVAL '365 days'
+
+ORDER BY 1 DESC;

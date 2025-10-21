@@ -1,0 +1,263 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.title,
+        p.tags,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.favoritecount,
+        p.closeddate,
+        p.communityowneddate,
+        coalesce(u.displayname, p.ownerdisplayname) as owner_name,
+        u.reputation,
+        u.location
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+tag_expanded as (
+    select
+        rp.*,
+        unnest(string_to_array(substring(rp.tags from 2 for length(rp.tags)-2), '><')) as tag
+    from recent_posts rp
+    where rp.posttypeid = 1
+),
+tag_stats as (
+    select
+        te.tag,
+        count(*) as tag_questions,
+        avg(te.score::numeric) as avg_q_score,
+        percentile_cont(0.9) within group (order by te.viewcount) as p90_views
+    from tag_expanded te
+    group by te.tag
+),
+answers as (
+    select
+        a.id,
+        a.parentid,
+        a.owneruserid,
+        a.score,
+        a.creationdate,
+        row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc, a.id asc) as rn_best_by_score,
+        dense_rank() over (partition by a.parentid order by a.creationdate asc) as dr_first_answer,
+        avg(a.score) over (partition by a.parentid) as avg_answer_score_for_question
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+question_metrics as (
+    select
+        te.id as question_id,
+        te.title,
+        te.tag,
+        te.owneruserid as q_ownerid,
+        te.owner_name as q_ownername,
+        te.reputation as q_owner_rep,
+        te.score as q_score,
+        te.viewcount as q_views,
+        te.answercount as q_answers,
+        te.favoritecount as q_favs,
+        te.creationdate as q_created,
+        ts.tag_questions,
+        ts.avg_q_score,
+        ts.p90_views,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_last_year,
+        count(*) filter (where v.votetypeid = 5) as favorites_last_year
+    from tag_expanded te
+    left join tag_stats ts on ts.tag = te.tag
+    left join votes v
+        on v.postid = te.id
+       and v.creationdate >= te.creationdate
+       and v.creationdate < te.creationdate + interval '365 days'
+       and v.votetypeid in (2,3,5)
+    group by
+        te.id, te.title, te.tag, te.owneruserid, te.owner_name, te.reputation,
+        te.score, te.viewcount, te.answercount, te.favoritecount, te.creationdate,
+        ts.tag_questions, ts.avg_q_score, ts.p90_views
+),
+first_and_best_answers as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid,
+        min(a.creationdate) as first_answer_time,
+        min(a.id) filter (where a.dr_first_answer = 1) as first_answer_id,
+        max(a.score) as best_answer_score,
+        min(a.id) filter (where a.rn_best_by_score = 1) as best_answer_id,
+        avg(a.avg_answer_score_for_question) as avg_ans_score
+    from posts q
+    left join answers a on a.parentid = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    group by q.id, q.acceptedanswerid
+),
+duplicates as (
+    select
+        pl.postid as dup_question_id,
+        count(*) as dup_count,
+        min(pl.creationdate) as first_dup_link_date,
+        bool_or(pl.linktypeid = 3) as has_duplicate_links
+    from postlinks pl
+    where pl.linktypeid in (1,3)
+    group by pl.postid
+),
+closure as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(case
+            when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$'
+            then cast(ph.comment as integer)
+            else null
+        end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+close_reason as (
+    select
+        c.postid,
+        crt.name as last_close_reason_name
+    from closure c
+    left join closerreasontypes crt on crt.id = c.last_close_reason_id
+),
+owner_activity as (
+    select
+        u.id as ownerid,
+        count(p.id) filter (where p.posttypeid = 1) as owner_q_count,
+        count(p.id) filter (where p.posttypeid = 2) as owner_a_count,
+        avg(p.score) as owner_avg_post_score,
+        percentile_cont(0.5) within group (order by p.score) as owner_median_post_score,
+        sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as owner_total_q_views
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+comment_engagement as (
+    select
+        c.postid,
+        count(*) as comments_count,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_date,
+        count(*) filter (where c.userid is null) as anon_comments
+    from comments c
+    group by c.postid
+),
+question_windowed as (
+    select
+        qm.*,
+        faa.first_answer_time,
+        faa.first_answer_id,
+        faa.best_answer_id,
+        faa.best_answer_score,
+        faa.acceptedanswerid,
+        faa.avg_ans_score,
+        d.dup_count,
+        d.first_dup_link_date,
+        d.has_duplicate_links,
+        c.first_closed_at,
+        c.last_reopened_at,
+        c.close_events,
+        c.reopen_events,
+        cr.last_close_reason_name,
+        ca.comments_count,
+        ca.avg_comment_score,
+        ca.last_comment_date,
+        ca.anon_comments,
+        oa.owner_q_count,
+        oa.owner_a_count,
+        oa.owner_avg_post_score,
+        oa.owner_median_post_score,
+        oa.owner_total_q_views,
+        count(*) over (partition by qm.tag) as questions_per_tag_window,
+        row_number() over (partition by qm.tag order by qm.q_score desc nulls last, qm.q_views desc nulls last, qm.net_votes_last_year desc nulls last, qm.q_created asc) as rn_in_tag_by_popularity,
+        sum(qm.q_views) over (partition by qm.tag) as sum_views_per_tag,
+        avg(qm.q_score) over (partition by qm.tag) as avg_score_per_tag
+    from question_metrics qm
+    left join first_and_best_answers faa on faa.question_id = qm.question_id
+    left join duplicates d on d.dup_question_id = qm.question_id
+    left join closure c on c.postid = qm.question_id
+    left join close_reason cr on cr.postid = qm.question_id
+    left join comment_engagement ca on ca.postid = qm.question_id
+    left join owner_activity oa on oa.ownerid = qm.q_ownerid
+),
+ranked as (
+    select
+        qw.*,
+        case
+            when qw.acceptedanswerid is not null then 'accepted'
+            when qw.best_answer_id is not null then 'answered'
+            else 'unanswered'
+        end as answer_status,
+        case
+            when qw.first_closed_at is not null and (qw.last_reopened_at is null or qw.first_closed_at > qw.last_reopened_at) then 'closed'
+            when qw.last_reopened_at is not null then 'reopened'
+            else 'open'
+        end as closure_status,
+        case when qw.q_views >= qw.p90_views then 1 else 0 end as is_highly_viewed_for_tag,
+        case when qw.q_score >= coalesce(qw.avg_score_per_tag, 0) then 1 else 0 end as is_above_avg_score_for_tag,
+        coalesce(qw.net_votes_last_year, 0) + coalesce(qw.q_favs, 0) * 0.5 as engagement_score,
+        coalesce(qw.q_score,0) * 2
+            + least(coalesce(qw.q_views,0)/1000.0, 50)
+            + coalesce(qw.net_votes_last_year,0) * 1.5
+            + case when qw.answer_status = 'accepted' then 10 when qw.answer_status = 'answered' then 5 else 0 end
+            - case when qw.closure_status = 'closed' then 8 else 0 end
+            - least(coalesce(qw.anon_comments,0) * 0.25, 5) as composite_rank_score
+    from question_windowed qw
+),
+final_set as (
+    select
+        r.*
+    from ranked r
+    where
+        (r.is_highly_viewed_for_tag = 1 or r.is_above_avg_score_for_tag = 1)
+        and (r.closure_status <> 'closed' or r.has_duplicate_links is true)
+        and (r.owner_q_count is null or r.owner_q_count >= 1)
+    union all
+    select
+        r.*
+    from ranked r
+    where
+        r.answer_status = 'unanswered'
+        and r.q_views > coalesce(r.avg_score_per_tag, 0) * 100
+)
+select
+    fs.tag,
+    fs.question_id,
+    fs.title,
+    fs.q_ownername,
+    fs.q_owner_rep,
+    fs.q_score,
+    fs.q_views,
+    fs.q_answers,
+    fs.engagement_score,
+    fs.composite_rank_score,
+    fs.answer_status,
+    fs.closure_status,
+    coalesce(fs.last_close_reason_name, 'N/A') as last_close_reason_name,
+    fs.comments_count,
+    fs.avg_comment_score,
+    fs.first_answer_id,
+    fs.best_answer_id,
+    case when fs.acceptedanswerid = fs.best_answer_id and fs.acceptedanswerid is not null then 1 else 0 end as accepted_is_best_by_score,
+    fs.dup_count,
+    fs.has_duplicate_links,
+    fs.rn_in_tag_by_popularity,
+    rank() over (partition by fs.tag order by fs.composite_rank_score desc, fs.engagement_score desc, fs.q_created asc, fs.question_id asc) as rank_in_tag_by_composite,
+    dense_rank() over (order by fs.composite_rank_score desc, fs.engagement_score desc) as global_dense_rank
+from final_set fs
+where
+    (fs.q_owner_rep is null or fs.q_owner_rep >= 1)
+    and (fs.q_views is not null and fs.q_views >= 0)
+    and (fs.tag is not null and fs.tag <> '')
+order by
+    fs.tag asc,
+    rank_in_tag_by_composite asc,
+    fs.question_id asc
+limit 500;

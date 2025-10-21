@@ -1,0 +1,28 @@
+SELECT 
+    u.DisplayName AS "User",
+    u.Reputation AS "Reputation",
+    COUNT(DISTINCT q.Id) AS "QuestionsAsked",
+    COUNT(DISTINCT a.Id) AS "AnswersProvided",
+    AVG(q.Score) AS "AverageQuestionScore",
+    AVG(a.Score) AS "AverageAnswerScore",
+    MAX(q.ViewCount) AS "MaxViewedQuestion",
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS "UpvotesReceived",
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS "DownvotesReceived",
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS "GoldBadges",
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS "SilverBadges",
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS "BronzeBadges",
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (5, 8)) AS "EditsMade"
+FROM 
+    Users u
+LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (5, 8)
+WHERE 
+    u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+ORDER BY 
+    "Reputation" DESC, "QuestionsAsked" DESC, "EditsMade" DESC
+LIMIT 100;

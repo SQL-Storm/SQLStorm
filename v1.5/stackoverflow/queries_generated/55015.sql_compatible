@@ -1,0 +1,82 @@
+WITH TagQuestions AS (
+    SELECT p.Id AS QuestionId,
+           p.OwnerUserId,
+           regexp_split_to_table(p.Tags, '><') AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+Answers AS (
+    SELECT a.Id AS AnswerId,
+           a.OwnerUserId,
+           a.ParentId,
+           a.Score,
+           tq.Tag
+    FROM Posts a
+    JOIN TagQuestions tq ON a.ParentId = tq.QuestionId
+    WHERE a.PostTypeId = 2
+),
+AnswerVotes AS (
+    SELECT ans.AnswerId,
+           ans.OwnerUserId,
+           ans.Tag,
+           ans.Score,
+           COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount
+    FROM Answers ans
+    LEFT JOIN Votes v ON v.PostId = ans.AnswerId AND v.VoteTypeId = 2
+    GROUP BY ans.AnswerId, ans.OwnerUserId, ans.Tag, ans.Score
+),
+UserTagStats AS (
+    SELECT av.Tag,
+           av.OwnerUserId AS UserId,
+           COUNT(*) AS AnswerCount,
+           AVG(av.Score) AS AvgScore,
+           SUM(av.UpVoteCount) AS TotalUpVotes
+    FROM AnswerVotes av
+    GROUP BY av.Tag, av.OwnerUserId
+    HAVING COUNT(*) >= 5
+),
+UserInfo AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.Views,
+           u.UpVotes,
+           u.DownVotes
+    FROM Users u
+),
+UserBadgeAgg AS (
+    SELECT b.UserId,
+           COUNT(*) AS BadgeCount,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RankedUsers AS (
+    SELECT uts.Tag,
+           ui.DisplayName,
+           ui.Reputation,
+           uts.AnswerCount,
+           uts.AvgScore,
+           COALESCE(ub.Gold, 0) AS Gold,
+           COALESCE(ub.Silver, 0) AS Silver,
+           COALESCE(ub.Bronze, 0) AS Bronze,
+           ROW_NUMBER() OVER (PARTITION BY uts.Tag ORDER BY uts.AvgScore DESC, uts.AnswerCount DESC) AS rn
+    FROM UserTagStats uts
+    JOIN UserInfo ui ON ui.Id = uts.UserId
+    LEFT JOIN UserBadgeAgg ub ON ub.UserId = uts.UserId
+)
+SELECT Tag,
+       DisplayName,
+       Reputation,
+       AnswerCount,
+       AvgScore,
+       Gold,
+       Silver,
+       Bronze
+FROM RankedUsers
+WHERE rn <= 5
+ORDER BY Tag, rn;

@@ -1,0 +1,101 @@
+-- {"query": "22026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1053} 
+WITH RankedUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS GlobalRank
+    FROM Users u
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END) AS TotalScore,
+        AVG(CASE WHEN p.PostTypeId = 1 AND p.ViewCount IS NOT NULL THEN p.ViewCount ELSE NULL END) AS AvgViewCount,
+        STRING_AGG(CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2) ELSE NULL END, ';') FILTER (WHERE p.PostTypeId = 1) AS AllTags,
+        MIN(p.CreationDate) AS FirstPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserVoteStats AS (
+    SELECT 
+        COALESCE(v.UserId, vt.UserId) AS UserId,  -- vt.UserId for bounties
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN vt.VoteTypeId = 8 THEN vt.BountyAmount END) AS TotalBountyGiven
+    FROM Votes v
+    FULL OUTER JOIN Votes vt ON vt.Id = v.Id AND vt.VoteTypeId = 8  -- Simplify, but actually need to sum bounties
+    GROUP BY COALESCE(v.UserId, vt.UserId)
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserCommentStats AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        SUM(c.Score) AS CommentScore
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+AcceptedAnswers AS (
+    SELECT DISTINCT 
+        pa.Id AS AnswerId,
+        pa.OwnerUserId,
+        pq.Id AS QuestionId,
+        pq.Title,
+        pa.Score
+    FROM Posts pa
+    JOIN Posts pq ON pa.ParentId = pq.Id AND pa.PostTypeId = 2
+    WHERE pa.Id = pq.AcceptedAnswerId
+)
+SELECT 
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.Location,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalScore,
+    ups.AvgViewCount,
+    ups.AllTags,
+    uvs.UpVotesGiven,
+    uvs.DownVotesGiven,
+    uvs.TotalBountyGiven,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    ucs.CommentCount,
+    ucs.CommentScore,
+    CASE WHEN ups.FirstPostDate IS NOT NULL THEN EXTRACT(YEAR FROM AGE(CURRENT_TIMESTAMP, ups.FirstPostDate)) ELSE NULL END AS YearsActive,
+    (SELECT COUNT(*) FROM AcceptedAnswers aa WHERE aa.OwnerUserId = ru.Id) AS AcceptedAnswerCount,
+    ROW_NUMBER() OVER (ORDER BY 
+        (COALESCE(ups.TotalScore, 0) + COALESCE(uvs.UpVotesGiven, 0) * 10 + COALESCE(ubs.GoldBadges, 0) * 1000 + COALESCE(ucs.CommentScore, 0) / 2) DESC
+    ) AS ComputedRank
+FROM RankedUsers ru
+LEFT JOIN UserPostStats ups ON ru.Id = ups.UserId
+LEFT JOIN UserVoteStats uvs ON ru.Id = uvs.UserId
+LEFT JOIN UserBadgeStats ubs ON ru.Id = ubs.UserId
+LEFT JOIN UserCommentStats ucs ON ru.Id = ucs.UserId
+WHERE ru.GlobalRank <= 1000
+    AND (ups.QuestionCount > 0 OR ups.AnswerCount > 0)
+    AND ru.Reputation > 100
+    AND EXISTS (
+        SELECT 1 FROM Badges b WHERE b.UserId = ru.Id AND b.Class <= 2
+    )
+ORDER BY ComputedRank
+LIMIT 50;

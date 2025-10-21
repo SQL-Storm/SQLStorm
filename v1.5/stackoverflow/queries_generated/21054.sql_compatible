@@ -1,0 +1,153 @@
+WITH ActiveUsers AS (
+  SELECT u.Id AS UserId, u.Reputation, u.CreationDate,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS RepRank
+  FROM Users u
+  WHERE u.Reputation >= 100
+    AND u.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    AND (u.Location IS NOT NULL OR u.WebsiteUrl IS NOT NULL)
+),
+QuestionStats AS (
+  SELECT p.Id AS PostId, p.OwnerUserId, p.CreationDate,
+         p.Score, p.ViewCount, p.AnswerCount,
+         COALESCE(p.CommentCount, 0) AS CommentCount,
+         CASE 
+           WHEN p.PostTypeId = 1 AND p.Score > 50 THEN 'HighImpact'
+           WHEN p.PostTypeId = 1 AND p.ViewCount > 10000 THEN 'Viral'
+           ELSE 'Standard'
+         END AS ImpactCategory,
+         LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+         AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate
+                             ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.DeletionDate IS NULL
+    AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years'
+),
+TopAnswers AS (
+  SELECT a.PostId AS AnswerPostId, a.OwnerUserId AS AnswerOwnerId,
+         a.Score AS AnswerScore,
+         ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY a.Score DESC, a.CreationDate DESC) AS AnswerRank,
+         COUNT(*) OVER (PARTITION BY q.OwnerUserId) AS TotalAnswersByUser
+  FROM Posts a
+  INNER JOIN Posts q ON a.ParentId = q.Id
+  WHERE a.PostTypeId = 2
+    AND a.Score >= 5
+    AND q.DeletionDate IS NULL
+    AND a.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+BadgeAchievements AS (
+  SELECT b.UserId, b.Name AS BadgeName, b.Date,
+         DENSE_RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS BadgeSequence,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY b.UserId) AS TotalGold
+  FROM Badges b
+  WHERE b.TagBased = FALSE
+    AND b.Date > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years'
+),
+TagActivity AS (
+  SELECT t.TagName, COUNT(DISTINCT ph.PostId) AS EditCount,
+         AVG(LENGTH(ph.Text)) AS AvgEditLength,
+         STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 10), ', ' ORDER BY t.TagName) AS TopTagsPreview
+  FROM Tags t
+  INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  INNER JOIN PostHistory ph ON ph.PostId = p.Id 
+    AND ph.PostHistoryTypeId IN (3, 6)
+  WHERE p.PostTypeId = 1
+    AND ph.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    AND t.Count > 100
+  GROUP BY t.TagName
+  HAVING COUNT(DISTINCT ph.PostId) > 10
+)
+SELECT 
+  au.UserId,
+  au.Reputation,
+  au.RepRank,
+  qs.PostId AS TopQuestionId,
+  qs.Title,
+  qs.ImpactCategory,
+  qs.RollingAvgScore,
+  ta.AnswerScore AS BestAnswerScore,
+  ta.AnswerRank,
+  ba.BadgeName,
+  ba.BadgeSequence,
+  ta.TotalAnswersByUser,
+  COALESCE(qs.AnswerCount, 0) * 1.0 / NULLIF(ta.TotalAnswersByUser, 0) AS AnswersPerQuestionRatio,
+  CASE 
+    WHEN ba.TotalGold >= 3 AND qs.Score > 25 THEN 'Elite'
+    WHEN ta.AnswerScore > 20 OR qs.ViewCount > 5000 THEN 'Influential'
+    WHEN au.Reputation > 5000 THEN 'Established'
+    ELSE 'Emerging'
+  END AS UserTier,
+  CONCAT(
+    COALESCE(au.DisplayName, 'Anonymous'), 
+    CASE WHEN ba.BadgeName IS NOT NULL THEN ' - ' || LEFT(ba.BadgeName, 20) ELSE '' END,
+    CASE WHEN ta.AnswerRank = 1 THEN ' (Top Answerer)' ELSE '' END
+  ) AS ProfileSummary,
+  GREATEST(
+    COALESCE(qs.ViewCount, 0) + COALESCE(ta.AnswerScore * 10, 0),
+    COALESCE(qs.Score * 5, 0)
+  ) AS EngagementScore,
+  (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+   FROM PostLinks pl 
+   WHERE pl.PostId = qs.PostId 
+     AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksCount,
+  (SELECT STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate DESC LIMIT 3)
+   FROM Comments c 
+   WHERE c.PostId = qs.PostId 
+     AND c.Score > 0 
+     AND LENGTH(c.Text) > 20
+  ) AS TopCommentsPreview
+FROM ActiveUsers au
+LEFT OUTER JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId
+  AND qs.CreationDate = (
+    SELECT MAX(qs2.CreationDate) 
+    FROM QuestionStats qs2 
+    WHERE qs2.OwnerUserId = au.UserId 
+      AND qs2.Score = (SELECT MAX(qs3.Score) FROM QuestionStats qs3 WHERE qs3.OwnerUserId = au.UserId)
+  )
+LEFT OUTER JOIN TopAnswers ta ON au.UserId = ta.AnswerOwnerId 
+  AND ta.AnswerRank <= 3
+LEFT OUTER JOIN BadgeAchievements ba ON au.UserId = ba.UserId
+  AND ba.Date >= (
+    SELECT MAX(qs.Date) - INTERVAL '6 months' 
+    FROM QuestionStats qs 
+    WHERE qs.OwnerUserId = au.UserId
+  )
+RIGHT OUTER JOIN TagActivity ta2 ON ta2.EditCount > 0
+WHERE au.RepRank <= 100
+  AND (qs.ImpactCategory != 'Standard' OR ta.AnswerScore IS NOT NULL)
+  AND NOT EXISTS (
+    SELECT 1 FROM Votes v 
+    WHERE v.PostId = qs.PostId 
+      AND v.VoteTypeId = 4
+      AND v.CreationDate > qs.CreationDate
+  )
+  AND (ba.TotalGold > 0 OR qs.RollingAvgScore > 10 OR ta.AnswerRank = 1)
+UNION ALL
+SELECT 
+  NULL AS UserId,
+  0 AS Reputation,
+  999 AS RepRank,
+  NULL AS TopQuestionId,
+  'Summary Stats' AS Title,
+  'Aggregate' AS ImpactCategory,
+  AVG(qs.RollingAvgScore) AS RollingAvgScore,
+  AVG(ta.AnswerScore) AS BestAnswerScore,
+  0 AS AnswerRank,
+  COUNT(DISTINCT ba.BadgeName) AS BadgeName,
+  0 AS BadgeSequence,
+  SUM(ta.TotalAnswersByUser) AS TotalAnswersByUser,
+  AVG(COALESCE(qs.AnswerCount, 0)) AS AnswersPerQuestionRatio,
+  'Overall' AS UserTier,
+  'Platform Summary' AS ProfileSummary,
+  SUM(COALESCE(qs.ViewCount, 0)) AS EngagementScore,
+  (SELECT COUNT(*) FROM PostLinks WHERE LinkTypeId = 3) AS DuplicateLinksCount,
+  (SELECT 'Generated summary of active community' || 
+          CASE WHEN (SELECT COUNT(*) FROM TagActivity) > 50 THEN ' with diverse tags' ELSE '' END
+  ) AS TopCommentsPreview
+FROM QuestionStats qs
+FULL OUTER JOIN TopAnswers ta ON qs.PostId = ta.AnswerPostId
+LEFT JOIN BadgeAchievements ba ON qs.OwnerUserId = ba.UserId
+WHERE qs.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+ORDER BY EngagementScore DESC, RepRank ASC
+LIMIT 50 OFFSET 0;

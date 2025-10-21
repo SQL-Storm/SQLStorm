@@ -1,0 +1,96 @@
+-- {"query": "50018.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1196} 
+
+WITH TagSpecificQuestions AS (
+    -- Step 1: Isolate all questions for a specific popular tag.
+    -- This CTE filters the massive Posts table to a more relevant subset.
+    SELECT Id, ViewCount, FavoriteCount, Score AS QuestionScore, OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 1 -- Questions
+      AND Tags LIKE '%<java>%'
+      AND ClosedDate IS NULL
+      AND DeletionDate IS NULL
+),
+UserAnswerMetrics AS (
+    -- Step 2: Aggregate metrics for users who answered these questions.
+    -- This involves joining the questions with their answers and then grouping by the answer's owner.
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalAnswersInTag,
+        SUM(p.Score) AS TotalAnswerScoreInTag,
+        AVG(p.Score) AS AvgAnswerScoreInTag,
+        SUM(p.CommentCount) AS TotalCommentsOnAnswers,
+        SUM(tq.ViewCount) AS CumulativeQuestionViews,
+        SUM(tq.FavoriteCount) AS CumulativeQuestionFavorites,
+        MAX(p.CreationDate) as LastAnswerDate
+    FROM Posts p
+    JOIN TagSpecificQuestions tq ON p.ParentId = tq.Id
+    WHERE p.PostTypeId = 2 -- Answers
+      AND p.DeletionDate IS NULL
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) > 10 -- Only consider users with a significant number of answers in the tag.
+),
+UserBadgePerformance AS (
+    -- Step 3: Calculate badge statistics for each user.
+    -- This provides another dimension of user contribution, independent of a single tag.
+    SELECT
+        UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserReputationRanking AS (
+    -- Step 4: Use a window function to rank users by reputation, partitioned by their location.
+    -- This can identify top users in specific geographical areas.
+    SELECT
+        Id,
+        Location,
+        Reputation,
+        DENSE_RANK() OVER(PARTITION BY Location ORDER BY Reputation DESC) as LocationReputationRank
+    FROM Users
+    WHERE Location IS NOT NULL AND Location != ''
+)
+-- Final Select Statement: Combine all metrics to calculate a composite "Influence Score".
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    uam.TotalAnswersInTag,
+    uam.TotalAnswerScoreInTag,
+    uam.CumulativeQuestionViews,
+    COALESCE(ubp.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubp.SilverBadges, 0) AS SilverBadges,
+    urr.Location,
+    urr.LocationReputationRank,
+    (
+        -- The core of the benchmark: a complex calculation involving multiple aggregated fields.
+        -- Weights are arbitrary and designed to create a varied workload.
+        (uam.TotalAnswerScoreInTag * 1.5) +
+        (uam.AvgAnswerScoreInTag * 10) +
+        (u.Reputation / 100.0) +
+        (uam.CumulativeQuestionViews / 1000.0) +
+        (COALESCE(ubp.GoldBadges, 0) * 200) +
+        (COALESCE(ubp.SilverBadges, 0) * 50) +
+        -- Subquery to find the number of times a user's answer was accepted for the target tag.
+        (SELECT COUNT(*) FROM Posts q WHERE q.AcceptedAnswerId IN
+            (SELECT a.Id FROM Posts a WHERE a.OwnerUserId = u.Id AND a.ParentId IN (SELECT Id FROM TagSpecificQuestions))
+        ) * 25.0
+    ) AS InfluenceScore,
+    -- Categorize users based on their calculated score.
+    CASE
+        WHEN (uam.TotalAnswerScoreInTag > 1000 AND COALESCE(ubp.GoldBadges, 0) > 2) THEN 'Java Guru'
+        WHEN (uam.TotalAnswerScoreInTag > 500 AND COALESCE(ubp.SilverBadges, 0) > 10) THEN 'Java Expert'
+        WHEN (uam.TotalAnswersInTag > 20) THEN 'Consistent Contributor'
+        ELSE 'Active Participant'
+    END AS UserTier
+FROM Users u
+JOIN UserAnswerMetrics uam ON u.Id = uam.OwnerUserId
+LEFT JOIN UserBadgePerformance ubp ON u.Id = ubp.UserId
+LEFT JOIN UserReputationRanking urr ON u.Id = urr.Id
+WHERE u.Reputation > 5000 -- Pre-filter to reduce the final join size.
+  AND u.CreationDate < (NOW() - INTERVAL '3 year') -- Focus on established users.
+ORDER BY InfluenceScore DESC
+LIMIT 200;

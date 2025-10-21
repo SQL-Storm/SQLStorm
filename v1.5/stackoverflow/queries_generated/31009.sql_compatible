@@ -1,0 +1,50 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS Rank
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1 AND p.Score > 0
+),
+TopUserPosts AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount
+    FROM 
+        RankedPosts rp
+    LEFT JOIN 
+        Comments c ON rp.PostId = c.PostId
+    WHERE 
+        rp.Rank <= 5
+    GROUP BY 
+        rp.PostId, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName
+)
+SELECT 
+    tup.OwnerDisplayName,
+    COUNT(DISTINCT tup.PostId) AS TotalTopPosts,
+    SUM(tup.Score) AS TotalScore,
+    AVG(tup.ViewCount) AS AvgViewCount
+FROM 
+    TopUserPosts tup
+JOIN 
+    Badges b ON CAST(tup.OwnerDisplayName AS VARCHAR) = CAST(b.UserId AS VARCHAR)
+WHERE 
+    b.Class = 1
+GROUP BY 
+    tup.OwnerDisplayName
+ORDER BY 
+    TotalScore DESC
+LIMIT 10;

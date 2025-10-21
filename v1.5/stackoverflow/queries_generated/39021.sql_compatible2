@@ -1,0 +1,117 @@
+WITH
+    -- questions in the last year with author info
+    recent_questions AS (
+        SELECT
+            q.Id,
+            q.Title,
+            q.CreationDate,
+            q.Tags,
+            q.ViewCount,
+            q.Score        AS QuestionScore,
+            u.Id           AS AuthorUserId,
+            u.DisplayName  AS AuthorName,
+            u.Reputation
+        FROM Posts AS q
+        JOIN Users AS u
+          ON q.OwnerUserId = u.Id
+        WHERE q.PostTypeId = 1
+          AND q.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    ),
+
+    -- explode tag strings into individual rows
+    question_tags AS (
+        SELECT
+            rq.Id       AS QuestionId,
+            tag.tag     AS TagName
+        FROM recent_questions AS rq
+        CROSS JOIN LATERAL
+            UNNEST(
+              STRING_TO_ARRAY(
+                SUBSTRING(rq.Tags FROM 2 FOR CHAR_LENGTH(rq.Tags) - 2),
+                '><'
+              )
+            ) AS tag(tag)
+    ),
+
+    -- aggregate answer statistics per question
+    answer_stats AS (
+        SELECT
+            p.ParentId                           AS QuestionId,
+            COUNT(*)                             AS AnswerCount,
+            AVG(p.Score)                         AS AvgAnswerScore,
+            MAX(p.Score)                         AS MaxAnswerScore,
+            SUM(CASE WHEN p.Score >= 5 THEN 1 ELSE 0 END) AS HighScoreAnswers
+        FROM Posts AS p
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ),
+
+    -- badge counts per user
+    user_badges AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+        FROM Badges AS b
+        GROUP BY b.UserId
+    ),
+
+    -- top answerers over the last year, ranked by their average answer score
+    top_answerers AS (
+        SELECT
+            p.OwnerUserId                     AS UserId,
+            COUNT(*)                          AS AnswersGiven,
+            AVG(p.Score)                      AS AvgAnswerScore,
+            ROW_NUMBER() OVER (
+                ORDER BY AVG(p.Score) DESC
+            )                                  AS RankByScore
+        FROM Posts AS p
+        WHERE p.PostTypeId = 2
+          AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+        GROUP BY p.OwnerUserId
+        HAVING COUNT(*) >= 10
+    ),
+
+    -- combine everything into per‑tag metrics
+    metrics AS (
+        SELECT
+            qt.TagName                                  AS Tag,
+            COUNT(DISTINCT rq.Id)                       AS Questions,
+            AVG(rq.QuestionScore)                       AS AvgQuestionScore,
+            SUM(rq.ViewCount)                           AS TotalViews,
+            COALESCE(SUM(asf.AnswerCount), 0)           AS TotalAnswers,
+            AVG(asf.AvgAnswerScore)                     AS AvgAnswerScore,
+            COALESCE(SUM(asf.HighScoreAnswers), 0)      AS HighScoreAnswers,
+            MAX(rq.Reputation)                          AS TopAuthorReputation,
+            AVG(ub.GoldBadges)                          AS AvgGoldBadgesOfAuthors,
+            AVG(ta.AvgAnswerScore)                      AS AvgTop10AnswerersScore,
+            AVG(CASE WHEN ta.RankByScore <= 10 THEN ta.AvgAnswerScore END) AS Top10AnswerersAvgScore
+        FROM question_tags AS qt
+        JOIN recent_questions AS rq
+          ON rq.Id = qt.QuestionId
+        LEFT JOIN answer_stats AS asf
+          ON asf.QuestionId = rq.Id
+        LEFT JOIN user_badges AS ub
+          ON ub.UserId = rq.AuthorUserId
+        LEFT JOIN top_answerers AS ta
+          ON ta.UserId = rq.AuthorUserId
+        GROUP BY qt.TagName
+    )
+
+SELECT
+    Tag,
+    Questions,
+    AvgQuestionScore,
+    TotalViews,
+    TotalAnswers,
+    AvgAnswerScore,
+    HighScoreAnswers,
+    TopAuthorReputation,
+    AvgGoldBadgesOfAuthors,
+    Top10AnswerersAvgScore,
+    DENSE_RANK() OVER (ORDER BY Questions DESC)           AS TagPopularityRank,
+    PERCENT_RANK() OVER (ORDER BY AvgAnswerScore DESC)    AS AnswerQualityPercentile
+FROM metrics
+ORDER BY Questions DESC, AvgAnswerScore DESC
+LIMIT 50;

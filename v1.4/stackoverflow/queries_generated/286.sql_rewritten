@@ -1,0 +1,86 @@
+-- {"query": "286.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 7563} 
+WITH
+RecentPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    COALESCE(u.DisplayName, 'unknown') AS OwnerName,
+    p.OwnerUserId AS OwnerUserId,
+    COALESCE(u.Reputation, 0) AS Reputation,
+    p.PostTypeId,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS TypeRank,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountFromSub
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    AND p.PostTypeId IN (1, 2)
+),
+ParsedTags AS (
+  SELECT rp.PostId,
+         unnest(string_to_array(substr(rp.Tags, 2, length(rp.Tags)-2), '><')) AS TagName
+  FROM RecentPosts rp
+),
+QueryA AS (
+  SELECT rp.PostId,
+         rp.Title,
+         rp.CreationDate,
+         rp.LastActivityDate,
+         rp.Score,
+         rp.ViewCount,
+         rp.OwnerName,
+         rp.OwnerUserId,
+         rp.Reputation,
+         rp.PostTypeId,
+         CASE WHEN rp.ViewCount > 0 THEN rp.Score::double precision / rp.ViewCount ELSE NULL END AS ScorePerView,
+         rp.OwnerName || ' [' || rp.Reputation::text || ']' AS OwnerDisplay,
+         rp.TypeRank,
+         rp.CommentCountFromSub AS CommentCountCorrelated,
+         NULL::text AS Extra
+  FROM RecentPosts rp
+  JOIN ParsedTags pt ON pt.PostId = rp.PostId
+  WHERE (rp.Score > 100 OR rp.ViewCount > 1000 OR rp.TypeRank <= 5)
+    AND EXISTS (SELECT 1 FROM ParsedTags t2 WHERE t2.PostId = rp.PostId)
+  GROUP BY rp.PostId, rp.Title, rp.CreationDate, rp.LastActivityDate, rp.Score, rp.ViewCount,
+           rp.OwnerName, rp.OwnerUserId, rp.Reputation, rp.PostTypeId, rp.TypeRank, rp.CommentCountFromSub
+),
+QueryB AS (
+  SELECT NULL::int AS PostId,
+         NULL::text AS Title,
+         NULL::timestamp AS CreationDate,
+         NULL::timestamp AS LastActivityDate,
+         NULL::int AS Score,
+         NULL::int AS ViewCount,
+         UserName AS OwnerName,
+         UserId AS OwnerUserId,
+         Reputation,
+         NULL::smallint AS PostTypeId,
+         NULL::double precision AS ScorePerView,
+         NULL::text AS OwnerDisplay,
+         NULL::int AS TypeRank,
+         NULL::int AS CommentCountCorrelated,
+         'From heavy-user activity (union)' AS Extra
+  FROM (
+     SELECT u.Id AS UserId,
+            COALESCE(u.DisplayName, 'anonymous') AS UserName,
+            COALESCE(u.Reputation, 0) AS Reputation
+     FROM Posts p
+     LEFT JOIN Users u ON p.OwnerUserId = u.Id
+     GROUP BY u.Id, u.DisplayName, u.Reputation
+     HAVING count(*) > 10
+  ) t
+)
+SELECT *
+FROM (
+  SELECT PostId, Title, CreationDate, LastActivityDate, Score, ViewCount, OwnerName, OwnerUserId, Reputation, PostTypeId, ScorePerView, OwnerDisplay, TypeRank, CommentCountCorrelated, Extra
+  FROM QueryA
+  UNION ALL
+  SELECT PostId, Title, CreationDate, LastActivityDate, Score, ViewCount, OwnerName, OwnerUserId, Reputation, PostTypeId, ScorePerView, OwnerDisplay, TypeRank, CommentCountCorrelated, Extra
+  FROM QueryB
+) AS combined
+ORDER BY COALESCE(Score, 0) DESC NULLS LAST
+LIMIT 100;

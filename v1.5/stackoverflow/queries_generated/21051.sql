@@ -1,0 +1,177 @@
+-- {"query": "21051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1823} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CURRENT_DATE - INTERVAL '365 days'
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopContributors AS (
+    SELECT 
+        au.*,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(au.Location, 1, POSITION(',' IN au.Location || ',') - 1) ORDER BY au.UpVotesReceived DESC, au.QuestionCount DESC) AS RankInLocation,
+        LAG(au.UpVotesReceived) OVER (PARTITION BY SUBSTRING(au.Location, 1, POSITION(',' IN au.Location || ',') - 1) ORDER BY au.Reputation DESC) AS PrevLocationUpVotes
+    FROM ActiveUsers au
+    WHERE au.Location IS NOT NULL AND LENGTH(TRIM(au.Location)) > 0
+),
+HighScorePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ' ORDER BY t.Count DESC)
+         FROM Tags t
+         WHERE POSITION(LOWER(t.TagName) IN LOWER(COALESCE(p.Tags, ''))) > 0
+           AND t.Count > (
+               SELECT AVG(t2.Count) 
+               FROM Tags t2 
+               WHERE t2.Count > 0
+           )
+        ) AS TopRelatedTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.Score > (
+          SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY p2.Score) 
+          FROM Posts p2 
+          WHERE p2.PostTypeId = 1 AND p2.Score > 0
+      )
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+DetailedContributions AS (
+    SELECT 
+        tc.UserId,
+        tc.Reputation,
+        tc.QuestionCount,
+        tc.AnswerCount,
+        tc.UpVotesReceived,
+        tc.RankInLocation,
+        COALESCE(hsp.Score, 0) AS AvgQuestionScore,
+        hsp.Title AS SampleHighScoreQuestion,
+        hsp.TopRelatedTags,
+        tc.PrevLocationUpVotes,
+        CASE 
+            WHEN tc.UpVotesReceived - COALESCE(tc.PrevLocationUpVotes, 0) > 100 THEN 'High Growth'
+            WHEN tc.RankInLocation <= 5 THEN 'Top Local'
+            ELSE 'Regular'
+        END AS ContributorCategory,
+        (tc.UpVotesReceived * 1.0 / NULLIF(tc.QuestionCount + tc.AnswerCount, 0)) AS VotesPerPostRatio
+    FROM TopContributors tc
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            AVG(p.Score) AS Score,
+            STRING_AGG(p.Title, ' || ', 1) AS Title,
+            STRING_AGG(hsp.TopRelatedTags, ' || ', 1) AS TopRelatedTags
+        FROM HighScorePosts hsp
+        JOIN Posts p ON p.Id = hsp.Id
+        GROUP BY p.OwnerUserId
+    ) hsp ON hsp.OwnerUserId = tc.UserId
+),
+ComplexInteractions AS (
+    SELECT 
+        dc.*,
+        COUNT(DISTINCT pl.RelatedPostId) AS ExternalLinks,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        STRING_AGG(DISTINCT LEFT(b.Name, 20), ' | ') AS NotableBadges,
+        AVG(CASE WHEN v.BountyAmount > 0 THEN v.BountyAmount END) AS AvgBountyOffered
+    FROM DetailedContributions dc
+    LEFT JOIN Posts p ON p.OwnerUserId = dc.UserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    LEFT JOIN Comments c ON c.PostId = p.Id OR c.UserId = dc.UserId
+    LEFT JOIN Badges b ON b.UserId = dc.UserId AND b.Date >= CURRENT_DATE - INTERVAL '365 days'
+    LEFT JOIN Votes v ON v.UserId = dc.UserId AND v.VoteTypeId = 8 AND v.BountyAmount > 0
+    GROUP BY 
+        dc.UserId, dc.Reputation, dc.QuestionCount, dc.AnswerCount, dc.UpVotesReceived,
+        dc.RankInLocation, dc.AvgQuestionScore, dc.SampleHighScoreQuestion, 
+        dc.TopRelatedTags, dc.PrevLocationUpVotes, dc.ContributorCategory, dc.VotesPerPostRatio
+)
+SELECT 
+    UserId,
+    Reputation,
+    QuestionCount,
+    AnswerCount,
+    UpVotesReceived,
+    RankInLocation,
+    AvgQuestionScore,
+    SampleHighScoreQuestion,
+    TopRelatedTags,
+    CASE 
+        WHEN PrevLocationUpVotes IS NULL THEN 'Newcomer'
+        ELSE CONCAT('Grew by ', (UpVotesReceived - PrevLocationUpVotes), ' upvotes')
+    END AS GrowthSummary,
+    ContributorCategory,
+    VotesPerPostRatio,
+    ExternalLinks,
+    TotalComments,
+    GoldBadges,
+    NotableBadges,
+    COALESCE(AvgBountyOffered, 0) AS AvgBountyOffered,
+    -- Complex calculated field with NULL logic and string operations
+    CASE 
+        WHEN GoldBadges > 0 AND ExternalLinks > 10 THEN 
+            CONCAT(
+                UPPER(SUBSTRING(ContributorCategory FROM 1 FOR 1)), 
+                LOWER(SUBSTRING(ContributorCategory FROM 2)), 
+                ': Elite with ', GoldBadges, ' golds'
+            )
+        WHEN TotalComments > 50 OR (VotesPerPostRatio > 5 AND Reputation > 10000) THEN 
+            CONCAT(
+                'Active: ', 
+                CASE WHEN Location IS NULL THEN 'Unknown' ELSE SUBSTRING(Location, 1, 20) END,
+                ' (', TotalComments, ' comments)'
+            )
+        ELSE 
+            COALESCE(ContributorCategory, 'Emerging') || ' contributor'
+    END AS ProfileSummary,
+    -- Window function for regional comparison
+    RANK() OVER (ORDER BY UpVotesReceived DESC, GoldBadges DESC) AS GlobalRank,
+    -- Set operation simulation via conditional aggregation
+    (SELECT COUNT(*) FROM ComplexInteractions ci2 
+     WHERE ci2.RankInLocation <= 3 AND ci2.Location LIKE '%' || SUBSTRING(ci.Location, 1, POSITION(',' IN ci.Location || ',') - 1) || '%') AS RegionalPeers
+FROM ComplexInteractions ci
+WHERE 
+    -- Complex predicates with subqueries and expressions
+    (UpVotesReceived > (
+        SELECT AVG(ci2.UpVotesReceived) * 1.5 
+        FROM ComplexInteractions ci2 
+        WHERE ci2.RankInLocation <= 10
+    ) OR GoldBadges >= 2)
+    AND (VotesPerPostRatio IS NULL OR VotesPerPostRatio > 2)
+    AND NOT (Location LIKE '%spam%' OR Location IS NULL AND Reputation < 100)
+    AND (
+        SampleHighScoreQuestion IS NOT NULL 
+        OR (QuestionCount > 20 AND AnswerCount > 10)
+    )
+    AND TotalComments > (
+        SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY TotalComments) 
+        FROM ComplexInteractions 
+        WHERE TotalComments > 0
+    )
+ORDER BY 
+    GlobalRank ASC,
+    CASE 
+        WHEN ContributorCategory = 'High Growth' THEN 1 
+        WHEN ContributorCategory = 'Top Local' THEN 2 
+        ELSE 3 
+    END,
+    Reputation DESC
+LIMIT 50;

@@ -1,0 +1,94 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+    AND p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TotalTagCount
+  FROM Tags t
+  GROUP BY t.TagName
+  ORDER BY TotalTagCount DESC
+  LIMIT 100
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT a.PostId) AS PostsCreated,
+    SUM(COALESCE(v.BountyAmount,0)) AS TotalBounties,
+    MAX(u.CreationDate) AS CreatedSince
+  FROM Users u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  WHERE u.Id IS NOT NULL
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+),
+ComplexStats AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.ViewCount,
+    rp.Score,
+    rp.CommentCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    COALESCE(pa.Id, -1) AS RelatedAcceptedAnswer,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rp.PostId) AS LinkCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS CommentTotal
+  FROM RecentActivePosts rp
+  LEFT JOIN Posts pa ON pa.Id = rp.AcceptedAnswerId
+)
+SELECT
+  cs.PostId,
+  cs.Title,
+  cs.Tags,
+  cs.ViewCount,
+  cs.Score,
+  cs.CommentTotal,
+  cs.AnswerCount,
+  cs.FavoriteCount,
+  cs.LinkCount,
+  ua.UserId AS TopContributorUserId,
+  ua.DisplayName AS TopContributorName,
+  ua.Reputation AS TopContributorRep,
+  ta.TagName AS TopTag,
+  ua.PostsCreated,
+  ua.TotalBounties
+FROM ComplexStats cs
+LEFT JOIN (
+  SELECT
+    a.OwnerUserId,
+    a.PostId
+  FROM Posts a
+  WHERE a.PostTypeId = 1
+  ORDER BY a.LastActivityDate DESC
+) lastpost ON lastpost.PostId = cs.PostId
+LEFT JOIN UserActivity ua ON ua.UserId = cs.OwnerUserId
+LEFT JOIN TopTags ta ON ta.TagName IN (SELECT unnest(string_to_array(REPLACE(cs.Tags, '><', ','), ',')))
+WHERE cs.ViewCount > 0
+ORDER BY cs.Score DESC NULLS LAST, cs.ViewCount DESC
+LIMIT 200;

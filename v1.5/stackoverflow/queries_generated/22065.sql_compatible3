@@ -1,0 +1,112 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN t.TagName ELSE NULL END, ', ') AS QuestionTags,
+        COUNT(DISTINCT v.Id) AS TotalVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        AND p.Score IS NOT NULL
+    LEFT JOIN Votes v ON p.Id = v.PostId
+        AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN (
+        SELECT DISTINCT
+            t.TagName
+        FROM (
+            SELECT SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2) AS tpls
+            FROM Posts p
+            WHERE p.Id IS NOT NULL
+        ) s
+        CROSS JOIN UNNEST(
+            COALESCE(STRING_TO_ARRAY(COALESCE(s.tpls, ''), '><'), ARRAY[])
+        ) AS t(TagName)
+    ) AS t ON p.PostTypeId = 1
+    WHERE u.Reputation > 1000 
+      AND (p.CreationDate >= TIMESTAMP '2018-01-01' OR p.CreationDate IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgedUsers AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+    HAVING COUNT(*) >= 5
+),
+RankedUsers AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.TotalScore,
+        ups.AvgScore,
+        COALESCE(ups.QuestionTags, 'No Tags') AS Tags,
+        ups.TotalVotesReceived,
+        ups.NetVotes,
+        bu.GoldBadges,
+        bu.SilverBadges,
+        bu.LatestBadgeDate,
+        ROW_NUMBER() OVER (ORDER BY ups.TotalScore DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY ups.AvgScore) AS ScorePercentile,
+        SUM(ups.TotalScore) OVER (PARTITION BY NULL ORDER BY ups.UserId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore
+    FROM UserPostStats ups
+    LEFT JOIN BadgedUsers bu ON ups.UserId = bu.UserId
+)
+SELECT ru.UserId,
+       ru.DisplayName,
+       ru.Reputation,
+       ru.TotalPosts,
+       ru.TotalScore,
+       ROUND(ru.AvgScore, 2) AS AvgScore,
+       ru.Tags,
+       ru.TotalVotesReceived,
+       ru.NetVotes,
+       COALESCE(ru.GoldBadges, 0) AS GoldBadges,
+       COALESCE(ru.SilverBadges, 0) AS SilverBadges,
+       ru.LatestBadgeDate,
+       ru.ScoreRank,
+       ROUND(ru.ScorePercentile * 100, 2) AS ScorePercentilePercent,
+       ru.CumulativeScore
+FROM RankedUsers ru
+WHERE ru.UserId IN (
+    SELECT DISTINCT c.UserId
+    FROM Comments c
+    WHERE c.Score > 5
+      AND c.UserId IS NOT NULL
+)
+  AND ru.UserId NOT IN (
+    SELECT DISTINCT ph.UserId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (12, 13) -- Deleted/Undeleted
+      AND ph.UserId IS NOT NULL
+)
+  AND POSITION('sql' IN LOWER(COALESCE(ru.Tags, ''))) > 0
+ORDER BY ru.ScoreRank
+LIMIT 10
+UNION ALL
+SELECT NULL AS UserId,
+       'Summary' AS DisplayName,
+       COUNT(*) AS Reputation,
+       SUM(TotalPosts) AS TotalPosts,
+       SUM(TotalScore) AS TotalScore,
+       AVG(AvgScore) AS AvgScore,
+       NULL AS Tags,
+       SUM(TotalVotesReceived) AS TotalVotesReceived,
+       SUM(NetVotes) AS NetVotes,
+       SUM(GoldBadges) AS GoldBadges,
+       SUM(SilverBadges) AS SilverBadges,
+       NULL AS LatestBadgeDate,
+       NULL AS ScoreRank,
+       NULL AS ScorePercentilePercent,
+       SUM(CumulativeScore) AS CumulativeScore
+FROM RankedUsers
+WHERE Tags IS NOT NULL;

@@ -1,0 +1,69 @@
+-- {"query": "52006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 638} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.Score, 0) ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.Score, 0) ELSE 0 END) AS AnswerScoreSum,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteGivenCount,
+        COUNT(DISTINCT vr.Id) AS VoteReceivedCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Votes vr ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = vr.PostId)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation
+),
+EngagementScore AS (
+    SELECT 
+        Id,
+        Reputation,
+        PostCount,
+        QuestionScoreSum,
+        AnswerScoreSum,
+        CommentCount,
+        VoteGivenCount,
+        VoteReceivedCount,
+        BadgeCount,
+        (Reputation * 0.1 + PostCount * 1 + QuestionScoreSum * 2 + AnswerScoreSum * 3 + CommentCount * 0.5 + VoteGivenCount * 0.1 + VoteReceivedCount * 1 + BadgeCount * 5) AS Score
+    FROM UserStats
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Score DESC) AS Rank
+    FROM EngagementScore
+)
+SELECT 
+    ru.Id,
+    ru.Reputation,
+    ru.PostCount,
+    ru.QuestionScoreSum,
+    ru.AnswerScoreSum,
+    ru.CommentCount,
+    ru.VoteGivenCount,
+    ru.VoteReceivedCount,
+    ru.BadgeCount,
+    ru.Score,
+    ru.Rank,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TopTags
+FROM RankedUsers ru
+LEFT JOIN Posts p ON ru.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN LATERAL (
+    SELECT TagName
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT DISTINCT UNNEST(ARRAY(
+            SELECT REGEXP_SPLIT_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')
+        ))::int
+    )
+    ORDER BY COUNT(*) OVER (PARTITION BY t.Id) DESC
+    LIMIT 5
+) t ON TRUE
+WHERE ru.Rank <= 10
+GROUP BY ru.Id, ru.Reputation, ru.PostCount, ru.QuestionScoreSum, ru.AnswerScoreSum, ru.CommentCount, ru.VoteGivenCount, ru.VoteReceivedCount, ru.BadgeCount, ru.Score, ru.Rank
+ORDER BY ru.Rank;

@@ -1,0 +1,184 @@
+-- {"query": "29058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1463} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId) 
+            THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END as score_status
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        COUNT(DISTINCT bp.Id) as badge_count,
+        COUNT(DISTINCT p.Id) as post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        MAX(p.CreationDate) as last_post_date,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags
+    FROM Users u
+    LEFT JOIN Badges bp ON u.Id = bp.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) THEN 'Rare'
+            ELSE 'Average'
+        END as tag_category,
+        RANK() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        NTILE(10) OVER (ORDER BY t.Count DESC) as decile
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexJoin AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.ParentId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.rn,
+        rp.prev_score,
+        rp.avg_score,
+        rp.score_status,
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.Views,
+        us.badge_count,
+        us.post_count,
+        us.question_count,
+        us.answer_count,
+        us.last_post_date,
+        us.all_tags,
+        ta.TagName,
+        ta.Count as tag_count,
+        ta.tag_category,
+        ta.popularity_rank,
+        ta.decile,
+        CASE 
+            WHEN rp.Score > 0 AND (rp.Score * 1.0 / NULLIF(rp.ViewCount, 0)) > 0.01 
+            THEN 'High Engagement'
+            WHEN rp.Score < 0 AND (rp.Score * 1.0 / NULLIF(rp.ViewCount, 0)) < -0.01
+            THEN 'Low Engagement'
+            ELSE 'Neutral Engagement'
+        END as engagement_level,
+        DATEDIFF('day', rp.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as days_since_creation,
+        CASE 
+            WHEN rp.PostTypeId = 1 AND rp.CommentCount > 5 THEN 'Highly Discussed'
+            WHEN rp.PostTypeId = 2 AND rp.Score > 20 THEN 'Highly Upvoted Answer'
+            ELSE 'Regular Post'
+        END as post_classification,
+        CONCAT(
+            'User: ', us.DisplayName, 
+            ' | Post: ', rp.Title, 
+            ' | Tag: ', COALESCE(ta.TagName, 'No Tags'),
+            ' | Status: ', rp.score_status,
+            ' | Engagement: ', CASE WHEN rp.Score > 0 THEN 'Positive' ELSE 'Negative' END
+        ) as comprehensive_description
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    LEFT JOIN TagAnalysis ta ON STRING_TO_ARRAY(rp.Tags, '><') @> ARRAY[ta.TagName] OR (rp.Tags LIKE '%' || ta.TagName || '%')
+    WHERE (rp.OwnerUserId IS NOT NULL OR us.UserId IS NOT NULL)
+)
+SELECT 
+    Id,
+    PostTypeId,
+    ParentId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    Title,
+    Tags,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    rn,
+    prev_score,
+    avg_score,
+    score_status,
+    UserId,
+    Reputation,
+    DisplayName,
+    Views,
+    badge_count,
+    post_count,
+    question_count,
+    answer_count,
+    last_post_date,
+    all_tags,
+    TagName,
+    tag_count,
+    tag_category,
+    popularity_rank,
+    decile,
+    engagement_level,
+    days_since_creation,
+    post_classification,
+    comprehensive_description,
+    CASE 
+        WHEN reputation > 10000 AND badge_count > 10 
+        THEN 'Elite User'
+        WHEN reputation > 1000 AND badge_count > 5 
+        THEN 'Active User'
+        WHEN reputation > 500 
+        THEN 'Contributor'
+        ELSE 'New User'
+    END as user_level_classification,
+    CASE 
+        WHEN Score > 100 AND AnswerCount > 5 THEN 'Expert Contributor'
+        WHEN Score > 50 AND AnswerCount > 2 THEN 'Regular Contributor'
+        WHEN Score > 0 AND AnswerCount > 0 THEN 'New Contributor'
+        ELSE 'Inactive Contributor'
+    END as contribution_level_classification,
+    ROUND(CAST((Score * 1.0 / NULLIF(ViewCount, 0)) AS NUMERIC), 4) as score_to_view_ratio,
+    ROUND(CAST((CommentCount * 1.0 / NULLIF(AnswerCount, 0)) AS NUMERIC), 2) as comment_to_answer_ratio
+FROM ComplexJoin
+WHERE 
+    (Score IS NOT NULL OR ViewCount IS NOT NULL OR AnswerCount IS NOT NULL OR CommentCount IS NOT NULL)
+    AND (DisplayName IS NOT NULL OR Reputation > 0)
+    AND (TagName IS NOT NULL OR TagName IS NULL)
+    AND (tag_count IS NOT NULL OR tag_count IS NULL)
+    AND Days_since_creation >= 30
+ORDER BY 
+    reputation DESC,
+    score DESC,
+    days_since_creation ASC,
+    tag_count DESC
+LIMIT 1000;

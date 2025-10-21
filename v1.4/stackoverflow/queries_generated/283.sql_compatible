@@ -1,0 +1,66 @@
+WITH
+BlockA AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Unknown') AS DisplayName,
+    u.Reputation,
+    tA.TotalPosts,
+    tA2.PositiveQuestions,
+    ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    COALESCE(to_char((SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id), 'YYYY-MM-DD HH24:MI:SS'), 'NULL') AS LastActivity,
+    '0' AS Extra
+  FROM Users u
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS TotalPosts
+    FROM Posts p
+    WHERE p.OwnerUserId = u.Id
+  ) tA ON true
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS PositiveQuestions
+    FROM Posts p
+    WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Score > 0
+  ) tA2 ON true
+  WHERE u.AccountId IS NOT NULL
+),
+BlockB AS (
+  SELECT DISTINCT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Unknown') AS DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COALESCE(SUM(CASE WHEN v2.VoteTypeId IN (8,9) THEN v2.BountyAmount ELSE 0 END), 0)
+     FROM Votes v2
+     WHERE v2.UserId = u.Id) AS BountyTotal,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    COALESCE(to_char((SELECT MAX(p.LastEditDate) FROM Posts p WHERE p.OwnerUserId = u.Id), 'YYYY-MM-DD HH24:MI:SS'), 'NULL') AS LastActivity,
+    '0' AS Extra
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  WHERE u.Reputation > 0
+)
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  TotalPosts,
+  PositiveQuestions,
+  LocationRank,
+  Location,
+  LastActivity,
+  Extra
+FROM BlockA
+UNION ALL
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  NULL AS TotalPosts,
+  NULL AS PositiveQuestions,
+  NULL AS LocationRank,
+  Location,
+  LastActivity,
+  Extra
+FROM BlockB
+ORDER BY UserId
+LIMIT 500;

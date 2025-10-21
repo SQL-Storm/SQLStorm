@@ -1,0 +1,116 @@
+WITH tag_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                            AS total_questions,
+        AVG(p.Score)                                           AS avg_score,
+        AVG(p.ViewCount)                                       AS avg_views,
+        MAX(p.CreationDate)                                    AS latest_question,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS total_upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS total_downvotes
+    FROM Tags t
+    JOIN Posts p
+        ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        AND p.PostTypeId = 1                                 -- only questions
+    LEFT JOIN Votes v
+        ON v.PostId = p.Id
+    GROUP BY t.TagName
+),
+
+user_activity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)   AS questions_asked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)   AS answers_given,
+        COUNT(DISTINCT c.Id)                                  AS comments_written,
+        SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END)    AS upvotes_cast,
+        SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END)    AS downvotes_cast,
+        MAX(p.CreationDate)                                   AS last_post_date,
+        MAX(c.CreationDate)                                   AS last_comment_date
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes vt  ON vt.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+question_closure AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        CAST(ph.Comment AS INTEGER)                                    AS close_reason_id,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)                    AS upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)                    AS downvotes,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts q
+    LEFT JOIN PostHistory ph
+        ON ph.PostId = q.Id
+        AND ph.PostHistoryTypeId = 10                               -- post closed
+    LEFT JOIN Votes v
+        ON v.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY
+        q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount,
+        q.FavoriteCount, q.ClosedDate, ph.Comment
+)
+
+SELECT
+    ts.TagName,
+    ts.total_questions,
+    ts.avg_score,
+    ts.avg_views,
+    ts.total_upvotes,
+    ts.total_downvotes,
+
+    ua.DisplayName,
+    ua.questions_asked,
+    ua.answers_given,
+    ua.comments_written,
+    ua.upvotes_cast,
+    ua.downvotes_cast,
+
+    qc.Title,
+    qc.CreationDate,
+    qc.Score,
+    qc.ViewCount,
+    qc.FavoriteCount,
+    qc.ClosedDate,
+    cr.Name                     AS close_reason_name,
+    qc.upvotes,
+    qc.downvotes
+
+FROM tag_stats ts
+JOIN LATERAL (
+    SELECT OwnerUserId
+    FROM Posts p
+    WHERE p.Tags LIKE '%' || '<' || ts.TagName || '>' || '%'
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) latest_owner ON TRUE
+JOIN user_activity ua
+    ON ua.Id = latest_owner.OwnerUserId
+
+JOIN LATERAL (
+    SELECT Id
+    FROM Posts p
+    WHERE p.Tags LIKE '%' || '<' || ts.TagName || '>' || '%'
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) latest_question ON TRUE
+JOIN question_closure qc
+    ON qc.Id = latest_question.Id
+   AND qc.rn = 1
+
+LEFT JOIN CloseReasonTypes cr
+    ON cr.Id = qc.close_reason_id
+
+ORDER BY ts.total_questions DESC,
+         ua.questions_asked DESC
+LIMIT 100;

@@ -1,0 +1,123 @@
+WITH recent_question_stats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+top_tag_activity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS total_questions,
+    SUM(p.ViewCount) AS total_views,
+    AVG(p.Score) AS avg_score
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tagname
+  ) AS x ON TRUE
+  JOIN Tags tg ON tg.TagName = x.tagname
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  ORDER BY total_questions DESC
+  LIMIT 50
+),
+complex_filters AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.Tags,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId), 0) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId = 2) AS LastUpvoteDate,
+    (SELECT ARRAY_AGG(v1.UserId) FROM Votes v1 WHERE v1.PostId = rp.PostId AND v1.VoteTypeId = 2) AS UpVoters
+  FROM recent_question_stats rp
+  WHERE rp.rn_owner = 1
+    AND rp.ViewCount > 100
+    AND rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+),
+correlated_subquery AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS LastUpvoteDate
+  FROM Posts p
+  JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > (SELECT DATEADD(month, -6, CAST('2024-10-01 12:34:56' AS TIMESTAMP)))
+    AND EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      JOIN Posts r ON r.Id = pl.RelatedPostId
+      WHERE pl.PostId = p.Id
+        AND pl.LinkTypeId IN (1,3)
+        AND r.PostTypeId = 1
+    )
+),
+final_selection AS (
+  SELECT
+    cf.PostId,
+    cf.Title,
+    cf.CreationDate,
+    cf.ViewCount,
+    cf.Score,
+    cf.Tags,
+    cf.CommentCount,
+    cf.UpVotes,
+    cf.LastUpvoteDate,
+    cs.Reputation,
+    cs.DisplayName,
+    cs.OwnerUserId
+  FROM complex_filters cf
+  LEFT JOIN correlated_subquery cs ON cs.PostId = cf.PostId
+  UNION ALL
+  SELECT
+    tta.TagName AS PostId,
+    NULL AS Title,
+    NULL AS CreationDate,
+    NULL AS ViewCount,
+    NULL AS Score,
+    NULL AS Tags,
+    NULL AS CommentCount,
+    NULL AS UpVotes,
+    NULL AS LastUpvoteDate,
+    NULL AS Reputation,
+    NULL AS DisplayName,
+    NULL AS OwnerUserId
+  FROM top_tag_activity tta
+)
+SELECT
+  fs.PostId,
+  fs.Title,
+  fs.CreationDate,
+  fs.ViewCount,
+  fs.Score,
+  fs.Tags,
+  fs.CommentCount,
+  fs.UpVotes,
+  fs.LastUpvoteDate,
+  fs.Reputation,
+  fs.DisplayName,
+  fs.OwnerUserId
+FROM final_selection fs
+ORDER BY
+  COALESCE(fs.CreationDate, (SELECT MIN(CreationDate) FROM Posts)) DESC
+LIMIT 100;

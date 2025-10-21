@@ -1,0 +1,178 @@
+-- {"query": "29077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1708} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        COALESCE(STRING_AGG(DISTINCT p.Tags, '; '), 'No Tags') as TagSummary
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+        END as PostType,
+        COALESCE(p.Tags, 'No Tags') as Tags,
+        IIF(p.Score > 0, 0, 1) as IsNegativeScore,
+        IIF(p.ViewCount > 1000, 1, 0) as IsHighViewCount,
+        (p.Score + p.ViewCount + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 5) as PerformanceScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp))
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.ReputationTier,
+        uas.TagSummary,
+        COUNT(pp.PostId) as RecentPosts,
+        AVG(pp.Score) as AvgScore,
+        SUM(pp.PerformanceScore) as TotalPerformanceScore,
+        MAX(pp.CreationDate) as LastPost,
+        ROW_NUMBER() OVER (PARTITION BY uas.ReputationTier ORDER BY SUM(pp.PerformanceScore) DESC) as TierRank
+    FROM UserActivityStats uas
+    INNER JOIN PostPerformance pp ON uas.UserId = pp.OwnerUserId
+    WHERE pp.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, uas.Questions, 
+             uas.Answers, uas.Comments, uas.Badges, uas.ReputationTier, uas.TagSummary
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        IIF(t.IsRequired = 1, 'Required Tag', 'Optional Tag') as TagType,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            WHEN t.Count >= 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName ASC) as TagOrder,
+        t.IsModeratorOnly as IsModOnly
+    FROM Tags t
+    WHERE t.Count > 0
+),
+AdvancedActivity AS (
+    SELECT 
+        pp.PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.PerformanceScore,
+        pp.CreationDate,
+        pp.PostType,
+        pp.Tags,
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.ReputationTier,
+        upa.TotalPerformanceScore,
+        upa.TierRank,
+        cta.TagName,
+        cta.PopularityLevel,
+        cta.PopularityRank,
+        cta.TagOrder,
+        CASE 
+            WHEN pp.IsNegativeScore = 1 AND pp.Score < -10 THEN 'Highly Negative'
+            WHEN pp.IsNegativeScore = 1 THEN 'Negative'
+            WHEN pp.ViewCount > 1000 THEN 'High Traffic'
+            ELSE 'Normal'
+        END as PostSeverity
+    FROM PostPerformance pp
+    INNER JOIN UserPostAnalysis upa ON pp.OwnerUserId = upa.UserId
+    INNER JOIN ComplexTagAnalysis cta ON pp.Tags LIKE '%' + cta.TagName + '%'
+    WHERE upa.TotalPerformanceScore > 1000
+)
+SELECT 
+    aa.PostId,
+    aa.Title,
+    aa.Score,
+    aa.ViewCount,
+    aa.AnswerCount,
+    aa.CommentCount,
+    aa.PerformanceScore,
+    aa.CreationDate,
+    aa.PostType,
+    aa.Tags,
+    aa.UserId,
+    aa.DisplayName,
+    aa.Reputation,
+    aa.ReputationTier,
+    aa.TotalPerformanceScore,
+    aa.TierRank,
+    aa.TagName,
+    aa.PopularityLevel,
+    aa.PopularityRank,
+    aa.TagOrder,
+    aa.PostSeverity,
+    CASE 
+        WHEN aa.ReputationTier = 'Elite' AND aa.PerformanceScore > 5000 THEN 'Top Performer'
+        WHEN aa.ReputationTier = 'Veteran' AND aa.PerformanceScore > 3000 THEN 'Solid Performer'
+        WHEN aa.TierRank <= 5 THEN 'Tier Top Performer'
+        WHEN aa.ViewCount > 5000 THEN 'Viral Content'
+        ELSE 'Regular'
+    END as ContentClassification,
+    DENSE_RANK() OVER (ORDER BY aa.PerformanceScore DESC) as OverallPerformanceRank,
+    PERCENT_RANK() OVER (ORDER BY aa.PerformanceScore) * 100 as PerformancePercentile,
+    COUNT(*) OVER () as TotalRecords,
+    COALESCE(
+        (SELECT TOP 1 Title FROM Posts p2 WHERE p2.OwnerUserId = aa.UserId ORDER BY p2.CreationDate DESC),
+        'No Recent Post'
+    ) as MostRecentPost,
+    IIF(aa.ViewCount > 1000 AND aa.AnswerCount > 0, 
+        CAST((aa.AnswerCount * 1.0 / NULLIF(aa.ViewCount, 0)) * 100 as DECIMAL(5,2)), 0) as AnswerRate,
+    CASE 
+        WHEN aa.Score > 0 AND aa.CommentCount > 0 THEN 
+            CAST((aa.CommentCount * 1.0 / NULLIF(aa.Score, 0)) as DECIMAL(5,2))
+        ELSE 0 
+    END as CommentToScoreRatio
+FROM AdvancedActivity aa
+WHERE aa.CreationDate >= DATEADD(month, -12, cast('2024-10-01 12:34:56' as timestamp))
+HAVING COUNT(*) > 0
+ORDER BY aa.PerformanceScore DESC, aa.ViewCount DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

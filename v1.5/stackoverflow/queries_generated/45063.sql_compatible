@@ -1,0 +1,35 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    u.DisplayName AS AuthorName,
+    t.TagName,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    AVG(COALESCE(v.Score, 0)) AS AverageVoteScore,
+    p.CreationDate,
+    DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC) AS TagPostRank
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+JOIN 
+    Tags t ON EXISTS (
+        SELECT 1
+        FROM UNNEST(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag
+        WHERE tag = t.TagName
+    )
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    p.PostTypeId = 1 
+    AND u.Reputation > 1000
+    AND p.CreationDate > DATE '2020-01-01'
+GROUP BY 
+    p.Id, p.Title, u.DisplayName, t.TagName, p.CreationDate
+HAVING 
+    COUNT(DISTINCT v.Id) > 10
+ORDER BY 
+    TagPostRank, VoteCount DESC
+LIMIT 500;

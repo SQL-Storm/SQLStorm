@@ -1,0 +1,42 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  p.Tags,
+  pc.CommentCount,
+  -- Engagement: recent activity score
+  (SELECT SUM(v2.Score)
+     FROM Votes v2
+     WHERE v2.PostId = p.Id
+       AND v2.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS RecentVoteScore30d,
+  -- Popularity via tag-based depth: count of related posts linked to this post (duplicates/linked)
+  (SELECT COUNT(*)
+     FROM PostLinks pl
+     WHERE pl.PostId = p.Id) AS LinkedCount,
+  -- Time-based signal: activity slope over last 7 and 30 days
+  (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 3600.0) *
+  (CASE
+     WHEN p.ViewCount > 0 THEN 1.0
+     ELSE 0.0
+   END) AS VelocityApprox,
+  -- Diversity of editors: number of distinct users who edited within last 90 days
+  (SELECT COUNT(DISTINCT hu.UserId)
+     FROM PostHistory hu
+     WHERE hu.PostId = p.Id
+       AND hu.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days') AS UniqueEditors90d
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (SELECT 1 AS dummy) pc ON TRUE
+WHERE
+  p.PostTypeId = 1
+  AND p.CreationDate < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 hour'
+ORDER BY
+  RecentVoteScore30d DESC NULLS LAST,
+  p.ViewCount DESC NULLS LAST
+LIMIT 100;

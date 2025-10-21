@@ -1,0 +1,152 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.Reputation, U.DisplayName
+    HAVING 
+        COUNT(DISTINCT B.Id) > 0
+),
+TopPosts AS (
+    SELECT 
+        RP.Id,
+        RP.PostTypeId,
+        RP.Score,
+        RP.ViewCount,
+        RP.CreationDate,
+        RP.OwnerUserId,
+        TU.DisplayName AS OwnerDisplayName,
+        TU.Reputation,
+        TU.TotalBadges,
+        TU.GoldBadges,
+        TU.SilverBadges,
+        TU.BronzeBadges
+    FROM 
+        RankedPosts RP
+    JOIN 
+        TopUsers TU ON RP.OwnerUserId = TU.Id
+    WHERE 
+        RP.UserPostRank <= 3
+),
+PostTags AS (
+    SELECT 
+        P.Id,
+        UNNEST(string_to_array(P.Tags, '<')) AS TagName
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1
+),
+TagStats AS (
+    SELECT 
+        PT.TagName,
+        COUNT(DISTINCT P.Id) AS QuestionCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        PostTags PT
+    JOIN 
+        Posts P ON PT.Id = P.Id
+    GROUP BY 
+        PT.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        COUNT(DISTINCT V.Id) AS VoteCount,
+        COUNT(DISTINCT PH.Id) AS PostHistoryCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN 
+        PostHistory PH ON U.Id = PH.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+ComplexPredicates AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Body,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        COALESCE(SUM(V.Score), 0) AS TotalVoteScore,
+        CASE 
+            WHEN LENGTH(P.Body) > 1000 THEN 'Long'
+            ELSE 'Short'
+        END AS BodyLengthCategory,
+        CASE 
+            WHEN P.Score > 10 THEN 'High'
+            WHEN P.Score BETWEEN 0 AND 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId AND V.VoteTypeId = 2
+    WHERE 
+        P.PostTypeId = 1
+        AND P.CreationDate > DATE '2024-10-01' - INTERVAL '1 year'
+    GROUP BY 
+        P.Id, P.Title, P.Body, P.Score, P.ViewCount, P.CreationDate, P.OwnerUserId, U.DisplayName
+)
+SELECT 
+    CP.Id,
+    CP.Title,
+    CP.Body,
+    CP.Score,
+    CP.ViewCount,
+    CP.CreationDate,
+    CP.OwnerUserId,
+    CP.OwnerDisplayName,
+    CP.TotalVoteScore,
+    CP.BodyLengthCategory,
+    CP.ScoreCategory,
+    TS.QuestionCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    UA.CommentCount,
+    UA.VoteCount,
+    UA.PostHistoryCount
+FROM 
+    ComplexPredicates CP
+LEFT JOIN 
+    TagStats TS ON CP.Title = TS.TagName
+LEFT JOIN 
+    UserActivity UA ON CP.OwnerUserId = UA.Id
+ORDER BY 
+    CP.TotalVoteScore DESC, 
+    CP.CreationDate;

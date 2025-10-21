@@ -1,0 +1,105 @@
+-- {"query": "20097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1169} 
+WITH UserQuestionStats AS (
+    -- For each user, rank their questions by a composite popularity score
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY (p.Score * 5 + COALESCE(p.ViewCount, 0) * 0.1 + COALESCE(p.FavoriteCount, 0) * 2.5) DESC, p.CreationDate ASC
+        ) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.OwnerUserId IS NOT NULL
+      AND p.DeletionDate IS NULL
+),
+UserActivitySummary AS (
+    -- Combine various user activities and calculate time between them
+    SELECT
+        UserId,
+        AVG(EXTRACT(EPOCH FROM (ActivityDate - PrevActivityDate))) AS AvgSecondsBetweenActivities,
+        COUNT(*) AS TotalActivities
+    FROM (
+        SELECT
+            UserId,
+            CreationDate AS ActivityDate,
+            LAG(CreationDate, 1) OVER (PARTITION BY UserId ORDER BY CreationDate) AS PrevActivityDate
+        FROM (
+            SELECT OwnerUserId as UserId, CreationDate FROM Posts WHERE OwnerUserId IS NOT NULL
+            UNION ALL
+            SELECT UserId, CreationDate FROM Comments WHERE UserId IS NOT NULL
+            UNION ALL
+            SELECT UserId, CreationDate FROM Votes WHERE VoteTypeId IN (2, 3) AND UserId IS NOT NULL -- Up/Down votes
+        ) AllActivities
+    ) LaggedActivities
+    WHERE PrevActivityDate IS NOT NULL
+    GROUP BY UserId
+    HAVING COUNT(*) > 50 -- Only consider active users
+)
+-- Main query: Analyze top users and their most popular question, along with their general activity patterns
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    b_gold.GoldBadges,
+    b_silver.SilverBadges,
+    qs.Title AS TopQuestionTitle,
+    qs.Score AS TopQuestionScore,
+    qs.ViewCount AS TopQuestionViewCount,
+    -- Did the user answer their own top question?
+    EXISTS(SELECT 1 FROM Posts a WHERE a.ParentId = qs.PostId AND a.OwnerUserId = u.Id) AS AnsweredOwnTopQuestion,
+    -- Score of the accepted answer on their top question
+    (SELECT aa.Score FROM Posts aa WHERE aa.Id = qs.AcceptedAnswerId) AS AcceptedAnswerScore,
+    -- Time elapsed between user creation and their top question being asked
+    EXTRACT(EPOCH FROM (qs.CreationDate - u.CreationDate)) / 86400.0 AS DaysToTopQuestion,
+    -- A complex "influence" score
+    (u.Reputation / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/86400.0, 0)) * LOG(1 + uas.TotalActivities) AS DailyReputationInfluence,
+    uas.AvgSecondsBetweenActivities,
+    -- Count of edits on their top question by other users
+    (SELECT COUNT(DISTINCT ph.UserId) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = qs.PostId 
+       AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+       AND ph.UserId != u.Id
+    ) AS OtherUserEditCount,
+    -- A categorization based on location string
+    CASE
+        WHEN u.Location LIKE '% %' AND LENGTH(u.Location) > 10 THEN 'Detailed Location'
+        WHEN u.Location IS NULL THEN 'No Location'
+        ELSE 'Concise Location'
+    END AS LocationType
+FROM Users u
+JOIN UserQuestionStats qs ON u.Id = qs.OwnerUserId AND qs.rn = 1 -- Join on each user's single top question
+LEFT JOIN UserActivitySummary uas ON u.Id = uas.UserId
+-- Subquery for Gold badge count
+LEFT JOIN (
+    SELECT UserId, COUNT(*) as GoldBadges
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+) b_gold ON u.Id = b_gold.UserId
+-- Subquery for Silver badge count
+LEFT JOIN (
+    SELECT UserId, COUNT(*) as SilverBadges
+    FROM Badges
+    WHERE Class = 2
+    GROUP BY UserId
+) b_silver ON u.Id = b_silver.UserId
+WHERE
+    u.Reputation > 10000
+    AND u.UpVotes > u.DownVotes * 2
+    AND qs.ClosedDate IS NULL
+    AND COALESCE(b_gold.GoldBadges, 0) > 0
+    AND (qs.Tags LIKE '%<sql>%' OR qs.Tags LIKE '%<python>%')
+ORDER BY DailyReputationInfluence DESC, u.Reputation DESC
+LIMIT 200;

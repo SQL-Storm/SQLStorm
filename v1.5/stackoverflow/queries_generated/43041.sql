@@ -1,0 +1,35 @@
+-- {"query": "43041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 368} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.Location, COUNT(p.Id) AS PostsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.LastAccessDate > CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY u.Id
+),
+TopQuestions AS (
+    SELECT p.Id, p.Title, p.ViewCount, p.Score, p.Tags, u.DisplayName AS OwnerName
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 100
+    ORDER BY p.ViewCount DESC
+    LIMIT 100
+),
+RecentComments AS (
+    SELECT c.PostId, COUNT(c.Id) AS CommentCount, MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.CreationDate > CURRENT_DATE - INTERVAL '1 month'
+    GROUP BY c.PostId
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    tq.Title AS TopQuestionTitle,
+    tq.ViewCount,
+    tq.Score,
+    rc.CommentCount,
+    rc.LastCommentDate
+FROM ActiveUsers au
+JOIN TopQuestions tq ON au.Id = tq.OwnerName
+JOIN RecentComments rc ON tq.Id = rc.PostId
+ORDER BY au.Reputation DESC, rc.CommentCount DESC;

@@ -1,0 +1,155 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id,
+        Posts.PostTypeId,
+        Posts.AcceptedAnswerId,
+        Posts.ParentId,
+        Posts.CreationDate,
+        Posts.Score,
+        Posts.ViewCount,
+        Posts.Body,
+        Posts.OwnerUserId,
+        Posts.OwnerDisplayName,
+        Posts.LastEditorUserId,
+        Posts.LastEditorDisplayName,
+        Posts.LastEditDate,
+        Posts.LastActivityDate,
+        Posts.Title,
+        Posts.Tags,
+        Posts.AnswerCount,
+        Posts.CommentCount,
+        Posts.FavoriteCount,
+        Posts.ClosedDate,
+        Posts.CommunityOwnedDate,
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        Users.Id AS UserId,
+        Users.DisplayName,
+        COUNT(Posts.Id) AS PostCount,
+        SUM(Posts.Score) AS TotalScore,
+        SUM(CASE WHEN Posts.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN Posts.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+    GROUP BY 
+        Users.Id, Users.DisplayName
+),
+BadgeSummary AS (
+    SELECT 
+        Badges.UserId,
+        COUNT(Badges.Id) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        Badges.UserId
+),
+PostTags AS (
+    SELECT 
+        Posts.Id,
+        CAST('{' AS TEXT) || SUBSTRING(Posts.Tags, 2, LENGTH(Posts.Tags) - 2) || CAST('}' AS TEXT) AS TagArrayRaw
+    FROM 
+        Posts
+    WHERE 
+        Posts.Tags IS NOT NULL
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) AS OccurrenceCount
+    FROM (
+        SELECT 
+            unnest(PostTags.TagArray) AS TagName
+        FROM 
+            PostTags
+    ) AS t
+    GROUP BY 
+        t.TagName
+),
+UserBadges AS (
+    SELECT 
+        Users.Id,
+        Badges.Name AS BadgeName,
+        Badges.Date AS BadgeDate
+    FROM 
+        Users
+    JOIN 
+        Badges ON Users.Id = Badges.UserId
+),
+PostVotesWithType AS (
+    SELECT 
+        Posts.Id AS PostId,
+        VoteTypes.Name AS VoteTypeName,
+        Votes.UserId,
+        Votes.CreationDate,
+        Votes.BountyAmount
+    FROM 
+        Votes
+    JOIN 
+        VoteTypes ON Votes.VoteTypeId = VoteTypes.Id
+    JOIN 
+        Posts ON Votes.PostId = Posts.Id
+)
+SELECT 
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Body,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.LastEditorUserId,
+    rp.LastEditorDisplayName,
+    rp.LastEditDate,
+    rp.LastActivityDate,
+    rp.Title,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    rp.CommunityOwnedDate,
+    rp.ContentLicense,
+    ua.DisplayName,
+    ua.PostCount,
+    ua.TotalScore,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    bs.BadgeCount,
+    tu.TagName,
+    tu.OccurrenceCount,
+    ub.BadgeName,
+    ub.BadgeDate,
+    pvwt.VoteTypeName,
+    pvwt.UserId AS VoterId,
+    pvwt.CreationDate AS VoteDate,
+    pvwt.BountyAmount
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN 
+    BadgeSummary bs ON rp.OwnerUserId = bs.UserId
+LEFT JOIN 
+    PostTags pt ON rp.Id = pt.Id
+LEFT JOIN 
+    TagUsage tu ON tu.TagName = ANY(string_to_array(replace(replace(pt.TagArrayRaw, '{', ''), '}', ''), ','))
+LEFT JOIN 
+    UserBadges ub ON rp.OwnerUserId = ub.Id
+LEFT JOIN 
+    PostVotesWithType pvwt ON rp.Id = pvwt.PostId
+ORDER BY 
+    rp.CreationDate DESC,
+    rp.Score DESC;

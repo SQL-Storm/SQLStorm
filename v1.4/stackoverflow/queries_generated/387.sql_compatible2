@@ -1,0 +1,55 @@
+WITH RecentPosts AS (
+  SELECT p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.Title, p.Tags, p.CreationDate, p.LastActivityDate
+  FROM Posts p
+  WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')
+),
+UserBadgeCounts AS (
+  SELECT b.UserId, COUNT(*) AS BadgeCount
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserPostStats AS (
+  SELECT rp.OwnerUserId AS UserId,
+         COUNT(*) AS PostsLastYear,
+         AVG(rp.Score) AS AvgScoreLastYear,
+         MAX(rp.LastActivityDate) AS LatestActivity
+  FROM RecentPosts rp
+  GROUP BY rp.OwnerUserId
+),
+UserSummary AS (
+  SELECT
+     1 AS type_id,
+     'user' AS type_label,
+     u.Id AS id,
+     u.DisplayName AS label,
+     COALESCE(ubc.BadgeCount, 0) AS value_a,
+     COALESCE(ups.PostsLastYear, 0) AS value_b,
+     COALESCE(ups.AvgScoreLastYear, 0.0) AS value_c,
+     to_char(ups.LatestActivity, 'YYYY-MM-DD HH24:MI:SS') AS value_d,
+     0 AS rn
+  FROM Users u
+  LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+  LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+),
+TopPosts AS (
+  SELECT
+     2 AS type_id,
+     'post' AS type_label,
+     p.Id AS id,
+     COALESCE(p.Title, '') || ' [' || COALESCE(p.Tags, '') || ']' AS label,
+     p.Score AS value_a,
+     p.ViewCount AS value_b,
+     p.Tags AS value_c,
+     to_char(p.LastActivityDate, 'YYYY-MM-DD HH24:MI:SS') || ' | comments: ' || (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS value_d,
+     ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')
+)
+SELECT *
+FROM (
+  SELECT * FROM UserSummary
+  UNION ALL
+  SELECT * FROM TopPosts WHERE rn <= 200
+) AS combined
+ORDER BY type_id, id
+LIMIT 400;

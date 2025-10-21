@@ -1,0 +1,80 @@
+-- {"query": "18021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1253} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn,
+        LAG(ph.PostHistoryTypeId) OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate ASC) as prev_history_type,
+        LEAD(ph.PostHistoryTypeId) OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as next_history_type
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId
+)
+SELECT
+    ua.DisplayName AS UserDisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.LastPostDate,
+    ua.GoldBadgeCount,
+    ua.SilverBadgeCount,
+    ua.BronzeBadgeCount,
+    COUNT(DISTINCT pe.PostId) AS TotalPostsEngaged,
+    SUM(pe.UpVoteCount) AS TotalUpvotesReceived,
+    SUM(pe.DownVoteCount) AS TotalDownvotesReceived,
+    AVG(pe.CommentCount) AS AvgCommentsPerPost,
+    SUM(pe.HasAcceptedAnswer) AS TotalAcceptedAnswers,
+    COUNT(DISTINCT rpe.PostId) FILTER (WHERE rpe.rn = 1 AND rpe.PostHistoryTypeId IN (4, 5, 6)) AS DistinctPostsEdited,
+    COUNT(DISTINCT rpe.PostId) FILTER (WHERE rpe.rn = 1 AND rpe.PostHistoryTypeId IN (7, 8, 9)) AS DistinctPostsRolledBack,
+    COUNT(DISTINCT pl.PostId) AS PostsWithLinks,
+    COUNT(DISTINCT p_closed.Id) AS ClosedQuestions,
+    CAST(AVG(CASE WHEN p_closed.ClosedDate IS NOT NULL THEN julianday(p_closed.ClosedDate) - julianday(p.CreationDate) ELSE NULL END) AS REAL) AS AvgDaysToClose,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%<sql>%' THEN p.Id ELSE NULL END) AS SQLRelatedPosts,
+    COUNT(DISTINCT CASE WHEN ua.DisplayName LIKE '%John%' THEN ua.Id ELSE NULL END) AS UsersNamedJohn
+FROM UserActivity ua
+LEFT JOIN PostEngagement pe ON ua.UserId = pe.OwnerUserId
+LEFT JOIN RankedPostEdits rpe ON ua.UserId = rpe.UserId AND rpe.rn = 1
+LEFT JOIN PostLinks pl ON ua.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = pl.PostId) OR ua.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = pl.RelatedPostId)
+LEFT JOIN Posts p_closed ON ua.UserId = p_closed.OwnerUserId AND p_closed.ClosedDate IS NOT NULL
+LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+WHERE ua.Reputation > 1000
+  AND ua.LastPostDate >= DATE('now', '-1 year')
+  AND ua.DisplayName IS NOT NULL
+  AND ua.DisplayName <> ''
+  AND ua.DisplayName NOT LIKE '%[bot]%'
+  AND ua.DisplayName NOT LIKE '%[automated]%'
+GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.LastPostDate, ua.GoldBadgeCount, ua.SilverBadgeCount, ua.BronzeBadgeCount
+ORDER BY ua.Reputation DESC, TotalPostsEngaged DESC
+LIMIT 100;

@@ -1,0 +1,115 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate
+    FROM Users u
+    WHERE u.Reputation >= 100
+      AND u.CreationDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+      AND u.LastAccessDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+QuestionContributors AS (
+    SELECT p.OwnerUserId AS UserId, COUNT(p.Id) AS QuestionCount,
+           AVG(p.Score) AS AvgQuestionScore, SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+      AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '6' MONTH)
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) >= 3
+),
+AnswerHelpers AS (
+    SELECT a.OwnerUserId AS UserId, COUNT(a.Id) AS AnswerCount,
+           AVG(a.Score) AS AvgAnswerScore, COUNT(CASE WHEN a.Score >= 5 THEN 1 END) AS HighScoreAnswers
+    FROM Posts a
+    INNER JOIN ActiveUsers au ON a.OwnerUserId = au.Id
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= (DATE '2024-10-01' - INTERVAL '3' MONTH)
+      AND q.Score >= 10
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(a.Id) >= 5
+),
+BadgeAchievers AS (
+    SELECT b.UserId, COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    INNER JOIN ActiveUsers au ON b.UserId = au.Id
+    WHERE b.Date >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+    GROUP BY b.UserId
+),
+PopularTags AS (
+    SELECT t.TagName, SUM(p.ViewCount) AS TotalViews, COUNT(DISTINCT p.Id) AS QuestionCount
+    FROM Posts p
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.Id
+    INNER JOIN Tags t ON POSITION(t.TagName IN p.Tags || '>') > 0
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '6' MONTH)
+      AND p.ViewCount > 100
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+VotePatterns AS (
+    SELECT v.PostId, v.UserId, v.VoteTypeId,
+           ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS VoteRecency
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    INNER JOIN ActiveUsers au ON v.UserId = au.Id
+    WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '1' MONTH)
+      AND v.VoteTypeId IN (2, 3)
+),
+RecentComments AS (
+    SELECT c.PostId, c.UserId, COUNT(c.Id) AS CommentCount,
+           AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    INNER JOIN ActiveUsers au ON c.UserId = au.Id
+    WHERE c.CreationDate >= (DATE '2024-10-01' - INTERVAL '15' DAY)
+    GROUP BY c.PostId, c.UserId
+)
+SELECT 
+    au.Id AS UserId,
+    au.Reputation,
+    au.CreationDate AS UserJoinDate,
+    COALESCE(qc.QuestionCount, 0) AS QuestionsPosted,
+    COALESCE(qc.AvgQuestionScore, 0) AS AvgQuestionScore,
+    COALESCE(qc.TotalViews, 0) AS TotalQuestionViews,
+    COALESCE(ah.AnswerCount, 0) AS AnswersPosted,
+    COALESCE(ah.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(ah.HighScoreAnswers, 0) AS HighScoringAnswers,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ba.UniqueBadges, 0) AS UniqueBadges,
+    COUNT(DISTINCT CASE WHEN vp.VoteRecency <= 100 THEN vp.PostId END) AS RecentUpvotes,
+    COUNT(DISTINCT CASE WHEN vp.VoteTypeId = 3 AND vp.VoteRecency <= 50 THEN vp.PostId END) AS RecentDownvotes,
+    COUNT(DISTINCT rc.PostId) AS PostsCommentedOn,
+    COUNT(DISTINCT tag_usage.TagName) AS PopularTagsUsed,
+    ROUND(
+        (COALESCE(qc.AvgQuestionScore, 0) * 0.4 + 
+         COALESCE(ah.AvgAnswerScore, 0) * 0.5 + 
+         COALESCE(ba.GoldBadges, 0) * 10 + 
+         COALESCE(rc.AvgCommentScore, 0) * 0.1), 2
+    ) AS CommunityImpactScore
+FROM ActiveUsers au
+LEFT JOIN QuestionContributors qc ON au.Id = qc.UserId
+LEFT JOIN AnswerHelpers ah ON au.Id = ah.UserId
+LEFT JOIN BadgeAchievers ba ON au.Id = ba.UserId
+LEFT JOIN VotePatterns vp ON au.Id = vp.UserId
+LEFT JOIN RecentComments rc ON au.Id = rc.UserId
+LEFT JOIN (
+    SELECT DISTINCT p.OwnerUserId AS UserId, t.TagName
+    FROM Posts p
+    INNER JOIN PopularTags t ON POSITION(t.TagName IN p.Tags || '>') > 0
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '6' MONTH)
+) tag_usage ON au.Id = tag_usage.UserId
+GROUP BY 
+    au.Id, au.Reputation, au.CreationDate,
+    qc.QuestionCount, qc.AvgQuestionScore, qc.TotalViews,
+    ah.AnswerCount, ah.AvgAnswerScore, ah.HighScoreAnswers,
+    ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges, ba.UniqueBadges
+HAVING 
+    (COALESCE(qc.QuestionCount, 0) + COALESCE(ah.AnswerCount, 0)) >= 5
+    OR COALESCE(ba.GoldBadges, 0) > 0
+    OR COUNT(DISTINCT vp.PostId) >= 50
+ORDER BY CommunityImpactScore DESC, au.Reputation DESC
+LIMIT 1000;

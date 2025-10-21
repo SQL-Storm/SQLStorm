@@ -1,0 +1,46 @@
+-- {"query": "92.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 478} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  COALESCE(u.Location, 'Unknown') AS Location,
+  COUNT(DISTINCT p.Id) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounty,
+  AVG(CASE WHEN v.VoteTypeId = 2 THEN v.BountyAmount ELSE NULL END) AS AvgUpvoteBounty,
+  MAX(p.LastActivityDate) AS LastActivity,
+  STRING_AGG(DISTINCT t.Name, ',') AS TopTags,
+  SUM(CASE WHEN b.Id IS NOT NULL THEN 1 ELSE 0 END) AS BadgesEarnedLastYear
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 6, 10, 11, 12, 14, 15, 16)
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      pt.Name
+    FROM
+      Posts s
+      CROSS APPLY STRING_SPLIT(s.Tags, '><') AS tag
+      INNER JOIN Tags t ON t.TagName = REPLACE(REPLACE(tag.value, '<', ''), '>', '')
+    WHERE
+      s.OwnerUserId = u.Id
+    GROUP BY
+      t.Name
+    ORDER BY
+      COUNT(*) DESC
+    LIMIT 3
+  ) t ON TRUE
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation >= 1000
+  AND u.LastAccessDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  TotalBounty DESC NULLS LAST, LastActivity DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

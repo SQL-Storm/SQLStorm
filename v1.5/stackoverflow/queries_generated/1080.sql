@@ -1,0 +1,72 @@
+-- {"query": "1080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 457} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 AND
+        p.Score > 0
+), 
+UserReputation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COALESCE(SUM(b.Class), 0) AS BadgeCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.Reputation
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(v.Id) AS VoteCount,
+        MAX(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS HasUpVote
+    FROM 
+        Votes v
+    WHERE 
+        v.CreationDate > (CURRENT_TIMESTAMP - INTERVAL '30 days')
+    GROUP BY 
+        v.PostId
+)
+
+SELECT 
+    rp.Id AS PostId,
+    rp.Title,
+    ur.Reputation,
+    ur.PostCount,
+    ur.BadgeCount,
+    rv.VoteCount,
+    rv.HasUpVote,
+    rp.CreationDate,
+    CASE 
+        WHEN rv.HasUpVote = 1 THEN 'Upvoted' 
+        ELSE 'Not Upvoted' 
+    END AS VoteStatus,
+    CASE 
+        WHEN rp.UserPostRank <= 5 THEN 'Top Recent Post' 
+        ELSE 'Other Post' 
+    END AS PostCategory
+FROM 
+    RankedPosts rp
+JOIN 
+    UserReputation ur ON rp.OwnerUserId = ur.UserId
+LEFT JOIN 
+    RecentVotes rv ON rp.Id = rv.PostId
+WHERE 
+    ur.Reputation > 1000
+ORDER BY 
+    rp.CreationDate DESC
+FETCH FIRST 10 ROWS ONLY;

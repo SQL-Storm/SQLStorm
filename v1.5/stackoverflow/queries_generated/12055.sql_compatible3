@@ -1,0 +1,131 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(V.Id) OVER (PARTITION BY P.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpVotes,
+        COUNT(V.Id) OVER (PARTITION BY P.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownVotes,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        MAX(PH.CreationDate) OVER (PARTITION BY P.Id) AS LastEditDate
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    LEFT JOIN 
+        Posts P ON POSITION(T.TagName IN P.Tags) > 0
+    GROUP BY 
+        T.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        STRING_AGG(PHT.Name, ', ') AS HistoryTypes
+    FROM 
+        Posts P
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN 
+        PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    GROUP BY 
+        P.Id, P.Title
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COUNT(C.Id) AS CommentsMade,
+        MAX(P.CreationDate) AS LastActivityDate
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Title,
+    RP.Tags,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.LastEditDate,
+    TU.Reputation,
+    TU.GoldBadges,
+    TU.SilverBadges,
+    TU.BronzeBadges,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    COALESCE(PHS.HistoryTypes, '') AS HistoryTypes,
+    UA.QuestionsAsked,
+    UA.AnswersGiven,
+    UA.CommentsMade,
+    UA.LastActivityDate
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+LEFT JOIN 
+    TagStats TS ON POSITION(TS.TagName IN RP.Tags) > 0
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.Id
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+WHERE 
+    RP.PostRank <= 10
+    AND (TU.UserRank IS NULL OR TU.UserRank <= 10)
+ORDER BY 
+    RP.PostRank, TU.UserRank;

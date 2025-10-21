@@ -1,0 +1,110 @@
+WITH question_posts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.Tags,
+        DATE_TRUNC('month', p.CreationDate) AS month_start
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.Tags IS NOT NULL
+),
+expanded_tags AS (
+    SELECT
+        qp.Id,
+        qp.Title,
+        qp.CreationDate,
+        qp.Score,
+        qp.ViewCount,
+        qp.AnswerCount,
+        qp.FavoriteCount,
+        qp.OwnerUserId,
+        qp.month_start,
+        unnest(
+            string_to_array(
+                substring(qp.Tags, 2, length(qp.Tags) - 2),
+                '><'
+            )
+        ) AS TagName
+    FROM question_posts qp
+),
+tag_month_agg AS (
+    SELECT
+        et.TagName,
+        et.month_start,
+        COUNT(*)                                   AS QuestionCount,
+        AVG(et.Score)                              AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY et.Score) AS MedianScore,
+        SUM(et.ViewCount)                          AS TotalViews,
+        SUM(et.AnswerCount)                        AS TotalAnswers,
+        SUM(et.FavoriteCount)                      AS TotalFavorites,
+        jsonb_agg(
+            jsonb_build_object(
+                'QuestionId',   et.Id,
+                'Score',        et.Score,
+                'Views',        et.ViewCount,
+                'Answers',      et.AnswerCount,
+                'Favorites',    et.FavoriteCount
+            )
+        )                                           AS QuestionsDetail
+    FROM expanded_tags et
+    GROUP BY et.TagName, et.month_start
+),
+user_month_votes AS (
+    SELECT
+        et.TagName,
+        et.month_start,
+        et.OwnerUserId,
+        COUNT(v.Id)                                   AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        jsonb_object_agg(
+            vt.Name,
+            COUNT(v.Id)
+        )                                            AS VoteBreakdown
+    FROM expanded_tags et
+    LEFT JOIN Votes v          ON v.PostId = et.Id
+    LEFT JOIN VoteTypes vt    ON vt.Id = v.VoteTypeId
+    GROUP BY et.TagName, et.month_start, et.OwnerUserId
+),
+top_user_per_tag_month AS (
+    SELECT
+        um.TagName,
+        um.month_start,
+        um.OwnerUserId,
+        um.VoteCount,
+        um.UpVotes,
+        um.DownVotes,
+        um.VoteBreakdown,
+        ROW_NUMBER() OVER (
+            PARTITION BY um.TagName, um.month_start
+            ORDER BY um.VoteCount DESC, um.OwnerUserId
+        ) AS rn
+    FROM user_month_votes um
+)
+SELECT
+    tma.TagName,
+    TO_CHAR(tma.month_start, 'YYYY-MM')               AS Month,
+    tma.QuestionCount,
+    tma.AvgScore,
+    tma.MedianScore,
+    tma.TotalViews,
+    tma.TotalAnswers,
+    tma.TotalFavorites,
+    tma.QuestionsDetail,
+    tup.OwnerUserId                                   AS TopUserId,
+    tup.VoteCount                                     AS TopUserVotes,
+    tup.UpVotes,
+    tup.DownVotes,
+    tup.VoteBreakdown                                 AS TopUserVoteBreakdown
+FROM tag_month_agg tma
+LEFT JOIN top_user_per_tag_month tup
+       ON tup.TagName = tma.TagName
+      AND tup.month_start = tma.month_start
+      AND tup.rn = 1
+ORDER BY tma.TagName, tma.month_start;

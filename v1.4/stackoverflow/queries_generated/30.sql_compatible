@@ -1,0 +1,29 @@
+SELECT
+  tq.Id AS QuestionId,
+  tq.Title,
+  tq.OwnerDisplayName,
+  tq.CreationDate AS QuestionCreated,
+  tq.LastActivityDate AS LastActive,
+  tq.ViewCount,
+  tq.Score,
+  ts.PostCount AS TaggedQuestionCount,
+  ts.AvgScore AS TaggedQuestionAvgScore,
+  at.MaxViews AS MaxTagView,
+  aw.AgeDays,
+  aw.TrafficBucket,
+  ca.TotalComments,
+  ca.TotalVotes
+FROM TopQuestions tq
+LEFT JOIN TagStats ts ON 1 = 1
+LEFT JOIN ActivityWindow aw ON aw.Id = tq.Id
+LEFT JOIN (
+  SELECT
+    p.Id,
+    COUNT(*) AS TotalComments,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalVotes
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+) ca ON ca.Id = tq.Id
+ORDER BY tq.CreationDate DESC;

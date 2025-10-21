@@ -1,0 +1,56 @@
+WITH RecentTopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 AND -- Only questions
+        p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+),
+UserBadgeCounts AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldCount,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverCount,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeCount
+    FROM 
+        Badges
+    GROUP BY UserId
+),
+CommentsWithHighScore AS (
+    SELECT 
+        c.PostId,
+        ARRAY_AGG(c.Text ORDER BY c.Score DESC NULLS LAST) FILTER (WHERE c.Text IS NOT NULL) AS TopComments
+    FROM 
+        Comments c
+    WHERE 
+        c.Score > 10
+    GROUP BY c.PostId
+)
+SELECT 
+    u.DisplayName,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    u.Reputation,
+    u.EmailHash,
+    rt.Title AS RecentPostTitle,
+    ubc.GoldCount,
+    ubc.SilverCount,
+    ubc.BronzeCount,
+    cwsc.TopComments
+FROM 
+    Users u
+LEFT JOIN 
+    RecentTopPosts rt ON u.Id = rt.OwnerUserId AND rt.rn = 1
+LEFT JOIN 
+    UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN 
+    CommentsWithHighScore cwsc ON rt.Id = cwsc.PostId
+WHERE 
+    u.Reputation > 1000
+ORDER BY 
+    u.Reputation DESC;

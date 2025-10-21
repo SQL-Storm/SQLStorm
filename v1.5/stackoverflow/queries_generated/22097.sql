@@ -1,0 +1,108 @@
+-- {"query": "22097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 872} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT LOWER(SPLIT_PART(t.TagName, ' ', 1)), ', ') AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS Tag
+        FROM Tags t WHERE t.TagName = UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+        LIMIT 1
+    ) tag_sub ON true
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        SUM(CASE WHEN Name LIKE '%Editor%' THEN 1 ELSE 0 END) AS EditorBadges
+    FROM Badges
+    GROUP BY UserId
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        bs.EditorBadges,
+        ROW_NUMBER() OVER (ORDER BY us.TotalScore DESC, us.Reputation DESC) AS OverallRank,
+        RANK() OVER (PARTITION BY COALESCE(us.TotalPosts, 0) > 0 ORDER BY us.AvgScore DESC) AS ScoreRank
+    FROM UserStats us
+    LEFT JOIN BadgeStats bs ON us.UserId = bs.UserId
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.TotalScore,
+    ru.AvgScore,
+    ru.TopTags,
+    ru.TotalBadges,
+    ru.GoldBadges,
+    ru.EditorBadges,
+    ru.OverallRank,
+    ru.ScoreRank,
+    CASE 
+        WHEN ru.TotalPosts IS NULL OR ru.TotalPosts = 0 THEN 'Inactive'
+        WHEN ru.TotalScore > (SELECT AVG(TotalScore) FROM RankedUsers WHERE TotalScore > 0) THEN 'High Performer'
+        ELSE 'Average'
+    END AS PerformanceCategory,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = ru.UserId 
+       AND v.VoteTypeId IN (2, 3)
+       AND v.CreationDate > ru.UserId::text || '-01-01'::timestamp
+    ) AS RecentVotes,
+    STRING_TO_ARRAY(ru.TopTags, ', ') AS TagArray
+FROM RankedUsers ru
+WHERE ru.OverallRank <= 100
+   AND EXISTS (
+       SELECT 1 
+       FROM Posts p 
+       WHERE p.OwnerUserId = ru.UserId 
+         AND p.Score > (
+             SELECT AVG(pp.Score) 
+             FROM Posts pp 
+             WHERE pp.OwnerUserId = ru.UserId
+         )
+         AND p.ClosedDate IS NULL
+   )
+   AND NOT EXISTS (
+       SELECT 1 
+       FROM PostHistory ph 
+       WHERE ph.UserId = ru.UserId 
+         AND ph.PostHistoryTypeId IN (12, 13)
+         AND ph.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+   )
+ORDER BY ru.OverallRank
+UNION ALL
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.TotalScore,
+    ru.AvgScore,
+    ru.TopTags,
+    ru.TotalBadges,
+    ru.GoldBadges,
+    ru.EditorBadges,
+    ru.OverallRank,
+    ru.ScoreRank,
+    'Moderator' AS PerformanceCategory,
+    NULL AS RecentVotes,
+    NULL AS TagArray
+FROM RankedUsers ru
+INNER JOIN (
+    SELECT DISTINCT UserId FROM Badges WHERE Name = 'Moderator'
+) mods ON ru.UserId = mods.UserId
+ORDER BY ru.Reputation DESC
+LIMIT 200;

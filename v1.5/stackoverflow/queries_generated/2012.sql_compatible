@@ -1,0 +1,62 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT p.Id AS PostId, p.CreationDate, p.Title, p.OwnerUserId, 1 AS Level
+    FROM Posts p
+    WHERE p.ParentId IS NULL
+    UNION ALL
+    SELECT p.Id, p.CreationDate, p.Title, p.OwnerUserId, r.Level + 1
+    FROM Posts p
+    INNER JOIN RecursiveCTE r ON p.ParentId = r.PostId
+),
+UserBadgeRank AS (
+    SELECT 
+        UserId, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    WHERE TagBased = 0
+    GROUP BY UserId
+),
+UserContribution AS (
+    SELECT 
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+)
+SELECT 
+    ru.UserId,
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    uc.QuestionCount,
+    uc.AnswerCount,
+    uc.TotalQuestionScore,
+    uc.TotalAnswerScore,
+    pd.PostId,
+    pd.Title,
+    pd.CommentCount,
+    pd.LatestCommentDate,
+    pd.AvgCommentScore
+FROM RecursiveCTE ru
+JOIN Users u ON ru.OwnerUserId = u.Id
+LEFT JOIN UserBadgeRank ub ON u.Id = ub.UserId
+LEFT JOIN UserContribution uc ON u.Id = uc.UserId
+LEFT JOIN PostDetails pd ON ru.PostId = pd.PostId
+ORDER BY ub.GoldBadges DESC, uc.TotalAnswerScore DESC, pd.CommentCount DESC;

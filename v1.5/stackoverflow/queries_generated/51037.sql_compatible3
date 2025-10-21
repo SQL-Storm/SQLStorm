@@ -1,0 +1,101 @@
+WITH monthly_user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        DATE_TRUNC('month', u.CreationDate) AS creation_month,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_asked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_given,
+        SUM(v.BountyAmount) AS total_bounties_offered,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        AVG(CASE WHEN (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) IS NOT NULL
+                 AND (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) <> INTERVAL '0 second'
+                 THEN u.Reputation * 1.0 / NULLIF(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)), 0)
+                 ELSE NULL END) AS rep_per_day
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8 AND v.CreationDate >= u.CreationDate
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, DATE_TRUNC('month', u.CreationDate)
+),
+question_engagement AS (
+    SELECT 
+        p.Id AS question_id,
+        p.Title,
+        p.Score AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        a.owner_user_id AS accepted_answerer_id,
+        COALESCE(SUM(a.score), 0) AS total_answer_scores,
+        COUNT(DISTINCT pl.related_post_id) AS linked_questions,
+        COUNT(DISTINCT c.id) AS total_comments
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            parent_id,
+            owner_user_id,
+            score,
+            ROW_NUMBER() OVER (PARTITION BY parent_id ORDER BY score DESC) as rn
+        FROM Posts 
+        WHERE PostTypeId = 2 AND DeletionDate IS NULL
+    ) a ON p.AcceptedAnswerId = a.parent_id AND a.rn = 1
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 AND p.DeletionDate IS NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.FavoriteCount, p.CreationDate, a.owner_user_id
+),
+tag_popularity AS (
+    SELECT 
+        t.tagname,
+        t.count AS tag_usage_count,
+        AVG(qe.total_answer_scores) AS avg_answer_quality,
+        AVG(qe.question_score) AS avg_question_score,
+        COUNT(DISTINCT qe.question_id) AS questions_with_tag,
+        SUM(qe.ViewCount) AS total_views_for_tag
+    FROM Tags t
+    LEFT JOIN Posts q ON CONCAT(',', q.Tags, ',') LIKE CONCAT('%,', t.TagName, ',%')
+    LEFT JOIN question_engagement qe ON q.Id = qe.question_id
+    WHERE q.PostTypeId = 1 AND q.DeletionDate IS NULL
+    GROUP BY t.tagname, t.count
+    HAVING t.count > 100
+)
+SELECT 
+    mua.displayname AS user_name,
+    mua.creation_month,
+    mua.total_posts,
+    mua.questions_asked,
+    mua.answers_given,
+    mua.total_bounties_offered,
+    mua.gold_badges,
+    mua.silver_badges,
+    mua.rep_per_day,
+    COALESCE(qe.question_score, 0) AS best_question_score,
+    COALESCE(tp.tagname, 'No Tag Specialization') AS primary_tag,
+    COALESCE(tp.avg_answer_quality, 0) AS avg_quality_in_specialty,
+    RANK() OVER (ORDER BY mua.Reputation DESC, mua.total_posts DESC) AS reputation_rank,
+    (mua.questions_asked + mua.answers_given + mua.total_bounties_offered * 10 + 
+     mua.gold_badges * 50 + mua.silver_badges * 10) AS engagement_score
+FROM monthly_user_activity mua
+LEFT JOIN (
+    SELECT 
+        p.owner_user_id,
+        MAX(p.score) AS question_score,
+        tp.tagname
+    FROM Posts p
+    JOIN tag_popularity tp ON p.Tags LIKE CONCAT('%', tp.tagname, '%')
+    WHERE p.PostTypeId = 1 AND p.DeletionDate IS NULL
+    GROUP BY p.owner_user_id, tp.tagname
+    HAVING COUNT(p.id) > 5
+) qe ON mua.user_id = qe.owner_user_id
+LEFT JOIN tag_popularity tp ON qe.tagname = tp.tagname
+WHERE mua.creation_month >= DATE '2024-10-01' - INTERVAL '2 years'
+  AND mua.total_posts > 10
+  AND mua.Reputation > 100
+ORDER BY engagement_score DESC, reputation_rank
+LIMIT 1000;

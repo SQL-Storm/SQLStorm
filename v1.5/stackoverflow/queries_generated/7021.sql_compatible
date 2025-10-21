@@ -1,0 +1,208 @@
+WITH
+QuestionTags AS (
+  SELECT
+    p.Id AS QuestionId,
+    lower(trim(both ' ' FROM unnest(string_to_array(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,'')) - 2,0)) , '><')))) AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+UserAgg AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.Views,0) AS Views,
+    COALESCE(u.UpVotes,0) AS UpVotes,
+    COALESCE(u.DownVotes,0) AS DownVotes,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Id IS NOT NULL) AS BadgeCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.OwnerUserId = u.Id) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - MAX(COALESCE(p.LastActivityDate,u.LastAccessDate))))/86400.0 AS DaysSinceLastActivity
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+AnswersWithRank AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank,
+    PERCENT_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score) AS ScorePctWithinQuestion
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+TopAnswers AS (
+  SELECT *
+  FROM AnswersWithRank
+  WHERE AnswerRank = 1
+),
+DuplicateClusters AS (
+  SELECT
+    pl.PostId AS DuplicatePostId,
+    pl.RelatedPostId AS MasterPostId,
+    pl.CreationDate AS LinkCreated
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+CloseEvents AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate,
+    ph.UserId AS ClosedByUser,
+    COALESCE(nullif(ph.Comment,''), NULL) AS CloseComment,
+    CASE WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS integer) ELSE NULL END AS CloseReasonId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10)
+),
+QuestionSummary AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.OwnerUserId,
+    qt.Tag,
+    ta.Id AS TopAnswerId,
+    ta.Score AS TopAnswerScore,
+    ta.OwnerUserId AS TopAnswerOwner,
+    ta.CreationDate AS TopAnswerDate,
+    ta.ScorePctWithinQuestion,
+    dc.MasterPostId,
+    ce.CloseReasonId,
+    ce.ClosedByUser,
+    ce.CreationDate AS ClosedAt
+  FROM Posts q
+  LEFT JOIN QuestionTags qt ON qt.QuestionId = q.Id
+  LEFT JOIN TopAnswers ta ON ta.ParentId = q.Id
+  LEFT JOIN DuplicateClusters dc ON dc.DuplicatePostId = q.Id
+  LEFT JOIN CloseEvents ce ON ce.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+TagPopularity AS (
+  SELECT
+    lower(TagName) AS Tag,
+    Count AS TagCount,
+    COALESCE(ExcerptPostId, -1) AS ExcerptId,
+    COALESCE(WikiPostId, -1) AS WikiId
+  FROM Tags
+),
+QuestionEnriched AS (
+  SELECT
+    qs.*,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    tp.TagCount,
+    GREATEST(0.0, 1.0 - LEAST(365.0, EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - qs.CreationDate))/86400.0) / 365.0) AS RecencyFactor,
+    (1.0 / (1.0 + EXP(-GREATEST(-50.0, LEAST(50.0, (qs.QuestionScore)::double precision / NULLIF(GREATEST(1, COALESCE(qs.ViewCount,0)),0)))))) AS ScoreFactor,
+    LOG(GREATEST(1, COALESCE(qs.AnswerCount,0)) + 1) AS AnswerFactor,
+    POWER(GREATEST(0.0, COALESCE(qs.FavoriteCount,0)), 0.5) AS FavoriteFactor,
+    COALESCE(tp.TagCount, 10)::double precision AS TagPopularityCount,
+    (
+      (1.5 * (1.0 / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - qs.CreationDate))/86400.0 + 1.0,0)))
+      + 2.0 * (COALESCE(qs.QuestionScore,0)::double precision)
+      + 0.5 * LOG(GREATEST(1, COALESCE(qs.ViewCount,0)))
+      + 3.0 * COALESCE(qs.FavoriteCount,0)
+      + 1.5 * COALESCE(tp.TagCount,10)::double precision
+    ) / NULLIF(1.0 + COALESCE(ta.ScorePctWithinQuestion,0), 1.0) AS RawHotness
+  FROM QuestionSummary qs
+  LEFT JOIN UserAgg ua ON ua.UserId = qs.OwnerUserId
+  LEFT JOIN TagPopularity tp ON tp.Tag = qs.Tag
+  LEFT JOIN TopAnswers ta ON ta.ParentId = qs.QuestionId
+),
+RankedQuestions AS (
+  SELECT
+    qe.*,
+    ROW_NUMBER() OVER (PARTITION BY qe.Tag ORDER BY qe.RawHotness DESC NULLS LAST) AS TagRank,
+    RANK() OVER (ORDER BY RawHotness DESC NULLS LAST) AS GlobalRank,
+    NTILE(100) OVER (ORDER BY RawHotness DESC NULLS LAST) AS HotnessPercentile
+  FROM QuestionEnriched qe
+),
+CloseStats AS (
+  SELECT
+    q.QuestionId,
+    (SELECT MIN(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = 10) AS FirstCloseAt,
+    (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL) AS DistinctCloseVoters
+  FROM (SELECT DISTINCT QuestionId FROM RankedQuestions) q
+),
+FinalSet AS (
+  SELECT DISTINCT ON (rq.QuestionId)
+    rq.QuestionId,
+    COALESCE(rq.Title, ('[no title]' || ' :: ' || rq.Tag)) AS TitleWithTag,
+    rq.Tag,
+    rq.OwnerName,
+    rq.OwnerReputation,
+    rq.QuestionScore,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.TopAnswerId,
+    rq.TopAnswerScore,
+    rq.TopAnswerOwner,
+    rq.RawHotness,
+    rq.TagRank,
+    rq.GlobalRank,
+    rq.HotnessPercentile,
+    cs.FirstCloseAt,
+    cs.DistinctCloseVoters,
+    rq.MasterPostId,
+    LEFT(
+      regexp_replace(
+        COALESCE(replace(replace(substr(rq.Title,1,180), E'\n',' '), E'\r',' '), '' )
+        || ' | tags: ' || COALESCE(rq.Tag,'<none>')
+        || ' | owner: ' || COALESCE(rq.OwnerName, 'anonymous')
+        || ' | score/view: ' || COALESCE((rq.QuestionScore::text || '/' || rq.ViewCount::text),'0/0')
+      , '\\s+', ' ', 'g'), 250) AS CompactSummary,
+    ( (COALESCE(rq.QuestionScore,0) & 255) * (COALESCE(rq.AnswerCount,0) + 1)
+      + COALESCE(rq.TopAnswerScore,0) * (CASE WHEN rq.TopAnswerId IS NULL THEN 0 ELSE 1 END)
+    ) AS DiagnosticCode
+  FROM RankedQuestions rq
+  LEFT JOIN CloseStats cs ON cs.QuestionId = rq.QuestionId
+  WHERE
+    (
+      rq.GlobalRank <= 500
+      OR rq.FirstCloseAt IS NOT NULL AND rq.FirstCloseAt > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+      OR rq.MasterPostId IS NOT NULL
+    )
+    AND (COALESCE(rq.ViewCount,0) > 10 OR rq.AnswerCount > 0)
+  ORDER BY rq.QuestionId, rq.GlobalRank
+)
+SELECT
+  fs.*,
+  COALESCE(v.UpVotes,0) AS TotalUpVotes,
+  COALESCE(v.DownVotes,0) AS TotalDownVotes,
+  COALESCE(c.CommentCount,0) AS CommentCount,
+  recent_similar.RecentSameTitleCount,
+  CASE
+    WHEN fs.CompactSummary ILIKE '%error%' OR fs.CompactSummary ~* 'exception|stacktrace' THEN 'Likely Debugging Question'
+    WHEN fs.MasterPostId IS NOT NULL THEN 'Duplicate'
+    WHEN fs.DistinctCloseVoters > 3 THEN 'HeavilyVotedToClose'
+    ELSE 'Normal'
+  END AS HeuristicFlag
+FROM FinalSet fs
+LEFT JOIN LATERAL (
+  SELECT
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes v
+  WHERE v.PostId = fs.QuestionId
+) v ON TRUE
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS CommentCount
+  FROM Comments c
+  WHERE c.PostId = fs.QuestionId
+) c ON TRUE
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS RecentSameTitleCount
+  FROM Posts p2
+  WHERE p2.PostTypeId = 1
+    AND p2.Id <> fs.QuestionId
+    AND p2.Title IS NOT NULL
+    AND similarity(p2.Title, fs.TitleWithTag) > 0.4
+    AND p2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+) recent_similar ON TRUE
+ORDER BY fs.GlobalRank ASC NULLS LAST, fs.RawHotness DESC NULLS LAST
+LIMIT 250;

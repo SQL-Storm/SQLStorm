@@ -1,0 +1,120 @@
+-- {"query": "21030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1476} 
+WITH ActiveUsers AS (
+    SELECT u.Id AS user_id, u.Reputation, u.CreationDate AS user_creation_date,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rep_rank
+    FROM Users u
+    WHERE u.Reputation >= 1000 AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+QuestionAuthors AS (
+    SELECT DISTINCT p.OwnerUserId AS user_id, p.CreationDate AS post_creation_date,
+           COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS total_questions
+    FROM Posts p
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.user_id
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '5 years'
+),
+HighImpactPosts AS (
+    SELECT p.Id AS post_id, p.OwnerUserId AS user_id, p.Score, p.ViewCount, p.AnswerCount,
+           p.Title, p.Tags,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+           AVG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate
+                                  ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rolling_avg_views,
+           CASE 
+               WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+               WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+               ELSE 'Active'
+           END AS post_status
+    FROM Posts p
+    INNER JOIN QuestionAuthors qa ON p.OwnerUserId = qa.user_id
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 1000
+),
+BadgeAchievers AS (
+    SELECT b.UserId AS user_id, b.Name AS badge_name, b.Date AS badge_date, b.Class,
+           STRING_AGG(DISTINCT t.TagName, ', ') AS related_tags
+    FROM Badges b
+    LEFT JOIN Tags t ON b.TagBased = 1 AND t.TagName ILIKE '%' || LOWER(b.Name) || '%'
+    WHERE b.Class IN (1, 2) AND b.Date > cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY b.UserId, b.Name, b.Date, b.Class
+),
+VotePatterns AS (
+    SELECT v.PostId, v.UserId AS voter_id, COUNT(*) AS vote_count,
+           SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS mod_votes,
+           MAX(v.CreationDate) AS last_vote_date
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1, 2, 3, 5) -- Accepted, Up, Down, Favorite
+    GROUP BY v.PostId, v.UserId
+    HAVING COUNT(*) > 5
+)
+SELECT 
+    au.user_id, au.DisplayName, au.Reputation, au.rep_rank,
+    qa.total_questions,
+    COALESCE(hp.post_id, 0) AS top_post_id,
+    COALESCE(hp.Title, 'No High Impact Post') AS top_post_title,
+    COALESCE(hp.score * (hp.AnswerCount + 1.0) / NULLIF(hp.ViewCount, 0), 0) AS impact_ratio,
+    COALESCE(hp.rolling_avg_views, 0) AS avg_views,
+    hp.post_status,
+    COALESCE(ba.badge_name, 'No Badges') AS top_badge,
+    COALESCE(vp.vote_count, 0) AS total_votes_cast,
+    CASE 
+        WHEN hp.prev_score IS NULL THEN 'First Post'
+        WHEN hp.score > COALESCE(hp.prev_score, 0) * 1.5 THEN 'Improving'
+        WHEN hp.score < COALESCE(hp.prev_score, 0) * 0.5 THEN 'Declining'
+        ELSE 'Stable'
+    END AS score_trend,
+    (SELECT STRING_AGG(DISTINCT pl.RelatedPostId::text, ', ')
+     FROM PostLinks pl 
+     WHERE pl.PostId = hp.post_id AND pl.LinkTypeId = 3) AS linked_duplicates,
+    LENGTH(COALESCE(p.Text, '')) - LENGTH(REPLACE(COALESCE(p.Text, ''), ' ', '')) AS word_count_estimate
+FROM ActiveUsers au
+INNER JOIN QuestionAuthors qa ON au.user_id = qa.user_id
+LEFT JOIN (
+    SELECT * FROM HighImpactPosts 
+    WHERE impact_ratio = (
+        SELECT MAX(COALESCE(score * (AnswerCount + 1.0) / NULLIF(ViewCount, 0), 0))
+        FROM HighImpactPosts sub
+        WHERE sub.user_id = HighImpactPosts.user_id
+    )
+) hp ON au.user_id = hp.user_id
+LEFT JOIN (
+    SELECT * FROM BadgeAchievers 
+    WHERE Class = 1 
+    AND badge_date = (
+        SELECT MAX(badge_date) 
+        FROM BadgeAchievers sub 
+        WHERE sub.user_id = BadgeAchievers.user_id
+    )
+) ba ON au.user_id = ba.user_id
+LEFT JOIN VotePatterns vp ON au.user_id = vp.voter_id
+LEFT JOIN PostHistory ph ON hp.post_id = ph.PostId 
+    AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edits to title, body, tags
+    AND ph.CreationDate = (
+        SELECT MAX(sub.CreationDate) 
+        FROM PostHistory sub 
+        WHERE sub.PostId = hp.post_id AND sub.PostHistoryTypeId IN (4, 5, 6)
+    )
+LEFT JOIN Comments c ON hp.post_id = c.PostId 
+    AND c.Score > 0 
+    AND c.CreationDate > COALESCE(hp.CreationDate, '1900-01-01'::timestamp)
+WHERE au.rep_rank <= 100
+   OR (qa.total_questions > 50 AND COALESCE(hp.AnswerCount, 0) > 10)
+   OR ba.Class = 1
+UNION ALL
+SELECT 
+    au.user_id, au.DisplayName, au.Reputation, au.rep_rank,
+    0 AS total_questions,
+    NULL AS top_post_id,
+    'Inactive High Rep User' AS top_post_title,
+    0 AS impact_ratio,
+    0 AS avg_views,
+    'Inactive' AS post_status,
+    COALESCE(ba.badge_name, 'No Badges') AS top_badge,
+    COALESCE(vp.vote_count, 0) AS total_votes_cast,
+    'No Posts' AS score_trend,
+    NULL AS linked_duplicates,
+    0 AS word_count_estimate
+FROM ActiveUsers au
+LEFT JOIN BadgeAchievers ba ON au.user_id = ba.user_id
+LEFT JOIN VotePatterns vp ON au.user_id = vp.voter_id
+WHERE au.user_id NOT IN (SELECT user_id FROM QuestionAuthors)
+  AND (au.rep_rank <= 50 OR au.Reputation > 50000)
+ORDER BY au.rep_rank ASC, COALESCE(hp.impact_ratio, 0) DESC
+LIMIT 200;

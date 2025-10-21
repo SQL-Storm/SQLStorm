@@ -1,0 +1,148 @@
+-- {"query": "21067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1617} 
+
+WITH ActiveUsers AS (
+  SELECT 
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.DeletedDate IS NULL
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+  WHERE u.Reputation > 100 
+    AND u.CreationDate >= NOW() - INTERVAL '1 year'
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+  HAVING COUNT(DISTINCT p.Id) > 5
+),
+UserBadges AS (
+  SELECT 
+    au.UserId,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+    STRING_AGG(DISTINCT b.Name, '; ') AS BadgeNames,
+    ROW_NUMBER() OVER (PARTITION BY au.UserId ORDER BY b.Date DESC) AS rn
+  FROM ActiveUsers au
+  LEFT JOIN Badges b ON b.UserId = au.UserId
+  GROUP BY au.UserId
+),
+QuestionStats AS (
+  SELECT 
+    p.Id AS QuestionId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(ph.Text, '') AS CloseReasonJson,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 
+        CASE 
+          WHEN LENGTH(COALESCE(ph.Text, '')) > 0 
+          THEN JSON_EXTRACT(ph.Text, '$[0].CloseReasonId')::smallint 
+          ELSE NULL 
+        END
+      ELSE NULL 
+    END AS CloseReasonId,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+    LEAD(p.AnswerCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextQuestionAnswers,
+    NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS ViewQuartile
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id 
+    AND ph.PostHistoryTypeId = 10 
+    AND ph.CreationDate = (
+      SELECT MAX(ph2.CreationDate) 
+      FROM PostHistory ph2 
+      WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10
+    )
+  WHERE p.PostTypeId = 1 
+    AND p.DeletedDate IS NULL
+    AND p.CreationDate >= NOW() - INTERVAL '6 months'
+),
+LinkedQuestions AS (
+  SELECT 
+    pl.PostId AS FromQuestionId,
+    pl.RelatedPostId AS ToQuestionId,
+    pl.LinkTypeId,
+    ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate) AS LinkSeq
+  FROM PostLinks pl
+  INNER JOIN QuestionStats qs1 ON qs1.QuestionId = pl.PostId
+  INNER JOIN QuestionStats qs2 ON qs2.QuestionId = pl.RelatedPostId
+  WHERE pl.LinkTypeId IN (1, 3)
+)
+SELECT 
+  au.UserId,
+  u.DisplayName,
+  au.Reputation,
+  au.QuestionCount,
+  au.AnswerCount,
+  (au.UpVotesReceived - COALESCE(au.DownVotesReceived, 0)) AS NetVotes,
+  ROUND(au.AvgPostScore::numeric, 2) AS AvgScore,
+  COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+  LENGTH(COALESCE(ub.BadgeNames, '')) AS BadgeNameLength,
+  qs.QuestionId,
+  qs.TitleSnippet,
+  qs.Score AS QuestionScore,
+  qs.ViewCount,
+  qs.AnswerCount,
+  CASE 
+    WHEN qs.AnswerCount > 0 THEN qs.Score / NULLIF(qs.AnswerCount, 0) 
+    ELSE 0 
+  END AS ScorePerAnswer,
+  CASE 
+    WHEN qs.CloseReasonId IS NOT NULL THEN crt.Name 
+    ELSE 'Open' 
+  END AS CloseStatus,
+  CASE 
+    WHEN qs.PrevQuestionScore IS NOT NULL 
+    THEN qs.Score - qs.PrevQuestionScore 
+    ELSE NULL 
+  END AS ScoreImprovement,
+  lq.ToQuestionId AS LinkedQuestionId,
+  lq.LinkTypeId,
+  CASE 
+    WHEN lq.LinkTypeId = 3 THEN 'Duplicate' 
+    WHEN lq.LinkTypeId = 1 THEN 'Related' 
+    ELSE 'Unknown' 
+  END AS LinkDescription,
+  RANK() OVER (PARTITION BY au.UserId ORDER BY qs.ViewCount DESC) AS ViewRank,
+  PERCENT_RANK() OVER (ORDER BY (au.QuestionCount * au.AvgPostScore)) AS UserPerformancePercentile,
+  (SELECT STRING_AGG(DISTINCT SUBSTRING(c.Text, 1, 50), ' | ' ORDER BY c.CreationDate DESC)
+   FROM Comments c 
+   WHERE c.PostId = qs.QuestionId 
+     AND c.Score > 0 
+     AND LENGTH(c.Text) > 10
+   LIMIT 3) AS TopCommentsPreview
+FROM ActiveUsers au
+INNER JOIN Users u ON u.Id = au.UserId
+LEFT JOIN UserBadges ub ON ub.UserId = au.UserId AND ub.rn = 1
+LEFT JOIN (
+  SELECT 
+    qs_inner.*,
+    SUBSTRING(p.Title, 1, 100) || CASE WHEN LENGTH(p.Title) > 100 THEN '...' ELSE '' END AS TitleSnippet,
+    p.Title
+  FROM QuestionStats qs_inner
+  INNER JOIN Posts p ON p.Id = qs_inner.QuestionId
+) qs ON qs.OwnerUserId = au.UserId
+LEFT JOIN LinkedQuestions lq ON lq.FromQuestionId = qs.QuestionId AND lq.LinkSeq <= 2
+LEFT JOIN (
+  SELECT 
+    ph.PostId,
+    JSON_ARRAY_LENGTH(ph.Text::json) AS VoterCount,
+    SUBSTRING(ph.Text, 1, 200) AS VoterDetails
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10
+) ph_details ON ph_details.PostId = qs.QuestionId
+LEFT JOIN CloseReasonTypes crt ON crt.Id = qs.CloseReasonId
+WHERE (au.QuestionCount > 0 OR au.AnswerCount > 0)
+  AND (qs.ViewCount > 100 OR qs.Score > 5 OR lq.ToQuestionId IS NOT NULL)
+  AND NOT (qs.ClosedDate IS NOT NULL AND qs.AnswerCount = 0 AND DATEDIFF('day', qs.CreationDate, qs.ClosedDate) < 1)
+ORDER BY au.Reputation DESC, qs.ViewCount DESC, lq.LinkSeq
+LIMIT 1000;

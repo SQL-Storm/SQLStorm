@@ -1,0 +1,60 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgScore,
+        MAX(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate ELSE TIMESTAMP '1900-01-01' END) AS LastPostDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditsMade
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgeScore,
+        STRING_AGG(CASE WHEN b.TagBased = 1 THEN b.Name ELSE NULL END, ';') AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteStats AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpvotedPosts
+    FROM Votes v
+    GROUP BY v.UserId
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalPosts,
+    ups.Questions,
+    ups.Answers,
+    ups.AvgScore,
+    bs.BadgeScore,
+    COALESCE(ups.EditsMade, 0) AS EditsMade,
+    vs.NetVotes,
+    CASE WHEN ups.LastPostDate IS NULL THEN 'Inactive' ELSE 'Active' END AS Status,
+    ROW_NUMBER() OVER (ORDER BY (COALESCE(ups.TotalPosts, 0) + COALESCE(bs.BadgeScore, 0) + COALESCE(vs.NetVotes, 0)) DESC) AS Rank,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ups.UserId AND c.Score > 0) AS PositiveComments,
+    REGEXP_REPLACE(COALESCE(bs.TagBadges, ''), ';+', ';', 'g') AS TagBadgesCleaned
+FROM UserPostStats ups
+LEFT JOIN BadgeSummary bs ON ups.UserId = bs.UserId
+LEFT JOIN VoteStats vs ON ups.UserId = vs.UserId
+WHERE ups.TotalPosts > 10
+  AND (bs.BadgeScore IS NOT NULL OR vs.NetVotes IS NOT NULL)
+  AND EXISTS (
+      SELECT 1 
+      FROM Posts p2 
+      WHERE p2.OwnerUserId = ups.UserId 
+        AND p2.Tags IS NOT NULL 
+        AND p2.Tags LIKE '%<sql>%'
+  )
+ORDER BY Rank, ups.UserId
+LIMIT 100;

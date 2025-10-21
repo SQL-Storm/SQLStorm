@@ -1,0 +1,52 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerDisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as DownVotes,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) as BronzeBadges,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as TagName
+    ) t) as TagsList,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) as QuestionCount,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) as AnswerCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) as DuplicateCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)) as EditHistoryCount,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) as LastEditDate,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.ParentId = p.Id) as ChildPostsCount,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.AcceptedAnswerId = p.Id) as AcceptedAnswersCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 5) as FavoriteCount,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 1) as InitialTitleCount,
+    (SELECT COUNT(*) FROM PostHistory ph3 WHERE ph3.PostId = p.Id AND ph3.PostHistoryTypeId = 2) as InitialBodyCount,
+    (SELECT COUNT(*) FROM PostHistory ph4 WHERE ph4.PostId = p.Id AND ph4.PostHistoryTypeId = 3) as InitialTagsCount,
+    (SELECT COUNT(*) FROM PostHistory ph5 WHERE ph5.PostId = p.Id AND ph5.PostHistoryTypeId BETWEEN 4 AND 9) as EditOperationsCount,
+    (SELECT COUNT(*) FROM PostHistory ph6 WHERE ph6.PostId = p.Id AND ph6.PostHistoryTypeId IN (35, 36)) as MigrationCount,
+    (SELECT COUNT(*) FROM PostHistory ph7 WHERE ph7.PostId = p.Id AND ph7.PostHistoryTypeId IN (17, 35, 36)) as PostMigrationCount,
+    (SELECT COUNT(*) FROM PostHistory ph8 WHERE ph8.PostId = p.Id AND ph8.PostHistoryTypeId IN (22, 37, 38)) as PostMergeCount,
+    (SELECT AVG(v3.BountyAmount) FROM Votes v3 WHERE v3.PostId = p.Id AND v3.VoteTypeId = 8) as AvgBountyAmount,
+    (SELECT COUNT(*) FROM Votes v4 WHERE v4.PostId = p.Id AND v4.VoteTypeId = 1) as AcceptVotesCount,
+    (SELECT COALESCE(MAX(COUNT(c2.Id)), 0) FROM Comments c2 WHERE c2.PostId = p.Id GROUP BY c2.UserId) as MaxCommentsPerUser
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1 
+  AND p.CreationDate >= '2022-01-01'
+  AND p.Score > 0
+  AND p.ViewCount > 1000
+  AND u.Reputation > 10000
+  AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)
+  AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+  AND EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3)
+  AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13))
+  AND NOT EXISTS (SELECT 1 FROM Posts p6 WHERE p6.ParentId = p.Id AND p6.PostTypeId = 2 AND p6.Score < 0)
+  AND NOT EXISTS (SELECT 1 FROM Tags t WHERE t.TagName LIKE '%performance%' OR t.TagName LIKE '%benchmark%')
+GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT u.Id) = 1
+ORDER BY p.Score DESC, p.ViewCount DESC
+LIMIT 1000;

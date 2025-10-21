@@ -1,0 +1,147 @@
+-- {"query": "25041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2162} 
+
+/*  Performance‑benchmarking query for the StackOverflow schema  */
+WITH 
+/*--------------------------------------------------------------
+  1. Aggregate per‑user statistics (questions, answers, scores)
+--------------------------------------------------------------*/
+user_stats AS (
+    SELECT 
+        u.id                              AS user_id,
+        u.displayname                     AS display_name,
+        u.reputation,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1)        AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2)        AS answer_cnt,
+        COALESCE(SUM(p.score),0)                           AS total_score,
+        MAX(p.creationdate)                               AS last_post_dt,
+        COUNT(v.id) FILTER (WHERE v.votetypeid = 2)       AS upvotes_given,
+        COUNT(v.id) FILTER (WHERE v.votetypeid = 3)       AS downvotes_given
+    FROM users u
+    LEFT JOIN posts p   ON p.owneruserid = u.id
+    LEFT JOIN votes v   ON v.userid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+/*--------------------------------------------------------------
+  2. Badge aggregates per user
+--------------------------------------------------------------*/
+badge_stats AS (
+    SELECT 
+        b.userid                           AS user_id,
+        COUNT(*)                           AS badge_total,
+        COUNT(*) FILTER (WHERE b.class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.class = 3) AS bronze_cnt,
+        STRING_AGG(DISTINCT b.name, ', ')  AS badge_list
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/*--------------------------------------------------------------
+  3. Tag‑level activity (questions only)
+--------------------------------------------------------------*/
+tag_activity AS (
+    SELECT 
+        t.tagname,
+        COUNT(p.id)                      AS posts_with_tag,
+        AVG(p.score)                     AS avg_score,
+        MAX(p.creationdate)              AS most_recent
+    FROM tags t
+    JOIN posts p 
+      ON p.posttypeid = 1                     -- only questions
+     AND p.tags LIKE '%'||t.tagname||'%'
+    GROUP BY t.tagname
+),
+
+/*--------------------------------------------------------------
+  4. Rank users by reputation + score and attach badge info
+--------------------------------------------------------------*/
+ranked_users AS (
+    SELECT 
+        us.user_id,
+        us.display_name,
+        us.reputation,
+        us.question_cnt,
+        us.answer_cnt,
+        us.total_score,
+        COALESCE(bs.badge_total,0)      AS badge_total,
+        COALESCE(bs.gold_cnt,0)         AS gold_cnt,
+        ROW_NUMBER() OVER (ORDER BY us.reputation DESC, us.total_score DESC) AS rn
+    FROM user_stats us
+    LEFT JOIN badge_stats bs ON bs.user_id = us.user_id
+    WHERE us.reputation >= 1000
+),
+
+/*--------------------------------------------------------------
+  5. Recent tags for the newest question per user (correlated sub‑query)
+--------------------------------------------------------------*/
+recent_user_tags AS (
+    SELECT 
+        ru.user_id,
+        (
+            SELECT STRING_AGG(t.tagname, ', ')
+            FROM (
+                SELECT trim(both '<>' FROM unnest(string_to_array(q.tags, '><'))) AS tag
+            ) AS x
+            JOIN tags t ON t.tagname = x.tag
+            ORDER BY t.tagname
+            LIMIT 5
+        ) AS recent_tags
+    FROM ranked_users ru
+    LEFT JOIN LATERAL (
+        SELECT p.id, p.tags
+        FROM posts p
+        WHERE p.owneruserid = ru.user_id
+          AND p.posttypeid = 1                -- questions
+        ORDER BY p.creationdate DESC
+        LIMIT 1
+    ) q ON true
+)
+
+/*=================================================================
+   Final result set:
+   – Top 50 users with computed ratios and recent tags
+   – UNION ALL with a concise tag‑summary (set operator)
+=================================================================*/
+SELECT 
+    ru.rn                                 AS rank,
+    ru.display_name,
+    ru.reputation,
+    ru.question_cnt,
+    ru.answer_cnt,
+    ru.total_score,
+    ru.badge_total,
+    ru.gold_cnt,
+    CASE 
+        WHEN ru.badge_total = 0 THEN 0
+        ELSE ROUND(ru.gold_cnt::numeric / ru.badge_total, 3)
+    END                                   AS gold_ratio,
+    CASE 
+        WHEN ru.answer_cnt = 0 THEN NULL
+        ELSE ROUND(ru.question_cnt::numeric / ru.answer_cnt, 2)
+    END                                   AS q_to_a_ratio,
+    rut.recent_tags
+FROM ranked_users ru
+LEFT JOIN recent_user_tags rut ON rut.user_id = ru.user_id
+WHERE ru.rn <= 50
+
+UNION ALL
+
+SELECT 
+    NULL                                 AS rank,
+    '--- Tag Summary (Top 10 by Post Count) ---' AS display_name,
+    NULL                                 AS reputation,
+    NULL                                 AS question_cnt,
+    NULL                                 AS answer_cnt,
+    NULL                                 AS total_score,
+    NULL                                 AS badge_total,
+    NULL                                 AS gold_cnt,
+    NULL                                 AS gold_ratio,
+    NULL                                 AS q_to_a_ratio,
+    STRING_AGG(t.tagname || ':' || t.posts_with_tag, '; ') AS recent_tags
+FROM (
+    SELECT *
+    FROM tag_activity
+    ORDER BY posts_with_tag DESC
+    LIMIT 10
+) t;

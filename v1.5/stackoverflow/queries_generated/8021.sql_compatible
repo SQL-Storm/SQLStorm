@@ -1,0 +1,315 @@
+with
+q as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate as QuestionCreation,
+    p.OwnerUserId as QuestionOwnerId,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select
+    p.Id as AnswerId,
+    p.ParentId as QuestionId,
+    p.OwnerUserId as AnswerOwnerId,
+    p.Score as AnswerScore,
+    p.CreationDate as AnswerCreation
+  from Posts p
+  where p.PostTypeId = 2
+),
+u as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreation,
+    coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm,
+    u.UpVotes,
+    u.DownVotes
+  from Users u
+),
+answers_ranked as (
+  select
+    a.*,
+    row_number() over (partition by a.QuestionId order by a.Score desc, a.AnswerCreation asc, a.AnswerId asc) as rn_score,
+    row_number() over (partition by a.QuestionId order by a.AnswerCreation asc, a.Score desc, a.AnswerId asc) as rn_time
+  from a
+),
+accepted as (
+  select
+    q.QuestionId,
+    q.AcceptedAnswerId,
+    ar.AnswerId,
+    ar.AnswerScore,
+    ar.AnswerCreation,
+    (ar.rn_score = 1) as IsTopByScore,
+    (ar.rn_time = 1) as IsFirstByTime
+  from q
+  left join answers_ranked ar
+    on ar.AnswerId = q.AcceptedAnswerId
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStart,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyClose,
+    min(v.CreationDate) filter (where v.VoteTypeId in (2,3)) as FirstVoteAt,
+    max(v.CreationDate) filter (where v.VoteTypeId in (2,3)) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+comments_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    max(c.Score) as MaxCommentScore,
+    min(c.CreationDate) as FirstCommentAt,
+    max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+edits_agg as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEditAt,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as ClosedAt,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as ReopenedAt,
+    max(case when ph.PostHistoryTypeId = 10 then nullif(ph.Comment,'') end) as LastCloseReasonId_raw
+  from PostHistory ph
+  group by ph.PostId
+),
+close_reason as (
+  select
+    e.PostId,
+    crt.Id as CloseReasonId,
+    crt.Name as CloseReasonName
+  from edits_agg e
+  left join CloseReasonTypes crt
+    on cast(nullif(e.LastCloseReasonId_raw, '') as int) = crt.Id
+),
+tag_split as (
+  select
+    q.QuestionId,
+    lower(trim(t)) as tag
+  from q
+  cross join lateral unnest(coalesce(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><'), array[]::varchar[])) as t
+),
+tag_stats as (
+  select
+    ts.QuestionId,
+    count(*) as TagCount,
+    min(ts.tag) as AlphaFirstTag,
+    max(ts.tag) as AlphaLastTag,
+    bool_or(ts.tag = 'sql') as HasSQL,
+    bool_or(ts.tag = 'postgresql') as HasPostgres
+  from tag_split ts
+  group by ts.QuestionId
+),
+linked as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+    max(pl.CreationDate) as LastLinkAt
+  from PostLinks pl
+  group by pl.PostId
+),
+question_user as (
+  select
+    q.QuestionId,
+    u.UserId as QUserId,
+    u.DisplayName as QDisplayName,
+    u.Reputation as QReputation,
+    u.LocationNorm as QLocation,
+    u.UpVotes as QUpVotesGiven,
+    u.DownVotes as QDownVotesGiven
+  from q
+  left join u on u.UserId = q.QuestionOwnerId
+),
+answer_user_best as (
+  select
+    q.QuestionId,
+    ar.AnswerId,
+    u.UserId as AUserId,
+    u.DisplayName as ADisplayName,
+    u.Reputation as AReputation,
+    u.LocationNorm as ALocation,
+    ar.AnswerScore,
+    ar.AnswerCreation
+  from answers_ranked ar
+  join q on q.QuestionId = ar.QuestionId
+  left join u on u.UserId = ar.AnswerOwnerId
+  where ar.rn_score = 1
+),
+question_activity as (
+  select
+    q.QuestionId,
+    q.QuestionCreation,
+    q.QuestionScore,
+    q.ViewCount,
+    coalesce(va.UpVotes,0) as QUpVotes,
+    coalesce(va.DownVotes,0) as QDownVotes,
+    coalesce(ca.CommentCount,0) as QComments,
+    coalesce(ca.MaxCommentScore,0) as MaxCommentScore,
+    va.FirstVoteAt,
+    va.LastVoteAt,
+    ca.FirstCommentAt,
+    ca.LastCommentAt,
+    ed.EditCount,
+    ed.LastEditAt,
+    cr.CloseReasonId,
+    cr.CloseReasonName,
+    ln.LinkedCount,
+    ln.DuplicateCount,
+    ln.LastLinkAt
+  from q
+  left join votes_agg va on va.PostId = q.QuestionId
+  left join comments_agg ca on ca.PostId = q.QuestionId
+  left join edits_agg ed on ed.PostId = q.QuestionId
+  left join close_reason cr on cr.PostId = q.QuestionId
+  left join linked ln on ln.QuestionId = q.QuestionId
+),
+accepted_position as (
+  select
+    q.QuestionId,
+    coalesce((
+      select count(*) from answers_ranked ar
+      where ar.QuestionId = q.QuestionId
+        and (ar.AnswerScore, ar.AnswerCreation, ar.AnswerId) >= (
+          select ar2.AnswerScore, ar2.AnswerCreation, ar2.AnswerId
+          from answers_ranked ar2
+          where ar2.AnswerId = q.AcceptedAnswerId
+          limit 1
+        )
+    ), null) as AcceptedRankByScore
+  from q
+),
+question_complex as (
+  select
+    qa.*,
+    ts.TagCount,
+    ts.AlphaFirstTag,
+    ts.AlphaLastTag,
+    ts.HasSQL,
+    ts.HasPostgres,
+    qp.QUserId,
+    qp.QDisplayName,
+    qp.QReputation,
+    qp.QLocation,
+    qp.QUpVotesGiven,
+    qp.QDownVotesGiven,
+    ab.AnswerId as BestAnswerId,
+    ab.AUserId,
+    ab.ADisplayName,
+    ab.AReputation,
+    ab.ALocation,
+    ab.AnswerScore as BestAnswerScore,
+    ab.AnswerCreation as BestAnswerCreation,
+    ac.AcceptedAnswerId,
+    ac.AnswerId as AcceptedAnswerActualId,
+    ac.AnswerScore as AcceptedAnswerScore,
+    ac.AnswerCreation as AcceptedAnswerCreation,
+    ac.IsTopByScore,
+    ac.IsFirstByTime,
+    apr.AcceptedRankByScore,
+    case
+      when ac.AcceptedAnswerId is null then 'NoAccepted'
+      when ac.IsTopByScore = 1 then 'AcceptedIsTop'
+      when ac.IsFirstByTime = 1 then 'AcceptedIsFirst'
+      when apr.AcceptedRankByScore is null then 'AcceptedNotFound'
+      when apr.AcceptedRankByScore <= 3 then 'AcceptedTop3'
+      else 'AcceptedLower'
+    end as AcceptedCategory
+  from question_activity qa
+  left join tag_stats ts on ts.QuestionId = qa.QuestionId
+  left join question_user qp on qp.QuestionId = qa.QuestionId
+  left join answer_user_best ab on ab.QuestionId = qa.QuestionId
+  left join accepted ac on ac.QuestionId = qa.QuestionId
+  left join accepted_position apr on apr.QuestionId = qa.QuestionId
+),
+score_buckets as (
+  select
+    qc.*,
+    width_bucket(coalesce(qc.QuestionScore,0), -10, 100, 15) as ScoreBucket,
+    width_bucket(coalesce(qc.ViewCount,0), 0, 100000, 10) as ViewBucket
+  from question_complex qc
+),
+time_diff as (
+  select
+    sb.*,
+    extract(epoch from (sb.BestAnswerCreation - sb.QuestionCreation))/60.0 as MinutesToBest,
+    extract(epoch from (sb.AcceptedAnswerCreation - sb.QuestionCreation))/60.0 as MinutesToAccepted,
+    extract(epoch from (coalesce(sb.LastEditAt, sb.LastLinkAt, sb.LastVoteAt, sb.LastCommentAt) - sb.QuestionCreation))/3600.0 as HoursToLastActivity
+  from score_buckets sb
+),
+ranked as (
+  select
+    td.*,
+    dense_rank() over (order by coalesce(td.TagCount,0) desc, coalesce(td.QReputation,0) desc, coalesce(td.ViewCount,0) desc, td.QuestionId) as DenseRankAll,
+    row_number() over (partition by td.AcceptedCategory order by coalesce(td.ViewCount,0) desc, coalesce(td.QuestionScore,0) desc) as RN_ByAcceptedCat
+  from time_diff td
+),
+unioned as (
+  select
+    'top_views' as section,
+    r.*
+  from ranked r
+  where r.RN_ByAcceptedCat <= 50
+  union all
+  select
+    'recently_active' as section,
+    r.*
+  from ranked r
+  where r.HoursToLastActivity between 0 and 72
+    and r.QuestionScore >= 0
+  union all
+  select
+    'sql_related' as section,
+    r.*
+  from ranked r
+  where r.HasSQL or r.HasPostgres
+),
+final as (
+  select
+    section,
+    QuestionId,
+    coalesce(Title, '[no title]') as Title,
+    coalesce(TagCount,0) as TagCount,
+    AlphaFirstTag,
+    AlphaLastTag,
+    AcceptedCategory,
+    AcceptedAnswerId,
+    AcceptedAnswerScore,
+    BestAnswerId,
+    BestAnswerScore,
+    QuestionScore,
+    ViewCount,
+    QReputation,
+    QLocation,
+    QUpVotes,
+    QDownVotes,
+    QComments,
+    EditCount,
+    DuplicateCount,
+    LinkedCount,
+    MinutesToBest,
+    MinutesToAccepted,
+    HoursToLastActivity,
+    ScoreBucket,
+    ViewBucket,
+    DenseRankAll,
+    RN_ByAcceptedCat
+  from unioned
+)
+select *
+from final
+qualify row_number() over (partition by section order by DenseRankAll asc, ViewCount desc, QuestionScore desc, QuestionId desc) <= 200;

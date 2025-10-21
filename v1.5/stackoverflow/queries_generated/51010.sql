@@ -1,0 +1,109 @@
+-- {"query": "51010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1059} 
+
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        SUM(p.ViewCount) as TotalViews,
+        SUM(p.FavoriteCount) as TotalFavorites
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+    ORDER BY TotalViews DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT ph.PostId) as ActivePosts,
+        AVG(p.Score) as AvgScore
+    FROM Tags t
+    INNER JOIN Posts p ON position(t.TagName in p.Tags) > 0
+    INNER JOIN PostHistory ph ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    WHERE p.PostTypeId = 1 AND p.CreationDate > NOW() - INTERVAL '2 years'
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 50 AND COUNT(DISTINCT ph.PostId) > 10
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        tu.DisplayName as OwnerName,
+        at.TagName,
+        COALESCE(v.UpVotes, 0) as UpVotes,
+        COALESCE(v.DownVotes, 0) as DownVotes,
+        COUNT(DISTINCT c.Id) as CommentCount
+    FROM Posts p
+    INNER JOIN TopUsers tu ON p.OwnerUserId = tu.Id
+    INNER JOIN ActiveTags at ON position(at.TagName in p.Tags) > 0
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes
+        FROM Votes 
+        WHERE VoteTypeId IN (2, 3) 
+        GROUP BY OwnerUserId
+    ) v ON tu.Id = v.OwnerUserId
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score > 0
+    WHERE p.PostTypeId = 1 
+        AND p.ViewCount > 1000 
+        AND p.AnswerCount >= 3
+        AND p.CreationDate > NOW() - INTERVAL '1 year'
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CreationDate, tu.DisplayName, at.TagName, v.UpVotes, v.DownVotes
+    HAVING AVG(c.Score) > 0 OR COUNT(DISTINCT c.Id) > 5
+)
+SELECT 
+    hip.Title,
+    hip.OwnerName,
+    hip.TagName,
+    hip.Score,
+    hip.ViewCount,
+    hip.AnswerCount,
+    hip.UpVotes,
+    hip.DownVotes,
+    hip.CommentCount,
+    tu.Reputation as OwnerReputation,
+    at.Count as TagPopularity,
+    at.AvgScore as TagAvgScore,
+    tu.QuestionCount as OwnerQuestionCount,
+    tu.TotalViews as OwnerTotalViews,
+    CASE 
+        WHEN hip.ViewCount > 10000 THEN 'Viral'
+        WHEN hip.ViewCount > 5000 THEN 'Popular'
+        WHEN hip.ViewCount > 1000 THEN 'Growing'
+        ELSE 'Emerging'
+    END as PopularityLevel,
+    ROW_NUMBER() OVER (
+        PARTITION BY hip.TagName 
+        ORDER BY hip.ViewCount DESC, hip.Score DESC
+    ) as RankInTag,
+    PERCENT_RANK() OVER (
+        ORDER BY hip.ViewCount 
+    ) * 100 as ViewPercentile,
+    (hip.UpVotes - hip.DownVotes) / NULLIF(hip.UpVotes + hip.DownVotes, 0) * 100 as VoteRatio,
+    EXTRACT(EPOCH FROM (NOW() - hip.CreationDate)) / 86400 as DaysOld,
+    hip.ViewCount / NULLIF(EXTRACT(EPOCH FROM (NOW() - hip.CreationDate)) / 86400, 0) as ViewsPerDay
+FROM HighImpactPosts hip
+INNER JOIN TopUsers tu ON hip.OwnerName = tu.DisplayName
+INNER JOIN ActiveTags at ON hip.TagName = at.TagName
+WHERE tu.TotalViews > 10000
+    AND at.ActivePosts > 100
+    AND hip.DaysOld < 365
+ORDER BY 
+    PopularityLevel DESC,
+    ViewsPerDay DESC,
+    RankInTag ASC
+LIMIT 50;

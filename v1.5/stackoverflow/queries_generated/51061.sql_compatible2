@@ -1,0 +1,115 @@
+WITH monthly_user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        DATE_TRUNC('month', u.CreationDate) AS user_creation_month,
+        DATE_TRUNC('month', p.CreationDate) AS activity_month,
+        COUNT(DISTINCT p.Id) AS posts_created,
+        COUNT(DISTINCT c.Id) AS comments_made,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_given,
+        COUNT(DISTINCT b.Id) AS badges_earned
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) AND p.CreationDate >= u.CreationDate
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= u.CreationDate
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.CreationDate >= u.CreationDate AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date >= u.CreationDate
+    WHERE u.Reputation >= 100
+      AND u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, user_creation_month, activity_month
+),
+top_tags_per_month AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS tag_list,
+        COUNT(p.Id) AS question_count
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+      AND p.Score >= 0
+      AND p.ClosedDate IS NULL
+    GROUP BY DATE_TRUNC('month', p.CreationDate), SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2)
+    HAVING COUNT(p.Id) >= 5
+),
+tag_popularity AS (
+    SELECT 
+        ttm.month,
+        UNNEST(STRING_TO_ARRAY(ttm.tag_list, '><')) AS tag_name,
+        SUM(ttm.question_count) AS total_questions
+    FROM top_tags_per_month ttm
+    GROUP BY ttm.month, tag_name
+),
+monthly_user_tags AS (
+    SELECT 
+        mua.user_id,
+        mua.activity_month,
+        mua.posts_created,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ';') AS user_tags
+    FROM monthly_user_activity mua
+    LEFT JOIN Posts p ON mua.user_id = p.OwnerUserId 
+        AND p.PostTypeId = 1 
+        AND DATE_TRUNC('month', p.CreationDate) = mua.activity_month
+    GROUP BY mua.user_id, mua.activity_month, mua.posts_created
+),
+user_tag_engagement AS (
+    SELECT 
+        mut.user_id,
+        mut.activity_month,
+        mut.posts_created,
+        mut.user_tags,
+        tp.tag_name,
+        tp.total_questions AS tag_popularity,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts_in_tag
+    FROM monthly_user_tags mut
+    LEFT JOIN LATERAL (
+        SELECT DISTINCT UNNEST(STRING_TO_ARRAY(mut.user_tags, ';')) AS tag_name
+    ) tag_names ON true
+    LEFT JOIN tag_popularity tp ON tp.tag_name = tag_names.tag_name 
+        AND tp.month = mut.activity_month
+    LEFT JOIN Posts related_p ON EXISTS (
+        SELECT 1 FROM Posts user_p 
+        WHERE user_p.OwnerUserId = mut.user_id 
+          AND user_p.PostTypeId = 1
+          AND DATE_TRUNC('month', user_p.CreationDate) = mut.activity_month
+          AND POSITION(tag_names.tag_name IN user_p.Tags) > 0
+    )
+    LEFT JOIN PostLinks pl ON pl.PostId = related_p.Id 
+        AND pl.LinkTypeId = 1
+    WHERE mut.posts_created > 0
+    GROUP BY mut.user_id, mut.activity_month, mut.posts_created, mut.user_tags, tp.tag_name, tp.total_questions
+)
+SELECT 
+    ute.user_id,
+    u.DisplayName,
+    u.Location,
+    ute.activity_month,
+    ute.posts_created,
+    ute.tag_name,
+    ute.tag_popularity,
+    ute.linked_posts_in_tag,
+    mua.comments_made,
+    mua.upvotes_given,
+    mua.downvotes_given,
+    mua.badges_earned,
+    (ute.posts_created * 10.0 + ute.comments_made * 2.0 + mua.upvotes_given * 1.0 - mua.downvotes_given * 3.0) AS engagement_score,
+    RANK() OVER (
+        PARTITION BY ute.activity_month 
+        ORDER BY (ute.posts_created * 10.0 + ute.comments_made * 2.0 + mua.upvotes_given * 1.0 - mua.downvotes_given * 3.0) DESC
+    ) AS monthly_rank,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Power User'
+        WHEN u.Reputation >= 1000 THEN 'Active User'
+        ELSE 'New User'
+    END AS user_tier
+FROM user_tag_engagement ute
+JOIN Users u ON ute.user_id = u.Id
+JOIN monthly_user_activity mua ON ute.user_id = mua.user_id 
+    AND ute.activity_month = mua.activity_month
+WHERE ute.tag_name IS NOT NULL
+  AND ute.tag_popularity > 10
+  AND ute.activity_month >= CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+ORDER BY 
+    ute.activity_month DESC,
+    engagement_score DESC,
+    user_id;

@@ -1,0 +1,119 @@
+-- {"query": "16080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 189135, "output_tokens": 175557} 
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedQuestions,
+        AVG(p.Score) AS AvgQuestionScore,
+        COALESCE(STRING_AGG(DISTINCT SUBSTRING(t.tag, 1, 20), ',' ORDER BY SUBSTRING(t.tag, 1, 20)), 'No Tags') AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(COALESCE(p.Tags, ''))-2), '><')) AS tag
+    ) t ON TRUE
+    WHERE u.CreationDate >= '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+AnswerQualityMetrics AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(*) AS TotalAnswers,
+        COUNT(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 END) AS AcceptedAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Score > 10 THEN 1 ELSE 0 END) AS HighQualityAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 END) DESC) AS AcceptanceRank
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2 
+        AND a.OwnerUserId IS NOT NULL
+        AND a.CreationDate >= '2019-01-01'
+    GROUP BY a.OwnerUserId
+),
+BadgeCollectors AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS LastGoldBadgeDate,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    WHERE b.Date >= '2018-01-01'
+    GROUP BY b.UserId
+),
+VotingPatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesMarked,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        AVG(CASE WHEN v.VoteTypeId IN (2, 3) THEN EXTRACT(HOUR FROM v.CreationDate) END) AS AvgVotingHour
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+CommentActivity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.Score) AS MaxCommentScore,
+        COUNT(DISTINCT c.PostId) AS UniquePostsCommented
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT 
+    uem.DisplayName,
+    COALESCE(uem.Location, 'Unknown') AS Location,
+    uem.Reputation,
+    uem.QuestionCount,
+    ROUND(CAST(uem.AcceptedQuestions AS NUMERIC) / NULLIF(uem.QuestionCount, 0) * 100, 2) AS AcceptanceRate,
+    COALESCE(aqm.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(aqm.AcceptedAnswers, 0) AS AcceptedAnswers,
+    ROUND(COALESCE(aqm.AvgAnswerScore, 0), 2) AS AvgAnswerScore,
+    COALESCE(aqm.MedianAnswerScore, 0) AS MedianAnswerScore,
+    COALESCE(bc.GoldBadges, 0) + COALESCE(bc.SilverBadges, 0) * 0.5 + COALESCE(bc.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    COALESCE(vp.UpvotesGiven, 0) AS UpvotesGiven,
+    COALESCE(vp.DownvotesGiven, 0) AS DownvotesGiven,
+    CASE 
+        WHEN COALESCE(vp.DownvotesGiven, 0) = 0 THEN NULL
+        ELSE ROUND(CAST(COALESCE(vp.UpvotesGiven, 0) AS NUMERIC) / vp.DownvotesGiven, 2)
+    END AS UpvoteDownvoteRatio,
+    COALESCE(vp.TotalBountyAmount, 0) AS TotalBountyAmount,
+    COALESCE(ca.CommentCount, 0) AS CommentCount,
+    ROUND(COALESCE(ca.AvgCommentLength, 0), 2) AS AvgCommentLength,
+    uem.TopTags,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = uem.Id 
+       AND p2.PostTypeId = 1 
+       AND p2.ClosedDate IS NOT NULL) AS ClosedQuestionCount,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId)
+     FROM Posts p3
+     INNER JOIN PostLinks pl ON p3.Id = pl.PostId
+     WHERE p3.OwnerUserId = uem.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    DENSE_RANK() OVER (ORDER BY uem.Reputation DESC) AS ReputationRank,
+    PERCENT_RANK() OVER (ORDER BY COALESCE(aqm.AcceptedAnswers, 0)) AS AcceptancePercentile,
+    LAG(uem.Reputation) OVER (ORDER BY uem.Id) AS PrevUserReputation,
+    LEAD(uem.Reputation) OVER (ORDER BY uem.Id) AS NextUserReputation
+FROM UserEngagementMetrics uem
+LEFT JOIN AnswerQualityMetrics aqm ON uem.Id = aqm.OwnerUserId
+LEFT JOIN BadgeCollectors bc ON uem.Id = bc.UserId
+LEFT JOIN VotingPatterns vp ON uem.Id = vp.UserId
+LEFT JOIN CommentActivity ca ON uem.Id = ca.UserId
+WHERE (aqm.AcceptanceRank <= 1000 OR aqm.AcceptanceRank IS NULL)
+    AND (uem.Reputation > 1000 OR COALESCE(bc.GoldBadges, 0) > 0)
+    AND LENGTH(COALESCE(uem.DisplayName, '')) > 0
+ORDER BY 
+    CASE WHEN COALESCE(aqm.TotalAnswers, 0) > 100 THEN 1 ELSE 2 END,
+    uem.Reputation DESC,
+    COALESCE(aqm.AcceptedAnswers, 0) DESC
+LIMIT 500;

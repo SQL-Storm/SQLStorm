@@ -1,0 +1,94 @@
+WITH TopQuestioners AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionsAsked,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgQuestionScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC, AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) DESC) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 10
+), BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+), RecentCloseReasons AS (
+    SELECT
+        ph.PostId,
+        CASE
+            WHEN ph.Comment ~ '^[0-9]+$' THEN crt.Name
+            ELSE NULL
+        END AS CloseReason,
+        ph.CreationDate,
+        ph.UserId AS CloserUserId
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+), PopularTags AS (
+    SELECT
+        unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS UsageCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY TagName
+    HAVING COUNT(*) > 50
+), TopAnswers AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+)
+SELECT
+    tq.UserId,
+    tq.DisplayName,
+    tq.QuestionsAsked,
+    tq.AvgQuestionScore,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(bs.BadgeNames, 'None') AS BadgeNames,
+    ARRAY(
+        SELECT DISTINCT pt.TagName
+        FROM Posts qp
+        JOIN PopularTags pt ON qp.Tags LIKE '%' || pt.TagName || '%'
+        WHERE qp.OwnerUserId = tq.UserId
+          AND qp.PostTypeId = 1
+        LIMIT 5
+    ) AS SamplePopularTags,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.UserId = tq.UserId AND v.VoteTypeId = 2
+    ) AS UpVotesCast,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.UserId = tq.UserId AND c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    ) AS RecentComments,
+    (
+        SELECT COUNT(*)
+        FROM TopAnswers ta
+        JOIN Posts q ON q.Id = ta.QuestionId
+        WHERE q.OwnerUserId = tq.UserId AND ta.AnswerRank = 1 AND ta.AnswerScore >= 5
+    ) AS HighScoringAcceptedAnswersOnQuestions,
+    (
+        SELECT COUNT(DISTINCT rc.CloseReason)
+        FROM Posts qp
+        JOIN RecentCloseReasons rc ON qp.Id = rc.PostId
+        WHERE qp.OwnerUserId = tq.UserId
+    ) AS RecentQuestionCloseReasonTypes
+FROM TopQuestioners tq
+LEFT JOIN BadgeSummary bs ON tq.UserId = bs.UserId
+WHERE tq.rn <= 25
+ORDER BY tq.QuestionsAsked DESC, tq.AvgQuestionScore DESC;

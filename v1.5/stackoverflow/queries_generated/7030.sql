@@ -1,0 +1,259 @@
+-- {"query": "7030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2665} 
+with
+-- recent active questions with parsed tags and tag counts
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.OwnerUserId,
+    p.Tags,
+    -- split tags into array-like rows (simulate by extracting between angle brackets)
+    regexp_matches(coalesce(p.Tags,''), '<([^>]+)>','g') as TagMatch
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '180 days'
+),
+ParsedTags as (
+  select
+    rq.Id as QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.OwnerUserId,
+    (regexp_replace(tm[1],'^\s+|\s+$',''))::varchar(35) as TagName
+  from RecentQuestions rq,
+       lateral regexp_matches(coalesce(rq.Tags,''), '<([^>]+)>','g') as tm
+),
+-- aggregate tag usage in recent window and join with global tags
+TagStats as (
+  select
+    pt.TagName,
+    count(*) as RecentQuestionCount,
+    max(p.CreationDate) as LastUsed,
+    sum(case when p.Score >= 5 then 1 else 0 end) as HighScoreOccurences
+  from ParsedTags pt
+  join Posts p on p.Id = pt.QuestionId
+  group by pt.TagName
+),
+-- rank users by multifaceted activity
+UserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(sum(case when p.PostTypeId=1 then 1 else 0 end),0) as QuestionsPosted,
+    coalesce(sum(case when p.PostTypeId=2 then 1 else 0 end),0) as AnswersPosted,
+    coalesce(sum(v.CaseWhenUpVotes),0) as EstimatedUpVotesReceived,
+    coalesce(b.BadgeScore,0) as BadgeScore,
+    row_number() over (order by (coalesce(sum(case when p.PostTypeId=2 then 1 else 0 end),0) * 2 + coalesce(sum(case when p.PostTypeId=1 then 1 else 0 end),0) + coalesce(sum(v.CaseWhenUpVotes),0) / 10 + coalesce(b.BadgeScore,0)) desc, u.Reputation desc) as ActivityRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= now() - interval '365 days'
+  left join lateral (
+    select sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as CaseWhenUpVotes
+    from Votes v
+    where v.PostId in (select p2.Id from Posts p2 where p2.OwnerUserId = u.Id)
+  ) v on true
+  left join lateral (
+    select sum(case when b.Class = 1 then 50 when b.Class = 2 then 20 else 5 end) as BadgeScore
+    from Badges b
+    where b.UserId = u.Id and b.Date >= now() - interval '365 days'
+  ) b on true
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, v.CaseWhenUpVotes, b.BadgeScore
+),
+-- compute per-question derived metrics and correlate with owner stats
+QuestionMetrics as (
+  select
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    coalesce(u.ActivityRank, 999999) as OwnerActivityRank,
+    coalesce(u.Reputation,0) as OwnerReputation,
+    coalesce(u.QuestionsPosted,0) as OwnerQuestionsPastYear,
+    coalesce(ts.RecentQuestionCount,0) as TagRecentCount,
+    ts.TagName,
+    -- normalized popularity score combining score, views, answers and owner's activity
+    (
+      (coalesce(q.Score,0) * 3)
+      + (log(greatest(coalesce(q.ViewCount,0),1)) * 2)
+      + (coalesce(q.AnswerCount,0) * 5)
+      + (1000.0 / nullif(coalesce(u.ActivityRank,100000),0))
+      + (case when ts.RecentQuestionCount > 10 then 50 else greatest(0, 10 - ts.RecentQuestionCount) end)
+    ) as PopularityEstimate
+  from Posts q
+  left join ParsedTags pt on pt.QuestionId = q.Id
+  left join TagStats ts on ts.TagName = pt.TagName
+  left join UserActivity u on u.UserId = q.OwnerUserId
+  where q.PostTypeId = 1
+    and q.CreationDate >= now() - interval '180 days'
+),
+-- find recent edits and closures with correlated subqueries
+QuestionLifecycle as (
+  select
+    qm.*,
+    -- last edit by non-owner
+    (
+      select ph.CreationDate
+      from PostHistory ph
+      where ph.PostId = qm.Id
+        and ph.PostHistoryTypeId in (4,5,6,24) -- edits/mods
+        and ph.UserId is not null
+        and ph.UserId <> qm.OwnerUserId
+      order by ph.CreationDate desc
+      limit 1
+    ) as LastEditByOther,
+    -- whether question was ever closed in recent window and reason
+    (
+      select ph.Comment
+      from PostHistory ph
+      where ph.PostId = qm.Id
+        and ph.PostHistoryTypeId = 10
+        and ph.CreationDate >= qm.CreationDate
+      order by ph.CreationDate desc
+      limit 1
+    ) as LastCloseReasonRaw,
+    -- correlated subquery to compute median answer score using window inside subquery
+    (
+      select avg(score) from (
+        select a.Score,
+               row_number() over (order by a.Score) as rn,
+               count(*) over () as cnt
+        from Posts a
+        where a.ParentId = qm.Id
+      ) s
+      where rn in (floor((cnt+1)/2.0)::int, ceil((cnt+1)/2.0)::int)
+    ) as MedianAnswerScore
+  from QuestionMetrics qm
+),
+-- combine with comments and votes and winner selection using set operators
+QuestionEnriched as (
+  select
+    ql.*,
+    coalesce(c.CommentCount,0) as RecentComments,
+    coalesce(vs.UpVotes,0) as UpVotes,
+    coalesce(vs.DownVotes,0) as DownVotes,
+    coalesce(av.AcceptedAnswerScore, null) as AcceptedAnswerScore,
+    -- classification bucket using complicated predicates
+    case
+      when ql.PopularityEstimate > 1000 and ql.OwnerReputation > 10000 then 'Hot:Experienced'
+      when ql.PopularityEstimate > 1000 and ql.OwnerReputation <= 10000 then 'Hot:New'
+      when ql.PopularityEstimate between 500 and 1000 then 'Warm'
+      when ql.PopularityEstimate between 100 and 499 then 'Cold'
+      else 'Dormant'
+    end as HeatBucket
+  from QuestionLifecycle ql
+  left join (
+    select PostId, count(*) as CommentCount
+    from Comments c
+    where c.CreationDate >= now() - interval '90 days'
+    group by PostId
+  ) c on c.PostId = ql.Id
+  left join (
+    select v.PostId,
+           sum(case when v.VoteTypeId=2 then 1 else 0 end) as UpVotes,
+           sum(case when v.VoteTypeId=3 then 1 else 0 end) as DownVotes
+    from Votes v
+    where v.CreationDate >= now() - interval '365 days'
+    group by v.PostId
+  ) vs on vs.PostId = ql.Id
+  left join lateral (
+    select a.Score as AcceptedAnswerScore
+    from Posts a
+    where a.Id = (select p.AcceptedAnswerId from Posts p where p.Id = ql.Id)
+    limit 1
+  ) av on true
+),
+-- pick top N per tag using window functions, but include also questions without tags
+TopPerTag as (
+  select *
+  from (
+    select
+      qe.*,
+      coalesce(qe.TagName, '<no-tag>') as EffectiveTag,
+      row_number() over (partition by coalesce(qe.TagName,'<no-tag>') order by qe.PopularityEstimate desc nulls last, qe.CreationDate desc) as rn_per_tag
+    from QuestionEnriched qe
+  ) x
+  where x.rn_per_tag <= 5
+),
+-- compute deltas and anomalies with complex expressions and null logic
+AnomalyScores as (
+  select
+    tpt.*,
+    -- anomaly: unexpected spike in views relative to owner's past average
+    greatest(
+      0,
+      (tpt.ViewCount::float - coalesce((
+        select avg(p2.ViewCount) from Posts p2 where p2.OwnerUserId = tpt.OwnerUserId and p2.PostTypeId=1 and p2.Id <> tpt.Id and p2.CreationDate >= now() - interval '365 days'
+      ), tpt.ViewCount)) / nullif(coalesce((
+        select stddev_pop(p2.ViewCount) from Posts p2 where p2.OwnerUserId = tpt.OwnerUserId and p2.PostTypeId=1 and p2.Id <> tpt.Id and p2.CreationDate >= now() - interval '365 days'
+      ), 1),0)
+    ) as ViewAnomalyZ,
+    -- complex string expression to create a compact fingerprint
+    left(md5(coalesce(tpt.Title,'') || '|' || coalesce(tpt.TagName,'') || '|' || coalesce(tpt.OwnerUserId::text,'-')), 16) as TitleTagFingerprint,
+    -- boolean messy null logic: flagged if closed recently or median answer score negative or no accepted answer but many answers
+    ( (tpt.LastCloseReasonRaw is not null)
+      or (coalesce(tpt.MedianAnswerScore,0) < 0)
+      or (tpt.AcceptedAnswerScore is null and tpt.AnswerCount >= 5 and tpt.UpVotes > 10)
+    ) as HasPotentialIssues
+  from TopPerTag tpt
+)
+-- final select: union a detailed list with a compact leaderboard combining set operators
+select
+  'DETAILED' as RowType,
+  a.Id,
+  a.Title,
+  a.EffectiveTag as TagName,
+  a.CreationDate,
+  a.OwnerUserId,
+  a.OwnerReputation,
+  a.PopularityEstimate,
+  round(a.ViewAnomalyZ::numeric,3) as ViewAnomalyZ,
+  a.HeatBucket,
+  a.HasPotentialIssues,
+  a.TitleTagFingerprint,
+  a.MedianAnswerScore,
+  a.AcceptedAnswerScore,
+  a.RecentComments,
+  a.UpVotes,
+  a.DownVotes
+from AnomalyScores a
+order by a.TagName, a.PopularityEstimate desc
+
+union all
+
+select
+  'LEADER' as RowType,
+  null, null,
+  t.TagName,
+  null, null, null,
+  null,
+  null,
+  null,
+  null,
+  left(md5(string_agg(coalesce(q.Id::text,'') || ':' || coalesce(q.Title,''), '||') order by q.PopularityEstimate desc),16) as fingerprint,
+  null,null,null,null
+from (
+  select distinct coalesce(TagName,'<no-tag>') as TagName from ParsedTags
+) t
+left join lateral (
+  select q.Id, q.Title, q.PopularityEstimate
+  from QuestionMetrics q
+  left join ParsedTags pt on pt.QuestionId = q.Id
+  where coalesce(pt.TagName,'<no-tag>') = t.TagName
+  order by q.PopularityEstimate desc nulls last
+  limit 10
+) q on true
+group by t.TagName
+
+order by 1 desc, 4 NULLS LAST, 8 desc;

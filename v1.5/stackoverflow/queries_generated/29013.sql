@@ -1,0 +1,120 @@
+-- {"query": "29013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1608} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as QuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as AnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+    COUNT(DISTINCT b.Id) as BadgesReceived,
+    STRING_AGG(DISTINCT b.Name, ', ') as BadgeTypes,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT pl.Id) as PostLinks,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalViews,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Tags END) as TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.ParentId END) as AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.DeletedDate IS NOT NULL) as DeletedQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.DeletedDate IS NOT NULL) as DeletedAnswers,
+    CASE WHEN u.AccountId IS NOT NULL THEN 'Multiple Accounts' ELSE 'Single Account' END as AccountStatus,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2,3)) as TotalVotes,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationPercentile,
+    NTILE(4) OVER (ORDER BY u.Reputation DESC) as ReputationQuartile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as PreviousReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as NextReputation,
+    ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as AccountUserNumber,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 AND AVG(p.Score) > 10 THEN 'HighlyActive'
+        WHEN COUNT(DISTINCT p.Id) > 50 AND AVG(p.Score) > 5 THEN 'Active'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Participatory'
+        ELSE 'Casual'
+    END as ActivityLevel,
+    TRIM(BOTH '{}' FROM COALESCE(
+        (SELECT STRING_AGG(
+            CASE 
+                WHEN p4.PostTypeId = 1 THEN 'Q'
+                WHEN p4.PostTypeId = 2 THEN 'A' 
+                ELSE 'O'
+            END, ''
+        ) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+        AND p4.DeletedDate IS NULL
+        ORDER BY p4.CreationDate
+        ), '')) as PostActivityPattern,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b3 WHERE b3.UserId = u.Id AND b3.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b4 WHERE b4.UserId = u.Id AND b4.Class = 3) as BronzeBadges,
+    COALESCE(
+        (SELECT MAX(ph.CreationDate) 
+         FROM PostHistory ph 
+         WHERE ph.UserId = u.Id 
+         AND ph.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13)
+        ), u.CreationDate
+    ) as LastActivityDate,
+    (SELECT STRING_AGG(
+        DISTINCT CONCAT('Tag:', t.TagName, ' Count:', t.Count), 
+        ', '
+    ) 
+    FROM Tags t 
+    INNER JOIN Posts p5 ON p5.Tags LIKE '%' || t.TagName || '%' 
+    WHERE p5.OwnerUserId = u.Id 
+    AND p5.PostTypeId = 1 
+    AND t.Count > 100) as PopularTagFocus,
+    (SELECT COALESCE(SUM(v.BountyAmount), 0) 
+     FROM Votes v 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 8) as TotalBountyAwarded,
+    (SELECT COALESCE(SUM(v.BountyAmount), 0) 
+     FROM Votes v 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 9) as TotalBountyClosed,
+    CASE 
+        WHEN EXISTS(
+            SELECT 1 FROM Posts p6 
+            WHERE p6.OwnerUserId = u.Id 
+            AND p6.PostTypeId = 1 
+            AND EXTRACT(YEAR FROM p6.CreationDate) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)
+        ) THEN 'ThisYear'
+        WHEN EXISTS(
+            SELECT 1 FROM Posts p7 
+            WHERE p7.OwnerUserId = u.Id 
+            AND p7.PostTypeId = 1 
+            AND EXTRACT(YEAR FROM p7.CreationDate) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP) - 1
+        ) THEN 'LastYear'
+        ELSE 'Inactive'
+    END as RecentActivity,
+    (SELECT COUNT(DISTINCT ph2.PostId) 
+     FROM PostHistory ph2 
+     WHERE ph2.UserId = u.Id 
+     AND ph2.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13)) as EditActivities
+FROM Users u
+FULL OUTER JOIN Posts p ON p.OwnerUserId = u.Id 
+FULL OUTER JOIN Badges b ON b.UserId = u.Id 
+FULL OUTER JOIN Comments c ON c.UserId = u.Id 
+FULL OUTER JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN Tags t ON t.TagName LIKE '%' || p.Tags || '%'
+WHERE u.Id IS NOT NULL
+  AND (p.PostTypeId IS NULL OR p.PostTypeId IN (1,2))
+  AND (b.Id IS NULL OR b.Date >= '2020-01-01')
+  AND (c.Id IS NULL OR c.CreationDate >= '2020-01-01')
+  AND (pl.Id IS NULL OR pl.CreationDate >= '2020-01-01')
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.AccountId,
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 0 
+    AND (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+         OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0)
+ORDER BY 
+    u.Reputation DESC,
+    TotalPosts DESC
+LIMIT 1000;

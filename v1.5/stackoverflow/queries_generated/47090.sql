@@ -1,0 +1,151 @@
+-- {"query": "47090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 206460, "output_tokens": 183305} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON t.Id != th.Id
+    WHERE th.Level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as AcceptedAnswers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    INNER JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+monthly_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as Month,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT p.OwnerUserId) as ActiveUsers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) as AvgViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) as P95Score,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT v.Id) as Votes
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+badge_patterns AS (
+    SELECT 
+        b.Name as BadgeName,
+        b.Class,
+        COUNT(DISTINCT b.UserId) as UniqueRecipients,
+        COUNT(*) as TotalAwarded,
+        AVG(u.Reputation) as AvgRecipientRep,
+        STDDEV(u.Reputation) as StdDevRecipientRep,
+        MIN(b.Date) as FirstAwarded,
+        MAX(b.Date) as LastAwarded,
+        COUNT(*) FILTER (WHERE b.Date >= CURRENT_DATE - INTERVAL '30 days') as Last30Days,
+        COUNT(*) FILTER (WHERE b.Date >= CURRENT_DATE - INTERVAL '90 days') as Last90Days
+    FROM Badges b
+    INNER JOIN Users u ON u.Id = b.UserId
+    WHERE b.TagBased = false
+    GROUP BY b.Name, b.Class
+),
+edit_velocity AS (
+    SELECT 
+        ph.PostId,
+        p.Title,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) as EditCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7, 8, 9)) as RollbackCount,
+        MIN(ph.CreationDate) as FirstEdit,
+        MAX(ph.CreationDate) as LastEdit,
+        EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 3600 as EditSpanHours,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.DisplayName) FILTER (WHERE u.Reputation > 10000) as HighRepEditors
+    FROM PostHistory ph
+    INNER JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+        AND p.PostTypeId = 1
+        AND p.Score > 50
+    GROUP BY ph.PostId, p.Title
+    HAVING COUNT(DISTINCT ph.UserId) > 5
+)
+SELECT 
+    ma.Month,
+    ma.Questions,
+    ma.Answers,
+    ROUND(ma.Answers::NUMERIC / NULLIF(ma.Questions, 0), 2) as AnswerRatio,
+    ma.ActiveUsers,
+    ma.AvgViews,
+    ma.MedianScore,
+    ma.P95Score,
+    ue.DisplayName as TopExpert,
+    ue.TagName as ExpertTag,
+    ue.TotalScore as ExpertScore,
+    ue.AcceptedAnswers,
+    bp.BadgeName,
+    bp.TotalAwarded,
+    bp.Last30Days as RecentBadges,
+    ev.Title as HighlyEditedPost,
+    ev.EditCount,
+    ev.UniqueEditors,
+    ROUND(ev.EditSpanHours / 24, 1) as EditSpanDays,
+    th.TagName as PopularTag,
+    th.QuestionCount as TagQuestions,
+    LAG(ma.Questions, 12) OVER (ORDER BY ma.Month) as QuestionsYearAgo,
+    LAG(ma.ActiveUsers, 12) OVER (ORDER BY ma.Month) as ActiveUsersYearAgo,
+    ROUND(((ma.Questions - LAG(ma.Questions, 12) OVER (ORDER BY ma.Month))::NUMERIC / 
+           NULLIF(LAG(ma.Questions, 12) OVER (ORDER BY ma.Month), 0)) * 100, 2) as YoYGrowthPercent
+FROM monthly_activity ma
+CROSS JOIN LATERAL (
+    SELECT * FROM user_expertise 
+    WHERE TagRank = 1 
+    ORDER BY TotalScore DESC 
+    LIMIT 1
+) ue
+CROSS JOIN LATERAL (
+    SELECT * FROM badge_patterns 
+    WHERE Class = 1 
+    ORDER BY Last30Days DESC 
+    LIMIT 1
+) bp
+CROSS JOIN LATERAL (
+    SELECT * FROM edit_velocity 
+    ORDER BY EditCount DESC 
+    LIMIT 1
+) ev
+CROSS JOIN LATERAL (
+    SELECT * FROM tag_hierarchy 
+    WHERE Level = 1 
+    ORDER BY QuestionCount DESC 
+    LIMIT 1
+) th
+WHERE ma.Month >= CURRENT_DATE - INTERVAL '18 months'
+ORDER BY ma.Month DESC;

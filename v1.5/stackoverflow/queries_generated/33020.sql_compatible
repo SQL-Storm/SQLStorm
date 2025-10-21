@@ -1,0 +1,35 @@
+SELECT
+    p.PostTypeId,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS total_posts,
+    AVG(p.Score) AS average_score,
+    AVG(p.ViewCount) AS average_views,
+    COUNT(DISTINCT c.Id) AS comment_count,
+    COUNT(DISTINCT v.Id) AS vote_count,
+    COUNT(DISTINCT b.Id) AS badge_count,
+    (SELECT COUNT(*) FROM Posts q WHERE q.PostTypeId = 1 AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS questions_last_year,
+    (SELECT COUNT(*) FROM Comments com WHERE com.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS comments_last_year,
+    (SELECT COUNT(*) FROM Votes vo WHERE vo.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS votes_last_year,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS popular_tags
+FROM
+    Posts p
+JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    PostTags pt ON pt.PostId = p.Id
+LEFT JOIN
+    Tags t ON t.Id = pt.TagId
+LEFT JOIN
+    Badges b ON b.UserId = u.Id
+WHERE
+    p.CreationDate >= '2020-01-01'
+GROUP BY
+    p.PostTypeId,
+    u.Reputation
+ORDER BY
+    total_posts DESC
+LIMIT 50;

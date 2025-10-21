@@ -1,0 +1,57 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount
+    FROM 
+        Posts p
+    WHERE 
+        p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30 days'
+),
+BadgeCounts AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+),
+TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(r.Score), 0) AS TotalScore,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(r.Score), 0) DESC) AS RowNum
+    FROM 
+        Users u
+    LEFT JOIN RecentPosts r ON u.Id = r.OwnerUserId
+    LEFT JOIN BadgeCounts bc ON u.Id = bc.UserId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.TotalScore,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges
+FROM 
+    TopUsers tu
+LEFT JOIN Users u ON tu.UserId = u.Id
+WHERE 
+    tu.RowNum <= 10 AND 
+    u.EmailHash IS NOT NULL AND 
+    u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1 year'
+ORDER BY 
+    tu.TotalScore DESC;

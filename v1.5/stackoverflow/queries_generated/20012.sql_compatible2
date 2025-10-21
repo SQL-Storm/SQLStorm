@@ -1,0 +1,114 @@
+WITH UserContributionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)), 0) AS AveragePostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate < DATE '2023-01-01' AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedAnswers AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as AnswerRank,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate ASC) as NextAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+QuestionAnalysis AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS QuestionDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        MIN(ra.CreationDate) AS FirstAnswerDate,
+        (SELECT aa.CreationDate FROM Posts aa WHERE aa.Id = p.AcceptedAnswerId) AS AcceptedAnswerDate,
+        (
+            SELECT STRING_AGG(t.TagName, ', ')
+            FROM (
+                SELECT tag_name
+            ) AS s
+            JOIN Tags t ON t.TagName = tag_name
+            WHERE t.IsRequired = '1'
+        ) AS RequiredTags
+    FROM Posts p
+    LEFT JOIN RankedAnswers ra ON p.Id = ra.ParentId
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.DeletionDate IS NULL
+    GROUP BY p.Id, p.OwnerUserId, p.AcceptedAnswerId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+)
+SELECT
+    ucs.DisplayName,
+    ucs.Reputation,
+    ucs.QuestionCount,
+    ucs.AnswerCount,
+    ucs.GoldBadges,
+    CASE
+        WHEN ucs.Reputation > 100000 AND ucs.GoldBadges > 10 THEN 'Community Pillar'
+        WHEN ucs.Reputation > 20000 OR ucs.GoldBadges > 1 THEN 'Veteran Contributor'
+        ELSE 'Active Member'
+    END AS UserTier,
+    AVG(qa.QuestionScore) AS AvgUserQuestionScore,
+    SUM(qa.ViewCount) AS TotalUserQuestionViews,
+    AVG(EXTRACT(EPOCH FROM (qa.AcceptedAnswerDate - qa.QuestionDate))) / 3600.0 AS AvgHoursToAcceptedAnswer,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph
+        JOIN Posts p_hist ON ph.PostId = p_hist.Id
+        WHERE ph.PostHistoryTypeId = 5
+          AND p_hist.OwnerUserId = ucs.UserId
+          AND ph.CreationDate > ucs.UserCreationDate + INTERVAL '1 year'
+    ) AS EditsAfterFirstYear,
+    CONCAT(
+        'Last active on: ',
+        TO_CHAR(
+            (SELECT MAX(LastAccessDate) FROM Users u_inner WHERE u_inner.Id = ucs.UserId),
+            'YYYY-MM-DD'
+        ),
+        '. Top Question Tags: ',
+        UPPER(
+            (SELECT SUBSTRING(Tags FROM 2 FOR 20) FROM Posts p_top WHERE p_top.OwnerUserId = ucs.UserId AND p_top.PostTypeId = 1 ORDER BY Score DESC LIMIT 1)
+        )
+    ) AS UserSummary
+FROM UserContributionStats ucs
+JOIN QuestionAnalysis qa ON ucs.UserId = qa.OwnerUserId
+WHERE
+    ucs.QuestionCount > 5
+    AND ucs.AnswerCount > ucs.QuestionCount
+    AND EXISTS (
+        SELECT 1
+        FROM RankedAnswers ra
+        JOIN QuestionAnalysis qa_answered ON ra.ParentId = qa_answered.QuestionId
+        WHERE ra.OwnerUserId = ucs.UserId
+          AND ra.AnswerRank = 1
+          AND qa_answered.ViewCount > (SELECT AVG(ViewCount) * 2 FROM Posts WHERE PostTypeId = 1)
+    )
+GROUP BY
+    ucs.UserId,
+    ucs.DisplayName,
+    ucs.Reputation,
+    ucs.QuestionCount,
+    ucs.AnswerCount,
+    ucs.GoldBadges,
+    ucs.UserCreationDate
+HAVING
+    AVG(qa.QuestionScore) > 5 AND SUM(qa.ViewCount) > 50000
+ORDER BY
+    (ucs.Reputation * 0.5 + SUM(qa.ViewCount) * 0.1 + ucs.GoldBadges * 100) DESC
+LIMIT 50;

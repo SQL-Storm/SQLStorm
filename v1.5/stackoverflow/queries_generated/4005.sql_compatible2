@@ -1,0 +1,206 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        t.Count as TagGlobalCount,
+        row_number() over (partition by null order by t.Count desc) as GlobalRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgesRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        rank() over (partition by b.UserId order by count(*) desc, b.Class) as BadgeClassRank
+    from Badges b
+    where b.TagBased = 0
+    group by b.UserId, b.Class
+),
+UserReputationBuckets as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        case 
+            when u.Reputation >= 50000 then '50k+'
+            when u.Reputation >= 20000 then '20k-50k'
+            when u.Reputation >= 10000 then '10k-20k'
+            when u.Reputation >= 5000 then '5k-10k'
+            when u.Reputation >= 1000 then '1k-5k'
+            else '<1k'
+        end as RepBucket
+    from Users u
+),
+PostActivityWindows as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostScore,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostScore,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RnDesc,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate) as RnAsc
+    from Posts p
+    where p.OwnerUserId is not null
+),
+QuestionsWithAcceptedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        a.CreationDate as AcceptedAnswerCreationDate
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReasonName,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes cht on ph.Comment = cast(cht.Id as varchar) and pht.Name = 'Post Closed'
+    where pht.Name = 'Post Closed' and ph.Comment ~ '^[0-9]+$'
+    group by cht.Name
+),
+HighActivityUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(p.Id) as TotalPosts,
+        count(distinct p.Tags) as DistinctTagsCount,
+        sum(p.Score) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(p.Id) > 100 and sum(p.Score) > 500
+),
+DuplicatesAndLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name in ('Duplicate', 'Linked')
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentsCount,
+        avg(c.Score) filter (where c.Score is not null) as AvgCommentScore,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.UserId is not null
+    group by c.UserId, u.DisplayName
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.FavoriteCount,
+        p.CommentCount
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score > 5 and (p.Tags is not null and p.Tags <> '')
+),
+AggregateAnswerScores as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswersCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.Score > 10 then 1 else 0 end) as HighScoreAnswers
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+FinalSelection as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName,
+        q.QuestionScore,
+        q.QuestionViewCount,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        a.DisplayName as AcceptedAnswerUserName,
+        a.Score as AcceptedAnswerScoreValue,
+        aa.AnswersCount,
+        aa.AvgAnswerScore,
+        aa.MaxAnswerScore,
+        aa.HighScoreAnswers,
+        rtc.TagName,
+        rtc.TagGlobalCount,
+        rtc.GlobalRank,
+        ubr.RepBucket,
+        ub.BadgeCount as GoldBadges,
+        coalesce(cc.ClosedPostsCount, 0) as ClosedAsDuplicates,
+        coalesce(uc.CommentsCount, 0) as UserCommentsCount,
+        CASE WHEN q.AcceptedAnswerScore > aa.MaxAnswerScore THEN 1 ELSE 0 END as AcceptedIsHighestScoreAnswer,
+        pl.LinkTypeName,
+        pl.RelatedPostTitle
+    from QuestionsWithAcceptedAnswers q
+    left join Users u on u.Id = q.OwnerUserId
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join AggregateAnswerScores aa on aa.QuestionId = q.QuestionId
+    left join RecursiveTagCounts rtc on rtc.TagName = substring(q.Tags from '<([^>]+)>')
+    left join UserReputationBuckets ubr on ubr.Id = q.OwnerUserId
+    left join UserBadgesRanks ub on ub.UserId = q.OwnerUserId and ub.Class = 1
+    left join CloseReasonCounts cc on cc.CloseReasonName = 'Duplicate'
+    left join UserCommentStats uc on uc.UserId = q.OwnerUserId
+    left join DuplicatesAndLinks pl on pl.PostId = q.QuestionId and pl.LinkTypeName = 'Duplicate'
+    where q.QuestionScore > 10 and (aa.HighScoreAnswers > 0 or q.AcceptedAnswerId is not null)
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.DisplayName as QuestionOwner,
+    fs.RepBucket,
+    fs.GoldBadges,
+    fs.QuestionScore,
+    fs.QuestionViewCount,
+    fs.AnswersCount,
+    round(fs.AvgAnswerScore, 2) as AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.AcceptedAnswerId,
+    fs.AcceptedAnswerUserName,
+    fs.AcceptedAnswerScoreValue,
+    fs.AcceptedIsHighestScoreAnswer,
+    fs.TagName,
+    fs.TagGlobalCount,
+    fs.GlobalRank,
+    fs.ClosedAsDuplicates,
+    fs.UserCommentsCount,
+    fs.LinkTypeName,
+    fs.RelatedPostTitle
+from FinalSelection fs
+order by fs.QuestionScore desc nulls last, fs.AnswersCount desc, fs.QuestionViewCount desc
+limit 100;

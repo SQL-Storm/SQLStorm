@@ -1,0 +1,116 @@
+WITH user_posts AS (
+   SELECT
+      p.OwnerUserId,
+      p.Id,
+      p.PostTypeId,
+      p.Score,
+      p.CreationDate,
+      p.Tags
+   FROM Posts p
+   WHERE p.OwnerUserId IS NOT NULL
+),
+tag_counts AS (
+   SELECT
+      up.OwnerUserId,
+      tag,
+      COUNT(*) AS tag_cnt
+   FROM user_posts up
+   CROSS JOIN LATERAL unnest(
+         string_to_array(
+             substring(up.Tags,2, length(up.Tags)-2),
+             '"><'
+         )
+   ) AS tags(tag)
+   WHERE up.PostTypeId = 1
+   GROUP BY up.OwnerUserId, tag
+),
+top_tags AS (
+   SELECT
+      tc.OwnerUserId,
+      tc.tag AS top_tag,
+      tc.tag_cnt
+   FROM (
+      SELECT
+         OwnerUserId,
+         tag,
+         tag_cnt,
+         ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY tag_cnt DESC, tag) AS rn
+      FROM tag_counts
+   ) tc
+   WHERE tc.rn = 1
+),
+post_stats AS (
+   SELECT
+      OwnerUserId,
+      SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+      SUM(Score) AS total_score
+   FROM user_posts
+   GROUP BY OwnerUserId
+),
+vote_stats AS (
+   SELECT
+      p.OwnerUserId,
+      COUNT(*) AS vote_count
+   FROM Votes v
+   JOIN Posts p ON v.PostId = p.Id
+   WHERE p.OwnerUserId IS NOT NULL
+   GROUP BY p.OwnerUserId
+),
+comment_stats AS (
+   SELECT
+      p.OwnerUserId,
+      COUNT(*) AS comment_count
+   FROM Comments c
+   JOIN Posts p ON c.PostId = p.Id
+   WHERE p.OwnerUserId IS NOT NULL
+   GROUP BY p.OwnerUserId
+),
+yearly_activity_raw AS (
+   SELECT
+      p.OwnerUserId,
+      EXTRACT(YEAR FROM p.CreationDate) AS year,
+      COUNT(*) AS posts_this_year
+   FROM user_posts p
+   GROUP BY p.OwnerUserId, EXTRACT(YEAR FROM p.CreationDate)
+),
+user_yearly AS (
+   SELECT
+      OwnerUserId,
+      JSON_AGG(
+         JSON_BUILD_OBJECT('year', year, 'posts', posts_this_year)
+        ORDER BY year
+      ) AS yearly_activity
+   FROM yearly_activity_raw
+   GROUP BY OwnerUserId
+)
+SELECT
+   u.Id,
+   u.DisplayName,
+   u.Reputation,
+   COALESCE(ps.question_count,0) AS question_count,
+   COALESCE(ps.answer_count,0) AS answer_count,
+   COALESCE(vs.vote_count,0) AS total_votes,
+   COALESCE(cs.comment_count,0) AS total_comments,
+   COALESCE(tt.top_tag,'<no tag>') AS top_tag,
+   ROUND(
+      COALESCE(ps.total_score,0) /
+      NULLIF(COALESCE(ps.question_count,0)+COALESCE(ps.answer_count,0),0),
+      2
+   ) AS avg_post_score,
+   CASE
+      WHEN ROUND(
+          COALESCE(ps.total_score,0) /
+          NULLIF(COALESCE(ps.question_count,0)+COALESCE(ps.answer_count,0),0),
+          2
+      ) > 5 THEN 'High' ELSE 'Low'
+   END AS engagement_level,
+   COALESCE(uy.yearly_activity, '[]') AS yearly_post_activity
+FROM Users u
+LEFT JOIN post_stats ps ON ps.OwnerUserId = u.Id
+LEFT JOIN vote_stats vs ON vs.OwnerUserId = u.Id
+LEFT JOIN comment_stats cs ON cs.OwnerUserId = u.Id
+LEFT JOIN top_tags tt ON tt.OwnerUserId = u.Id
+LEFT JOIN user_yearly uy ON uy.OwnerUserId = u.Id
+ORDER BY u.Reputation DESC
+LIMIT 100;

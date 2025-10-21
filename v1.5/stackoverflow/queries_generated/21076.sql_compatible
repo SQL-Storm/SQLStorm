@@ -1,0 +1,123 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS RepRank,
+        AVG(u.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)) AS AvgRepByYear
+    FROM Users u
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE((
+            SELECT AVG(v.BountyAmount) 
+            FROM Votes v 
+            WHERE v.PostId = p.Id 
+              AND v.VoteTypeId = 8
+        ), 0) AS AvgBounty,
+        LAG(p.Score) OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.CreationDate) AS PrevScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND (p.DeletionDate IS NULL OR p.DeletionDate IS NULL)
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS BadgesInClass,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 10), ', ') OVER (
+            PARTITION BY b.UserId 
+            ORDER BY b.Date 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS RecentTagBadges
+    FROM Badges b
+    LEFT JOIN Badges bt ON bt.UserId = b.UserId AND bt.TagBased = 1
+    LEFT JOIN Tags t ON t.TagName LIKE '%' || bt.Name || '%'
+    WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+      AND (b.TagBased = 0 OR t.Id IS NOT NULL)
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.RepRank,
+    ROUND(au.Reputation / NULLIF(au.AvgRepByYear, 0), 2) AS RepRatio,
+    COUNT(qs.PostId) AS QuestionCount,
+    SUM(COALESCE(qs.AnswerCount, 0)) AS TotalAnswers,
+    AVG(COALESCE(qs.Score, 0)) AS AvgQuestionScore,
+    SUM(COALESCE(qs.ViewCount, 0)) AS TotalViews,
+    MAX(ba.BadgeName) AS TopBadge,
+    CASE 
+        WHEN ba.BadgesInClass >= 5 THEN 'High Achiever'
+        WHEN ba.BadgesInClass BETWEEN 1 AND 4 THEN 'Rising Star'
+        ELSE 'Newcomer'
+    END AS AchievementLevel,
+    LENGTH(COALESCE(ba.RecentTagBadges, '')) AS TagActivityScore,
+    (SELECT STRING_AGG(DISTINCT CAST(pl.RelatedPostId AS TEXT), ';') 
+     FROM PostLinks pl 
+     INNER JOIN Posts rp ON pl.RelatedPostId = rp.Id 
+     WHERE pl.PostId IN (SELECT PostId FROM QuestionStats WHERE OwnerUserId = au.UserId)
+       AND pl.LinkTypeId = 3
+       AND rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    ) AS DuplicateConnections,
+    GREATEST(
+        COALESCE(SUM(qs.AvgBounty), 0),
+        (SELECT MIN(v.BountyAmount) FROM Votes v WHERE v.UserId = au.UserId AND v.VoteTypeId = 8),
+        50
+    ) AS EffectiveBountyInfluence
+FROM ActiveUsers au
+LEFT OUTER JOIN QuestionStats qs ON qs.OwnerUserId = au.UserId 
+    AND EXTRACT(MONTH FROM qs.CreationDate) = EXTRACT(MONTH FROM au.CreationDate)
+INNER JOIN BadgeAchievements ba ON ba.UserId = au.UserId 
+    AND ba.Date = (SELECT MAX(Date) FROM Badges WHERE UserId = au.UserId)
+LEFT OUTER JOIN Comments c ON c.PostId = qs.PostId 
+    AND c.Score > 0 
+    AND (c.Text ILIKE '%great%' OR c.Text ILIKE '%thanks%')
+WHERE au.RepRank <= 1000
+  AND (qs.AvgQuestionScore > 5 OR qs.PostId IS NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph 
+      WHERE ph.PostId = qs.PostId 
+        AND ph.PostHistoryTypeId IN (12, 35)
+        AND ph.CreationDate > qs.CreationDate - INTERVAL '1 month'
+  )
+GROUP BY 
+    au.UserId, au.DisplayName, au.Reputation, au.RepRank, au.AvgRepByYear,
+    ba.BadgeName, ba.BadgesInClass, ba.RecentTagBadges
+HAVING 
+    COUNT(qs.PostId) > 0 
+    OR SUM(COALESCE(qs.ViewCount, 0)) > 10000
+    OR LENGTH(COALESCE(ba.RecentTagBadges, '')) > 20
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Anonymous Contributors' AS DisplayName,
+    0 AS Reputation,
+    9999 AS RepRank,
+    0 AS RepRatio,
+    COUNT(*) AS QuestionCount,
+    0 AS TotalAnswers,
+    AVG(0) AS AvgQuestionScore,
+    SUM(0) AS TotalViews,
+    NULL AS TopBadge,
+    'Community' AS AchievementLevel,
+    0 AS TagActivityScore,
+    NULL AS DuplicateConnections,
+    0 AS EffectiveBountyInfluence
+FROM Posts p
+WHERE p.OwnerUserId IS NULL 
+  AND p.PostTypeId = 1
+  AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+ORDER BY RepRank ASC, TotalViews DESC NULLS LAST
+LIMIT 50;

@@ -1,0 +1,220 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ', ') as TagFocus,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) * 0.1 + COALESCE(p.AnswerCount, 0) * 5 as WeightedScore
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+),
+ComplexActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6, 7, 8, 9) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'StatusChange'
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 'Moderation'
+            WHEN ph.PostHistoryTypeId IN (24, 35, 36) THEN 'Special'
+            ELSE 'Other'
+        END as ActivityType,
+        COALESCE(CAST(SUBSTRING(ph.Comment, 1, 50) AS VARCHAR(50)), 'No Comment') as ShortComment,
+        LENGTH(ph.Text) as TextLength,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousActivityDate,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) as TimeBetweenActivities
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATE '2018-01-01'
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationTier,
+    us.ReputationRank,
+    us.ReputationPercentile,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.LastPostDate,
+    us.AvgPostScore,
+    CASE 
+        WHEN us.QuestionCount > 0 THEN (CAST(us.AnswerCount AS DOUBLE PRECISION) / us.QuestionCount) * 100
+        ELSE 0
+    END as AnswerToQuestionRatio,
+    STRING_AGG(DISTINCT t.TagFocus, '; ') as UserTagFocus,
+    COUNT(DISTINCT CASE WHEN tp.PostTypeId = 1 THEN tp.Id END) as TopQuestions,
+    COUNT(DISTINCT CASE WHEN tp.PostTypeId = 2 THEN tp.Id END) as TopAnswers,
+    MAX(tp.Score) as MaxPostScore,
+    MIN(tp.Score) as MinPostScore,
+    AVG(tp.Score) as AvgTopPostScore,
+    STRING_AGG(DISTINCT t.ShortComment, ' | ') as RecentActivity,
+    COUNT(ca.PostId) as TotalActivity,
+    AVG(ca.TimeBetweenActivities) as AvgTimeBetweenActivities,
+    CASE 
+        WHEN COUNT(ca.PostId) > 0 THEN 
+            COUNT(DISTINCT CASE WHEN ca.ActivityType = 'Edit' THEN 1 END) * 100.0 / COUNT(ca.PostId)
+        ELSE 0
+    END as EditPercentage,
+    COALESCE(
+        (SELECT AVG(b2.Reputation) 
+         FROM UserStats b2 
+         WHERE b2.UserId IN (
+             SELECT DISTINCT p.OwnerUserId 
+             FROM Posts p 
+             WHERE p.Id IN (
+                 SELECT ph2.PostId 
+                 FROM PostHistory ph2 
+                 WHERE ph2.UserId = us.UserId 
+                 AND ph2.PostHistoryTypeId = 24 
+                 AND ph2.CreationDate >= DATE '2020-01-01'
+             )
+         )
+        ), 
+        0
+    ) as AvgReputationOfEditedPosts,
+    CASE 
+        WHEN us.PostCount > 0 THEN 
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = us.UserId 
+             AND p.Score >= (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = us.UserId)
+            ) * 100.0 / us.PostCount 
+        ELSE 0
+    END as AboveAvgScorePostsPercent,
+    CAST(
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = us.UserId 
+         AND (p.AcceptedAnswerId IS NOT NULL OR p.Score > 10)
+        ) * 100.0 / us.PostCount 
+    AS INT) as HighValuePostPercent,
+    COALESCE(
+        (SELECT STRING_AGG(CAST(p2.Id AS VARCHAR(10)), ', ') 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = us.UserId 
+         AND p2.PostTypeId = 1 
+         ORDER BY p2.CreationDate DESC 
+         LIMIT 5
+        ), 
+        'None'
+    ) as RecentQuestions,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1
+            FROM Votes v 
+            WHERE v.UserId = us.UserId 
+            AND v.VoteTypeId = 2 
+            AND v.CreationDate > DATE '2020-01-01'
+        )
+        THEN 'Regular Voter'
+        ELSE 'Inactive Voter'
+    END as VotingStatus,
+    CASE 
+        WHEN us.DownVotes > 0 THEN 
+            (CAST(us.UpVotes AS DOUBLE PRECISION) / us.DownVotes) * 100
+        ELSE us.UpVotes * 100
+    END as UpVsDownRatio,
+    CAST(
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = us.UserId 
+         AND b.Date > DATE '2020-01-01'
+        ) AS VARCHAR(10)
+    ) || ' recent badges' as RecentBadges,
+    LPAD('*', CASE WHEN us.Reputation > 1000 THEN 5 ELSE 1 END, '*') as StarRating,
+    COALESCE(
+        (SELECT MAX(p3.Score) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = us.UserId 
+         AND p3.PostTypeId = 1 
+         AND p3.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2021-12-31'
+        ), 
+        0
+    ) as MaxQuestionScore2020
+FROM UserStats us
+LEFT JOIN TopPosts tp ON us.UserId = tp.OwnerUserId
+LEFT JOIN ComplexActivity ca ON us.UserId = ca.UserId
+LEFT JOIN Posts p ON us.UserId = p.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        UserId,
+        STRING_AGG(TagFocus, '; ') as TagFocus,
+        STRING_AGG(ShortComment, ' | ') as ShortComment
+    FROM (
+        SELECT 
+            u.Id as UserId,
+            STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ', ') as TagFocus,
+            ph.Comment as ShortComment
+        FROM Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+        WHERE u.CreationDate >= DATE '2010-01-01'
+        GROUP BY u.Id, ph.Comment
+    ) sub
+    GROUP BY UserId
+) t ON us.UserId = t.UserId
+WHERE us.PostCount >= 5
+GROUP BY 
+    us.UserId, us.DisplayName, us.Reputation, us.ReputationTier, 
+    us.ReputationRank, us.ReputationPercentile, 
+    us.PostCount, us.CommentCount, us.BadgeCount, 
+    us.LastPostDate, us.AvgPostScore, 
+    us.QuestionCount, us.AnswerCount
+HAVING 
+    COUNT(DISTINCT CASE WHEN tp.PostTypeId = 1 THEN tp.Id END) >= 1 
+    OR COUNT(DISTINCT CASE WHEN tp.PostTypeId = 2 THEN tp.Id END) >= 2
+ORDER BY us.Reputation DESC
+LIMIT 1000
+OFFSET 50;

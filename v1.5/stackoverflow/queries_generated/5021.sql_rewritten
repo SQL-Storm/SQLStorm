@@ -1,0 +1,104 @@
+-- {"query": "5021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1012} 
+WITH recent_active_users AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostsLastMonth,
+        COUNT(DISTINCT c.Id) AS CommentsLastMonth,
+        COALESCE(SUM(b.Class = 1), 0) AS GoldBadgesLastMonth,
+        u.LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON u.Id = p.OwnerUserId
+        AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+    LEFT JOIN Comments c
+        ON u.Id = c.UserId
+        AND c.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+    LEFT JOIN Badges b
+        ON u.Id = b.UserId
+        AND b.Class = 1
+        AND b.Date >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+    WHERE u.LastAccessDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+user_question_stats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotesOnQuestions
+    FROM Posts p
+    LEFT JOIN Votes v
+        ON p.Id = v.PostId AND v.VoteTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+user_answer_stats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS AnswersGiven,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotesOnAnswers
+    FROM Posts p
+    LEFT JOIN Votes v
+        ON p.Id = v.PostId AND v.VoteTypeId = 2
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+most_commented_post AS (
+    SELECT DISTINCT ON (p.OwnerUserId)
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CommentCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    ORDER BY p.OwnerUserId, p.CommentCount DESC NULLS LAST, p.CreationDate DESC
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.PostsLastMonth,
+    rau.CommentsLastMonth,
+    rau.GoldBadgesLastMonth,
+    rau.LastAccessDate,
+    uqs.QuestionsAsked,
+    uqs.AvgQuestionScore,
+    uqs.TotalUpvotesOnQuestions,
+    uas.AnswersGiven,
+    uas.AvgAnswerScore,
+    uas.TotalUpvotesOnAnswers,
+    CONCAT(rau.DisplayName, ' (UserId: ', rau.UserId, ')') AS UserSummary,
+    mc.PostId AS MostCommentedPostId,
+    mc.Title AS MostCommentedPostTitle,
+    mc.Score AS MostCommentedPostScore,
+    mc.CommentCount AS MostCommentedPostComments,
+    CASE
+        WHEN rau.Reputation >= 10000 AND rau.GoldBadgesLastMonth > 0 THEN 'Legendary'
+        WHEN rau.Reputation >= 10000 THEN 'High Rep'
+        WHEN rau.Reputation >= 1000 THEN 'Mid Rep'
+        ELSE 'Newbie'
+    END AS UserTier,
+    CASE
+        WHEN (uqs.QuestionsAsked IS NULL OR uqs.QuestionsAsked = 0)
+             AND (uas.AnswersGiven IS NULL OR uas.AnswersGiven = 0)
+        THEN TRUE
+        ELSE FALSE
+    END AS IsLurker,
+    ROW_NUMBER() OVER (ORDER BY rau.Reputation DESC, rau.PostsLastMonth DESC) AS UserRank
+FROM recent_active_users rau
+LEFT JOIN user_question_stats uqs ON rau.UserId = uqs.UserId
+LEFT JOIN user_answer_stats uas ON rau.UserId = uas.UserId
+LEFT JOIN most_commented_post mc ON rau.UserId = mc.OwnerUserId
+WHERE
+    (rau.PostsLastMonth > 0 OR rau.CommentsLastMonth > 0)
+    AND COALESCE(rau.GoldBadgesLastMonth, 0) >= 0
+    AND (
+        (uqs.AvgQuestionScore IS NULL OR uqs.AvgQuestionScore > -3) -- ignore bad questioners
+        OR (uas.AvgAnswerScore IS NULL OR uas.AvgAnswerScore > -3)
+    )
+ORDER BY rau.Reputation DESC, rau.PostsLastMonth DESC
+LIMIT 100;

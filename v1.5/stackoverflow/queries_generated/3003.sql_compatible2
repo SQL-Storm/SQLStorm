@@ -1,0 +1,105 @@
+WITH UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COUNT(CASE WHEN bh.PostHistoryTypeId IN (2, 5, 6, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66) THEN 1 END) AS TotalEdits,
+        MAX(u.LastAccessDate) OVER (PARTITION BY u.Id) AS LastActive
+    FROM
+        Users u
+        LEFT OUTER JOIN Votes v ON u.Id = v.UserId
+        LEFT OUTER JOIN PostHistory bh ON u.Id = bh.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        pt.Name AS PostType,
+        tc.Name AS ClosedReason,
+        ARRAY_AGG(c.Id) FILTER (WHERE c.Score >= 0) AS PositiveComments,
+        ARRAY_AGG(c.Id) FILTER (WHERE c.Score < 0) AS NegativeComments,
+        vl.TotalVotes,
+        NULLIF(p.Body, '') AS BodyContent,
+        pg.LastActivityDate,
+        un.LastAccessDate AS LastOwnerAccess,
+        jsonb_object_agg(t.TagName, t.Count) AS TagCountMap
+    FROM
+        Posts p
+        JOIN PostTypes pt ON p.PostTypeId = pt.Id
+        LEFT OUTER JOIN PostLinks pl ON pl.PostId = p.Id
+        LEFT OUTER JOIN PostLinks pl2 ON pl.RelatedPostId = pl2.PostId AND pl2.PostId = p.Id
+        LEFT OUTER JOIN ClosedReasonTypes tc ON p.ClosedDate IS NOT NULL AND tc.Id = (
+            SELECT bla.Comment FROM PostHistory bla WHERE bla.PostId = p.Id AND bla.PostHistoryTypeId = 10 ORDER BY bla.CreationDate DESC
+        )
+        LEFT OUTER JOIN Comments c ON c.PostId = p.Id
+        LEFT OUTER JOIN (
+            SELECT PostId, COUNT(*) AS TotalVotes FROM Votes GROUP BY PostId
+        ) vl ON vl.PostId = p.Id
+        LEFT OUTER JOIN Users un ON p.OwnerUserId = un.Id
+        LEFT OUTER JOIN LATERAL (
+            SELECT t.TagName, t.Count
+            FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name
+            LEFT JOIN Tags t ON t.TagName = tag_name
+        ) t ON true
+        LEFT OUTER JOIN LATERAL (
+            SELECT MAX(LastActivityDate) AS LastActivityDate FROM Posts WHERE ParentId = p.Id OR Id = p.Id
+        ) pg ON true
+    GROUP BY
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, pt.Name, tc.Name, un.LastAccessDate
+),
+ComplexPostAnalysis AS (
+    SELECT
+        pe.PostId,
+        pe.Title,
+        pe.PostType,
+        pe.BodyContent,
+        CASE WHEN pe.Score > 10 AND pe.ViewCount > 1000 THEN true ELSE false END AS PopularFlag,
+        (pe.PositiveComments @> ARRAY[ARRAY_AGG(c.Id) FILTER (WHERE c.Score >= 0)]) AS HasPositiveComments,
+        EXISTS (
+            SELECT 1 FROM PostLinks pl3 WHERE pl3.PostId = pe.PostId AND pl3.LinkTypeId = 3
+        ) AS IsDuplicate,
+        ROW_NUMBER() OVER (PARTITION BY pe.PostType ORDER BY pe.CreationDate DESC) AS RecentPostsRank
+    FROM
+        PostEngagement pe
+        LEFT OUTER JOIN Comments c ON c.PostId = pe.PostId
+)
+
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotesReceived,
+    u.DownVotesReceived,
+    u.TotalEdits,
+    u.LastActive,
+    p.PostId,
+    p.Title,
+    p.PostType,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.ClosedReason,
+    p.LastActivityDate,
+    p.LastOwnerAccess,
+    p.TagCountMap,
+    ca.PopularFlag,
+    ca.HasPositiveComments,
+    ca.IsDuplicate,
+    ca.RecentPostsRank
+FROM
+    UserReputationStats u
+FULL OUTER JOIN
+    ComplexPostAnalysis ca ON u.UserId = ca.PostId
+LEFT OUTER JOIN
+    PostEngagement p ON ca.PostId = p.PostId
+WHERE
+    (u.Reputation > 1000 AND u.UpVotesReceived > 500) OR (ca.PopularFlag = true) OR (ca.IsDuplicate = true)
+ORDER BY
+    u.Reputation DESC NULLS LAST, p.CreationDate DESC NULLS LAST;

@@ -1,0 +1,62 @@
+-- {"query": "28058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1573} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 2
+    GROUP BY u.Id
+), PostClosures AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE pht.Name = 'Post Closed') AS CloseCount,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.Comment::INT = crt.Id) AS CloseReasons
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment::INT = crt.Id
+    WHERE pht.Name IN ('Post Closed', 'Post Reopened')
+    GROUP BY ph.PostId
+)
+SELECT 
+    us.Id,
+    us.GlobalRank,
+    us.Location,
+    CONCAT(us.GoldBadges, '/', us.SilverBadges, '/', us.BronzeBadges) AS BadgeHierarchy,
+    (us.Reputation * 0.1 + COALESCE(SUM(p.AnswerCount * 10 + p.FavoriteCount), 0)) AS WeightedScore,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = us.Id 
+     AND p2.PostTypeId = 1 
+     AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p2.Id AND v.VoteTypeId = 2)) AS QuestionsWithUpvotes,
+    ARRAY_TO_STRING(ARRAY(SELECT DISTINCT SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2) 
+                          FROM Posts p3 
+                          WHERE p3.OwnerUserId = us.Id 
+                          AND p3.Tags IS NOT NULL), '|') AS UniqueTags,
+    COALESCE(pc.CloseReasons, 'Never Closed') AS ClosureHistory,
+    ROW_NUMBER() OVER (ORDER BY us.AvgPostScore DESC NULLS LAST) AS PostQualityRank,
+    LEAD(us.Id, 1) OVER (ORDER BY us.Reputation DESC) AS NextTopUser,
+    CASE 
+        WHEN us.Reputation > 100000 THEN 'Elite' 
+        WHEN us.Reputation BETWEEN 50000 AND 100000 THEN 'Advanced' 
+        ELSE 'Standard' 
+    END AS ReputationTier
+FROM UserStats us
+LEFT JOIN Posts p ON us.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN PostClosures pc ON p.Id = pc.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId AND c.CreationDate BETWEEN p.CreationDate AND p.CreationDate + INTERVAL '7 days'
+WHERE us.Reputation > 1000
+  AND (EXTRACT(YEAR FROM us.CreationDate) >= 2010 OR us.WebsiteUrl IS NOT NULL)
+  AND (us.Location LIKE '%USA%' OR us.Location = 'Unknown')
+GROUP BY us.Id, us.GlobalRank, us.Location, us.GoldBadges, us.SilverBadges, us.BronzeBadges, us.AvgPostScore, pc.CloseReasons
+HAVING COUNT(p.Id) > 5 OR SUM(p.ViewCount) > 10000
+ORDER BY WeightedScore DESC NULLS LAST, PostQualityRank
+LIMIT 100;

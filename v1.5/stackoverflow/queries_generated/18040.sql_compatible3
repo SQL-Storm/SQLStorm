@@ -1,0 +1,177 @@
+WITH
+  PostScoreDelta AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Score,
+      SUM(
+        CASE
+          WHEN v.VoteTypeId = 2 THEN 1
+          WHEN v.VoteTypeId = 3 THEN -1
+          ELSE 0
+        END
+      ) AS VoteScoreDelta
+    FROM
+      Posts AS p
+      LEFT JOIN Votes AS v
+        ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Score
+  ),
+  UserPostEngagement AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(psd.VoteScoreDelta) AS TotalVoteScore,
+      AVG(psd.Score) AS AveragePostScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts AS p
+      JOIN PostScoreDelta AS psd
+        ON p.Id = psd.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.OwnerUserId
+  ),
+  TagWisdom AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TagQuestionCount,
+      AVG(psd.Score) AS AverageTagQuestionScore,
+      MAX(p.CreationDate) AS LastTagQuestionDate
+    FROM
+      Tags AS t
+      JOIN Posts AS p
+        ON t.TagName = ANY(
+          string_to_array(
+            substr(p.Tags, 2, char_length(p.Tags) - 2),
+            '><'
+          )
+        )
+      JOIN PostScoreDelta AS psd
+        ON p.Id = psd.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT p.Id) > 50
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM
+      Badges AS b
+    GROUP BY
+      b.UserId
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  COALESCE(upe.TotalPosts, 0) AS TotalPosts,
+  COALESCE(upe.TotalVoteScore, 0) AS TotalVoteScore,
+  COALESCE(upe.AveragePostScore, 0.0) AS AveragePostScore,
+  CASE
+    WHEN upe.LastPostDate IS NULL THEN 'Never Posted'
+    ELSE CAST(upe.LastPostDate AS VARCHAR)
+  END AS LastActivity,
+  COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+  (
+    SELECT
+      COUNT(*) AS count
+    FROM
+      Comments AS c
+    WHERE
+      c.UserId = u.Id
+      AND c.CreationDate >= u.CreationDate
+  ) AS UserCommentCount,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    ELSE
+      CASE
+        WHEN POSITION('://' IN u.WebsiteUrl) > 0 THEN
+          SUBSTR(u.WebsiteUrl, POSITION('://' IN u.WebsiteUrl) + 3, NULL)
+        ELSE u.WebsiteUrl
+      END
+  END AS WebsiteDomain,
+  (
+    u.Reputation * 1.0
+    + COALESCE(upe.TotalVoteScore, 0) * 0.5
+    + COALESCE(upe.TotalPosts, 0) * 0.2
+    + COALESCE(ubs.GoldBadges, 0) * 10
+    + COALESCE(ubs.SilverBadges, 0) * 5
+    + COALESCE(ubs.BronzeBadges, 0) * 1
+  ) AS UserEngagementScore,
+  (
+    SELECT
+      COUNT(*) AS count
+    FROM
+      Posts AS p
+      LEFT JOIN PostLinks AS pl
+        ON p.Id = pl.PostId
+    WHERE
+      p.OwnerUserId = u.Id
+      AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksCreated,
+  (
+    SELECT
+      COUNT(*) AS count
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id
+      AND ph.PostHistoryTypeId = 10
+      AND ph.Comment IS NOT NULL
+      AND ph.Comment <> '0'
+  ) AS PostsClosedByThisUser,
+  tw.TagName AS TopActiveTagName,
+  tw.AverageTagQuestionScore AS AverageScoreInTopTag
+FROM
+  Users AS u
+  LEFT JOIN UserPostEngagement AS upe
+    ON u.Id = upe.OwnerUserId
+  LEFT JOIN UserBadgeSummary AS ubs
+    ON u.Id = ubs.UserId
+  LEFT JOIN LATERAL (
+    SELECT
+      tw_inner.TagName,
+      tw_inner.AverageTagQuestionScore
+    FROM
+      TagWisdom AS tw_inner
+      JOIN Posts AS p_inner
+        ON tw_inner.TagName = ANY(
+          string_to_array(
+            substr(p_inner.Tags, 2, char_length(p_inner.Tags) - 2),
+            '><'
+          )
+        )
+    WHERE
+      p_inner.OwnerUserId = u.Id
+      AND p_inner.PostTypeId = 1
+    ORDER BY
+      tw_inner.AverageTagQuestionScore DESC
+    LIMIT 1
+  ) AS tw
+    ON TRUE
+WHERE
+  u.Reputation > 1000
+  AND u.DownVotes < u.UpVotes * 0.1
+  AND (
+    upe.TotalPosts > 50
+    OR ubs.GoldBadges > 0
+  )
+ORDER BY
+  UserEngagementScore DESC
+LIMIT 100;

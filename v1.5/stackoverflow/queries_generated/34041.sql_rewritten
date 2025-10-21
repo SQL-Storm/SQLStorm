@@ -1,0 +1,83 @@
+-- {"query": "34041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 838} 
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 1000
+    LIMIT 100
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Date::date) AS ActiveDaysWithBadges
+    FROM Badges b
+    WHERE b.UserId IN (SELECT Id FROM TopUsers)
+    GROUP BY b.UserId
+),
+UserActivity AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionViewCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.OwnerUserId IN (SELECT Id FROM TopUsers)
+    GROUP BY p.OwnerUserId
+),
+UserLinkStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT pl.Id) AS OutboundPostLinks,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateLinkedPosts
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.OwnerUserId IN (SELECT Id FROM TopUsers)
+    GROUP BY p.OwnerUserId
+),
+TagUsage AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(SUM((p.Tags IS NOT NULL)::int),0) AS PostsWithTags,
+        COUNT(DISTINCT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><'))) AS DistinctTagsUsed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE u.Id IN (SELECT Id FROM TopUsers)
+    GROUP BY u.Id
+)
+SELECT
+    tu.rn,
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.ActiveDaysWithBadges,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ROUND(ua.AvgQuestionScore::numeric,2) AS AvgQuestionScore,
+    ROUND(ua.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+    ua.MaxQuestionViewCount,
+    ua.CommentsCount,
+    ua.LastActivity,
+    ul.OutboundPostLinks,
+    ul.DuplicateLinkedPosts,
+    tg.PostsWithTags,
+    tg.DistinctTagsUsed
+FROM TopUsers tu
+LEFT JOIN UserBadgeStats ub ON ub.UserId = tu.Id
+LEFT JOIN UserActivity ua ON ua.UserId = tu.Id
+LEFT JOIN UserLinkStats ul ON ul.UserId = tu.Id
+LEFT JOIN TagUsage tg ON tg.UserId = tu.Id
+ORDER BY tu.rn;

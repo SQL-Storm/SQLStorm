@@ -1,0 +1,186 @@
+-- {"query": "29081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1720} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) AS AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                ROUND(CAST(COUNT(DISTINCT p.Id) AS FLOAT) / NULLIF(DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate), 0) * 30, 2)
+            ELSE 0 
+        END AS AvgPostsPerMonth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) AS AgeDays,
+        CASE 
+            WHEN p.Score >= 10 THEN 'High'
+            WHEN p.Score >= 5 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    ELSE 'Unanswered'
+                END
+            WHEN p.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN p.Score >= 10 THEN 'High Quality'
+                    WHEN p.Score >= 0 THEN 'Moderate Quality'
+                    ELSE 'Low Quality'
+                END
+            ELSE 'Other'
+        END AS PostQuality,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+                    ELSE 0
+                END
+            ELSE 0
+        END AS HasAcceptedAnswer,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS OwnerPreviousScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedUserMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.AccountAgeDays,
+        uas.AvgPostsPerMonth,
+        ppm.PostId,
+        ppm.Title,
+        ppm.Score,
+        ppm.ViewCount,
+        ppm.CommentCount,
+        ppm.FavoriteCount,
+        ppm.CreationDate,
+        ppm.AgeDays,
+        ppm.ScoreCategory,
+        ppm.PostQuality,
+        ppm.AnswerCount,
+        ppm.HasAcceptedAnswer,
+        ppm.PreviousScore,
+        ppm.OwnerPreviousScore,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY ppm.CreationDate DESC) AS RowNum,
+        RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalPosts DESC) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY ppm.Score DESC) AS ScoreRank,
+        NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS ReputationDecile
+    FROM UserActivityStats uas
+    LEFT JOIN PostPerformanceMetrics ppm ON uas.UserId = ppm.OwnerUserId
+    WHERE uas.TotalPosts > 0
+),
+UserPostSummary AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        SUM(TotalPosts) AS TotalPosts,
+        SUM(Questions) AS TotalQuestions,
+        SUM(Answers) AS TotalAnswers,
+        SUM(Comments) AS TotalComments,
+        SUM(Badges) AS TotalBadges,
+        AVG(AccountAgeDays) AS AvgAccountAge,
+        AVG(AvgPostsPerMonth) AS AvgPostsPerMonth,
+        COUNT(DISTINCT PostId) AS UniquePosts,
+        SUM(CASE WHEN ScoreCategory = 'High' THEN 1 ELSE 0 END) AS HighScorePosts,
+        SUM(CASE WHEN PostQuality = 'Answered' THEN 1 ELSE 0 END) AS AnsweredQuestions,
+        SUM(CASE WHEN HasAcceptedAnswer = 1 THEN 1 ELSE 0 END) AS PostsWithAcceptedAnswer
+    FROM CombinedUserMetrics
+    GROUP BY UserId, DisplayName, Reputation
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.TotalQuestions,
+    ups.TotalAnswers,
+    ups.TotalComments,
+    ups.TotalBadges,
+    ups.AvgAccountAge,
+    ups.AvgPostsPerMonth,
+    ups.UniquePosts,
+    ups.HighScorePosts,
+    ups.AnsweredQuestions,
+    ups.PostsWithAcceptedAnswer,
+    CASE 
+        WHEN ups.TotalPosts > 0 AND ups.TotalAnswers > 0 THEN 
+            ROUND(CAST(ups.TotalAnswers AS FLOAT) / NULLIF(ups.TotalQuestions, 0) * 100, 2)
+        ELSE 0 
+    END AS AnswerQuestionRatio,
+    CASE 
+        WHEN ups.TotalPosts > 0 THEN 
+            ROUND(CAST(ups.TotalComments AS FLOAT) / NULLIF(ups.TotalPosts, 0), 2)
+        ELSE 0 
+    END AS CommentsPerPost,
+    CASE 
+        WHEN ups.TotalBadges > 0 THEN 
+            ROUND(CAST(ups.TotalBadges AS FLOAT) / NULLIF(ups.TotalPosts, 0), 2)
+        ELSE 0 
+    END AS BadgesPerPost,
+    CASE 
+        WHEN ups.TotalPosts > 0 THEN 
+            ROUND(CAST(ups.TotalPosts AS FLOAT) / NULLIF(ups.AvgAccountAge, 0) * 30, 2)
+        ELSE 0 
+    END AS PostsPerMonth,
+    CASE 
+        WHEN ups.Reputation >= 10000 THEN 'Master'
+        WHEN ups.Reputation >= 5000 THEN 'Expert'
+        WHEN ups.Reputation >= 1000 THEN 'Intermediate'
+        WHEN ups.Reputation >= 100 THEN 'Beginner'
+        ELSE 'Novice'
+    END AS ReputationTier,
+    CASE 
+        WHEN ups.TotalPosts > 100 THEN 'Veteran'
+        WHEN ups.TotalPosts > 50 THEN 'Seasoned'
+        WHEN ups.TotalPosts > 10 THEN 'Experienced'
+        ELSE 'New'
+    END AS ContributionLevel,
+    'UserRank: ' + CAST(ups.UserId AS VARCHAR(10)) + ' - ScoreRank: ' + CAST(DENSE_RANK() OVER (ORDER BY ups.Reputation DESC) AS VARCHAR(10)) AS UserPerformanceSummary
+FROM UserPostSummary ups
+WHERE ups.TotalPosts > 0
+    AND ups.TotalPosts >= (SELECT AVG(TotalPosts) FROM UserPostSummary WHERE TotalPosts > 0)
+    AND ups.Reputation >= (SELECT AVG(Reputation) FROM UserPostSummary WHERE Reputation > 0)
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = ups.UserId 
+            AND p.PostTypeId IN (1, 2)
+            AND p.CreationDate >= DATEADD(MONTH, -12, CURRENT_TIMESTAMP)
+    )
+ORDER BY ups.Reputation DESC, ups.TotalPosts DESC, ups.UniquePosts DESC
+LIMIT 1000;

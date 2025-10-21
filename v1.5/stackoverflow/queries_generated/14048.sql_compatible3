@@ -1,0 +1,71 @@
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    CAST(ROUND(DATE_PART('epoch', TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) / (365.25 * 24 * 60 * 60), 2) AS DECIMAL(10, 2)) AS UserAgeYears,
+    COALESCE(b.Name, '') AS Badge,
+    CASE WHEN b.TagBased = 1 THEN 'Tag-based' ELSE 'Named' END AS BadgeType,
+    CASE b.Class
+      WHEN 1 THEN 'Gold'
+      WHEN 2 THEN 'Silver'
+      WHEN 3 THEN 'Bronze'
+      ELSE 'Unknown'
+    END AS BadgeClass,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - b.Date) AS DaysSinceBadgeAwarded
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+)
+SELECT
+  c1.PostId,
+  c1.Title,
+  c1.Body,
+  c1.Tags,
+  c1.OwnerUserId,
+  c1.OwnerDisplayName,
+  c1.Reputation,
+  c1.UserCreationDate,
+  c1.LastAccessDate,
+  DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - c1.LastAccessDate) AS DaysLastAccess,
+  c1.Views,
+  c1.UpVotes,
+  c1.DownVotes,
+  CAST(ROUND((CAST(c1.UpVotes AS DECIMAL) / NULLIF(CAST((c1.UpVotes + c1.DownVotes) AS DECIMAL), 0)) , 2) AS DECIMAL(3, 2)) AS VoteRatio,
+  c1.UserAgeYears,
+  (
+    SELECT STRING_AGG(c2.Badge, ', ')
+    FROM (
+      SELECT c2.Badge
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+      ORDER BY c2.DaysSinceBadgeAwarded DESC
+    ) AS sub
+  ) AS Badges,
+  (
+    SELECT STRING_AGG(DISTINCT c2.BadgeType, ', ')
+    FROM (
+      SELECT c2.BadgeType
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS sub2
+  ) AS BadgeTypes,
+  (
+    SELECT STRING_AGG(DISTINCT c2.BadgeClass, ', ')
+    FROM (
+      SELECT c2.BadgeClass
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS sub3
+  ) AS BadgeClasses
+FROM cte c1
+ORDER BY c1.PostId;

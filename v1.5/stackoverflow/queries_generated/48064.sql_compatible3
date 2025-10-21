@@ -1,0 +1,129 @@
+WITH UserPostInteractions AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPosts,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  LEFT JOIN Votes AS v
+    ON u.Id = v.UserId
+  LEFT JOIN PostHistory AS ph
+    ON u.Id = ph.UserId
+  LEFT JOIN Badges AS b
+    ON u.Id = b.UserId
+  GROUP BY
+    u.Id,
+    u.DisplayName
+),
+PostMetrics AS (
+  SELECT
+    p.Id AS PostId,
+    pt.Name AS PostType,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    CAST(
+      (strftime('%s', COALESCE(p.LastActivityDate, p.CreationDate)) - strftime('%s', COALESCE(p.CreationDate, p.LastActivityDate))) / 60 AS INTEGER
+    ) AS ActiveDurationMinutes,
+    (
+      SELECT
+        COUNT(*)
+      FROM Comments AS c2
+      WHERE
+        c2.PostId = p.Id
+    ) AS CommentCountSubquery,
+    (
+      SELECT
+        COUNT(*)
+      FROM Votes AS v2
+      WHERE
+        v2.PostId = p.Id AND v2.VoteTypeId = 2
+    ) AS UpVoteCountSubquery,
+    (
+      SELECT
+        COUNT(*)
+      FROM Votes AS v3
+      WHERE
+        v3.PostId = p.Id AND v3.VoteTypeId = 3
+    ) AS DownVoteCountSubquery,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 1
+      ELSE 0
+    END AS IsClosed,
+    CASE
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 1
+      ELSE 0
+    END AS IsCommunityOwned
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+)
+SELECT
+  upi.UserId,
+  upi.DisplayName,
+  upi.TotalPostsCreated,
+  upi.TotalQuestions,
+  upi.TotalAnswers,
+  upi.TotalComments,
+  upi.TotalVotes,
+  upi.TotalUpVotes,
+  upi.TotalDownVotes,
+  upi.TotalHistoryEntries,
+  upi.BodyEdits,
+  upi.TitleEdits,
+  upi.TagEdits,
+  upi.ClosedPosts,
+  upi.GoldBadges,
+  upi.SilverBadges,
+  upi.BronzeBadges,
+  pm.PostId,
+  pm.PostType,
+  pm.Score,
+  pm.ViewCount,
+  pm.FavoriteCount,
+  pm.AnswerCount,
+  pm.CommentCount,
+  pm.CreationDate,
+  pm.LastActivityDate,
+  pm.ActiveDurationMinutes,
+  pm.CommentCountSubquery,
+  pm.UpVoteCountSubquery,
+  pm.DownVoteCountSubquery,
+  pm.IsClosed,
+  pm.IsCommunityOwned
+FROM UserPostInteractions AS upi
+CROSS JOIN PostMetrics AS pm
+WHERE
+  upi.UserId = (
+    SELECT
+      OwnerUserId
+    FROM Posts
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+ORDER BY
+  upi.TotalPostsCreated DESC,
+  pm.Score DESC
+LIMIT 100;

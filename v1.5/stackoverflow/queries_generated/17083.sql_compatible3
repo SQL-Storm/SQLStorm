@@ -1,0 +1,163 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ', ') AS UserTags,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= (DATE '2024-10-01') - INTERVAL '365 days'
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN TagBased = B'1' THEN Name END) AS UniqueTagBadges,
+        MAX(Date) AS LastBadgeDate,
+        LAG(COUNT(*), 1, 0) OVER (PARTITION BY UserId ORDER BY DATE_TRUNC('month', Date)) AS PrevMonthBadges
+    FROM Badges
+    WHERE Date >= (DATE '2024-10-01') - INTERVAL '730 days'
+    GROUP BY UserId, DATE_TRUNC('month', Date)
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN 
+                CAST(p.Score AS DOUBLE PRECISION) / NULLIF(LOG(p.ViewCount + 1), 0)
+            ELSE 0 
+        END AS EngagementScore,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY c.Score) AS MedianCommentScore
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= (DATE '2024-10-01') - INTERVAL '180 days'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount
+),
+EditActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorId,
+        COUNT(*) AS EditCount,
+        STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 'Edit'
+                WHEN ph.PostHistoryTypeId IN (7,8,9) THEN 'Rollback'
+                WHEN ph.PostHistoryTypeId = 10 THEN 'Close'
+                WHEN ph.PostHistoryTypeId = 11 THEN 'Reopen'
+                ELSE 'Other'
+            END, 
+            ' → ' ORDER BY ph.CreationDate
+        ) AS EditSequence,
+        EXTRACT(EPOCH FROM MAX(ph.CreationDate) - MIN(ph.CreationDate))/3600 AS EditSpanHours
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,10,11)
+        AND ph.CreationDate >= (DATE '2024-10-01') - INTERVAL '90 days'
+    GROUP BY ph.PostId, ph.UserId
+    HAVING COUNT(*) > 1
+),
+LinkedPostNetwork AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        p1.Score AS SourceScore,
+        p2.Score AS TargetScore,
+        ABS(COALESCE(p1.Score, 0) - COALESCE(p2.Score, 0)) AS ScoreDifference,
+        CASE 
+            WHEN p1.OwnerUserId = p2.OwnerUserId THEN 'SameUser'
+            WHEN p1.OwnerUserId IS NULL OR p2.OwnerUserId IS NULL THEN 'DeletedUser'
+            ELSE 'DifferentUser'
+        END AS UserRelation
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts p1 ON pl.PostId = p1.Id
+    LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE pl.CreationDate >= (DATE '2024-10-01') - INTERVAL '365 days'
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    um.ReputationRank,
+    um.PostCount,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.AvgPostScore, 2) AS AvgPostScore,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ba.UniqueTagBadges, 0) AS UniqueTagBadges,
+    COUNT(DISTINCT pe.PostId) AS RecentEngagedPosts,
+    COALESCE(AVG(pe.EngagementScore), 0) AS AvgEngagementScore,
+    SUM(pe.Upvotes) AS TotalUpvotesReceived,
+    SUM(pe.Downvotes) AS TotalDownvotesReceived,
+    COUNT(DISTINCT ea.PostId) AS PostsEdited,
+    COALESCE(AVG(ea.EditCount), 0) AS AvgEditsPerPost,
+    COUNT(DISTINCT lpn.PostId) AS LinkedPosts,
+    COALESCE(AVG(lpn.ScoreDifference), 0) AS AvgLinkedScoreDiff,
+    SUBSTRING(um.UserTags FROM 1 FOR 100) AS TopTags,
+    CASE 
+        WHEN um.ReputationRank <= 10 THEN 'Top10'
+        WHEN um.ReputationRank <= 100 THEN 'Top100'
+        WHEN um.ReputationRank <= 1000 THEN 'Top1000'
+        ELSE 'Other'
+    END AS UserTier,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p_sub 
+         WHERE p_sub.AcceptedAnswerId IN (
+             SELECT Id FROM Posts WHERE OwnerUserId = um.Id
+         )),
+        0
+    ) AS AcceptedAnswers,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p_closed 
+        WHERE p_closed.OwnerUserId = um.Id 
+            AND p_closed.ClosedDate IS NOT NULL
+    ) AS HasClosedPosts,
+    FIRST_VALUE(pe.PostId) OVER (
+        PARTITION BY um.Id 
+        ORDER BY pe.EngagementScore DESC NULLS LAST
+    ) AS TopEngagementPostId
+FROM UserMetrics um
+LEFT JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT JOIN PostEngagement pe ON um.Id = pe.OwnerUserId
+LEFT JOIN EditActivity ea ON um.Id = ea.EditorId
+LEFT JOIN LinkedPostNetwork lpn ON lpn.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = um.Id
+)
+WHERE um.PostCount > 0
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 0)
+    AND um.DisplayName IS NOT NULL
+    AND LENGTH(COALESCE(um.DisplayName, '')) > 2
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.ReputationRank, 
+    um.PostCount, um.QuestionCount, um.AnswerCount, um.AvgPostScore,
+    um.UserTags, um.PostCountRank,
+    ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges, ba.UniqueTagBadges,
+    pe.PostId, pe.EngagementScore
+HAVING COUNT(DISTINCT pe.PostId) > 0 
+    OR COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) + COALESCE(ba.BronzeBadges, 0) > 5
+ORDER BY 
+    um.ReputationRank ASC,
+    COALESCE(AVG(pe.EngagementScore), 0) DESC,
+    um.PostCount DESC
+LIMIT 100;

@@ -1,0 +1,187 @@
+-- {"query": "27047.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 2077} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(b.Date) AS LastBadgeDate,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) AS TotalVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistory,
+        COUNT(DISTINCT pl.Id) AS TotalPostLinks,
+        SUM(v.BountyAmount) AS TotalBountyAmount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, p.LastEditDate, p.LastActivityDate, p.AnswerCount, p.CommentCount, p.FavoriteCount
+),
+BadgeDistribution AS (
+    SELECT
+        b.UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Badges b
+    JOIN
+        Users u ON b.UserId = u.Id
+    GROUP BY
+        b.UserId, u.DisplayName
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalBadges,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastVoteDate,
+    ua.LastBadgeDate,
+    ua.TotalPostScore,
+    ua.TotalBountyAmount,
+    pm.PostId,
+    pm.PostTypeId,
+    pm.PostCreationDate,
+    pm.Score AS PostScore,
+    pm.ViewCount,
+    pm.OwnerUserId,
+    pm.OwnerDisplayName,
+    pm.LastEditDate,
+    pm.LastActivityDate,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.TotalVotes AS PostTotalVotes,
+    pm.TotalComments AS PostTotalComments,
+    pm.TotalPostHistory,
+    pm.TotalPostLinks,
+    pm.TotalBountyAmount AS PostTotalBountyAmount,
+    pm.PostRank,
+    bd.TotalBadges AS UserBadges,
+    bd.GoldBadges,
+    bd.SilverBadges,
+    bd.BronzeBadges,
+    bd.LastBadgeDate AS UserLastBadgeDate,
+    CASE
+        WHEN pm.PostTypeId = 1 THEN 'Question'
+        WHEN pm.PostTypeId = 2 THEN 'Answer'
+        WHEN pm.PostTypeId = 3 THEN 'Wiki'
+        WHEN pm.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN pm.PostTypeId = 5 THEN 'TagWiki'
+        WHEN pm.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN pm.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN pm.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostTypeName,
+    CONCAT(
+        SUBSTRING(p.Title, 1, 50),
+        CASE
+            WHEN LENGTH(p.Title) > 50 THEN '...'
+            ELSE ''
+        END
+    ) AS ShortTitle,
+    SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS TagsList,
+    CASE
+        WHEN ph.PostHistoryTypeId IS NOT NULL THEN 'Yes'
+        ELSE 'No'
+    END AS HasPostHistory,
+    CASE
+        WHEN pl.LinkTypeId IS NOT NULL THEN 'Yes'
+        ELSE 'No'
+    END AS HasPostLinks,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    COALESCE(v.BountyAmount, 0) AS VoteBountyAmount,
+    v.CreationDate AS VoteCreationDate,
+    v.UserId AS VoterId,
+    COALESCE(uv.DisplayName, 'Unknown') AS VoterDisplayName,
+    uv.Reputation AS VoterReputation
+FROM
+    UserActivity ua
+LEFT JOIN
+    PostMetrics pm ON ua.UserId = pm.OwnerUserId
+LEFT JOIN
+    BadgeDistribution bd ON ua.UserId = bd.UserId
+LEFT JOIN
+    Posts p ON pm.PostId = p.Id
+LEFT JOIN
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN
+    Votes v ON p.Id = v.PostId
+LEFT JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN
+    Users uv ON v.UserId = uv.Id
+WHERE
+    ua.TotalPosts > 0
+    AND (ua.TotalQuestions > 0 OR ua.TotalAnswers > 0)
+    AND pm.PostRank <= 10
+    AND (v.VoteTypeId IS NOT NULL OR ph.PostHistoryTypeId IS NOT NULL OR pl.LinkTypeId IS NOT NULL)
+ORDER BY
+    ua.Reputation DESC,
+    pm.PostRank ASC,
+    pm.Score DESC,
+    v.CreationDate DESC
+LIMIT 100;

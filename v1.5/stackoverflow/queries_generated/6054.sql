@@ -1,0 +1,109 @@
+-- {"query": "6054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 812} 
+WITH RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+TagExpansion AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    t.TagName,
+    ROW_NUMBER() OVER (PARTITION BY p.PostId ORDER BY t.TagName) AS rn
+  FROM RecentActivity p
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) t ON TRUE
+),
+Aggregated AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    STRING_AGG(DISTINCT t.TagName, ',') FILTER (WHERE t.TagName IS NOT NULL) AS TagsAgg,
+    COUNT(*) OVER (PARTITION BY p.PostId) AS TagCount,
+    p.Body,
+    p.OwnerDisplayName
+  FROM TagExpansion p
+  GROUP BY
+    p.PostId, p.Title, p.PostTypeId, p.CreationDate, p.LastActivityDate,
+    p.OwnerUserId, p.ViewCount, p.Score, p.Body, p.OwnerDisplayName
+),
+Windowed AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY a.OwnerUserId
+      ORDER BY a.LastActivityDate DESC
+    ) AS rn_by_owner,
+    SUM(a.ViewCount) OVER (PARTITION BY a.OwnerUserId) AS TotalViewsByOwner,
+    AVG(a.Score) OVER (PARTITION BY a.OwnerUserId) AS AvgScoreByOwner
+  FROM Aggregated a
+),
+ScoreJunction AS (
+  SELECT
+    w.*,
+    CASE
+      WHEN w.Score > 0 THEN 'Positive'
+      WHEN w.Score = 0 THEN 'Neutral'
+      ELSE 'Negative'
+    END AS Sentiment,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = w.PostId AND v.VoteTypeId IN (2,7)) AS UpDownVotes
+  FROM Windowed w
+),
+ComplexFilter AS (
+  SELECT *
+  FROM ScoreJunction
+  WHERE
+    (PostTypeId = 1 AND TagCount >= 2) OR
+    (PostTypeId = 2 AND LastActivityDate >= NOW() - INTERVAL '14 days')
+)
+SELECT
+  cf.PostId,
+  cf.Title,
+  cf.PostTypeId,
+  (cf.CreationDate AT TIME ZONE 'UTC') AS CreationUTC,
+  (cf.LastActivityDate AT TIME ZONE 'UTC') AS LastActivityUTC,
+  cf.OwnerUserId,
+  cf.OwnerDisplayName,
+  cf.ViewCount,
+  cf.Score,
+  cf.TagsAgg AS Tags,
+  cf.Body,
+  cf.Sentiment,
+  cf.TotalViewsByOwner,
+  cf.AvgScoreByOwner,
+  cf.UpDownVotes,
+  cf.rn_by_owner
+FROM ComplexFilter cf
+LEFT JOIN Users u ON cf.OwnerUserId = u.Id
+ORDER BY cf.LastActivityDate DESC NULLS LAST
+LIMIT 100;

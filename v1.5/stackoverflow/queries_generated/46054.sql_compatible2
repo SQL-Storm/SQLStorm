@@ -1,0 +1,124 @@
+WITH TopQuestionOwners AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.Score) as avg_score,
+        SUM(p.ViewCount) as total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId,
+        a.Id as answer_id,
+        a.OwnerUserId as answerer_id,
+        a.Score as answer_score,
+        a.CreationDate as answer_date,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvote_count,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as answer_rank
+    FROM Posts a
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as user_id,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) as gold_badges,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as total_upvotes_given,
+        COUNT(DISTINCT ph.Id) as edit_count
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '3 years')
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_usage_count,
+        AVG(p.Score) as avg_question_score,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.AnswerCount) as avg_answer_count,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views
+    FROM Tags t
+    INNER JOIN Posts p ON p.PostTypeId = 1 
+        AND p.Tags LIKE '%<' || t.TagName || '>%'
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '18 months')
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 10
+)
+SELECT 
+    q.Id as question_id,
+    q.Title,
+    q.Score as question_score,
+    q.ViewCount,
+    q.AnswerCount,
+    u.DisplayName as author_name,
+    u.Reputation as author_reputation,
+    ue.badge_count,
+    ue.gold_badges,
+    tqo.question_count as author_total_questions,
+    tqo.avg_score as author_avg_question_score,
+    am.answer_rank as best_answer_rank,
+    am.answer_score as best_answer_score,
+    am.comment_count as best_answer_comments,
+    answerer.DisplayName as best_answerer_name,
+    answerer.Reputation as best_answerer_reputation,
+    tp.TagName as primary_tag,
+    tp.avg_question_score as tag_avg_score,
+    tp.median_views as tag_median_views,
+    COUNT(DISTINCT pl.Id) as related_questions_count,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 5) as favorite_count,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5)) as edit_history_count,
+    EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate))/86400 as days_active,
+    CASE 
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+        WHEN q.AnswerCount > 0 THEN 'Has Answers'
+        ELSE 'No Answers'
+    END as answer_status
+FROM Posts q
+INNER JOIN TopQuestionOwners tqo ON q.OwnerUserId = tqo.OwnerUserId
+INNER JOIN Users u ON q.OwnerUserId = u.Id
+INNER JOIN UserEngagement ue ON u.Id = ue.user_id
+LEFT JOIN AnswerMetrics am ON q.Id = am.ParentId AND am.answer_rank = 1
+LEFT JOIN Users answerer ON am.answerer_id = answerer.Id
+LEFT JOIN PostLinks pl ON q.Id = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN Votes v ON q.Id = v.PostId
+LEFT JOIN PostHistory ph ON q.Id = ph.PostId
+CROSS JOIN LATERAL (
+    SELECT t.TagName, t.avg_question_score, t.median_views
+    FROM TagPerformance t
+    WHERE q.Tags LIKE '%<' || t.TagName || '>%'
+    ORDER BY t.tag_usage_count DESC
+    LIMIT 1
+) tp
+WHERE q.PostTypeId = 1
+    AND q.Score >= 5
+    AND q.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '18 months')
+GROUP BY 
+    q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.AcceptedAnswerId,
+    q.CreationDate, q.LastActivityDate,
+    u.DisplayName, u.Reputation,
+    ue.badge_count, ue.gold_badges,
+    tqo.question_count, tqo.avg_score,
+    am.answer_rank, am.answer_score, am.comment_count,
+    answerer.DisplayName, answerer.Reputation,
+    tp.TagName, tp.avg_question_score, tp.median_views
+HAVING COUNT(DISTINCT v.Id) >= 3
+ORDER BY 
+    q.Score DESC, 
+    q.ViewCount DESC,
+    ue.Reputation DESC
+LIMIT 100;

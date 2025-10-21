@@ -1,0 +1,43 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(c.Id) AS CommentCount,
+  MAX(v.CreationDate) AS LastVoteDate,
+  SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS NetVotes,
+  STRING_AGG(pt.Name, ',') FILTER (WHERE p.PostTypeId = 1) AS RelatedPostTypes,
+  ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE p.PostTypeId = 1) AS TagsList
+FROM Posts AS p
+LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments AS c ON c.PostId = p.Id
+LEFT JOIN Votes AS v ON v.PostId = p.Id
+LEFT JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+LEFT JOIN (
+  SELECT p2.Id AS PostId, t2.TagName
+  FROM Posts AS p2
+  CROSS JOIN LATERAL (
+    SELECT TRIM(tag) AS TagName
+    FROM (
+      SELECT UNNEST(string_to_array(substr(p2.Tags, 2, length(p2.Tags) - 2), '><')) AS tag
+    ) AS s
+  ) AS t2 ON TRUE
+  WHERE p2.PostTypeId = 1
+) AS tgs ON tgs.PostId = p.Id
+LEFT JOIN Tags AS t ON t.ExcerptPostId = p.Id
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName
+HAVING COUNT(c.Id) > 0
+ORDER BY NetVotes DESC NULLS LAST, p.CreationDate DESC
+LIMIT 100;

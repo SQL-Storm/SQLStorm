@@ -1,0 +1,128 @@
+-- {"query": "25006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1986} 
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(b.Gold, 0)   AS GoldBadges,
+            COALESCE(b.Silver, 0) AS SilverBadges,
+            COALESCE(b.Bronze, 0) AS BronzeBadges,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostCount
+        FROM Users u
+        LEFT JOIN (
+            SELECT
+                UserId,
+                SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+                SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+                SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+            FROM Badges
+            GROUP BY UserId
+        ) b ON b.UserId = u.Id
+    ),
+
+    TagStats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                                   AS QuestionCount,
+            SUM(p.Score)                                  AS TotalScore,
+            AVG(p.ViewCount)                              AS AvgViews,
+            MAX(p.CreationDate)                           AS MostRecentQuestion,
+            ROW_NUMBER() OVER (
+                PARTITION BY t.TagName
+                ORDER BY p.Score DESC NULLS LAST
+            )                                             AS TopScoringQuestionRank
+        FROM Tags t
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+              AND p.Tags IS NOT NULL
+              AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+        ) p ON TRUE
+        GROUP BY t.TagName
+    ),
+
+    RecentComments AS (
+        SELECT
+            c.PostId,
+            (SELECT text
+               FROM Comments c2
+               WHERE c2.PostId = c.PostId
+               ORDER BY c2.CreationDate DESC
+               LIMIT 1)                                    AS LatestCommentText,
+            COUNT(*) FILTER (WHERE c.Score > 0) AS PositiveCommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+
+    UserVoteAgg AS (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        JOIN Votes v  ON v.PostId = p.Id
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY p.OwnerUserId
+    )
+
+SELECT
+    us.Id                                    AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.PostCount,
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.AvgViews,
+    ts.MostRecentQuestion,
+    CASE WHEN ts.TopScoringQuestionRank = 1 THEN 'TOP' END AS TopQuestionFlag,
+    rc.LatestCommentText,
+    rc.PositiveCommentCount,
+    COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS NetVoteBalance,
+    ROW_NUMBER() OVER (
+        PARTITION BY us.Id
+        ORDER BY ts.TotalScore DESC NULLS LAST
+    )                                        AS TagRankingForUser
+FROM UserStats us
+LEFT JOIN TagStats ts ON ts.QuestionCount > 0
+LEFT JOIN RecentComments rc ON rc.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = us.Id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN UserVoteAgg v ON v.OwnerUserId = us.Id
+WHERE (us.Reputation > 10000 OR us.GoldBadges > 0)
+
+UNION ALL
+
+SELECT
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    t.TagName,
+    t.QuestionCount,
+    t.TotalScore,
+    t.AvgViews,
+    t.MostRecentQuestion,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM TagStats t
+WHERE t.QuestionCount > 1000
+
+ORDER BY Reputation DESC NULLS LAST,
+         TotalScore DESC NULLS LAST;

@@ -1,0 +1,138 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                 AS AnswerCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                 AS QuestionCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)                AS AvgAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)           AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)           AS DownVoteCount,
+        MAX(p.CreationDate)                                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v  ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                            AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)        AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)        AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)        AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ',')                    AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                AS TaggedPostCount,
+        SUM(p.Score)               AS TotalScore,
+        MAX(p.CreationDate)        AS MostRecentPost
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName
+),
+RecentCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        MIN(ph.CreationDate)                                         AS FirstClosed,
+        MAX(ph.CreationDate)                                         AS LastClosed,
+        STRING_AGG(DISTINCT ph.Comment, '; ') 
+            FILTER (WHERE ph.Comment IS NOT NULL)                   AS CloseReasons
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10               -- Close vote
+    GROUP BY ph.PostId
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.AnswerCount,
+    us.QuestionCount,
+    ROUND(us.AvgAnswerScore, 2)                               AS AvgAnsScore,
+    us.UpVoteCount,
+    us.DownVoteCount,
+    CASE 
+        WHEN us.DownVoteCount = 0 THEN NULL 
+        ELSE ROUND(us.UpVoteCount * 1.0 / us.DownVoteCount, 2) 
+    END                                                      AS UpDownRatio,
+    COALESCE(bs.TotalBadges, 0)                               AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0)                                AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0)                              AS SilverBadges,
+    COALESCE(bs.BadgeList, '')                                AS BadgeList,
+    us.LastPostDate,
+    ROW_NUMBER() OVER (PARTITION BY us.Reputation 
+                       ORDER BY us.AnswerCount DESC)          AS RankByAnswersInReputationBand,
+    EXISTS (SELECT 1 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = us.Id 
+              AND p2.CreationDate > DATE '2024-10-01' - INTERVAL '30 days') AS HasRecentPosts,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = us.Id AND c.Score > 0)                 AS PositiveCommentCount,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id) 
+       AND pl.LinkTypeId = 3)                                 AS DuplicateLinkCount,
+    rc.FirstClosed,
+    rc.LastClosed,
+    rc.CloseReasons
+FROM UserStats us
+LEFT JOIN BadgeStats bs          ON bs.UserId = us.Id
+LEFT JOIN LATERAL (
+    SELECT rc.FirstClosed, rc.LastClosed, rc.CloseReasons
+    FROM RecentCloseReasons rc
+    WHERE rc.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id LIMIT 1)
+) rc ON TRUE
+WHERE us.Reputation > 10000
+  AND (us.AnswerCount > 0 OR us.QuestionCount > 0)
+  AND (us.UpVoteCount + us.DownVoteCount) > 10
+  AND us.LastPostDate IS NOT NULL
+  AND NOT EXISTS (
+        SELECT 1 FROM Users udel 
+        WHERE udel.Id = us.Id AND udel.EmailHash IS NULL
+      )
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL,
+    'Tag Summary',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM (SELECT 1) dummy
+WHERE EXISTS (SELECT 1 FROM TagActivity WHERE TaggedPostCount > 1000)
+ORDER BY NULL;

@@ -1,0 +1,83 @@
+-- {"query": "3015.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 912} 
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LastAccessRank
+    FROM Users u
+),
+RecentQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate,
+           array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><''), 1) AS TagCount,
+           p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+QuestionAnswers AS (
+    SELECT qa.PostId AS QuestionId, COUNT(*) AS AnswerCount
+    FROM Posts qa
+    WHERE qa.PostTypeId = 2 AND qa.ParentId IS NOT NULL
+    GROUP BY qa.ParentId
+),
+AnswerVotes AS (
+    SELECT v.PostId, COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+           COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+    FROM Votes v
+    WHERE v.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 2)
+    GROUP BY v.PostId
+),
+UserBadgeSummary AS (
+    SELECT b.UserId, COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostHistoryCounts AS (
+    SELECT ph.PostId, COUNT(*) AS EditCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostTags AS (
+    SELECT p.Id, unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagUsage AS (
+    SELECT Tag, COUNT(*) AS TagFrequency
+    FROM PostTags
+    GROUP BY Tag
+),
+TopTags AS (
+    SELECT Tag, TagFrequency,
+           ROW_NUMBER() OVER (ORDER BY TagFrequency DESC) AS Rank
+    FROM TagUsage
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ac.LastAccessDate,
+    CASE WHEN ac.LastAccessRank = 1 THEN TRUE ELSE FALSE END AS IsMostRecent,
+    rq.Title AS RecentQuestionTitle,
+    rq.CreationDate AS QuestionDate,
+    rq.TagCount,
+    COALESCE(qa.AnswerCount, 0) AS NumberOfAnswers,
+    COALESCE(av.UpVotes, 0) AS UpVotesReceived,
+    COALESCE(av.DownVotes, 0) AS DownVotesReceived,
+    COALESCE(us.GoldBadges, 0) AS GoldBadges,
+    COALESCE(us.SilverBadges, 0) AS SilverBadges,
+    COALESCE(us.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(pres.EditCount, 0) AS NumberOfEdits,
+    (SELECT JSON_AGG(Tag) FROM (SELECT Tag FROM PostTags WHERE PostTags.PostId = rq.Id LIMIT 5) sub) AS SampleTopTags,
+    (SELECT JSON_AGG(ROW(Tag, TagFrequency) ORDER BY TagFrequency DESC LIMIT 5) FROM TagUsage) AS TopFiveTags,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = u.Id AND p2.Score > 10) AS PopularQuestionsCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= NOW() - INTERVAL '6 months') AS RecentCommentsCount
+FROM ActiveUsers ac
+JOIN Users u ON u.Id = ac.Id
+LEFT JOIN RecentQuestions rq ON rq.OwnerUserId = u.Id
+LEFT JOIN QuestionAnswers qa ON qa.QuestionId = rq.Id
+LEFT JOIN AnswerVotes av ON av.PostId = qa.QuestionId
+LEFT JOIN UserBadgeSummary us ON us.UserId = u.Id
+LEFT JOIN PostHistoryCounts pres ON pres.PostId = rq.Id
+WHERE ac.LastAccessRank = 1
+ORDER BY u.Reputation DESC
+LIMIT 100;

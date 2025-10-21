@@ -1,0 +1,115 @@
+WITH HighRepUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation
+    FROM Users u
+    WHERE u.Reputation > (
+        SELECT AVG(Reputation) FROM Users
+    )
+),
+UserBadges AS (
+    SELECT b.UserId, COUNT(*) AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           MIN(b.Date) AS FirstBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPosts AS (
+    SELECT p.OwnerUserId AS UserId,
+           COUNT(*) AS NumPosts,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+QuestionStats AS (
+    SELECT p.Id AS QuestionId, p.OwnerUserId,
+           COALESCE(p.ViewCount, 0) AS ViewCount,
+           COALESCE(p.Score, 0) AS Score,
+           COALESCE(p.AnswerCount, 0) AS AnswerCount,
+           COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+           COALESCE((LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1), 0) AS NumTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT p.ParentId AS QuestionId,
+           COUNT(*) AS NumAnswers,
+           AVG(COALESCE(p.Score, 0)) AS AvgAnswerScore,
+           MAX(COALESCE(p.Score, 0)) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+    GROUP BY p.ParentId
+),
+ClosedQuestions AS (
+    SELECT ph.PostId AS QuestionId,
+           MAX(ph.CreationDate) AS ClosedDate,
+           MAX(CASE
+                WHEN ph.PostHistoryTypeId = 10 THEN
+                    CASE
+                        WHEN CAST(ph.Comment AS INTEGER) IS NOT NULL AND crt.Name IS NOT NULL
+                            THEN crt.Name
+                        ELSE ph.Comment
+                    END
+               ELSE NULL END) AS CloseReason
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt
+      ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT
+    hu.UserId,
+    hu.DisplayName,
+    hu.Reputation,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.FirstBadgeDate,
+    up.NumPosts,
+    up.Questions,
+    up.Answers,
+    up.LastPostDate,
+    q.QuestionId,
+    q.ViewCount,
+    q.Score AS QuestionScore,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.NumTags,
+    a.NumAnswers,
+    a.AvgAnswerScore,
+    a.MaxAnswerScore,
+    cq.ClosedDate,
+    cq.CloseReason,
+    u.Location,
+    u.WebsiteUrl,
+    CASE
+        WHEN q.Score >= 10 AND q.AnswerCount > 5 THEN 'Popular & Many Answers'
+        WHEN q.Score < 0 THEN 'Low Scoring'
+        ELSE 'Normal'
+    END AS QuestionCategory,
+    ROW_NUMBER() OVER (PARTITION BY hu.UserId ORDER BY q.ViewCount DESC, q.QuestionId) AS QuestionRankByViews,
+    RANK() OVER (PARTITION BY hu.UserId ORDER BY q.Score DESC, q.QuestionId) AS QuestionRankByScore
+FROM HighRepUsers hu
+LEFT JOIN UserBadges ub ON hu.UserId = ub.UserId
+LEFT JOIN UserPosts up ON hu.UserId = up.UserId
+LEFT JOIN Users u ON hu.UserId = u.Id
+LEFT JOIN QuestionStats q ON hu.UserId = q.OwnerUserId
+LEFT JOIN AnswerStats a ON q.QuestionId = a.QuestionId
+LEFT JOIN ClosedQuestions cq ON q.QuestionId = cq.QuestionId
+WHERE (ub.TotalBadges IS NULL OR ub.GoldBadges > 0)
+  AND (up.Answers IS NULL OR up.Answers >= 1)
+  AND (
+        (cq.CloseReason IS NULL) OR
+        (LOWER(cq.CloseReason) NOT LIKE '%duplicate%')
+      )
+  AND (
+        q.QuestionId IS NOT NULL
+        AND q.ViewCount > 10
+        AND (q.Score IS NULL OR q.Score >= 5 OR q.FavoriteCount > 2)
+      )
+ORDER BY hu.Reputation DESC, q.ViewCount DESC NULLS LAST, ub.TotalBadges DESC NULLS LAST, q.Score DESC NULLS LAST
+LIMIT 100;

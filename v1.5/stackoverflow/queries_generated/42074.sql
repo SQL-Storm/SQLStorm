@@ -1,0 +1,47 @@
+-- {"query": "42074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2057, "output_tokens": 412} 
+
+SELECT 
+    p.Id,
+    p.Title,
+    p.Score,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(v.Id) AS TotalVotes,
+    COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    COUNT(DISTINCT t.Id) AS TagCount
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 24)
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE 
+    p.PostTypeId = 1
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+GROUP BY 
+    p.Id, u.Id
+HAVING 
+    COUNT(v.Id) > 10
+    AND COUNT(DISTINCT ph.UserId) > 3
+ORDER BY 
+    p.Score DESC, 
+    COUNT(v.Id) DESC, 
+    COUNT(DISTINCT ph.UserId) DESC, 
+    COUNT(DISTINCT c.Id) DESC, 
+    COUNT(DISTINCT b.Id) DESC, 
+    COUNT(DISTINCT pl.Id) DESC, 
+    COUNT(DISTINCT t.Id) DESC
+LIMIT 100;

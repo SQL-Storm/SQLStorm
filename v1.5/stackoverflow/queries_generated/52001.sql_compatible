@@ -1,0 +1,109 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViews,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedQuestions,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END) AS BadgePoints,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) AS BountiesStarted,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 9 THEN v.Id END) AS BountiesClosed,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount
+    FROM Votes v
+    GROUP BY v.UserId
+),
+CombinedStats AS (
+    SELECT 
+        ups.Id,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.CreationDate,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalQuestionScore,
+        ups.TotalAnswerScore,
+        COALESCE(ups.AvgQuestionViews, 0) AS AvgQuestionViews,
+        ups.AcceptedQuestions,
+        ups.CommentCount,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ubs.BadgePoints, 0) AS BadgePoints,
+        COALESCE(ubs.TagBasedBadges, 0) AS TagBasedBadges,
+        COALESCE(uvs.UpvotesGiven, 0) AS UpvotesGiven,
+        COALESCE(uvs.DownvotesGiven, 0) AS DownvotesGiven,
+        COALESCE(uvs.BountiesStarted, 0) AS BountiesStarted,
+        COALESCE(uvs.BountiesClosed, 0) AS BountiesClosed,
+        COALESCE(uvs.TotalBountyAmount, 0) AS TotalBountyAmount
+    FROM UserPostStats ups
+    LEFT JOIN UserBadgeStats ubs ON ups.Id = ubs.UserId
+    LEFT JOIN UserVoteStats uvs ON ups.Id = uvs.UserId
+),
+ImpactRanking AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY 
+            (Reputation * 0.1 +
+             TotalQuestionScore * 0.3 +
+             TotalAnswerScore * 0.5 +
+             AcceptedQuestions * 2 +
+             GoldBadges * 5 + SilverBadges * 2 + BronzeBadges * 1 +
+             BountiesClosed * 1 +
+             (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - CreationDate)) / 86400) * -0.01) DESC
+        ) AS GlobalRank,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM CreationDate) ORDER BY Reputation DESC) AS YearlyReputationRank
+    FROM CombinedStats
+)
+SELECT 
+    Id,
+    DisplayName,
+    Reputation,
+    CreationDate,
+    QuestionCount,
+    AnswerCount,
+    TotalQuestionScore,
+    TotalAnswerScore,
+    AvgQuestionViews,
+    AcceptedQuestions,
+    CommentCount,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    BadgePoints,
+    TagBasedBadges,
+    UpvotesGiven,
+    DownvotesGiven,
+    BountiesStarted,
+    BountiesClosed,
+    TotalBountyAmount,
+    GlobalRank,
+    YearlyReputationRank
+FROM ImpactRanking
+WHERE GlobalRank <= 100
+ORDER BY GlobalRank;

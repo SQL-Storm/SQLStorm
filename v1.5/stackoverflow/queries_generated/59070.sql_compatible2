@@ -1,0 +1,48 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS Wikis,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    COUNT(DISTINCT pl.Id) AS PostLinks,
+    COUNT(DISTINCT v.Id) AS Votes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MAX(u.LastAccessDate) AS LastUserAccess,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS UserTags,
+    COUNT(DISTINCT CASE WHEN p.ViewCount > 1000 THEN p.Id END) AS HighViewPosts,
+    COUNT(DISTINCT CASE WHEN p.Score > 100 THEN p.Id END) AS HighScorePosts,
+    COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionWithAcceptedAnswer,
+    COUNT(DISTINCT CASE WHEN p.CommentCount > 10 THEN p.Id END) AS PostsWithManyComments,
+    COUNT(DISTINCT CASE WHEN p.FavoriteCount > 5 THEN p.Id END) AS HighlyFavoritedPosts
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN (
+    SELECT PostId, STRING_AGG(TagName, ', ') AS TagName
+    FROM (
+        SELECT p.Id AS PostId, 
+               TRIM(BOTH ' ' FROM
+                    REPLACE(REPLACE(REPLACE(p.Tags, '&lt;', '<'), '&gt;', '>'), '<', ''), '>') AS TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+    ) sub
+    GROUP BY PostId
+) t ON p.Id = t.PostId
+WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC, TotalPosts DESC
+LIMIT 1000;

@@ -1,0 +1,111 @@
+-- {"query": "39061.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 1981} 
+
+WITH
+-- break tags into individual tag names per question
+TagAgg AS (
+    SELECT
+        p.OwnerUserId    AS UserId,
+        lower(t.tag)     AS Tag,
+        count(*)         AS QuestionsAsked
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+        )
+    ) AS t(tag)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, lower(t.tag)
+),
+-- statistics on users’ answers
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId         AS UserId,
+        count(*)              AS Answers,
+        avg(a.Score)          AS AvgAnswerScore,
+        max(a.Score)          AS MaxAnswerScore,
+        sum(
+            CASE
+                WHEN a.CreationDate > now() - interval '30 days' THEN 1
+                ELSE 0
+            END
+        )                     AS RecentAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+-- badge totals by class per user
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        count(*)                                     AS BadgeCount,
+        count(*) FILTER (WHERE b.Class = 1)          AS Gold,
+        count(*) FILTER (WHERE b.Class = 2)          AS Silver,
+        count(*) FILTER (WHERE b.Class = 3)          AS Bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+-- vote activity by user
+UserVoteStats AS (
+    SELECT
+        v.UserId,
+        count(*) FILTER (WHERE v.VoteTypeId = 2)     AS UpvotesMade,
+        count(*) FILTER (WHERE v.VoteTypeId = 3)     AS DownvotesMade,
+        count(*) FILTER (WHERE v.VoteTypeId IN (8,9)) AS Bounties
+    FROM Votes v
+    GROUP BY v.UserId
+),
+-- comment statistics per user
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        count(*)             AS Comments,
+        avg(c.Score)         AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.UserId
+),
+-- rank users by reputation and join answer stats
+TopUsers AS (
+    SELECT
+        u.Id                  AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        uas.Answers,
+        uas.AvgAnswerScore,
+        row_number() OVER (ORDER BY u.Reputation DESC) AS RN
+    FROM Users u
+    LEFT JOIN UserAnswerStats uas
+        ON uas.UserId = u.Id
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Answers,
+    tu.AvgAnswerScore,
+    ub.BadgeCount,
+    ub.Gold,
+    ub.Silver,
+    ub.Bronze,
+    uv.UpvotesMade,
+    uv.DownvotesMade,
+    uv.Bounties,
+    uc.Comments,
+    uc.AvgCommentScore,
+    array_agg(DISTINCT ta.Tag ORDER BY ta.QuestionsAsked DESC) AS TopTags
+FROM TopUsers tu
+LEFT JOIN UserBadgeStats ub
+    ON ub.UserId = tu.UserId
+LEFT JOIN UserVoteStats uv
+    ON uv.UserId = tu.UserId
+LEFT JOIN UserCommentStats uc
+    ON uc.UserId = tu.UserId
+LEFT JOIN TagAgg ta
+    ON ta.UserId = tu.UserId
+WHERE tu.RN <= 10
+GROUP BY
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.Answers, tu.AvgAnswerScore,
+    ub.BadgeCount, ub.Gold, ub.Silver, ub.Bronze,
+    uv.UpvotesMade, uv.DownvotesMade, uv.Bounties,
+    uc.Comments, uc.AvgCommentScore
+ORDER BY tu.Reputation DESC;

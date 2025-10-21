@@ -1,0 +1,157 @@
+-- {"query": "37071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1880} 
+WITH
+-- recent high-activity questions with expanded tag arrays
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount,
+         COALESCE(ARRAY_REMOVE(REGEXP_SPLIT_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><'), ''), ARRAY[]::varchar[]) AS Tags,
+         p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - INTERVAL '2 years'
+),
+-- aggregate answers, comments, votes for each question (including answers linked by ParentId)
+AnswersAgg AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCountActual,
+         SUM(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AnswerScoreSum,
+         COUNT(cq.Id) AS QuestionCommentCount,
+         COUNT(ca.Id) FILTER (WHERE ca.PostId IS NOT NULL) AS AnswerCommentCount,
+         COUNT(vq.Id) FILTER (WHERE vq.PostId = q.Id AND vq.VoteTypeId = 2) AS QuestionUpVotes,
+         COUNT(va.Id) FILTER (WHERE va.PostId IS NOT NULL AND va.PostId <> q.Id AND va.VoteTypeId = 2) AS AnswerUpVotes
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id OR a.Id = q.AcceptedAnswerId
+  LEFT JOIN Comments cq ON cq.PostId = q.Id
+  LEFT JOIN Comments ca ON ca.PostId = a.Id
+  LEFT JOIN Votes vq ON vq.PostId = q.Id
+  LEFT JOIN Votes va ON va.PostId = a.Id
+  GROUP BY q.Id
+),
+-- detect tag co-occurrence pairs and their statistics
+TagPairs AS (
+  SELECT t1.tag AS TagA, t2.tag AS TagB, COUNT(*) AS PairCount,
+         SUM(q.Score) AS PairScoreSum, AVG(q.ViewCount) AS PairAvgViews
+  FROM Questions q
+  CROSS JOIN LATERAL UNNEST(q.Tags) AS t1(tag)
+  CROSS JOIN LATERAL UNNEST(q.Tags) AS t2(tag)
+  WHERE t1.tag < t2.tag
+  GROUP BY t1.tag, t2.tag
+  HAVING COUNT(*) >= 5
+),
+-- top contributors per tag: combine question owners, answer owners, and commenters
+TagContributors AS (
+  SELECT tag, u.Id AS UserId, u.DisplayName,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAuthored,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersAuthored,
+         COUNT(DISTINCT c.Id) AS CommentsMade,
+         SUM(COALESCE(vote_counts.UpVotes,0)) AS UpVotesReceived,
+         MAX(u.Reputation) AS Reputation
+  FROM (
+    SELECT q.Id AS PostId, q.Tags, q.OwnerUserId, NULL::int AS AnswerId
+    FROM Questions q
+    UNION ALL
+    SELECT a.ParentId AS PostId, q.Tags, a.OwnerUserId, a.Id AS AnswerId
+    FROM Posts a
+    JOIN Questions q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+  ) p
+  LEFT JOIN LATERAL UNNEST(p.Tags) AS t(tag) ON true
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT v.PostId, COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes
+    FROM Votes v
+    WHERE v.UserId = u.Id OR v.PostId IN (p.PostId)
+    GROUP BY v.PostId
+  ) vote_counts ON true
+  WHERE u.Id IS NOT NULL
+  GROUP BY tag, u.Id, u.DisplayName
+),
+-- compute historical edit churn per post (revisions, rollbacks)
+EditChurn AS (
+  SELECT ph.PostId,
+         COUNT(*) AS RevisionCount,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)) AS NonInitialEdits,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) AS Rollbacks,
+         MAX(ph.CreationDate) AS LastEditDate
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= now() - INTERVAL '5 years'
+  GROUP BY ph.PostId
+),
+-- recent suspicious link graph: duplicates and linked posts with high score differences
+LinkMetrics AS (
+  SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkType, p1.Score AS ScoreA, p2.Score AS ScoreB,
+         ABS(COALESCE(p1.Score,0) - COALESCE(p2.Score,0)) AS ScoreDiff,
+         GREATEST(COALESCE(p1.ViewCount,0), COALESCE(p2.ViewCount,0)) AS MaxViews
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  LEFT JOIN Posts p1 ON p1.Id = pl.PostId
+  LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE pl.CreationDate >= now() - INTERVAL '3 years'
+    AND lt.Name IN ('Duplicate','Linked')
+),
+-- combine everything into an expensive analytical scan
+BenchmarkBase AS (
+  SELECT q.Id AS QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags,
+         aa.AnswerCountActual, aa.QuestionCommentCount, aa.AnswerCommentCount,
+         aa.QuestionUpVotes, aa.AnswerUpVotes,
+         ec.RevisionCount, ec.NonInitialEdits, ec.Rollbacks, ec.LastEditDate,
+         tp.PairCount AS TagPairCount, tp.PairScoreSum, tp.PairAvgViews,
+         lm.ScoreDiff AS LinkScoreDiff, lm.LinkType, lm.MaxViews AS LinkedMaxViews,
+         tc_top.UserId AS TopContributorId, tc_top.DisplayName AS TopContributor,
+         tc_top.Reputation AS TopContributorReputation,
+         ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY COALESCE(lm.ScoreDiff,0) DESC, aa.AnswerScoreSum DESC NULLS LAST) AS rn
+  FROM Questions q
+  LEFT JOIN AnswersAgg aa ON aa.QuestionId = q.Id
+  LEFT JOIN EditChurn ec ON ec.PostId = q.Id
+  LEFT JOIN LATERAL (
+    SELECT tp.PairCount, tp.PairScoreSum, tp.PairAvgViews
+    FROM TagPairs tp
+    WHERE (tp.TagA = (q.Tags[1]) OR tp.TagB = (q.Tags[1]) OR tp.TagA = (q.Tags[2]) OR tp.TagB = (q.Tags[2]))
+    ORDER BY tp.PairCount DESC
+    LIMIT 1
+  ) tp ON true
+  LEFT JOIN LATERAL (
+    SELECT lm.*
+    FROM LinkMetrics lm
+    WHERE lm.PostId = q.Id OR lm.RelatedPostId = q.Id
+    ORDER BY lm.ScoreDiff DESC NULLS LAST
+    LIMIT 1
+  ) lm ON true
+  LEFT JOIN LATERAL (
+    SELECT tc.UserId, tc.DisplayName, tc.Reputation
+    FROM TagContributors tc
+    WHERE tc.tag = q.Tags[1]
+    ORDER BY tc.QuestionsAuthored DESC, tc.AnswersAuthored DESC, tc.Reputation DESC
+    LIMIT 1
+  ) tc_top ON true
+)
+SELECT
+  bb.QuestionId,
+  bb.Title,
+  bb.CreationDate,
+  bb.Score,
+  bb.ViewCount,
+  array_to_string(bb.Tags, ',') AS Tags,
+  bb.AnswerCountActual,
+  bb.QuestionCommentCount,
+  bb.AnswerCommentCount,
+  bb.QuestionUpVotes,
+  bb.AnswerUpVotes,
+  bb.RevisionCount,
+  bb.NonInitialEdits,
+  bb.Rollbacks,
+  bb.LastEditDate,
+  bb.TagPairCount,
+  bb.PairScoreSum,
+  bb.PairAvgViews,
+  bb.LinkType,
+  bb.LinkScoreDiff,
+  bb.LinkedMaxViews,
+  bb.TopContributorId,
+  bb.TopContributor,
+  bb.TopContributorReputation
+FROM BenchmarkBase bb
+WHERE bb.rn = 1
+  AND (bb.Score >= 10 OR bb.ViewCount >= 5000 OR bb.AnswerCountActual >= 5 OR bb.RevisionCount >= 3)
+ORDER BY (bb.Score * 2 + bb.ViewCount/1000.0 + COALESCE(bb.AnswerCountActual,0)*3 + COALESCE(bb.RevisionCount,0)*2) DESC
+LIMIT 200;

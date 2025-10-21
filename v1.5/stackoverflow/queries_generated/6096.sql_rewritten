@@ -1,0 +1,133 @@
+-- {"query": "6096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 799} 
+WITH recent_low_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    AND p.OwnerUserId IS NOT NULL
+),
+tag_stats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS total_questions,
+    AVG(p.Score) AS avg_score,
+    MAX(p.ViewCount) AS max_views,
+    MIN(p.LastActivityDate) AS first_activity
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.Id
+  WHERE t.TagName IS NOT NULL
+  GROUP BY t.TagName
+),
+mixed AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.OwnerUserId,
+    r.ViewCount,
+    r.Score,
+    r.CommentCount,
+    r.AnswerCount,
+    ts.total_questions,
+    ts.avg_score,
+    ts.max_views,
+    ts.first_activity
+  FROM recent_low_activity r
+  LEFT JOIN tag_stats ts ON ts.TagName = any(string_to_array(r.Tags, '>') )
+),
+xp AS (
+  SELECT
+    m.PostId,
+    m.Title,
+    m.Tags,
+    m.CreationDate,
+    m.LastActivityDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    m.ViewCount,
+    m.Score,
+    m.CommentCount,
+    m.AnswerCount,
+    m.total_questions,
+    m.avg_score,
+    m.max_views,
+    m.first_activity,
+    COALESCE(b.Count, 0) AS badge_count
+  FROM mixed m
+  LEFT JOIN Users u ON u.Id = m.OwnerUserId
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE m.Score > 0
+    AND (m.ViewCount > 100 OR m.AnswerCount > 2)
+),
+final AS (
+  SELECT
+    xp.PostId,
+    xp.Title,
+    xp.Tags,
+    xp.CreationDate,
+    xp.LastActivityDate,
+    xp.OwnerDisplayName,
+    xp.Reputation,
+    xp.ViewCount,
+    xp.Score,
+    xp.CommentCount,
+    xp.AnswerCount,
+    xp.total_questions,
+    xp.avg_score,
+    xp.max_views,
+    xp.first_activity,
+    xp.badge_count,
+    CASE
+      WHEN xp.LastActivityDate > xp.CreationDate + INTERVAL '30 days' THEN true
+      ELSE false
+    END AS ActiveLag
+  FROM xp
+  LEFT JOIN LATERAL (
+    SELECT 1
+    FROM Votes v
+    WHERE v.PostId = xp.PostId
+      AND v.VoteTypeId = 2
+    LIMIT 1
+  ) AS up ON true
+  LEFT JOIN LATERAL (
+    SELECT 1
+    FROM PostLinks pl
+    WHERE pl.PostId = xp.PostId
+      AND pl.RelatedPostId = xp.PostId
+    LIMIT 1
+  ) AS pl ON true
+)
+SELECT
+  PostId,
+  Title,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  OwnerDisplayName,
+  Reputation,
+  ViewCount,
+  Score,
+  CommentCount,
+  AnswerCount,
+  total_questions,
+  avg_score,
+  max_views,
+  first_activity,
+  badge_count,
+  ActiveLag
+FROM final
+ORDER BY LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,52 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxViewCount,
+        DENSE_RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT 
+        CAST(unnest(string_to_array(substr(Tags, 2, char_length(Tags) - 2), '><')) AS TEXT) AS TagName,
+        COUNT(*) AS TagFrequency,
+        AVG(Score) AS AvgTagScore
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY 1
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.PostCount,
+    ups.AvgPostScore,
+    ups.MaxViewCount,
+    ups.PostCountRank,
+    COALESCE(
+        (SELECT SUM(v.BountyAmount) 
+         FROM Votes v 
+         WHERE v.UserId = ups.UserId AND v.VoteTypeId = 8), 0) AS TotalBountyStarted,
+    (SELECT tp.TagFrequency 
+     FROM TagPopularity tp 
+     WHERE tp.TagFrequency = (SELECT MAX(TagFrequency) FROM TagPopularity)) AS MostPopularTagFrequency,
+    CASE 
+        WHEN ups.PostCount > 10 AND ups.AvgPostScore > 5 THEN 'High Impact User'
+        WHEN ups.PostCount BETWEEN 5 AND 10 THEN 'Emerging Contributor'
+        ELSE 'New User'
+    END AS UserCategory,
+    ROW_NUMBER() OVER (ORDER BY ups.AvgPostScore DESC) AS ScoreRank
+FROM UserPostStats ups
+WHERE ups.PostCount > 0
+    AND EXISTS (
+        SELECT 1 
+        FROM Badges b 
+        WHERE b.UserId = ups.UserId 
+        AND b.Class = 1
+    )
+ORDER BY ups.PostCount DESC, ups.AvgPostScore DESC
+LIMIT 100;

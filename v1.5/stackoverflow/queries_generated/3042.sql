@@ -1,0 +1,135 @@
+-- {"query": "3042.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1016} 
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate
+    FROM
+        Users u
+    WHERE
+        u.LastAccessDate >= CURRENT_TIMESTAMP - INTERVAL '1 year'
+),
+QuestionsWithComments AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        c.CommentCount,
+        c.LastActivityDate
+    FROM
+        Posts p
+        LEFT JOIN (
+            SELECT
+                PostId,
+                COUNT(*) AS CommentCount,
+                MAX(CreationDate) AS LastCommentDate
+            FROM
+                Comments
+            GROUP BY
+                PostId
+        ) c ON p.Id = c.PostId
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= '2022-01-01'
+),
+TagStatistics AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT q.QuestionId) AS QuestionCount,
+        AVG(q.CommentCount)::numeric(10,2) AS AvgCommentsPerQuestion
+    FROM
+        Tags t
+        JOIN QuestionsWithComments q ON q.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY
+        t.TagName
+),
+QuestionAnswers AS (
+    SELECT
+        p1.Id AS QuestionId,
+        COUNT(p2.Id) AS AnswerCount,
+        AVG(p2.Score) AS AvgAnswerScore
+    FROM
+        Posts p1
+        LEFT JOIN Posts p2 ON p2.ParentId = p1.Id AND p2.PostTypeId = 2
+    GROUP BY
+        p1.Id
+),
+AnswerVoteDistribution AS (
+    SELECT
+        p.Id AS AnswerId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NetVotes
+    FROM
+        Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.Id
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+ActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= '2022-01-01') AS QuestionsPosted20,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2 AND p.LastActivityDate >= '2022-01-01') AS AnswersUpdated20
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY
+        u.Id
+),
+MainQuery AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        ua.QuestionsPosted20,
+        ua.AnswersUpdated20,
+        ts.QuestionCount,
+        ts.AvgCommentsPerQuestion,
+        qa.AnswerCount,
+        qa.AvgAnswerScore,
+        adb.GoldBadges,
+        adb.SilverBadges,
+        adb.BronzeBadges,
+        COALESCE(av.UpVotes, 0) AS UpVotes,
+        COALESCE(av.DownVotes, 0) AS DownVotes,
+        COALESCE(av.NetVotes, 0) AS NetVotes
+    FROM
+        ActiveUsers u
+        LEFT JOIN ActivitySummary ua ON u.UserId = ua.UserId
+        LEFT JOIN TagStatistics ts ON TRUE
+        LEFT JOIN QuestionAnswers qa ON qa.QuestionId IN (
+            SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+        )
+        LEFT JOIN UserBadgeCounts adb ON u.UserId = adb.UserId
+        LEFT JOIN AnswerVoteDistribution av ON av.AnswerId IN (
+            SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 2
+        )
+)
+SELECT
+    *
+FROM
+    MainQuery
+WHERE
+    Reputation > 1000
+    AND (QuestionsPosted20 > 5 OR AnswersUpdated20 > 3)
+    AND QuestionCount IS NOT NULL
+ORDER BY
+    Reputation DESC,
+    UserId
+LIMIT 50;

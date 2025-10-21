@@ -1,0 +1,143 @@
+WITH
+HotQuestions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount,
+         p.OwnerUserId, p.Tags,
+         ROW_NUMBER() OVER (ORDER BY (CAST(p.ViewCount AS BIGINT) * GREATEST(p.Score, 1)) DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years'
+    AND p.ViewCount IS NOT NULL
+),
+RecentAnswers AS (
+  SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.CreationDate AS AnswerDate, a.Score AS AnswerScore,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate DESC) AS rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+QuestionMetrics AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS UniqueAnswerers,
+         AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+         SUM(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS SumAnswerScore,
+         COALESCE(q.AnswerCount, 0) AS AnswerCount,
+         COALESCE(q.CommentCount, 0) AS CommentCount,
+         COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) / 86400.0 AS AgeDays
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.CreationDate
+),
+QuestionTags AS (
+  SELECT q.Id AS QuestionId,
+         TRIM(BOTH '<>' FROM UNNEST(string_to_array(SUBSTRING(q.Tags FROM 2 FOR CHAR_LENGTH(q.Tags) - 2), '><'))) AS Tag
+  FROM Posts q
+  WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL AND q.Tags <> ''
+),
+HotTagStats AS (
+  SELECT qt.Tag,
+         COUNT(DISTINCT qt.QuestionId) AS QuestionsWithTag,
+         SUM(q.ViewCount) AS ViewsOnTaggedQuestions,
+         AVG(q.Score) AS AvgScoreOnTaggedQuestions
+  FROM QuestionTags qt
+  JOIN Posts q ON q.Id = qt.QuestionId
+  WHERE q.PostTypeId = 1
+  GROUP BY qt.Tag
+  HAVING COUNT(DISTINCT qt.QuestionId) > 10
+),
+UserReputationProfile AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 50 WHEN b.Class = 2 THEN 20 WHEN b.Class = 3 THEN 5 ELSE 0 END), 0) AS BadgeScore,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AS PostsLastYear,
+         MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS BestQuestionScore,
+         MAX(p.Score) FILTER (WHERE p.PostTypeId = 2) AS BestAnswerScore
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+PostLinkNetwork AS (
+  SELECT p.Id AS PostId,
+         COALESCE(SUM(CASE WHEN pl.PostId = p.Id THEN 1 ELSE 0 END), 0) AS OutLinks,
+         COALESCE(SUM(CASE WHEN pl.RelatedPostId = p.Id THEN 1 ELSE 0 END), 0) AS InLinks,
+         COUNT(DISTINCT pl.LinkTypeId) AS DistinctLinkTypes
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+  GROUP BY p.Id
+),
+RecentVoteStats AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+         COUNT(*) AS TotalVotes
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE v.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+  GROUP BY v.PostId
+),
+Candidates AS (
+  SELECT h.Id, h.Title, h.CreationDate, h.LastActivityDate, h.Score, h.ViewCount, h.Tags,
+         qm.UniqueAnswerers, qm.AvgAnswerScore, qm.SumAnswerScore, qm.AnswerCount, qm.CommentCount, qm.FavoriteCount, qm.AgeDays,
+         rp.UpVotes, rp.DownVotes, rp.Favorites AS RecentFavorites, pln.OutLinks, pln.InLinks, pln.DistinctLinkTypes,
+         u.Reputation AS OwnerReputation, urp.BadgeScore AS OwnerBadgeScore, urp.PostsLastYear,
+         ht.ViewsOnTaggedQuestions, ht.AvgScoreOnTaggedQuestions
+  FROM HotQuestions h
+  LEFT JOIN QuestionMetrics qm ON qm.QuestionId = h.Id
+  LEFT JOIN PostLinkNetwork pln ON pln.PostId = h.Id
+  LEFT JOIN RecentVoteStats rp ON rp.PostId = h.Id
+  LEFT JOIN Users u ON u.Id = h.OwnerUserId
+  LEFT JOIN UserReputationProfile urp ON urp.UserId = u.Id
+  LEFT JOIN (
+    SELECT qt.QuestionId, SUM(hts.ViewsOnTaggedQuestions) OVER (PARTITION BY qt.QuestionId) AS ViewsOnHotTags, AVG(hts.AvgScoreOnTaggedQuestions) OVER (PARTITION BY qt.QuestionId) AS AvgTaggedScore
+    FROM QuestionTags qt
+    LEFT JOIN HotTagStats hts ON hts.Tag = qt.Tag
+  ) ht ON ht.QuestionId = h.Id
+  WHERE h.rn <= 250
+),
+CandidateScores AS (
+  SELECT c.*,
+         (
+           (COALESCE(c.ViewCount, 0) * 1.0 + 50 * GREATEST(c.Score, 0)) *
+           (1 + LEAST(GREATEST(COALESCE(c.AnswerCount, 0) * 1.0, 1), 10) / 10.0) *
+           (1 + COALESCE(c.UniqueAnswerers, 0) * 1.0 / 5.0) *
+           (1 + COALESCE(c.OwnerBadgeScore, 0) * 1.0 / 100.0) *
+           (1 + COALESCE(c.ViewsOnTaggedQuestions, 0) * 1.0 / NULLIF(GREATEST((SELECT SUM(ViewCount) FROM Posts WHERE PostTypeId = 1), 1), 0)) *
+           (1 / (1 + c.AgeDays / 365.0)) *
+           (1 - LEAST(COALESCE(c.DownVotes, 0) * 1.0 / GREATEST(NULLIF(c.UpVotes, 0), 1), 0.5))
+         ) AS HotnessScore
+  FROM Candidates c
+),
+TopEnriched AS (
+  SELECT cs.*,
+         ra.AnswerId AS MostRecentAnswerId, ra.AnswerDate, ra.AnswerScore,
+         (SELECT json_agg(json_build_object('Id', com.Id, 'UserId', com.UserId, 'Text', substring(com.Text, 1, 200), 'CreationDate', com.CreationDate) ORDER BY com.CreationDate DESC)
+          FROM Comments com WHERE com.PostId = cs.Id ORDER BY com.CreationDate DESC LIMIT 5) AS RecentComments
+  FROM CandidateScores cs
+  LEFT JOIN RecentAnswers ra ON ra.QuestionId = cs.Id AND ra.rn = 1
+  ORDER BY cs.HotnessScore DESC
+  LIMIT 50
+)
+SELECT te.Id AS QuestionId,
+       te.Title,
+       te.CreationDate,
+       te.LastActivityDate,
+       te.Score AS QuestionScore,
+       te.ViewCount,
+       te.AnswerCount,
+       te.UniqueAnswerers,
+       ROUND(te.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+       te.CommentCount,
+       te.FavoriteCount,
+       ROUND(te.HotnessScore::numeric, 2) AS HotnessScore,
+       te.OwnerReputation,
+       te.OwnerBadgeScore,
+       te.OutLinks, te.InLinks, te.DistinctLinkTypes,
+       te.MostRecentAnswerId, te.AnswerDate, te.AnswerScore AS MostRecentAnswerScore,
+       te.RecentComments,
+       RANK() OVER (ORDER BY te.HotnessScore DESC) AS RankByHotness,
+       ROW_NUMBER() OVER (ORDER BY te.LastActivityDate DESC) AS RankByRecency,
+       COUNT(*) OVER () AS TotalSelected
+FROM TopEnriched te
+ORDER BY te.HotnessScore DESC, te.LastActivityDate DESC;

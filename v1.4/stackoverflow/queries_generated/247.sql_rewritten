@@ -1,0 +1,86 @@
+-- {"query": "247.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 6859} 
+WITH
+BadgeCounts AS (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+  FROM Badges
+  GROUP BY UserId
+),
+UserTotals AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.LastAccessDate,
+         COALESCE(b.GoldCount,0) AS GoldBadges,
+         COALESCE(b.SilverCount,0) AS SilverBadges,
+         COALESCE(b.BronzeCount,0) AS BronzeBadges,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostCount,
+         (SELECT MAX(LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostActivity
+  FROM Users u
+  LEFT JOIN BadgeCounts b ON b.UserId = u.Id
+),
+RecentPosts AS (
+  SELECT p.Id AS PostId,
+         p.OwnerUserId,
+         p.LastActivityDate,
+         p.Score,
+         p.Title,
+         p.Tags,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+),
+TopPostPerUser AS (
+  SELECT rp.UserId,
+         rp.PostId,
+         rp.Title,
+         rp.LastActivityDate,
+         rp.Score,
+         rp.Tags,
+         rp.rn
+  FROM RecentPosts rp
+  WHERE rp.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+)
+SELECT
+  ut.UserId,
+  ut.DisplayName,
+  ut.Reputation,
+  ut.LastAccessDate,
+  ut.GoldBadges,
+  ut.SilverBadges,
+  ut.BronzeBadges,
+  ut.PostCount,
+  ut.LastPostActivity,
+  tp.PostId AS MostActivePostId,
+  tp.Title AS MostActivePostTitle,
+  tp.LastActivityDate AS MostActiveDate,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tp.PostId) AS MostActivePostComments,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ut.UserId AND p2.LastActivityDate > tp.LastActivityDate) AS PostsAfterMostActive,
+  lower(regexp_replace(ut.DisplayName, '[[:space:]]+', '-', 'g')) AS DisplayNameSlug
+FROM UserTotals ut
+LEFT JOIN TopPostPerUser tp
+  ON tp.UserId = ut.UserId AND tp.rn = 1
+
+UNION ALL
+
+SELECT
+  ut.UserId,
+  ut.DisplayName,
+  ut.Reputation,
+  ut.LastAccessDate,
+  ut.GoldBadges,
+  ut.SilverBadges,
+  ut.BronzeBadges,
+  ut.PostCount,
+  ut.LastPostActivity,
+  NULL AS MostActivePostId,
+  NULL AS MostActivePostTitle,
+  NULL AS MostActiveDate,
+  NULL AS MostActivePostComments,
+  NULL AS PostsAfterMostActive,
+  lower(regexp_replace(ut.DisplayName, '[[:space:]]+', '-', 'g')) AS DisplayNameSlug
+FROM UserTotals ut
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 200;

@@ -1,0 +1,142 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(p.Tags, '') AS TagsRaw,
+         REGEXP_SPLIT_TO_TABLE(SUBSTRING(COALESCE(p.Tags, ''), 2, GREATEST(LENGTH(COALESCE(p.Tags, '')) - 2, 0)), E'><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY
+),
+UserStats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         COALESCE(u.Views,0) AS Views,
+         COALESCE(u.UpVotes,0) AS UpVotes,
+         COALESCE(u.DownVotes,0) AS DownVotes,
+         CASE WHEN COALESCE(u.DownVotes,0)=0 THEN NULL ELSE ROUND( (COALESCE(u.UpVotes,0) / NULLIF(COALESCE(u.DownVotes,0),0))::NUMERIC, 4) END AS UpDownRatio,
+         (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / 86400)::INT AS DaysSinceSignup
+  FROM Users u
+),
+TagQuestionRank AS (
+  SELECT rq.*,
+         ROW_NUMBER() OVER (PARTITION BY rq.Tag ORDER BY rq.Score DESC, rq.ViewCount DESC, rq.CreationDate DESC) AS TagRank,
+         RANK() OVER (ORDER BY rq.Score DESC, rq.ViewCount DESC) AS GlobalRank
+  FROM RecentQuestions rq
+),
+TopTagQuestions AS (
+  SELECT tqr.*,
+         p.AcceptedAnswerId,
+         p.AnswerCount,
+         p.CommentCount,
+         p.LastActivityDate,
+         (SELECT COUNT(DISTINCT COALESCE(a.OwnerUserId, c.UserId, v.UserId))
+          FROM Posts a
+          LEFT JOIN Comments c ON c.PostId = tqr.Id
+          LEFT JOIN Votes v ON v.PostId = tqr.Id
+          WHERE (a.ParentId = tqr.Id AND a.PostTypeId = 2) OR c.PostId = tqr.Id OR v.PostId = tqr.Id
+         ) AS DistinctInteractors,
+         (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = tqr.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+  FROM TagQuestionRank tqr
+  JOIN Posts p ON p.Id = tqr.Id
+  WHERE tqr.TagRank <= 10
+),
+UserBadgeScore AS (
+  SELECT b.UserId,
+         SUM(
+           (CASE b.Class WHEN 1 THEN 5 WHEN 2 THEN 3 WHEN 3 THEN 1 ELSE 0 END)
+           * GREATEST(0.1, 1 - (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - b.Date)) / (365.0*86400)))
+         )::NUMERIC(10,4) AS BadgeScore
+  FROM Badges b
+  WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR
+  GROUP BY b.UserId
+),
+LastEditors AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastHistoryEdit,
+         STRING_AGG(DISTINCT COALESCE(u.DisplayName, ph.UserDisplayName, 'unknown') || ':' || COALESCE(CAST(ph.UserId AS TEXT), '0'), ',' ORDER BY MAX(ph.CreationDate) DESC) AS EditorsSample
+  FROM PostHistory ph
+  LEFT JOIN Users u ON u.Id = ph.UserId
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR
+  GROUP BY ph.PostId
+),
+EnrichedTop AS (
+  SELECT ttq.Id AS QuestionId,
+         ttq.Title,
+         ttq.Tag,
+         ttq.Score,
+         ttq.ViewCount,
+         ttq.CreationDate,
+         ttq.OwnerUserId,
+         us.DisplayName AS OwnerName,
+         us.Reputation,
+         us.DaysSinceSignup,
+         COALESCE(ubs.BadgeScore,0) AS BadgeScore,
+         COALESCE(ttq.DistinctInteractors,0) AS DistinctInteractors,
+         COALESCE(ttq.DuplicateCount,0) AS DuplicateCount,
+         le.LastHistoryEdit,
+         le.EditorsSample,
+         ( LENGTH(ttq.Title || '||' || ttq.Tag) +
+           COALESCE(NULLIF(REGEXP_REPLACE(LOWER(ttq.Title), '[^a-z]', '', 'g'), '' )::TEXT, '')::INT
+           ) AS FuzzyTitleMetric
+  FROM TopTagQuestions ttq
+  LEFT JOIN UserStats us ON us.UserId = ttq.OwnerUserId
+  LEFT JOIN UserBadgeScore ubs ON ubs.UserId = ttq.OwnerUserId
+  LEFT JOIN LastEditors le ON le.PostId = ttq.Id
+),
+FinalAgg AS (
+  SELECT e.*,
+         AVG(e.Score) OVER (PARTITION BY e.Tag) AS AvgScoreByTag,
+         PERCENT_RANK() OVER (PARTITION BY e.Tag ORDER BY e.Score) AS ScorePercentileInTag,
+         NTILE(4) OVER (ORDER BY e.ViewCount DESC) AS ViewQuartile,
+         SUM(e.DistinctInteractors) OVER (PARTITION BY e.OwnerUserId) AS OwnerTotalInteractors,
+         (SELECT a.Score FROM Posts a WHERE a.ParentId = e.QuestionId AND a.PostTypeId = 2 ORDER BY a.CreationDate DESC LIMIT 1) AS MostRecentAnswerScore,
+         (SELECT a.OwnerUserId FROM Posts a WHERE a.ParentId = e.QuestionId AND a.PostTypeId = 2 ORDER BY a.CreationDate DESC LIMIT 1) AS MostRecentAnswerOwner
+  FROM EnrichedTop e
+)
+SELECT DISTINCT fa.QuestionId,
+       fa.Title,
+       fa.Tag,
+       fa.Score,
+       fa.ViewCount,
+       fa.AvgScoreByTag,
+       fa.ScorePercentileInTag,
+       fa.ViewQuartile,
+       fa.OwnerName,
+       fa.Reputation,
+       fa.BadgeScore,
+       fa.DistinctInteractors,
+       fa.OwnerTotalInteractors,
+       fa.DuplicateCount,
+       fa.LastHistoryEdit,
+       fa.EditorsSample,
+       fa.MostRecentAnswerScore,
+       fa.MostRecentAnswerOwner,
+       CASE
+         WHEN fa.Score IS NULL THEN 'no-score'
+         WHEN fa.Score > COALESCE(fa.AvgScoreByTag,0) AND fa.ViewQuartile = 1 THEN 'high-score-high-views'
+         WHEN fa.Score > COALESCE(fa.AvgScoreByTag,0) THEN 'high-score'
+         WHEN COALESCE(fa.DistinctInteractors,0) > 10 AND COALESCE(fa.BadgeScore,0) > 2 THEN 'engaged-expert'
+         ELSE 'other'
+       END AS Category
+FROM FinalAgg fa
+WHERE EXISTS (
+        SELECT 1 FROM Tags t
+        WHERE t.TagName = fa.Tag
+          AND t.Count > 100
+      )
+  AND fa.Tag NOT IN (
+        SELECT DISTINCT REGEXP_REPLACE(tn.TagName, '[^a-z0-9]', '', 'gi')
+        FROM Tags tn
+        WHERE tn.IsModeratorOnly = 1
+      )
+  AND fa.QuestionId IN (
+        SELECT pq.Id FROM Posts pq WHERE pq.PostTypeId = 1 AND pq.AnswerCount > 0
+      )
+  AND NOT EXISTS (
+        SELECT 1 FROM Votes v2
+        WHERE v2.PostId = fa.QuestionId AND v2.VoteTypeId = 12
+      )
+ORDER BY fa.Tag, fa.Score DESC, fa.ViewCount DESC
+LIMIT 500;

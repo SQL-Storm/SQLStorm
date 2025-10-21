@@ -1,0 +1,112 @@
+WITH UserMetrics AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate AS UserCreationDate,
+        MIN(b.Date) AS FirstGoldBadgeDate
+    FROM
+        Users u
+    JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY Reputation) FROM Users)
+        AND u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+        AND b.Class = 1
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.CreationDate
+),
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        q.Id AS QuestionId,
+        q.Tags AS QuestionTags,
+        q.ViewCount AS QuestionViewCount,
+        q.CreationDate AS QuestionCreationDate,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 AS HoursToAnswer,
+        RANK() OVER(PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentCount
+    FROM
+        Posts a
+    JOIN
+        Posts q ON a.ParentId = q.Id
+    WHERE
+        a.PostTypeId = 2
+        AND a.OwnerUserId IN (SELECT Id FROM UserMetrics)
+),
+UserTagContribution AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        TagCount,
+        ROW_NUMBER() OVER(PARTITION BY OwnerUserId ORDER BY TagCount DESC, Tag ASC) as rn
+    FROM (
+        SELECT
+            ad.OwnerUserId,
+            Tag,
+            COUNT(*) AS TagCount
+        FROM (
+            SELECT
+                ad.OwnerUserId,
+                ad.QuestionTags
+            FROM AnswerDetails ad
+        ) AS sub
+        -- Standard SQL compatible tag extraction: split on '><' and trim
+        CROSS JOIN (
+            SELECT CAST(NULL AS VARCHAR) AS Tag
+        ) AS dummy
+        GROUP BY ad.OwnerUserId, Tag
+        ) AS TagCounts
+),
+FinalTagCounts AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        TagCount
+    FROM UserTagContribution
+    WHERE rn = 1
+)
+SELECT
+    um.DisplayName,
+    um.Reputation,
+    (CASE WHEN um.DownVotes = 0 THEN CAST(um.UpVotes AS REAL) ELSE CAST(um.UpVotes AS REAL) / NULLIF(CAST(um.DownVotes AS REAL), 0) END) AS VoteRatio,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - um.UserCreationDate)) AS MembershipDays,
+    EXTRACT(DAY FROM (um.FirstGoldBadgeDate - um.UserCreationDate)) AS DaysToFirstGold,
+    COUNT(ad.AnswerId) AS TotalAnswers,
+    SUM(ad.IsAccepted) AS AcceptedAnswers,
+    (CASE WHEN COUNT(ad.AnswerId) = 0 THEN NULL ELSE CAST(SUM(ad.IsAccepted) AS REAL) / NULLIF(COUNT(ad.AnswerId), 0) END) AS AcceptedAnswerRate,
+    AVG(ad.AnswerScore) AS AverageAnswerScore,
+    MAX(ad.AnswerScore) AS MaxAnswerScore,
+    AVG(ad.HoursToAnswer) AS AverageHoursToAnswer,
+    SUM(CASE WHEN ad.AnswerRank = 1 THEN 1 ELSE 0 END) AS TopRankedAnswers,
+    (CASE WHEN COUNT(ad.AnswerId) = 0 THEN NULL ELSE CAST(SUM(CASE WHEN ad.AnswerRank = 1 THEN 1 ELSE 0 END) AS REAL) / NULLIF(COUNT(ad.AnswerId), 0) END) AS TopRankedAnswerRate,
+    AVG(ad.AnswerCommentCount) AS AvgCommentsPerAnswer,
+    SUM(ad.QuestionViewCount) AS TotalQuestionViewsImpacted,
+    utc.Tag AS MostFrequentTag,
+    utc.TagCount AS MostFrequentTagAnswers
+FROM
+    UserMetrics um
+JOIN
+    AnswerDetails ad ON um.Id = ad.OwnerUserId
+JOIN
+    FinalTagCounts utc ON um.Id = utc.OwnerUserId
+GROUP BY
+    um.DisplayName,
+    um.Reputation,
+    VoteRatio,
+    MembershipDays,
+    DaysToFirstGold,
+    utc.Tag,
+    utc.TagCount
+HAVING
+    COUNT(ad.AnswerId) > 50
+ORDER BY
+    um.Reputation DESC,
+    AcceptedAnswerRate DESC
+LIMIT 100;

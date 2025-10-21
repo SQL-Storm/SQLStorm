@@ -1,0 +1,66 @@
+-- {"query": "52073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 740} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.UpVotes) AS TotalUpVotes,
+        SUM(v.DownVotes) AS TotalDownVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(u.LastAccessDate) AS LastActivity,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) DESC) AS EngagementRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagUsage AS (
+    SELECT 
+        p.OwnerUserId,
+        t.TagName,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    JOIN Tags t ON position('<' || t.TagName || '>' in p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, t.TagName
+),
+TopTags AS (
+    SELECT 
+        OwnerUserId,
+        TagName,
+        TagCount,
+        RANK() OVER (PARTITION BY OwnerUserId ORDER BY TagCount DESC) AS TagRank
+    FROM TagUsage
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.TotalComments,
+    us.QuestionsPosted,
+    us.AnswersPosted,
+    us.AvgPostScore,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    us.TotalBadges,
+    us.LastActivity,
+    us.EngagementRank,
+    STRING_AGG(tt.TagName || ' (' || tt.TagCount || ')', ', ' ORDER BY tt.TagCount DESC) FILTER (WHERE tt.TagRank <= 5) AS TopTags,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = us.Id) AS TotalEdits,
+    (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.UserId = us.Id AND v.VoteTypeId = 8) AS TotalBountiesOffered,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.Id) AND v.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) FROM Posts p WHERE p.AcceptedAnswerId IS NOT NULL AND p.AcceptedAnswerId IN (SELECT pa.Id FROM Posts pa WHERE pa.OwnerUserId = us.Id)) AS AcceptedAnswers
+FROM UserStats us
+LEFT JOIN TopTags tt ON tt.OwnerUserId = us.Id
+WHERE us.TotalPosts > 0
+GROUP BY us.Id, us.DisplayName, us.Reputation, us.TotalPosts, us.TotalComments, us.QuestionsPosted, us.AnswersPosted, us.AvgPostScore, us.TotalUpVotes, us.TotalDownVotes, us.TotalBadges, us.LastActivity, us.EngagementRank
+ORDER BY us.EngagementRank
+LIMIT 100;

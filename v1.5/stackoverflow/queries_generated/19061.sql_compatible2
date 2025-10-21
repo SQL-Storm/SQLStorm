@@ -1,0 +1,166 @@
+WITH UserMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserProfileUpVotes,
+        U.DownVotes AS UserProfileDownVotes,
+        COUNT(P.Id) AS TotalPostsContributed,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        SUM(P.Score) AS TotalPostsScoreReceived,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.UpVotes, U.DownVotes
+),
+PostDetailsExtended AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount AS QuestionViewCount,
+        Q.Score AS QuestionScore,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.AnswerCount,
+        Q.Tags AS QuestionTags,
+        Q.AcceptedAnswerId,
+        Q.ClosedDate,
+        A.Id AS AnswerId,
+        A.Score AS AnswerScore,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.CreationDate AS AnswerCreationDate,
+        A.ParentId AS AnswerParentId,
+        CASE WHEN Q.AcceptedAnswerId = A.Id THEN TRUE ELSE FALSE END AS IsAcceptedAnswer,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END), 0) AS TotalBountyOnQuestion,
+        COUNT(DISTINCT V.UserId) FILTER (WHERE V.VoteTypeId = 8) AS UniqueBountyDonors,
+        (SELECT COUNT(DISTINCT PH_q_inner.UserId) FROM PostHistory PH_q_inner WHERE PH_q_inner.PostId = Q.Id AND PH_q_inner.PostHistoryTypeId IN (4,5,6)) AS QuestionDistinctEditors,
+        (SELECT COUNT(DISTINCT PH_a_inner.UserId) FROM PostHistory PH_a_inner WHERE PH_a_inner.PostId = A.Id AND PH_a_inner.PostHistoryTypeId IN (4,5,6)) AS AnswerDistinctEditors
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Votes V ON Q.Id = V.PostId AND V.VoteTypeId IN (8,9)
+    WHERE Q.PostTypeId = 1
+    GROUP BY
+        Q.Id, Q.Title, Q.CreationDate, Q.ViewCount, Q.Score, Q.OwnerUserId,
+        Q.AnswerCount, Q.Tags, Q.AcceptedAnswerId, Q.ClosedDate,
+        A.Id, A.Score, A.OwnerUserId, A.CreationDate, A.ParentId
+),
+BadgeSummary AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(Id) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserTagContributions AS (
+    WITH AllPostTags AS (
+        SELECT
+            P.OwnerUserId AS UserId,
+            TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName,
+            P.Id AS PostId,
+            P.PostTypeId
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.OwnerUserId IS NOT NULL
+    ),
+    Top500Tags AS (
+        SELECT TagName
+        FROM AllPostTags
+        GROUP BY TagName
+        ORDER BY COUNT(PostId) DESC
+        LIMIT 500
+    )
+    SELECT
+        APT.UserId,
+        APT.TagName,
+        COUNT(APT.PostId) AS UserTagPostCount,
+        SUM(CASE WHEN APT.PostTypeId = 1 THEN 1 ELSE 0 END) AS UserTagQuestionCount,
+        SUM(CASE WHEN APT.PostTypeId = 2 THEN 1 ELSE 0 END) AS UserTagAnswerCount
+    FROM AllPostTags APT
+    JOIN Top500Tags T500 ON APT.TagName = T500.TagName
+    GROUP BY APT.UserId, APT.TagName
+)
+SELECT
+    UM.UserId,
+    UM.DisplayName,
+    UM.Reputation,
+    UM.QuestionsAsked,
+    UM.AnswersPosted,
+    UM.TotalCommentsMade,
+    COALESCE(BS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(BS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(BS.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(BS.TotalBadges, 0) AS TotalBadges,
+    UM.UserProfileUpVotes,
+    UM.UserProfileDownVotes,
+    (UM.UserProfileUpVotes - UM.UserProfileDownVotes) AS NetUserProfileVotes,
+    RANK() OVER (ORDER BY COALESCE(UM.AvgAnswerScore, 0) DESC NULLS LAST, UM.Reputation DESC) AS AnswerScoreRank,
+    COALESCE(AVG(PDE.QuestionDistinctEditors) FILTER (WHERE PDE.QuestionOwnerUserId = UM.UserId), 0) AS AvgDistinctEditorsOnOwnedQuestions,
+    EXISTS (
+        SELECT 1
+        FROM PostDetailsExtended PDE_inner
+        WHERE PDE_inner.AnswerOwnerUserId = UM.UserId
+          AND PDE_inner.QuestionViewCount > 20000
+          AND PDE_inner.AnswerCount < 5
+          AND PDE_inner.AnswerScore > 15
+          AND PDE_inner.ClosedDate IS NULL
+    ) AS SolvedChallengingQuestion,
+    SUM(CASE WHEN UTC.TagName = 'sql' THEN UTC.UserTagPostCount ELSE 0 END) AS SqlTagContributions,
+    SUM(CASE WHEN UTC.TagName = 'performance' THEN UTC.UserTagPostCount ELSE 0 END) AS PerformanceTagContributions,
+    SUM(CASE WHEN UTC.TagName LIKE '%.net%' THEN UTC.UserTagPostCount ELSE 0 END) AS DotNetTagContributions,
+    (
+        COALESCE(UM.AvgAnswerScore, 0) * 0.45 +
+        COALESCE(UM.TotalPostsScoreReceived, 0) / 200.0 * 0.25 +
+        COALESCE(BS.GoldBadges, 0) * 75 +
+        COALESCE(BS.SilverBadges, 0) * 15 +
+        COALESCE(UM.QuestionsAsked, 0) * 0.3 +
+        COALESCE(UM.AnswersPosted, 0) * 0.7 +
+        (UM.UserProfileUpVotes - UM.UserProfileDownVotes) * 0.1
+    ) AS CommunityInfluenceScore,
+    EXTRACT(DAY FROM (UM.LastAccessDate - COALESCE(GREATEST(UM.LastPostActivityDate, UM.LastCommentDate), UM.UserCreationDate))) AS DaysSinceLastSignificantActivity,
+    COUNT(DISTINCT PDE.QuestionId) AS TotalQuestionsUserInvolvedWith,
+    SUM(CASE WHEN PDE.QuestionOwnerUserId = UM.UserId AND PDE.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS OwnedClosedQuestions,
+    SUM(CASE WHEN PDE.AnswerOwnerUserId = UM.UserId AND PDE.IsAcceptedAnswer THEN 1 ELSE 0 END) AS AcceptedAnswersAchieved,
+    AVG(CASE WHEN PDE.AnswerOwnerUserId = UM.UserId AND PDE.IsAcceptedAnswer THEN PDE.AnswerScore ELSE NULL END) AS AvgScoreOfAcceptedAnswers,
+    SUM(PDE.TotalBountyOnQuestion) FILTER (WHERE PDE.QuestionOwnerUserId = UM.UserId) AS TotalBountyOnOwnedQuestions,
+    CASE
+        WHEN SUM(CASE WHEN (UTC.UserTagAnswerCount > 10) THEN 1 ELSE 0 END) OVER (PARTITION BY UM.UserId) >= 3 THEN 'TopAnswerer_MultiTag'
+        WHEN SUM(CASE WHEN (UTC.UserTagPostCount > 20) THEN 1 ELSE 0 END) OVER (PARTITION BY UM.UserId) >= 1 THEN 'Prolific_SingleTag'
+        WHEN SUM(CASE WHEN (UTC.UserTagPostCount > 0) THEN 1 ELSE 0 END) OVER (PARTITION BY UM.UserId) > 5 THEN 'Broad_Contributor'
+        ELSE 'Niche_Contributor'
+    END AS TagEngagementCategory
+FROM UserMetrics UM
+LEFT JOIN BadgeSummary BS ON UM.UserId = BS.UserId
+LEFT JOIN PostDetailsExtended PDE ON UM.UserId = PDE.QuestionOwnerUserId OR UM.UserId = PDE.AnswerOwnerUserId
+LEFT JOIN UserTagContributions UTC ON UM.UserId = UTC.UserId
+WHERE
+    UM.Reputation > 25000
+    AND UM.AnswersPosted > 25
+    AND (UM.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    AND (BS.GoldBadges > 0 OR BS.SilverBadges > 3 OR BS.BronzeBadges > 15)
+    AND UM.AvgAnswerScore IS NOT NULL
+    AND UM.TotalCommentsMade > 50
+GROUP BY
+    UM.UserId, UM.DisplayName, UM.Reputation, UM.QuestionsAsked, UM.AnswersPosted,
+    UM.TotalCommentsMade, BS.GoldBadges, BS.SilverBadges, BS.BronzeBadges,
+    BS.TotalBadges, UM.UserProfileUpVotes, UM.UserProfileDownVotes, UM.AvgAnswerScore,
+    UM.LastAccessDate, UM.LastPostActivityDate, UM.LastCommentDate, UM.UserCreationDate,
+    UM.TotalPostsScoreReceived
+HAVING
+    COUNT(DISTINCT PDE.QuestionId) >= 10
+    AND SUM(CASE WHEN PDE.AnswerOwnerUserId = UM.UserId AND PDE.IsAcceptedAnswer THEN 1 ELSE 0 END) >= 3
+    AND SUM(CASE WHEN UTC.UserTagPostCount > 0 THEN 1 ELSE 0 END) > 2
+ORDER BY
+    CommunityInfluenceScore DESC, AnswerScoreRank ASC, UM.Reputation DESC
+LIMIT 75;

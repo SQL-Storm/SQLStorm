@@ -1,0 +1,211 @@
+-- {"query": "19044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3118} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersGiven,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount, 0) ELSE 0 END) AS TotalQuestionViews,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN COALESCE(P.Score, 0) ELSE NULL END) AS AvgAnswerScoreOverall,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        DATE_PART('day', NOW() - U.CreationDate) AS UserTenureDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostHistoryMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.Score AS CurrentPostScore,
+        COALESCE(P.ViewCount, 0) AS CurrentViewCount,
+        -- Count specific history event types for each post
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN PH.Id END) AS TotalEditHistoryEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) AND PH.UserId IS NOT NULL THEN PH.UserId END) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        -- Extract the numeric part of the close reason from comment, handling potential NULLs
+        COALESCE(
+            CAST(SUBSTRING(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment ELSE NULL END)
+                FROM '^[0-9]+') AS SMALLINT),
+            -1) AS LastCloseReasonTypeId
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.Score, P.ViewCount
+),
+MostFrequentTagPerUser AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        (
+            SELECT sub_tag
+            FROM (
+                SELECT unnest(string_to_array(SUBSTRING(P_sub.Tags, 2, LENGTH(P_sub.Tags) - 2), '><')) AS sub_tag,
+                       COUNT(*) AS tag_count
+                FROM Posts P_sub
+                WHERE P_sub.OwnerUserId = P.OwnerUserId AND P_sub.PostTypeId = 1 AND P_sub.Tags IS NOT NULL AND LENGTH(P_sub.Tags) > 2
+                GROUP BY sub_tag
+                ORDER BY tag_count DESC
+                LIMIT 1
+            ) AS MostFrequentTagSub
+        ) AS TopTag
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY P.OwnerUserId
+),
+GlobalTagAvgScores AS (
+    SELECT
+        unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS TagName,
+        AVG(P.Score) AS AvgGlobalScoreForTag
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TagName
+),
+UserTagPerformance AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS UniqueTagsUsed,
+        AVG(P.Score) AS AvgQuestionScoreAcrossTagsUsed
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY P.OwnerUserId
+),
+TopLevelUsers AS (
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.TotalPostsCreated,
+        UES.TotalQuestionsAsked,
+        UES.TotalAnswersGiven,
+        UES.TotalPostScore,
+        UES.UserTenureDays,
+        UES.TotalUpVotesGiven,
+        UES.TotalDownVotesGiven,
+        UES.AvgAnswerScoreOverall,
+        COALESCE(UTP.UniqueTagsUsed, 0) AS UniqueTagsUsed,
+        COALESCE(UTP.AvgQuestionScoreAcrossTagsUsed, 0.0) AS AvgQuestionScoreAcrossTagsUsed,
+        COALESCE(GTS.AvgGlobalScoreForTag, 0.0) AS AvgScoreOfMostFrequentTagGlobally,
+        SUM(PHM.TotalEditHistoryEvents) AS TotalPostEditEventsSum,
+        SUM(PHM.DistinctEditors) AS TotalDistinctEditorsOnPosts,
+        MAX(PHM.WasClosed) AS UserHasClosedPosts,
+        MAX(PHM.WasReopened) AS UserHasReopenedPosts,
+        STRING_AGG(DISTINCT
+            CASE PHM.LastCloseReasonTypeId
+                WHEN 1 THEN 'Duplicate' WHEN 2 THEN 'Off-topic' WHEN 3 THEN 'Subjective'
+                WHEN 4 THEN 'Not a real question' WHEN 101 THEN 'Duplicate (New)' WHEN 102 THEN 'Off-topic (New)'
+                ELSE NULL
+            END, ', ' ORDER BY PHM.LastCloseReasonTypeId ASC) FILTER (WHERE PHM.LastCloseReasonTypeId <> -1) AS UserCloseReasonSummary
+    FROM UserEngagementSummary UES
+    LEFT JOIN PostHistoryMetrics PHM ON UES.UserId = PHM.OwnerUserId
+    LEFT JOIN UserTagPerformance UTP ON UES.UserId = UTP.UserId
+    LEFT JOIN MostFrequentTagPerUser MFTPU ON UES.UserId = MFTPU.UserId
+    LEFT JOIN GlobalTagAvgScores GTS ON MFTPU.TopTag = GTS.TagName
+    WHERE UES.TotalPostsCreated > 5
+      AND UES.Reputation > 500
+    GROUP BY
+        UES.UserId, UES.DisplayName, UES.Reputation, UES.CreationDate, UES.TotalPostsCreated,
+        UES.TotalQuestionsAsked, UES.TotalAnswersGiven, UES.TotalPostScore, UES.UserTenureDays,
+        UES.TotalUpVotesGiven, UES.TotalDownVotesGiven, UES.AvgAnswerScoreOverall,
+        UTP.UniqueTagsUsed, UTP.AvgQuestionScoreAcrossTagsUsed, GTS.AvgGlobalScoreForTag
+)
+-- Main Query with Window Functions, Complex Predicates, and Set Operators
+SELECT
+    TLU.UserId,
+    TLU.DisplayName,
+    TLU.Reputation,
+    TLU.TotalPostsCreated,
+    TLU.TotalQuestionsAsked,
+    TLU.TotalAnswersGiven,
+    TLU.TotalPostScore,
+    TLU.UserTenureDays,
+    TLU.UniqueTagsUsed,
+    TLU.AvgQuestionScoreAcrossTagsUsed,
+    TLU.AvgScoreOfMostFrequentTagGlobally,
+    TLU.TotalPostEditEventsSum,
+    TLU.TotalDistinctEditorsOnPosts,
+    TLU.UserHasClosedPosts,
+    TLU.UserHasReopenedPosts,
+    TLU.UserCloseReasonSummary,
+    -- Window function 1: Rank users by their total post score within their reputation decile
+    RANK() OVER (PARTITION BY NTILE(10) OVER (ORDER BY TLU.Reputation DESC) ORDER BY TLU.TotalPostScore DESC) AS RankInReputationDecile,
+    -- Window function 2: Calculate the moving average of total posts created by users with similar tenure
+    AVG(TLU.TotalPostsCreated) OVER (ORDER BY TLU.UserTenureDays ASC ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgPostsByTenure,
+    -- Complex calculated field: "Impact Score"
+    CAST(
+        (TLU.TotalPostScore * 0.6) +
+        (TLU.TotalAnswersGiven * 1.5) +
+        (TLU.TotalQuestionsAsked * 0.8) -
+        (TLU.TotalPostEditEventsSum * 0.1) -
+        (TLU.TotalDistinctEditorsOnPosts * 0.2)
+    AS NUMERIC) AS UserImpactScore,
+    -- String expression and NULL logic: Elaborate user engagement status
+    CASE
+        WHEN TLU.Reputation > 20000 AND TLU.UserHasClosedPosts = 0 AND TLU.TotalAnswersGiven > 100 THEN
+            'High-Tier Mentor: Elite and Unproblematic'
+        WHEN TLU.TotalQuestionsAsked > TLU.TotalAnswersGiven * 2 AND TLU.TotalPostScore > 1000 THEN
+            'Prolific Questioner with High Engagement'
+        WHEN TLU.UserHasClosedPosts = 1 AND TLU.TotalPostEditEventsSum > TLU.TotalPostsCreated * 1.5 AND TLU.TotalDistinctEditorsOnPosts > 0 THEN
+            'Moderation-Intensive Profile: Needs Review'
+        WHEN TLU.UniqueTagsUsed >= 10 AND TLU.AvgScoreOfMostFrequentTagGlobally > 50 THEN
+            'Niche Expert with High-Performing Tags'
+        WHEN TLU.UserTenureDays > 365 * 3 AND TLU.TotalPostsCreated < 20 THEN
+            'Long-Term Lurker or Infrequent Contributor'
+        ELSE
+            'General Engaged User: ' || COALESCE(TLU.UserCloseReasonSummary, 'No Specific Issues Detected')
+    END AS DetailedUserStatus
+FROM TopLevelUsers TLU
+WHERE TLU.UserImpactScore > 50 -- Filter for users with a positive calculated impact
+  AND TLU.UniqueTagsUsed IS NOT NULL
+  AND (TLU.UserHasClosedPosts = 0 OR TLU.TotalDistinctEditorsOnPosts < 3) -- Complex predicate with OR and AND
+UNION ALL
+-- A second branch using a set operator to find users with high downvotes relative to upvotes
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersGiven,
+    UES.TotalPostScore,
+    UES.UserTenureDays,
+    0 AS UniqueTagsUsed, -- Not relevant for this branch, so default to 0
+    0.0 AS AvgQuestionScoreAcrossTagsUsed,
+    0.0 AS AvgScoreOfMostFrequentTagGlobally,
+    SUM(PHM.TotalEditHistoryEvents) AS TotalPostEditEventsSum,
+    SUM(PHM.DistinctEditors) AS TotalDistinctEditorsOnPosts,
+    MAX(PHM.WasClosed) AS UserHasClosedPosts,
+    MAX(PHM.WasReopened) AS UserHasReopenedPosts,
+    STRING_AGG(DISTINCT
+        CASE PHM.LastCloseReasonTypeId
+            WHEN 1 THEN 'Duplicate' WHEN 2 THEN 'Off-topic' WHEN 3 THEN 'Subjective'
+            WHEN 4 THEN 'Not a real question' WHEN 101 THEN 'Duplicate (New)' WHEN 102 THEN 'Off-topic (New)'
+            ELSE NULL
+        END, ', ' ORDER BY PHM.LastCloseReasonTypeId ASC) FILTER (WHERE PHM.LastCloseReasonTypeId <> -1) AS UserCloseReasonSummary,
+    0 AS RankInReputationDecile, -- Not ranked in this branch
+    0.0 AS MovingAvgPostsByTenure, -- Not calculated in this branch
+    CAST(
+        (UES.TotalUpVotesGiven * 0.1) - (UES.TotalDownVotesGiven * 2.0)
+    AS NUMERIC) AS UserImpactScore, -- A different impact score for this branch
+    'Negative Feedback Magnet' AS DetailedUserStatus
+FROM UserEngagementSummary UES
+LEFT JOIN PostHistoryMetrics PHM ON UES.UserId = PHM.OwnerUserId
+WHERE UES.TotalDownVotesGiven > UES.TotalUpVotesGiven * 0.5 -- Users with significant downvotes
+  AND UES.Reputation < 2000 -- Filter out very high rep users who might just be active
+  AND UES.TotalPostsCreated > 3
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.CreationDate, UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked, UES.TotalAnswersGiven, UES.TotalPostScore, UES.UserTenureDays,
+    UES.TotalUpVotesGiven, UES.TotalDownVotesGiven
+ORDER BY Reputation DESC, UserImpactScore DESC
+LIMIT 200;

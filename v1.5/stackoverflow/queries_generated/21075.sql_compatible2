@@ -1,0 +1,155 @@
+WITH active_users AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS positive_posts,
+        AVG(p.Score) AS avg_post_score,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(p.Id) > 5
+),
+high_activity_posts AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CreationDate,
+        u.DisplayName AS owner_name,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS all_tags,
+        COALESCE(ac.comments_count, 0) AS comment_count,
+        COALESCE(DATE_PART('epoch', p.LastActivityDate - p.CreationDate) / 3600, 0) AS activity_hours
+    FROM Posts p
+    INNER JOIN active_users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS comments_count
+        FROM Comments c
+        WHERE c.Score >= -2
+        GROUP BY PostId
+    ) ac ON p.Id = ac.PostId
+    LEFT JOIN Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1 
+        AND p.ClosedDate IS NULL
+        AND (p.ViewCount > 1000 OR p.Score > 10)
+        AND p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+    GROUP BY p.Id, p.Title, p.ViewCount, p.Score, p.AnswerCount, p.CreationDate, 
+             u.DisplayName, ac.comments_count, p.LastActivityDate
+    HAVING p.AnswerCount > 0
+),
+engaged_users AS (
+    SELECT 
+        v.UserId,
+        v.PostId,
+        SUM(CASE 
+            WHEN v.VoteTypeId IN (2, 1) THEN 1 
+            WHEN v.VoteTypeId = 3 THEN -1 
+            ELSE 0 
+        END) AS net_votes,
+        COUNT(DISTINCT v.Id) AS vote_count
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '3 months'
+        AND v.VoteTypeId IN (1, 2, 3)
+    GROUP BY v.UserId, v.PostId
+    HAVING COUNT(DISTINCT v.Id) > 2
+)
+SELECT 
+    hap.post_id,
+    hap.Title,
+    hap.owner_name,
+    au.rep_rank,
+    hap.Score AS post_score,
+    hap.AnswerCount AS answer_count,
+    hap.ViewCount AS view_count,
+    hap.comment_count,
+    hap.all_tags,
+    COALESCE(eu.net_votes, 0) AS user_engagement_score,
+    eu.vote_count AS user_vote_activity,
+    RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM hap.CreationDate) 
+        ORDER BY 
+            (hap.Score + hap.AnswerCount * 5 + hap.ViewCount / 100) DESC
+    ) AS yearly_quality_rank,
+    CASE 
+        WHEN hap.ViewCount > 10000 THEN 'Viral'
+        WHEN hap.Score > 50 THEN 'Excellent'
+        WHEN COALESCE(eu.net_votes, 0) > 20 THEN 'Highly Engaged'
+        WHEN hap.activity_hours < 24 THEN 'Fresh'
+        ELSE 'Standard'
+    END AS post_category,
+    CASE 
+        WHEN hap.Title ~* 'performance|optimization|slow' 
+        THEN CONCAT(
+            UPPER(SUBSTRING(hap.Title FROM 1 FOR 1)),
+            LOWER(SUBSTRING(hap.Title FROM 2)),
+            ' - ',
+            COALESCE(
+                NULLIF(TRIM(SUBSTRING(hap.all_tags FROM 1 FOR POSITION(',' IN hap.all_tags || ',') - 1)), ''),
+                'General'
+            )
+        )
+        ELSE NULL 
+    END AS performance_related_title,
+    AVG(hap.Score) OVER (
+        ORDER BY hap.CreationDate 
+        ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+    ) AS recent_score_trend
+FROM high_activity_posts hap
+INNER JOIN active_users au ON hap.owner_name = au.DisplayName
+LEFT JOIN engaged_users eu ON hap.post_id = eu.PostId 
+    AND eu.UserId = au.Id
+LEFT JOIN (
+    SELECT DISTINCT 
+        pl.PostId,
+        COUNT(pl.RelatedPostId) OVER (PARTITION BY pl.PostId) AS duplicate_count
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+        AND pl.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+) dup ON hap.post_id = dup.PostId
+WHERE (hap.ViewCount > 5000 OR hap.Score > 25)
+    AND (dup.duplicate_count IS NULL OR dup.duplicate_count < 3)
+    AND au.rep_rank <= 1000
+    AND COALESCE(eu.net_votes, 0) > -5
+ORDER BY 
+    yearly_quality_rank ASC,
+    hap.ViewCount DESC,
+    hap.CreationDate DESC
+LIMIT 250
+UNION ALL
+SELECT 
+    NULL AS post_id,
+    'SUMMARY STATISTICS' AS Title,
+    NULL AS owner_name,
+    NULL AS rep_rank,
+    SUM(post_score) AS post_score,
+    SUM(answer_count) AS answer_count,
+    SUM(view_count) AS view_count,
+    SUM(comment_count) AS comment_count,
+    NULL AS all_tags,
+    SUM(COALESCE(user_engagement_score, 0)) AS user_engagement_score,
+    SUM(COALESCE(user_vote_activity, 0)) AS user_vote_activity,
+    NULL AS yearly_quality_rank,
+    NULL AS post_category,
+    NULL AS performance_related_title,
+    NULL AS recent_score_trend
+FROM (
+    SELECT 
+        hap.Score AS post_score,
+        hap.AnswerCount,
+        hap.ViewCount,
+        hap.comment_count,
+        eu.net_votes AS user_engagement_score,
+        eu.vote_count AS user_vote_activity
+    FROM high_activity_posts hap
+    INNER JOIN active_users au ON hap.owner_name = au.DisplayName
+    LEFT JOIN engaged_users eu ON hap.post_id = eu.PostId AND eu.UserId = au.Id
+    WHERE hap.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 month'
+) monthly_stats;

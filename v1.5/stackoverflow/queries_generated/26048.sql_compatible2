@@ -1,0 +1,62 @@
+WITH ranked_posts AS (
+  SELECT 
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS row_num
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+top_100_posts AS (
+  SELECT * FROM ranked_posts WHERE row_num <= 100
+),
+top_users AS (
+  SELECT 
+    u.Id,
+    u.Reputation,
+    COUNT(DISTINCT b.Id) AS badge_count
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.Reputation
+  ORDER BY u.Reputation DESC
+  LIMIT 100
+),
+post_history_stats AS (
+  SELECT 
+    ph.PostId,
+    COUNT(DISTINCT ph.PostHistoryTypeId) AS post_history_type_count,
+    MAX(ph.CreationDate) AS latest_post_history_date
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+question_tags AS (
+  SELECT 
+    p.Id,
+    STRING_AGG(t.TagName, ',') AS tags
+  FROM Posts p
+  JOIN PostLinks pl ON p.Id = pl.PostId
+  JOIN Tags t ON pl.RelatedPostId = t.Id
+  WHERE p.PostTypeId = 1 AND t.IsRequired = FALSE
+  GROUP BY p.Id
+)
+SELECT 
+  tp.Id,
+  tp.Score,
+  tp.ViewCount,
+  tp.AnswerCount,
+  tp.CommentCount,
+  tp.FavoriteCount,
+  phs.post_history_type_count,
+  phs.latest_post_history_date,
+  qt.tags,
+  tu.Id AS top_user_id,
+  tu.Reputation AS top_user_reputation,
+  tu.badge_count AS top_user_badge_count
+FROM top_100_posts tp
+LEFT JOIN post_history_stats phs ON tp.Id = phs.PostId
+LEFT JOIN question_tags qt ON tp.Id = qt.Id
+LEFT JOIN top_users tu ON tp.OwnerUserId = tu.Id
+ORDER BY tp.Score DESC;

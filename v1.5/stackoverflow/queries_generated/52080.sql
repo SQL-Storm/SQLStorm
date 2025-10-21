@@ -1,0 +1,55 @@
+-- {"query": "52080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 550} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p_q.Id) AS QuestionCount,
+        COUNT(DISTINCT p_a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(p_q.Score), 0) + COALESCE(SUM(p_a.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS UpvoteCount,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS DownvoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(CASE WHEN p_a.PostTypeId = 2 THEN p_a.Score ELSE NULL END) AS AvgAnswerScore,
+        MIN(u.CreationDate) AS CreationDate,
+        MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON (p_q.Id = v.PostId OR p_a.Id = v.PostId) AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+UserRankings AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPostScore DESC, BadgeCount DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY QuestionCount + AnswerCount DESC, CommentCount DESC) AS ActivityRank,
+        ROW_NUMBER() OVER (ORDER BY AvgAnswerScore DESC NULLS LAST) AS AnswerQualityRank
+    FROM UserStats
+)
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    QuestionCount,
+    AnswerCount,
+    CommentCount,
+    TotalPostScore,
+    UpvoteCount,
+    DownvoteCount,
+    BadgeCount,
+    ROUND(AvgAnswerScore, 2) AS AvgAnswerScore,
+    ReputationRank,
+    ActivityRank,
+    AnswerQualityRank,
+    CASE 
+        WHEN ReputationRank <= 100 AND ActivityRank <= 100 THEN 'Elite Contributor'
+        WHEN ReputationRank <= 500 OR ActivityRank <= 500 THEN 'Active Contributor'
+        ELSE 'Regular User'
+    END AS Category
+FROM UserRankings
+WHERE ReputationRank <= 1000
+ORDER BY ReputationRank;

@@ -1,0 +1,71 @@
+-- {"query": "28054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1357} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Location
+),
+PostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '>, <') AS AllTags,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 5) AS BodyEdits
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, p.Score
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Location,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalPosts,
+    us.TotalComments,
+    us.Upvotes - us.Downvotes AS NetVotes,
+    pa.AvgPostScore,
+    pa.LastPostDate,
+    pa.AllTags,
+    pa.BodyEdits,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = us.Id AND p2.ClosedDate IS NOT NULL) AS ClosedPosts,
+    (SELECT STRING_AGG(lt.Name, ', ') FROM PostLinks pl 
+     JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id 
+     WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id)) AS LinkTypesUsed,
+    CASE 
+        WHEN us.ReputationRank <= 100 THEN 'Top Contributor'
+        WHEN us.GoldBadges > 5 THEN 'Expert'
+        WHEN pa.AvgPostScore > 1000 THEN 'High Quality'
+        ELSE 'Regular'
+    END AS UserCategory
+FROM UserStats us
+LEFT JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+WHERE us.TotalPosts > 10 OR us.GoldBadges > 0
+ORDER BY 
+    CASE 
+        WHEN UserCategory = 'Top Contributor' THEN 1
+        WHEN UserCategory = 'Expert' THEN 2
+        WHEN UserCategory = 'High Quality' THEN 3
+        ELSE 4
+    END,
+    us.ReputationRank
+LIMIT 100;

@@ -1,0 +1,274 @@
+-- {"query": "38080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2824} 
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select date_trunc('day', max(creationdate)) - interval '365 days' from users)
+),
+power_tags as (
+  select t.id as tag_id, t.tagname, t.count
+  from tags t
+  where t.count > (select percentile_cont(0.9) within group (order by count) from tags)
+),
+question_posts as (
+  select p.id as post_id, p.owneruserid as user_id, p.creationdate, p.score, p.viewcount, p.answercount, p.favoritecount, p.tags, p.title
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select a.id as answer_id, a.parentid as question_id, a.owneruserid as user_id, a.creationdate, a.score
+  from posts a
+  where a.posttypeid = 2
+),
+q_with_tags as (
+  select q.post_id, q.user_id, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.title,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+  from question_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+q_with_power_tags as (
+  select q.post_id, q.user_id, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.title, q.tagname
+  from q_with_tags q
+  join power_tags pt on pt.tagname = q.tagname
+),
+user_activity as (
+  select u.user_id,
+         count(distinct q.post_id) as questions_asked,
+         count(distinct a.answer_id) as answers_posted,
+         coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes_cast,
+         coalesce(sum(case when v.votetypeid = 8 then v.bountyamount when v.votetypeid = 9 then -v.bountyamount else 0 end), 0) as net_bounty_flow
+  from recent_users u
+  left join question_posts q on q.user_id = u.user_id
+  left join answer_posts a on a.user_id = u.user_id
+  left join votes v on v.userid = u.user_id
+  group by u.user_id
+),
+q_engagement as (
+  select q.post_id,
+         count(distinct c.id) as comments_count,
+         coalesce(sum(case when vt.votetypeid = 2 then 1 when vt.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count
+  from question_posts q
+  left join comments c on c.postid = q.post_id
+  left join votes vt on vt.postid = q.post_id
+  left join posthistory ph on ph.postid = q.post_id
+  group by q.post_id
+),
+a_engagement as (
+  select a.answer_id,
+         a.question_id,
+         count(distinct c.id) as comments_count,
+         coalesce(sum(case when vt.votetypeid = 2 then 1 when vt.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count
+  from answer_posts a
+  left join comments c on c.postid = a.answer_id
+  left join votes vt on vt.postid = a.answer_id
+  left join posthistory ph on ph.postid = a.answer_id
+  group by a.answer_id, a.question_id
+),
+q_answer_stats as (
+  select a.question_id,
+         count(*) as answers_count,
+         avg(a.score) as avg_answer_score,
+         sum(case when a.score > 0 then 1 else 0 end)::float / nullif(count(*),0) as pct_positive_answers,
+         max(a.creationdate) as last_answer_date
+  from answer_posts a
+  group by a.question_id
+),
+q_dup_links as (
+  select pl.postid as post_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links_count,
+         count(*) filter (where pl.linktypeid = 1) as related_links_count
+  from postlinks pl
+  group by pl.postid
+),
+q_close_reasons as (
+  select ph.postid as post_id,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+         max((case when ph.posthistorytypeid = 10 then ph.creationdate end)) as last_closed_at,
+         max((case when ph.posthistorytypeid = 11 then ph.creationdate end)) as last_reopened_at,
+         array_agg(distinct crt.name) filter (where ph.posthistorytypeid = 10 and crt.name is not null) as close_reasons
+  from posthistory ph
+  left join closerreasontypes crt on crt.id::varchar = ph.comment
+  group by ph.postid
+),
+q_tag_agg as (
+  select q.post_id,
+         array_agg(distinct q.tagname) as power_tags,
+         count(*) as power_tag_count
+  from q_with_power_tags q
+  group by q.post_id
+),
+q_hotness as (
+  select q.post_id,
+         q.viewcount,
+         q.score,
+         q.favoritecount,
+         q.answercount,
+         qe.net_votes,
+         qa.answers_count,
+         qa.avg_answer_score,
+         greatest(coalesce(extract(epoch from (now() - q.creationdate)), 1), 1) as age_seconds,
+         (q.score * 3 + coalesce(q.favoritecount,0) * 2 + coalesce(qe.net_votes,0) + coalesce(qa.answers_count,0)) / greatest((extract(epoch from (now() - q.creationdate)) / 3600.0 + 2)^1.5, 1) as hotness_score
+  from question_posts q
+  left join q_engagement qe on qe.post_id = q.post_id
+  left join q_answer_stats qa on qa.question_id = q.post_id
+),
+user_badges as (
+  select b.userid as user_id,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         count(*) filter (where b.tagbased = 1) as tag_badges,
+         count(*) as total_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+user_summary as (
+  select u.user_id,
+         u.displayname,
+         u.reputation,
+         ua.questions_asked,
+         ua.answers_posted,
+         ua.net_votes_cast,
+         ua.net_bounty_flow,
+         ub.gold_badges,
+         ub.silver_badges,
+         ub.bronze_badges,
+         ub.tag_badges,
+         ub.total_badges,
+         ub.last_badge_date
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join user_badges ub on ub.user_id = u.user_id
+),
+ranked_questions as (
+  select q.post_id,
+         q.user_id,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.favoritecount,
+         q.title,
+         coalesce(qta.power_tags, array[]::varchar[]) as power_tags,
+         coalesce(qta.power_tag_count, 0) as power_tag_count,
+         coalesce(qe.comments_count,0) as comments_count,
+         coalesce(qe.net_votes,0) as net_votes,
+         coalesce(qe.edit_count,0) as edit_count,
+         qe.last_edit_date,
+         coalesce(qas.answers_count,0) as answers_count,
+         coalesce(qas.avg_answer_score,0) as avg_answer_score,
+         qas.last_answer_date,
+         coalesce(qdl.duplicate_links_count,0) as duplicate_links_count,
+         coalesce(qdl.related_links_count,0) as related_links_count,
+         coalesce(qcr.close_events,0) as close_events,
+         qcr.last_closed_at,
+         qcr.last_reopened_at,
+         coalesce(qh.hotness_score,0) as hotness_score,
+         row_number() over (partition by q.user_id order by coalesce(qh.hotness_score,0) desc, q.viewcount desc, q.score desc) as rn_by_user_hot,
+         row_number() over (order by coalesce(qh.hotness_score,0) desc) as rn_global_hot
+  from question_posts q
+  left join q_tag_agg qta on qta.post_id = q.post_id
+  left join q_engagement qe on qe.post_id = q.post_id
+  left join q_answer_stats qas on qas.question_id = q.post_id
+  left join q_dup_links qdl on qdl.post_id = q.post_id
+  left join q_close_reasons qcr on qcr.post_id = q.post_id
+  left join q_hotness qh on qh.post_id = q.post_id
+),
+user_question_agg as (
+  select rq.user_id,
+         count(*) as total_questions,
+         avg(rq.hotness_score) as avg_hotness,
+         max(rq.hotness_score) as max_hotness,
+         sum(case when rq.power_tag_count > 0 then 1 else 0 end) as questions_with_power_tags,
+         sum(rq.duplicate_links_count) as total_dupe_links,
+         sum(rq.close_events) as total_close_events
+  from ranked_questions rq
+  group by rq.user_id
+),
+final_users as (
+  select us.*,
+         uqa.total_questions,
+         uqa.avg_hotness,
+         uqa.max_hotness,
+         uqa.questions_with_power_tags,
+         uqa.total_dupe_links,
+         uqa.total_close_events
+  from user_summary us
+  left join user_question_agg uqa on uqa.user_id = us.user_id
+),
+top_user_questions as (
+  select rq.*
+  from ranked_questions rq
+  where rq.rn_by_user_hot <= 5
+),
+recent_activity_buckets as (
+  select rq.post_id,
+         width_bucket(extract(epoch from (now() - rq.creationdate))::numeric, 0, 3600*24*365, 12) as age_bucket
+  from ranked_questions rq
+),
+bucket_stats as (
+  select rab.age_bucket,
+         count(*) as bucket_questions,
+         avg(rq.hotness_score) as bucket_avg_hotness,
+         max(rq.hotness_score) as bucket_max_hotness,
+         percentile_cont(0.5) within group (order by rq.hotness_score) as bucket_p50_hotness
+  from recent_activity_buckets rab
+  join ranked_questions rq on rq.post_id = rab.post_id
+  group by rab.age_bucket
+)
+select
+  fu.user_id,
+  fu.displayname,
+  fu.reputation,
+  fu.questions_asked,
+  fu.answers_posted,
+  fu.net_votes_cast,
+  fu.net_bounty_flow,
+  fu.gold_badges,
+  fu.silver_badges,
+  fu.bronze_badges,
+  fu.tag_badges,
+  fu.total_badges,
+  fu.last_badge_date,
+  fu.total_questions,
+  fu.avg_hotness,
+  fu.max_hotness,
+  fu.questions_with_power_tags,
+  fu.total_dupe_links,
+  fu.total_close_events,
+  tq.post_id,
+  tq.title,
+  tq.creationdate as question_creationdate,
+  tq.viewcount,
+  tq.score as question_score,
+  tq.favoritecount,
+  tq.answers_count,
+  tq.avg_answer_score,
+  tq.comments_count,
+  tq.net_votes as question_net_votes,
+  tq.edit_count as question_edit_count,
+  tq.last_edit_date,
+  tq.duplicate_links_count,
+  tq.related_links_count,
+  tq.close_events,
+  tq.last_closed_at,
+  tq.last_reopened_at,
+  tq.power_tags,
+  tq.power_tag_count,
+  tq.hotness_score,
+  bs.age_bucket,
+  bs.bucket_questions,
+  bs.bucket_avg_hotness,
+  bs.bucket_max_hotness,
+  bs.bucket_p50_hotness
+from final_users fu
+join top_user_questions tq on tq.user_id = fu.user_id
+left join recent_activity_buckets rab on rab.post_id = tq.post_id
+left join bucket_stats bs on bs.age_bucket = rab.age_bucket
+where coalesce(fu.total_questions,0) > 0
+order by fu.reputation desc, tq.hotness_score desc, tq.viewcount desc
+limit 500;

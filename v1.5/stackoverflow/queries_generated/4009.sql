@@ -1,0 +1,106 @@
+-- {"query": "4009.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1037} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        cast(1 as int) as ActivityLevel,
+        array[u.Id]::int[] as VisitedUsers
+    from Users u
+    where u.Reputation > 1000 and u.LastAccessDate > current_date - interval '1 year'
+
+    union all
+
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        rua.ActivityLevel + 1,
+        VisitedUsers || u.Id
+    from Users u
+    join Votes v on v.UserId = u.Id
+    join RecursiveUserActivity rua on rua.UserId = v.UserId
+    where 
+        u.Id <> all(rua.VisitedUsers)
+        and rua.ActivityLevel < 4
+        and v.CreationDate > current_date - interval '6 months'
+), TopQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10 and p.CreationDate > current_date - interval '1 year'
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        count(a.Id) filter (where a.Score > 0) as PositiveAnswers,
+        count(a.Id) filter (where a.Score <= 0 or a.Score is null) as NonPositiveAnswers,
+        coalesce(sum(a.Score), 0) as TotalAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        (select count(1) from Comments c where c.PostId = q.Id) as QuestionCommentsCount,
+        (select count(1) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        (select string_agg(distinct b.Name, ',' order by b.Name) from Badges b where b.UserId = q.OwnerUserId and b.Date >= current_date - interval '2 years') as UserRecentBadges
+    from TopQuestions q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    group by q.Id, q.OwnerUserId, q.Title
+), DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p.Title as PostTitle,
+        rp.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+    inner join Posts rp on rp.Id = pl.RelatedPostId and rp.PostTypeId = 1
+    where pl.LinkTypeId = 3  -- Duplicate
+)
+select 
+    qa.QuestionId,
+    qa.Title,
+    u.DisplayName,
+    u.Reputation,
+    qa.PositiveAnswers,
+    qa.NonPositiveAnswers,
+    qa.TotalAnswerScore,
+    qa.MaxAnswerScore,
+    qa.QuestionCommentsCount,
+    qa.QuestionUpVotes,
+    coalesce(qa.UserRecentBadges, 'None') as RecentBadges,
+    case 
+        when qa.MaxAnswerScore >= 100 then 'Highly Valued'
+        when qa.MaxAnswerScore between 50 and 99 then 'Moderately Valued'
+        else 'Less Valued'
+    end as AnswerQualityCategory,
+    string_agg(distinct dl.RelatedPostTitle, ' | ') as DuplicateQuestionTitles,
+    lag(qa.TotalAnswerScore, 1) over (partition by u.Id order by qa.QuestionId) as PrevTotalAnswerScore,
+    lead(qa.TotalAnswerScore, 1) over (partition by u.Id order by qa.QuestionId) as NextTotalAnswerScore
+from QuestionAnswerStats qa
+inner join Users u on u.Id = qa.OwnerUserId
+left join DuplicateLinks dl on dl.PostId = qa.QuestionId
+where 
+    exists (
+        select 1 
+        from RecursiveUserActivity rua 
+        where rua.UserId = u.Id
+    )
+group by 
+    qa.QuestionId, qa.Title, u.DisplayName, u.Reputation, qa.PositiveAnswers, qa.NonPositiveAnswers, qa.TotalAnswerScore, 
+    qa.MaxAnswerScore, qa.QuestionCommentsCount, qa.QuestionUpVotes, qa.UserRecentBadges, u.Id
+having 
+    (qa.PositiveAnswers + qa.NonPositiveAnswers) > 0
+    and (qa.QuestionCommentsCount + qa.QuestionUpVotes) > 10
+order by qa.TotalAnswerScore desc, qa.MaxAnswerScore desc, u.Reputation desc
+fetch first 50 rows only;
