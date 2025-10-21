@@ -357,7 +357,7 @@ async def claude_llm(model: str, count: int, id: int | List[str], prompt: str | 
 
                 input_tokens += input_token
                 output_tokens += output_token
-                callback(custom_id, content, input_tokens, output_tokens)
+                callback(custom_id, content, input_token, output_token)
         log.info(f"Processed {len(responses)} responses (input tokens: {input_tokens}, output tokens: {output_tokens})", model)
 
     if batch_output_file:
