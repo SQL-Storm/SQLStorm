@@ -1,4 +1,4 @@
--- {"query": "44002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 4588, "output_tokens": 1252} 
+-- {"query": "44002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 497}
 
 SELECT 
   CAST(DATEDIFF(SECOND, p.CreationDate, p.LastEditDate) AS FLOAT) / DATEDIFF(SECOND, p.CreationDate, p.LastActivityDate) AS PostEditToActivityRatio,

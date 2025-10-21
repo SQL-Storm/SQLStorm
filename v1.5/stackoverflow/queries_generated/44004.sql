@@ -1,4 +1,4 @@
--- {"query": "44004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 9176, "output_tokens": 3289} 
+-- {"query": "44004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 815}
 
 WITH cte AS (
   SELECT p.Id AS PostId, 

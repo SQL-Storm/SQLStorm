@@ -1,4 +1,4 @@
--- {"query": "14097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 228830, "output_tokens": 100093} 
+-- {"query": "14097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 952}
 WITH cte AS (
   SELECT p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.OwnerUserId, p.LastEditorUserId, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate,
          CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END AS AnswerCount,

@@ -1,0 +1,26 @@
+title: SQLStorm v1.2 Features Benchmark
+repetitions: 1
+warmup: 0
+timeout: 100
+query_seed: 42
+fetch_result: true # needed to compute the number of rows
+fetch_result_limit: 1
+query_plan:
+  retrieve: true
+  system_representation: true
+output: results/v1.2/features
+systems:
+  - title: Umbra
+    dbms: umbradev
+    disabled: false
+    settings:
+      usedirectio: true
+      optimizer.json.types: true
+      optimizer.sidewayinformationpassing: false
+      optimizer.earlyprobe: false
+      optimizer.joinfilter: false
+      optimizer.minmaxbounds: false
+      optimizer.limitfilter: false
+      multiway: d
+    parameter:
+      version: "25.01"

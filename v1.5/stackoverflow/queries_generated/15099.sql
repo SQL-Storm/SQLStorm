@@ -1,4 +1,4 @@
--- {"query": "15099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 233500, "output_tokens": 69018} 
+-- {"query": "15099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 785}
 WITH UserTagActivity AS (
     SELECT 
         u.Id AS UserId,

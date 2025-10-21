@@ -1,4 +1,4 @@
--- {"query": "15084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 198475, "output_tokens": 58288} 
+-- {"query": "15084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 587}
 WITH TagPopularity AS (
     SELECT 
         t.TagName,

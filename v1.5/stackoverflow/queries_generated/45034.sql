@@ -1,4 +1,4 @@
--- {"query": "45034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 77996, "output_tokens": 14027} 
+-- {"query": "45034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 391}
 WITH high_impact_users AS (
     SELECT UserId, COUNT(DISTINCT Posts.Id) as posts_count, 
            AVG(Posts.Score) as avg_post_score,

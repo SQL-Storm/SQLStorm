@@ -1,4 +1,4 @@
--- {"query": "15094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 221825, "output_tokens": 65412} 
+-- {"query": "15094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 660}
 WITH UserBadgeStats AS (
     SELECT 
         u.Id AS UserId,

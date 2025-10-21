@@ -1,4 +1,4 @@
--- {"query": "14012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 30355, "output_tokens": 13246} 
+-- {"query": "14012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 591}
 WITH cte AS (
     SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags, 
            CAST(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS VARCHAR(4000)) AS tag_array,

@@ -1,4 +1,4 @@
--- {"query": "14027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 65380, "output_tokens": 29420} 
+-- {"query": "14027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 831}
 WITH cte AS (
   SELECT p.Id, p.PostTypeId, p.CreationDate, p.OwnerUserId, u.Reputation, u.Location, u.AccountId, u.DisplayName, u.EmailHash, u.UpVotes, u.DownVotes,
          CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered' ELSE 'Unanswered' END AS AnswerStatus,
