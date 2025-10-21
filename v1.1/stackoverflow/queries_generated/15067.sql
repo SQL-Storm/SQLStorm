@@ -1,4 +1,4 @@
--- {"query": "15067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 158780, "output_tokens": 46694} 
+-- {"query": "15067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 679}
 WITH UserQuestionActivity AS (
     SELECT 
         u.Id AS UserId,

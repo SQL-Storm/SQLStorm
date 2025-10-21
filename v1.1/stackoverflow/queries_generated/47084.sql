@@ -1,4 +1,4 @@
--- {"query": "47084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 192696, "output_tokens": 169515} 
+-- {"query": "47084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 2005}
 
 WITH RECURSIVE tag_hierarchy AS (
     SELECT 

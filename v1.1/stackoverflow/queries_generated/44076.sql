@@ -1,4 +1,4 @@
--- {"query": "44076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 174344, "output_tokens": 59743} 
+-- {"query": "44076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 162}
 
 SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId, u.DisplayName, u.Reputation, COUNT(v.Id) AS VoteCount
 FROM Posts p

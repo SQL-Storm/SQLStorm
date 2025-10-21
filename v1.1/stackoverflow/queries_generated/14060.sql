@@ -1,4 +1,4 @@
--- {"query": "14060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 142435, "output_tokens": 61462} 
+-- {"query": "14060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 1283}
 WITH cte AS (
   SELECT p.Id, p.PostTypeId, p.ParentId, p.OwnerUserId, p.Score, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.LastActivityDate,
          CASE WHEN p.PostTypeId = 1 THEN (

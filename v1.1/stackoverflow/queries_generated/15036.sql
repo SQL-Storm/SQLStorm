@@ -1,4 +1,4 @@
--- {"query": "15036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 86395, "output_tokens": 25816} 
+-- {"query": "15036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 633}
 WITH TopTags AS (
     SELECT 
         t.TagName, 

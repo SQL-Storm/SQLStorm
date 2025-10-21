@@ -1,4 +1,4 @@
--- {"query": "14041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 98070, "output_tokens": 41642} 
+-- {"query": "14041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 693}
 WITH cte AS (
   SELECT p.Id AS PostId, p.Title, p.CreationDate, p.OwnerUserId, 
          CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed,

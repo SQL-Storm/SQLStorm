@@ -1,4 +1,4 @@
--- {"query": "45090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 206460, "output_tokens": 36548} 
+-- {"query": "45090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 407}
 WITH TopTags AS (
     SELECT Tags, COUNT(*) as TagCount,
            AVG(Score) as AvgScore,

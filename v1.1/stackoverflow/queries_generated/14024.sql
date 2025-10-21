@@ -1,4 +1,4 @@
--- {"query": "14024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 58375, "output_tokens": 26332} 
+-- {"query": "14024.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 488}
 SELECT 
   CONCAT(
     LOWER(u.DisplayName), 

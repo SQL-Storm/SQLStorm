@@ -1,4 +1,4 @@
--- {"query": "44066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 151404, "output_tokens": 51860} 
+-- {"query": "44066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 615}
 Here is an elaborate SQL query for performance benchmarking:
 
 WITH recent_posts AS (

@@ -1,4 +1,4 @@
--- {"query": "14053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 126090, "output_tokens": 53992} 
+-- {"query": "14053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 934}
 WITH cte AS (
   SELECT p.Id, p.PostTypeId, p.CreationDate, p.OwnerUserId, p.AnswerCount, 
          CAST(ROUND(DATEDIFF(p.LastActivityDate, p.CreationDate) / 365.0, 2) AS DECIMAL(5,2)) AS age_in_years,

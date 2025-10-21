@@ -1,4 +1,4 @@
--- {"query": "14010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 25685, "output_tokens": 11209} 
+-- {"query": "14010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 1127}
 WITH cte AS (
   SELECT p.Id, p.PostTypeId, p.Title, p.Body, p.OwnerUserId, p.LastEditDate, p.CreationDate, p.Tags, p.ViewCount, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate,
          CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId ELSE NULL END AS AcceptedAnswerId,

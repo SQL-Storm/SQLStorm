@@ -1,4 +1,4 @@
--- {"query": "15074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 175125, "output_tokens": 51542} 
+-- {"query": "15074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 588}
 WITH UserPostStats AS (
     SELECT 
         u.Id AS UserId,

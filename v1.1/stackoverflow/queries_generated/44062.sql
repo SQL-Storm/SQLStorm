@@ -1,4 +1,4 @@
--- {"query": "44062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 142228, "output_tokens": 49330} 
+-- {"query": "44062.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 755}
 Here is an elaborate SQL query for performance benchmarking on the StackOverflow database schema:
 
 ```sql

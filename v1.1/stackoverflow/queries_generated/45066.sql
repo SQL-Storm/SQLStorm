@@ -1,4 +1,4 @@
--- {"query": "45066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 151404, "output_tokens": 26801} 
+-- {"query": "45066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 400}
 WITH RankedUserPosts AS (
     SELECT 
         u.Id AS UserId,

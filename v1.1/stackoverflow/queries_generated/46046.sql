@@ -1,4 +1,4 @@
--- {"query": "46046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 105524, "output_tokens": 86070} 
+-- {"query": "46046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 1679}
 
 WITH RECURSIVE UserEngagementMetrics AS (
     SELECT 

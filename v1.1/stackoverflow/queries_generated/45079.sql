@@ -1,4 +1,4 @@
--- {"query": "45079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 181226, "output_tokens": 31590} 
+-- {"query": "45079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2294, "output_tokens": 404}
 WITH TopActiveUsers AS (
     SELECT 
         u.Id, 

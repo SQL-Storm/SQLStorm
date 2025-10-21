@@ -1,4 +1,4 @@
--- {"query": "14034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 81725, "output_tokens": 35399} 
+-- {"query": "14034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 1323}
 WITH cte AS (
   SELECT p.Id, p.Title, p.Body, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
          u.DisplayName AS OwnerDisplayName, u.Reputation AS OwnerReputation, u.Location, u.AboutMe, u.Views AS UserViews, u.UpVotes AS UserUpVotes, u.DownVotes AS UserDownVotes,

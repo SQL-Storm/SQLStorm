@@ -1,4 +1,4 @@
--- {"query": "14038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 91065, "output_tokens": 38009} 
+-- {"query": "14038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2335, "output_tokens": 545}
 WITH cte AS (
     SELECT p.Id, p.Title, p.Body, p.CreationDate, p.Score, u.DisplayName AS OwnerDisplayName, u.Reputation AS OwnerReputation, 
         ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
