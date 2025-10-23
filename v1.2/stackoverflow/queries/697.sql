@@ -1,3 +1,4 @@
+-- {"query": "697.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1329} 
 with RecursiveTagCounts as (
     select
         t.Id,
@@ -6,7 +7,7 @@ with RecursiveTagCounts as (
         coalesce(p.AnswerCount, 0) as AnswerCount,
         coalesce(p.ViewCount, 0) as ViewCount,
         coalesce(p.Score, 0) as Score,
-        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+        row_number() over (partition by t.Id order by p.CreationDate desc nulls last) as rn
     from Tags t
     left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
 ),
@@ -23,9 +24,9 @@ TopUsers as (
         u.CreationDate,
         u.Location,
         dense_rank() over (order by u.Reputation desc) as ReputationRank,
-        count(case when b.Class = 1 then 1 end) as GoldBadges,
-        count(case when b.Class = 2 then 1 end) as SilverBadges,
-        count(case when b.Class = 3 then 1 end) as BronzeBadges
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
     from Users u
     left join Badges b on b.UserId = u.Id
     group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
@@ -34,8 +35,8 @@ TopUsers as (
 UserActivity as (
     select
         u.Id as UserId,
-        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
-        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
         coalesce(sum(vtUp.VoteCount),0) as TotalUpVotes,
         coalesce(sum(vtDown.VoteCount),0) as TotalDownVotes,
         max(p.CreationDate) as LastPostDate,
@@ -60,8 +61,8 @@ UserActivity as (
 PostLinkAggregates as (
     select
         pl.PostId,
-        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
-        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
     from PostLinks pl
     join LinkTypes lt on lt.Id = pl.LinkTypeId
     group by pl.PostId
@@ -76,15 +77,15 @@ QuestionStats as (
         p.ViewCount,
         p.AnswerCount,
         p.FavoriteCount,
-        coalesce(pla.LinkedCount,0) as LinkedCount,
-        coalesce(pla.DuplicateCount,0) as DuplicateCount,
+        pla.LinkedCount,
+        pla.DuplicateCount,
         u.DisplayName as OwnerName,
-        coalesce(ua.QuestionsAsked,0) as QuestionsAsked,
-        coalesce(ua.AnswersGiven,0) as AnswersGiven,
-        coalesce(ua.TotalUpVotes,0) as TotalUpVotes,
-        coalesce(ua.TotalDownVotes,0) as TotalDownVotes,
-        coalesce(ua.CommentsMade,0) as CommentsMade,
-        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopQuestionRank
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.CommentsMade,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserTopQuestionRank
     from Posts p
     left join Users u on u.Id = p.OwnerUserId
     left join UserActivity ua on ua.UserId = p.OwnerUserId
@@ -93,25 +94,9 @@ QuestionStats as (
 ),
 RankedQuestions as (
     select
-        qs.Id,
-        qs.Title,
-        qs.Tags,
-        qs.CreationDate,
-        qs.Score,
-        qs.ViewCount,
-        qs.AnswerCount,
-        qs.FavoriteCount,
-        qs.LinkedCount,
-        qs.DuplicateCount,
-        qs.OwnerName,
-        qs.QuestionsAsked,
-        qs.AnswersGiven,
-        qs.TotalUpVotes,
-        qs.TotalDownVotes,
-        qs.CommentsMade,
-        qs.UserTopQuestionRank,
-        lag(qs.Score) over (order by qs.Score desc) as PrevScore,
-        lead(qs.Score) over (order by qs.Score desc) as NextScore,
+        qs.*,
+        lag(qs.Score) over (order by qs.Score desc nulls last) as PrevScore,
+        lead(qs.Score) over (order by qs.Score desc nulls last) as NextScore,
         case when qs.Score is null then 0 else qs.Score end * coalesce(qs.ViewCount,0) as ScoreViewProduct,
         (select count(1) from Comments c where c.PostId = qs.Id and c.CreationDate > qs.CreationDate) as CommentsAfterPost
     from QuestionStats qs
@@ -147,12 +132,13 @@ FinalResult as (
         fhq.NextScore,
         fhq.ScoreViewProduct,
         fhq.CommentsAfterPost,
-        ( 'Score: ' || coalesce(cast(fhq.Score as varchar), '') 
-          || ' | Views: ' || coalesce(cast(fhq.ViewCount as varchar), '') 
-          || ' | Answers: ' || coalesce(cast(fhq.AnswerCount as varchar), '') 
-          || ' | Favorites: ' || coalesce(cast(fhq.FavoriteCount as varchar), '')
-          || ' | Linked: ' || coalesce(cast(fhq.LinkedCount as varchar), '')
-          || ' | Duplicates: ' || coalesce(cast(fhq.DuplicateCount as varchar), '')
+        concat_ws(' | ',
+            'Score:', fhq.Score::text,
+            'Views:', fhq.ViewCount::text,
+            'Answers:', fhq.AnswerCount::text,
+            'Favorites:', fhq.FavoriteCount::text,
+            'Linked:', fhq.LinkedCount::text,
+            'Duplicates:', fhq.DuplicateCount::text
         ) as SummaryStats,
         case
             when fhq.Score >= 50 then 'Hot'
@@ -163,5 +149,5 @@ FinalResult as (
 )
 select *
 from FinalResult
-order by ScoreViewProduct desc, CreationDate desc
+order by ScoreViewProduct desc nulls last, CreationDate desc
 limit 50;

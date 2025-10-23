@@ -1,3 +1,4 @@
+-- {"query": "997.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1703} 
 with RecursiveUserBadges as (
     select
         u.Id as UserId,
@@ -29,55 +30,16 @@ QuestionAnswerStats as (
 UserTagUsage as (
     select
         p.OwnerUserId,
-        trim(both '<>' from tag) as Tag,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
         count(*) as TagCount
     from Posts p
-    cross join lateral (
-        select value as tag
-        from (
-            select
-                case when length(p.Tags) >= 2 then substring(p.Tags from 2 for length(p.Tags) - 2) else '' end as tags_inner
-        ) s,
-        lateral (
-            with recursive parts(pos, rest) as (
-                select 1 as pos, s.tags_inner as rest
-                union all
-                select pos + 1,
-                       case
-                         when position('><' in rest) = 0 then ''
-                         else substring(rest from position('><' in rest) + 2)
-                       end
-                from parts
-                where rest <> ''
-            ),
-            extracted(idx, value, remaining) as (
-                select
-                    row_number() over () as idx,
-                    case
-                      when position('><' in parts.rest) = 0 then parts.rest
-                      else substring(parts.rest from 1 for position('><' in parts.rest) - 1)
-                    end as value,
-                    parts.rest as remaining
-                from parts
-                where parts.rest <> ''
-            )
-            select value from extracted where value <> ''
-        ) splits
-    ) t
     where p.PostTypeId = 1 and p.Tags is not null
-    group by p.OwnerUserId, trim(both '<>' from tag)
+    group by p.OwnerUserId, Tag
 ),
 TopTagsPerUser as (
-    select OwnerUserId, Tag, TagCount
-    from (
-        select
-            OwnerUserId,
-            Tag,
-            TagCount,
-            row_number() over (partition by OwnerUserId order by TagCount desc) as rn
-        from UserTagUsage
-    ) x
-    where rn = 1
+    select distinct on (OwnerUserId) OwnerUserId, Tag, TagCount
+    from UserTagUsage
+    order by OwnerUserId, TagCount desc
 ),
 UserCommentStats as (
     select
@@ -154,7 +116,7 @@ UserDuplicates as (
     inner join Posts p1 on p1.Id = pl.PostId
     inner join Posts p2 on p2.Id = pl.RelatedPostId
     inner join Users u on u.Id = p1.OwnerUserId
-    where pl.LinkTypeId = 3
+    where pl.LinkTypeId = 3 -- Duplicate link type
     and p1.PostTypeId = 1
     and p2.PostTypeId = 1
 ),
@@ -195,10 +157,10 @@ FinalOutput as (
         u.Reputation,
         u.Questions,
         u.Answers,
-        round(cast(u.AvgQScore as numeric),2) as AvgQuestionScore,
-        round(cast(u.AvgAScore as numeric),2) as AvgAnswerScore,
+        round(u.AvgQScore,2) as AvgQuestionScore,
+        round(u.AvgAScore,2) as AvgAnswerScore,
         u.Comments,
-        round(cast(u.AvgCScore as numeric),2) as AvgCommentScore,
+        round(u.AvgCScore,2) as AvgCommentScore,
         u.UpVotesReceived,
         u.DownVotesReceived,
         u.BadgeName,

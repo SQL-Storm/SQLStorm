@@ -1,8 +1,9 @@
+-- {"query": "370.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 14321} 
 WITH UserMetrics AS (
   SELECT
     u.Id AS UserId,
-    COALESCE(u.DisplayName, 'User_' || CAST(u.Id AS VARCHAR)) AS DisplayName,
-    (COALESCE(u.DisplayName, 'User_' || CAST(u.Id AS VARCHAR)) || ' [' || CAST(u.Id AS VARCHAR) || ']') AS Label,
+    COALESCE(u.DisplayName, 'User_' || CAST(u.Id AS TEXT)) AS DisplayName,
+    (COALESCE(u.DisplayName, 'User_' || CAST(u.Id AS TEXT)) || ' [' || CAST(u.Id AS TEXT) || ']') AS Label,
     COALESCE(pc.PostCount365, 0) AS PostCount365,
     COALESCE((SELECT SUM(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id), 0) AS SumPostScores,
     COALESCE(v365.UpVotes365, 0) AS UpVotes365,
@@ -11,13 +12,13 @@ WITH UserMetrics AS (
   LEFT JOIN (
     SELECT OwnerUserId, COUNT(*) AS PostCount365
     FROM Posts
-    WHERE CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+    WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
     GROUP BY OwnerUserId
   ) pc ON pc.OwnerUserId = u.Id
   LEFT JOIN (
     SELECT UserId, COUNT(*) AS UpVotes365
     FROM Votes
-    WHERE CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days' AND VoteTypeId = 2
+    WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' AND VoteTypeId = 2
     GROUP BY UserId
   ) v365 ON v365.UserId = u.Id
   LEFT JOIN (
@@ -41,13 +42,13 @@ Ranked AS (
   FROM UserMetrics
 ),
 ScoreSet AS (
-  SELECT UserId, DisplayName, Label, PostCount365, SumPostScores, UpVotes365, GoldBadges, ScoreRank, NULL AS AltRank, 'score' AS Source
+  SELECT UserId, DisplayName, Label, PostCount365, SumPostScores, UpVotes365, GoldBadges, ScoreRank, NULL::int AS AltRank, 'score' AS Source
   FROM Ranked
   ORDER BY ScoreRank
   LIMIT 200
 ),
 VoteSet AS (
-  SELECT UserId, DisplayName, Label, PostCount365, SumPostScores, UpVotes365, GoldBadges, NULL AS ScoreRank, VotesRank, 'votes' AS Source
+  SELECT UserId, DisplayName, Label, PostCount365, SumPostScores, UpVotes365, GoldBadges, NULL::int AS ScoreRank, VotesRank, 'votes' AS Source
   FROM Ranked
   ORDER BY VotesRank
   LIMIT 200

@@ -1,3 +1,4 @@
+-- {"query": "293.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1576} 
 with RecursiveUserActivity as (
     select
         u.Id as UserId,
@@ -26,7 +27,7 @@ TopTags as (
         p.OwnerUserId,
         count(p.Id) as PostsWithTag
     from Tags t
-    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
     group by t.TagName, t.Count, p.OwnerUserId
     having count(p.Id) > 10
 ),
@@ -85,7 +86,7 @@ ClosedQuestionsWithReasons as (
         p.Title,
         p.OwnerUserId
     from PostHistory ph
-    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
     join Posts p on p.Id = ph.PostId
     where ph.PostHistoryTypeId = 10
 ),
@@ -169,6 +170,6 @@ left join (
     where ph.UserId is not null
     group by ph.UserId
 ) aes on aes.UserId = uas.UserId
-where coalesce(uas.TotalPosts,0) > 50
+where uas.TotalPosts > 50
 order by uas.Reputation desc, uas.TotalPosts desc
 limit 100;

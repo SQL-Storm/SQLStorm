@@ -1,16 +1,17 @@
+-- {"query": "298.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 7705} 
 WITH
 RecentQuestions AS (
   SELECT p.Id AS PostId, p.Title, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.ViewCount, p.Score, p.Tags
   FROM Posts p
   WHERE p.PostTypeId = 1
-    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
 ),
 VeryViewed AS (
   SELECT p.Id AS PostId, p.Title, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.ViewCount, p.Score, p.Tags
   FROM Posts p
   WHERE p.PostTypeId = 1
     AND p.ViewCount > 10000
-    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365' DAY
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
 ),
 PostSet AS (
   SELECT * FROM RecentQuestions
@@ -55,22 +56,16 @@ Final AS (
          m.NetVotes,
          m.CommentCount,
          CASE
-           WHEN m.Tags IS NOT NULL THEN
-             ARRAY_TO_STRING(
-               COALESCE(string_to_array(substr(m.Tags, 2, LENGTH(m.Tags) - 2), '><'), ARRAY[]::text[]),
-               ','
-             )
+           WHEN m.Tags IS NOT NULL THEN array_to_string(COALESCE(string_to_array(substr(m.Tags, 2, length(m.Tags) - 2), '><'), ARRAY[]::text[]), ',')
            ELSE NULL
          END AS TagList,
          u.Reputation AS OwnerReputation,
          COALESCE(os.GoldBadges, 0) AS OwnerGoldBadges,
-         (
-           SELECT c.Text
-           FROM Comments c
-           WHERE c.PostId = m.PostId
-           ORDER BY c.CreationDate DESC
-           LIMIT 1
-         ) AS LatestComment
+         (SELECT c.Text
+          FROM Comments c
+          WHERE c.PostId = m.PostId
+          ORDER BY c.CreationDate DESC NULLS LAST
+          LIMIT 1) AS LatestComment
   FROM Metrics m
   LEFT JOIN Users u ON u.Id = m.OwnerUserId
   LEFT JOIN OwnerStats os ON os.UserId = m.OwnerUserId

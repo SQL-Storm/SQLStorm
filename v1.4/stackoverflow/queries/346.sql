@@ -1,3 +1,4 @@
+-- {"query": "346.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16393} 
 WITH Q AS (
   SELECT
     p.Id AS PostId,
@@ -17,7 +18,8 @@ WITH Q AS (
     p.CommentCount,
     p.FavoriteCount,
     p.LastEditDate,
-    (SELECT ph.Comment FROM PostHistory ph
+    (SELECT ph.Comment::smallint
+     FROM PostHistory ph
      WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
      ORDER BY ph.CreationDate DESC
      LIMIT 1) AS LastCloseReasonId,

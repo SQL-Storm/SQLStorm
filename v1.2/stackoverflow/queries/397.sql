@@ -1,3 +1,4 @@
+-- {"query": "397.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1420} 
 with RecursiveTagCounts as (
     select
         t.Id,
@@ -9,26 +10,20 @@ with RecursiveTagCounts as (
     from Tags t
     left join (
         select
-            Tag,
+            unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
             sum(case when p.PostTypeId = 1 then p.AnswerCount else 0 end) as AnswerCount,
             sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as ViewCount
-        from (
-            select
-                p.*,
-                -- remove surrounding angle brackets and split into tags
-                regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as Tag
-            from Posts p
-            where p.Tags is not null
-        ) p
+        from Posts p
+        where p.Tags is not null
         group by Tag
     ) p on p.Tag = t.TagName
 ),
 UserBadgeAgg as (
     select
         b.UserId,
-        count(case when b.Class = 1 then 1 end) as GoldBadges,
-        count(case when b.Class = 2 then 1 end) as SilverBadges,
-        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
         max(b.Date) as LastBadgeDate
     from Badges b
     group by b.UserId
@@ -45,7 +40,7 @@ TopUsers as (
         uba.SilverBadges,
         uba.BronzeBadges,
         uba.LastBadgeDate,
-        rank() over (order by u.Reputation desc, u.Views desc) as UserRank
+        rank() over (order by u.Reputation desc, u.Views desc nulls last) as UserRank
     from Users u
     left join UserBadgeAgg uba on uba.UserId = u.Id
     where u.Reputation > 1000
@@ -60,7 +55,7 @@ PostActivityWindow as (
         p.ViewCount,
         p.Tags,
         p.Title,
-        count(c.Id) over (partition by p.Id order by coalesce(c.CreationDate, p.CreationDate) rows between unbounded preceding and current row) as CumulativeComments,
+        count(c.Id) over (partition by p.Id order by c.CreationDate rows between unbounded preceding and current row) as CumulativeComments,
         row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
     from Posts p
     left join Comments c on c.PostId = p.Id
@@ -74,7 +69,7 @@ ClosedQuestionsWithReasons as (
         ph.UserId as CloserUserId,
         u.DisplayName as CloserUserName
     from PostHistory ph
-    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
     left join Users u on u.Id = ph.UserId
     where ph.PostHistoryTypeId = 10
 ),
@@ -141,7 +136,7 @@ select
     cuss.SilverBadges,
     cuss.BronzeBadges,
     cuss.AnswerCount,
-    round(cast(cuss.AvgAnswerScore as numeric), 2) as AvgAnswerScore,
+    round(cuss.AvgAnswerScore, 2) as AvgAnswerScore,
     cuss.HighScoreAnswers,
     cuss.MaxAnswerScore,
     cuss.LastBadgeDate,
@@ -165,6 +160,6 @@ left join DuplicateLinks dq on dq.PostId in (
 )
 left join PostActivityWindow paw on paw.OwnerUserId = cuss.Id and paw.RecentPostRank = 1
 where cuss.AnswerCount > 5
-  and (cqwr.CloseReason is null or lower(cqwr.CloseReason) not like '%duplicate%')
-order by cuss.Reputation desc, cuss.Views desc, rtc.Count desc
+  and (cqwr.CloseReason is null or cqwr.CloseReason not ilike '%duplicate%')
+order by cuss.Reputation desc, cuss.Views desc nulls last, rtc.Count desc
 limit 50;

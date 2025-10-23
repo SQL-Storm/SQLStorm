@@ -1,3 +1,4 @@
+-- {"query": "286.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 7563} 
 WITH
 RecentPosts AS (
   SELECT
@@ -16,12 +17,12 @@ RecentPosts AS (
     (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountFromSub
   FROM Posts p
   LEFT JOIN Users u ON p.OwnerUserId = u.Id
-  WHERE p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days')
+  WHERE p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
     AND p.PostTypeId IN (1, 2)
 ),
 ParsedTags AS (
   SELECT rp.PostId,
-         UNNEST(string_to_array(substr(rp.Tags, 2, length(rp.Tags) - 2), '><')) AS TagName
+         unnest(string_to_array(substr(rp.Tags, 2, length(rp.Tags)-2), '><')) AS TagName
   FROM RecentPosts rp
 ),
 QueryA AS (
@@ -35,11 +36,11 @@ QueryA AS (
          rp.OwnerUserId,
          rp.Reputation,
          rp.PostTypeId,
-         CASE WHEN rp.ViewCount > 0 THEN (rp.Score * 1.0) / rp.ViewCount ELSE NULL END AS ScorePerView,
-         rp.OwnerName || ' [' || CAST(rp.Reputation AS TEXT) || ']' AS OwnerDisplay,
+         CASE WHEN rp.ViewCount > 0 THEN rp.Score::double precision / rp.ViewCount ELSE NULL END AS ScorePerView,
+         rp.OwnerName || ' [' || rp.Reputation::text || ']' AS OwnerDisplay,
          rp.TypeRank,
          rp.CommentCountFromSub AS CommentCountCorrelated,
-         NULL AS Extra
+         NULL::text AS Extra
   FROM RecentPosts rp
   JOIN ParsedTags pt ON pt.PostId = rp.PostId
   WHERE (rp.Score > 100 OR rp.ViewCount > 1000 OR rp.TypeRank <= 5)
@@ -48,20 +49,20 @@ QueryA AS (
            rp.OwnerName, rp.OwnerUserId, rp.Reputation, rp.PostTypeId, rp.TypeRank, rp.CommentCountFromSub
 ),
 QueryB AS (
-  SELECT NULL::INTEGER AS PostId,
-         NULL::TEXT AS Title,
-         NULL::TIMESTAMP WITHOUT TIME ZONE AS CreationDate,
-         NULL::TIMESTAMP WITHOUT TIME ZONE AS LastActivityDate,
-         NULL::INTEGER AS Score,
-         NULL::INTEGER AS ViewCount,
-         t.UserName AS OwnerName,
-         t.UserId AS OwnerUserId,
-         t.Reputation,
-         NULL::INTEGER AS PostTypeId,
-         NULL::NUMERIC AS ScorePerView,
-         NULL AS OwnerDisplay,
-         NULL AS TypeRank,
-         NULL AS CommentCountCorrelated,
+  SELECT NULL::int AS PostId,
+         NULL::text AS Title,
+         NULL::timestamp AS CreationDate,
+         NULL::timestamp AS LastActivityDate,
+         NULL::int AS Score,
+         NULL::int AS ViewCount,
+         UserName AS OwnerName,
+         UserId AS OwnerUserId,
+         Reputation,
+         NULL::smallint AS PostTypeId,
+         NULL::double precision AS ScorePerView,
+         NULL::text AS OwnerDisplay,
+         NULL::int AS TypeRank,
+         NULL::int AS CommentCountCorrelated,
          'From heavy-user activity (union)' AS Extra
   FROM (
      SELECT u.Id AS UserId,
@@ -70,7 +71,7 @@ QueryB AS (
      FROM Posts p
      LEFT JOIN Users u ON p.OwnerUserId = u.Id
      GROUP BY u.Id, u.DisplayName, u.Reputation
-     HAVING COUNT(*) > 10
+     HAVING count(*) > 10
   ) t
 )
 SELECT *

@@ -1,3 +1,4 @@
+-- {"query": "395.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 14881} 
 WITH
 questions_tags AS (
     SELECT
@@ -7,14 +8,12 @@ questions_tags AS (
         q.AcceptedAnswerId,
         COALESCE(q.ViewCount,0) AS view_count,
         LOWER(TRIM(t.tag)) AS tag
-    FROM Posts q,
-    LATERAL (
-      SELECT unnest(
+    FROM Posts q
+    CROSS JOIN LATERAL unnest(
         string_to_array(
-          CASE WHEN LENGTH(COALESCE(q.Tags,'')) > 2 THEN SUBSTRING(q.Tags FROM 2 FOR (LENGTH(q.Tags)-2)) ELSE '' END
+            CASE WHEN LENGTH(COALESCE(q.Tags,'')) > 2 THEN SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2) ELSE '' END
         , '><')
-      ) AS tag
-    ) t
+    ) AS t(tag)
     WHERE q.PostTypeId = 1
       AND COALESCE(q.Tags,'') <> ''
       AND t.tag <> ''
@@ -51,9 +50,9 @@ contributions_by_tag_user AS (
         SUM(DISTINCT tam.view_count) AS unique_question_views,
         MIN(tam.answer_creation) AS first_answer_date,
         MAX(tam.answer_creation) AS last_answer_date,
-        SUM(CASE WHEN tam.answer_creation >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '180 days' THEN 1 ELSE 0 END) AS answers_last_180_days
+        SUM(CASE WHEN tam.answer_creation >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days' THEN 1 ELSE 0 END) AS answers_last_180_days
     FROM tag_answer_mapping tam
-    GROUP BY tam.tag, COALESCE(tam.answer_owner, -1)
+    GROUP BY 1,2
 ),
 user_global AS (
     SELECT
@@ -67,7 +66,7 @@ user_global AS (
         COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS upvotes_on_owned_posts,
         COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS downvotes_on_owned_posts,
         MAX(p.LastEditDate) AS last_post_edit,
-        EXTRACT(EPOCH FROM ((TIMESTAMP '2024-10-01 12:34:56') - u.CreationDate))/86400.0 AS account_age_days
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/86400.0 AS account_age_days
     FROM Users u
     LEFT JOIN Posts p ON p.OwnerUserId = u.Id
     LEFT JOIN Badges b ON b.UserId = u.Id
@@ -92,15 +91,13 @@ tag_user_metrics AS (
         COALESCE(ug.downvotes_on_owned_posts,0) AS downvotes_on_owned_posts,
         COALESCE(ug.last_post_edit, ug.created_at) AS last_activity,
         COALESCE(ug.account_age_days, 0) AS account_age_days,
-        CAST(
-            (
-                (COALESCE(c.answers_count,0) * LEAST(GREATEST(COALESCE(c.avg_answer_score,0), -5), 50))
-              + (COALESCE(c.accepted_count,0) * 15)
-              + LN(1 + GREATEST(COALESCE(c.unique_question_views,0),0)) * 2.5
-              + (COALESCE(ug.Reputation,0) / NULLIF(COALESCE(ug.account_age_days,365),0)) * 0.8
-              + (COALESCE(ug.badges_count,0) * 1.7)
-            ) AS numeric
-        ) AS composite_score
+        (
+            (COALESCE(c.answers_count,0) * LEAST(GREATEST(COALESCE(c.avg_answer_score,0), -5), 50))
+          + (COALESCE(c.accepted_count,0) * 15)
+          + LOG(1 + GREATEST(COALESCE(c.unique_question_views,0),0)) * 2.5
+          + (COALESCE(ug.Reputation,0) / NULLIF(COALESCE(ug.account_age_days,365),0)) * 0.8
+          + (COALESCE(ug.badges_count,0) * 1.7)
+        )::numeric AS composite_score
     FROM contributions_by_tag_user c
     LEFT JOIN user_global ug ON ug.user_id = c.user_id
 ),
@@ -119,8 +116,8 @@ top_recent AS (
         t.reputation,
         t.badges_count,
         t.composite_score,
-        ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.answers_last_180_days DESC, t.composite_score DESC) AS recent_rank,
-        'recent' AS window_type
+        ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.answers_last_180_days DESC, t.composite_score DESC NULLS LAST) AS recent_rank,
+        'recent'::text AS window_type
     FROM tag_user_metrics t
     WHERE t.answers_last_180_days > 0
 ),
@@ -129,7 +126,7 @@ top_alltime AS (
         t.tag,
         t.user_id,
         t.display_name,
-        CAST(NULL AS integer) AS answers_last_180_days,
+        NULL::int AS answers_last_180_days,
         t.answers_count,
         t.distinct_questions_answered,
         t.accepted_count,
@@ -139,8 +136,8 @@ top_alltime AS (
         t.reputation,
         t.badges_count,
         t.composite_score,
-        ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.composite_score DESC, t.accepted_count DESC) AS alltime_rank,
-        'alltime' AS window_type
+        ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.composite_score DESC, t.accepted_count DESC NULLS LAST) AS alltime_rank,
+        'alltime'::text AS window_type
     FROM tag_user_metrics t
 ),
 top_combined AS (
@@ -201,10 +198,10 @@ SELECT
     e.answers_last_180_days,
     e.distinct_questions_answered,
     e.accepted_count,
-    ROUND(CAST(e.avg_answer_score AS numeric), 3) AS avg_answer_score,
-    ROUND(CAST(COALESCE(e.median_answer_score,0) AS numeric), 3) AS median_answer_score,
+    ROUND(e.avg_answer_score::numeric, 3) AS avg_answer_score,
+    ROUND(COALESCE(e.median_answer_score,0)::numeric, 3) AS median_answer_score,
     e.unique_question_views,
-    ROUND(CAST(e.composite_score AS numeric), 3) AS composite_score,
+    ROUND(e.composite_score::numeric, 3) AS composite_score,
     COALESCE(e.last_comment_text, '(no comments)') AS last_comment_text_snippet,
     COALESCE(e.commented_questions_count, 0) AS commented_questions_count,
     COALESCE(e.last_history_comment, '(no history comment)') AS last_history_comment,

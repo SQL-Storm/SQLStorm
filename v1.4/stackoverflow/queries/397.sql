@@ -1,3 +1,4 @@
+-- {"query": "397.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 19129} 
 WITH
   VotesAgg AS (
     SELECT PostId,
@@ -29,12 +30,12 @@ WITH
              ORDER BY c.CreationDate DESC
              LIMIT 1
            ) AS LastCommentSnippet,
-           (COALESCE(u.DisplayName, p.OwnerDisplayName) || ' [' || COALESCE(CAST(u.Reputation AS TEXT), '0') || ']') AS OwnerSummary
+           (COALESCE(u.DisplayName, p.OwnerDisplayName) || ' [' || COALESCE(u.Reputation::text, '0') || ']') AS OwnerSummary
     FROM Posts p
     LEFT JOIN Users u ON u.Id = p.OwnerUserId
     LEFT JOIN VotesAgg V ON V.PostId = p.Id
     LEFT JOIN CommentCounts CC ON CC.PostId = p.Id
-    WHERE p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
       AND COALESCE(V.UpVotes, 0) > 50
   ),
   SetB AS (
@@ -55,7 +56,7 @@ WITH
              ORDER BY c.CreationDate DESC
              LIMIT 1
            ) AS LastCommentSnippet,
-           (COALESCE(u.DisplayName, p.OwnerDisplayName) || ' [' || COALESCE(CAST(u.Reputation AS TEXT), '0') || ']') AS OwnerSummary
+           (COALESCE(u.DisplayName, p.OwnerDisplayName) || ' [' || COALESCE(u.Reputation::text, '0') || ']') AS OwnerSummary
     FROM Posts p
     LEFT JOIN Users u ON u.Id = p.OwnerUserId
     LEFT JOIN VotesAgg V ON V.PostId = p.Id
@@ -77,4 +78,4 @@ SELECT PostId, Title, CreationDate, Score, ViewCount, OwnerUserId, OwnerName, Ow
        UpVotes, DownVotes, CommentCount, LastCommentSnippet, OwnerSummary, GlobalRank
 FROM Ranked
 ORDER BY GlobalRank
-FETCH FIRST 200 ROWS ONLY;
+LIMIT 200;

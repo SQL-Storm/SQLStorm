@@ -1,3 +1,4 @@
+-- {"query": "676.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1886} 
 with RecursiveUserActivity as (
     select
         u.Id as UserId,
@@ -21,9 +22,9 @@ with RecursiveUserActivity as (
 UserBadgeCounts as (
     select
         b.UserId,
-        count(case when b.Class = 1 then 1 end) as GoldBadges,
-        count(case when b.Class = 2 then 1 end) as SilverBadges,
-        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
         count(distinct b.Name) as DistinctBadges
     from Badges b
     group by b.UserId
@@ -44,10 +45,7 @@ PostWithTagArray as (
         p.ViewCount,
         p.Title,
         p.Tags,
-        -- convert tags like '<tag1><tag2>' into array ['tag1','tag2']
-        -- replace PostgreSQL substring(... from ...) and regexp_split_to_array with standard-compatible functions
-        -- remove leading and trailing angle brackets then split by '><'
-        trim(both '<>' from p.Tags) as TagString
+        string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><') as TagArray
     from Posts p
     where p.PostTypeId = 1 and p.Tags is not null
 ),
@@ -58,45 +56,8 @@ PostsWithTopTags as (
         p.Score,
         p.ViewCount,
         p.Title,
-        t.Tag
-    from PostWithTagArray p,
-    lateral (
-        -- split TagString by '><' into rows. Use a generic split approach using recursive CTE for portability.
-        select split_parts.part as Tag
-        from (
-            with recursive splitter(pos, rest) as (
-                select 1, p.TagString
-                union all
-                select
-                    instr(rest, '><') + 3,
-                    substr(rest, instr(rest, '><') + 3)
-                from splitter
-                where instr(rest, '><') > 0
-            ),
-            parts as (
-                select
-                    case
-                        when instr(p.TagString, '><') = 0 then p.TagString
-                        else
-                            substr(
-                                p.TagString,
-                                case when n.pos = 1 then 1 else n.pos end,
-                                case
-                                    when instr(substr(p.TagString, n.pos), '><') = 0 then length(substr(p.TagString, n.pos))
-                                    else instr(substr(p.TagString, n.pos), '><') - 1
-                                end
-                            )
-                    end as part
-                from (
-                    select 1 as ord
-                    union all
-                    select row_number() over () from (select 1) -- placeholder to allow lateral; actual splitting handled below
-                ) r
-                join splitter n on 1=1
-            )
-            select distinct part from parts where part is not null
-        ) split_parts
-    ) t
+        unnest(p.TagArray) as Tag
+    from PostWithTagArray p
 ),
 UserTopTagStats as (
     select
@@ -161,7 +122,7 @@ UserCommentStats as (
         c.UserId,
         count(*) as TotalComments,
         avg(length(c.Text)) as AvgCommentLength,
-        sum(case when c.CreationDate > (date '2024-10-01' - interval '1 year') then 1 else 0 end) as CommentsLastYear
+        sum(case when c.CreationDate > cast('2024-10-01' as date) - interval '1 year' then 1 else 0 end) as CommentsLastYear
     from Comments c
     where c.UserId is not null
     group by c.UserId
@@ -169,9 +130,9 @@ UserCommentStats as (
 UserVoteStats as (
     select
         v.UserId,
-        count(case when vt.Name = 'UpMod' then 1 end) as UpVotesCast,
-        count(case when vt.Name = 'DownMod' then 1 end) as DownVotesCast,
-        count(case when vt.Name = 'Favorite' then 1 end) as FavoritesCast
+        count(*) filter (where vt.Name = 'UpMod') as UpVotesCast,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotesCast,
+        count(*) filter (where vt.Name = 'Favorite') as FavoritesCast
     from Votes v
     join VoteTypes vt on vt.Id = v.VoteTypeId
     where v.UserId is not null
@@ -253,13 +214,13 @@ select
         else 'Intermediate'
     end as UserLevel,
     case
-        when (cast(fr.QuestionsWithAcceptedAnswer as numeric) / nullif(fr.TotalQuestions,0)) > 0.75 then 'High Acceptance'
-        when (cast(fr.QuestionsWithAcceptedAnswer as numeric) / nullif(fr.TotalQuestions,0)) between 0.4 and 0.75 then 'Medium Acceptance'
+        when fr.QuestionsWithAcceptedAnswer::float / nullif(fr.TotalQuestions,0) > 0.75 then 'High Acceptance'
+        when fr.QuestionsWithAcceptedAnswer::float / nullif(fr.TotalQuestions,0) between 0.4 and 0.75 then 'Medium Acceptance'
         else 'Low Acceptance'
     end as AcceptanceCategory,
     (fr.UpVotesCast - fr.DownVotesCast) as NetVotesCast,
     (fr.GoldBadges * 3 + fr.SilverBadges * 2 + fr.BronzeBadges) as BadgeScore,
-    length(coalesce(fr.TopTags,'')) as TopTagsNameLength
+    length(fr.TopTags) as TopTagsNameLength
 from FinalResult fr
 where fr.TotalQuestions > 10
 order by BadgeScore desc, fr.Reputation desc, fr.TotalComments desc

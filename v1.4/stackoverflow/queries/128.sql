@@ -1,3 +1,4 @@
+-- {"query": "128.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1432} 
 WITH 
 latest_posts AS (
   SELECT
@@ -44,7 +45,7 @@ hot_posts AS (
     p.LastActivityDate,
     p.Tags
   FROM Posts p
-  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+  WHERE p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
 )
 SELECT
   lp.PostId,
@@ -77,7 +78,7 @@ SELECT
   hp.Score,
   hp.CommentCount,
   hp.LastActivityDate,
-  CAST(NULL AS INTEGER) AS tag_popularity,
+  NULL::int AS tag_popularity,
   (SELECT COUNT(*) FROM Comments c WHERE c.PostId = hp.Id AND c.Score > 0) AS positive_comments,
   (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = hp.Id) AS last_comment_date
 FROM hot_posts hp

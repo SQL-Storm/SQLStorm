@@ -1,3 +1,4 @@
+-- {"query": "196.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2752} 
 with recent_activity as (
     select
         u.id as user_id,
@@ -5,7 +6,9 @@ with recent_activity as (
         u.reputation,
         u.creationdate,
         u.lastaccessdate,
-        greatest(0, extract(epoch from (timestamp '2024-10-01 12:34:56' - u.lastaccessdate))/86400) as days_since_last_access,
+        -- recency score: more recent activity -> higher
+        greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400) as days_since_last_access,
+        -- weighted interactions
         coalesce((select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 1),0) as q_count,
         coalesce((select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 2),0) as a_count,
         coalesce((select count(*) from comments c where c.userid = u.id),0) as comment_count,
@@ -16,9 +19,9 @@ with recent_activity as (
 user_badge_agg as (
     select
         b.userid,
-        count(case when b.class = 1 then 1 end) as gold_badges,
-        count(case when b.class = 2 then 1 end) as silver_badges,
-        count(case when b.class = 3 then 1 end) as bronze_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
         count(*) as total_badges,
         max(b.date) as most_recent_badge_date
     from badges b
@@ -37,6 +40,7 @@ user_post_stats as (
     group by u.id
 ),
 question_answer_details as (
+    -- for each question compute aggregated answer metrics and top answer info
     select
         q.id as question_id,
         q.owneruserid as asker_id,
@@ -49,11 +53,13 @@ question_answer_details as (
         count(a.id) as existing_answers,
         avg(a.score) as avg_answer_score,
         max(a.score) as best_answer_score,
+        -- id of the highest-scoring answer (ties broken by earliest creationdate)
         (select a2.id
          from posts a2
          where a2.parentid = q.id and a2.posttypeid = 2
          order by a2.score desc nulls last, a2.creationdate asc
          limit 1) as top_answer_id,
+        -- correlated subquery: percent of answers from users with reputation > asker
         (select round(100.0 * sum(case when u.reputation > coalesce(q_owner.reputation,0) then 1 else 0 end) / nullif(count(a3.id),0),2)
          from posts a3
          left join users u on u.id = a3.owneruserid
@@ -66,12 +72,13 @@ question_answer_details as (
     group by q.id, q.owneruserid, q.title, q.creationdate, q.score, q.viewcount, q.tags, q.answercount
 ),
 tag_exploded as (
+    -- explosion of tags for questions (PostTypeId = 1), handle NULL tags gracefully
     select
         q.id as question_id,
         trim(t) as tag
-    from posts q,
-    lateral (
-        select unnest(string_to_array(substring(coalesce(q.tags,''), 2, length(coalesce(q.tags,'')) - 2), '><')) as t
+    from posts q
+    cross join lateral (
+        select unnest(string_to_array(substring(coalesce(q.tags,''), 2, char_length(coalesce(q.tags,'')) - 2), '><')) as t
     ) s
     where q.posttypeid = 1 and coalesce(q.tags,'') <> ''
 ),
@@ -86,6 +93,7 @@ tag_popularity as (
     group by te.tag
 ),
 user_tag_skill as (
+    -- per user, compute top tag by number of answers they posted in that tag and avg score
     select
         u.id as user_id,
         coalesce(t.tag,'<no-tag>') as tag,
@@ -96,7 +104,7 @@ user_tag_skill as (
     left join posts a on a.owneruserid = u.id and a.posttypeid = 2
     left join posts q on q.id = a.parentid and q.posttypeid = 1
     left join lateral (
-        select unnest(string_to_array(substring(coalesce(q.tags,''), 2, length(coalesce(q.tags,'')) - 2), '><')) as tag
+        select unnest(string_to_array(substring(coalesce(q.tags,''), 2, char_length(coalesce(q.tags,'')) - 2), '><')) as tag
     ) t on q.tags is not null and q.tags <> ''
     group by u.id, t.tag
 ),
@@ -106,6 +114,7 @@ best_user_tag as (
     where rn = 1
 ),
 complex_user_score as (
+    -- Combine many signals into a synthetic benchmark score
     select
         ra.user_id,
         ra.displayname,
@@ -118,10 +127,13 @@ complex_user_score as (
         coalesce(ups.questions_posted,0) as questions_posted,
         coalesce(ups.answers_posted,0) as answers_posted,
         coalesce(ups.avg_post_score,0) as avg_post_score,
-        (case when extract(epoch from (timestamp '2024-10-01 12:34:56' - ra.creationdate)) <= 0 then 1.0
-              else 1.0 / (1 + ln(1 + extract(epoch from (timestamp '2024-10-01 12:34:56' - ra.creationdate))/86400))
+        -- time decay factor: newer accounts penalized (inverse log)
+        (case when extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.creationdate)) <= 0 then 1.0
+              else 1.0 / (1 + ln(1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.creationdate))/86400))
          end) as age_decay,
+        -- engagement index
         (ra.a_count * 2.5 + ra.q_count * 3 + ra.comment_count * 0.8 + ra.vote_actions * 0.5 + coalesce(ub.gold_badges,0) * 10 + coalesce(ub.silver_badges,0) * 3 + coalesce(ub.bronze_badges,0) * 1) as raw_engagement,
+        -- normalized final score
         round(
             (
                 (ra.reputation * 0.001)
@@ -130,7 +142,7 @@ complex_user_score as (
                 + (coalesce(ub.total_badges,0) * 0.02)
                 + ((case when ra.days_since_last_access < 30 then 1 else 0 end) * 0.5)
             ) * (case when ra.days_since_last_access is null then 1 else greatest(0.1, 1 - ra.days_since_last_access/365.0) end)
-            * (case when (case when extract(epoch from (timestamp '2024-10-01 12:34:56' - ra.creationdate)) <= 0 then 1.0 else 1.0 / (1 + ln(1 + extract(epoch from (timestamp '2024-10-01 12:34:56' - ra.creationdate))/86400)) end) is null then 1 else (case when extract(epoch from (timestamp '2024-10-01 12:34:56' - ra.creationdate)) <= 0 then 1.0 else 1.0 / (1 + ln(1 + extract(epoch from (timestamp '2024-10-01 12:34:56' - ra.creationdate))/86400)) end) end)
+            * (case when (case when extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.creationdate)) <= 0 then 1.0 else 1.0 / (1 + ln(1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.creationdate))/86400)) end) is null then 1 else (case when extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.creationdate)) <= 0 then 1.0 else 1.0 / (1 + ln(1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.creationdate))/86400)) end) end)
             ,4) as benchmark_score
     from recent_activity ra
     left join user_badge_agg ub on ub.userid = ra.user_id
@@ -138,62 +150,35 @@ complex_user_score as (
 ),
 ranked_users as (
     select
-        ru.user_id,
-        ru.displayname,
-        ru.reputation,
-        ru.q_count,
-        ru.a_count,
-        ru.comment_count,
-        ru.vote_actions,
-        ru.total_badges,
-        ru.questions_posted,
-        ru.answers_posted,
-        ru.avg_post_score,
-        ru.age_decay,
-        ru.raw_engagement,
-        ru.benchmark_score,
-        rank() over (order by ru.benchmark_score desc nulls last) as rank_by_score,
-        dense_rank() over (order by coalesce(ru.total_badges,0) desc) as rank_by_badges,
-        ntile(10) over (order by ru.benchmark_score desc nulls last) as decile
-    from complex_user_score ru
+        *,
+        rank() over (order by benchmark_score desc nulls last) as rank_by_score,
+        dense_rank() over (order by coalesce(total_badges,0) desc) as rank_by_badges,
+        ntile(10) over (order by benchmark_score desc nulls last) as decile
+    from complex_user_score
 ),
 top_questions_with_answer_stats as (
     select
-        qad.question_id,
-        qad.asker_id,
-        qad.title,
-        qad.asked_at,
-        qad.question_score,
-        qad.viewcount,
-        qad.tags,
-        qad.answercount,
-        qad.existing_answers,
-        qad.avg_answer_score,
-        qad.best_answer_score,
-        qad.top_answer_id,
-        qad.pct_answers_from_higher_rep,
+        qad.*,
         tp.tag,
         tp.questions_with_tag,
         tp.total_views_for_tag,
         tp.avg_question_score_for_tag,
         best_user_tag.tag as asker_top_tag,
         best_user_tag.answers_in_tag as asker_top_tag_answers,
+        -- string expression: concise question summary
         left(coalesce(qad.title, '') || ' [' || coalesce(tp.tag,'no-tag') || ']', 200) as short_summary
     from question_answer_details qad
     left join lateral (
         select tag, questions_with_tag, total_views_for_tag, avg_question_score_for_tag
-        from tag_popularity tp
-        where tp.tag = (
-            select unnest(string_to_array(substring(coalesce(qad.tags,''),2,length(coalesce(qad.tags,''))-2),'><')) 
-            limit 1
-        )
+        from tag_popularity tp where tp.tag = (select unnest(string_to_array(substring(coalesce(qad.tags,''),2,char_length(coalesce(qad.tags,''))-2),'><')) limit 1)
         limit 1
     ) tp on true
     left join best_user_tag on best_user_tag.user_id = qad.asker_id
 ),
 combined_final AS (
+    -- Combine top users and a sample of hot questions using UNION to exercise set operators and NULL handling
     select
-        'user' as row_type,
+        'user'::varchar as row_type,
         ru.user_id as id,
         ru.displayname as title_or_name,
         ru.benchmark_score as metric1,
@@ -202,14 +187,14 @@ combined_final AS (
         ru.total_badges as misc1,
         ru.avg_post_score as misc2,
         ru.age_decay as misc3,
-        cast(null as integer) as question_id,
-        cast(null as varchar) as question_short_summary,
-        timestamp '2024-10-01 12:34:56' as snapshot_at
+        null::int as question_id,
+        null::varchar as question_short_summary,
+        cast('2024-10-01 12:34:56' as timestamp) as snapshot_at
     from ranked_users ru
-    where ru.rank_by_score <= 100
+    where ru.rank_by_score <= 100 -- top 100 users
     union all
     select
-        'question' as row_type,
+        'question'::varchar as row_type,
         qad.question_id as id,
         coalesce(qad.title, left(qad.tags,100)) as title_or_name,
         coalesce(qad.question_score,0) as metric1,
@@ -217,15 +202,12 @@ combined_final AS (
         coalesce(qad.best_answer_score,0) as metric3,
         coalesce(tp.questions_with_tag,0) as misc1,
         coalesce(qad.pct_answers_from_higher_rep,0) as misc2,
-        cast(null as double precision) as misc3,
+        null::float as misc3,
         qad.question_id as question_id,
         qad.short_summary as question_short_summary,
-        timestamp '2024-10-01 12:34:56' as snapshot_at
+        cast('2024-10-01 12:34:56' as timestamp) as snapshot_at
     from top_questions_with_answer_stats qad
-    left join tag_popularity tp on tp.tag = (
-        select unnest(string_to_array(substring(coalesce(qad.tags,''),2,length(coalesce(qad.tags,''))-2),'><')) 
-        limit 1
-    )
+    left join tag_popularity tp on tp.tag = (select unnest(string_to_array(substring(coalesce(qad.tags,''),2,char_length(coalesce(qad.tags,''))-2),'><')) limit 1)
     where coalesce(qad.answercount,0) >= 2 and coalesce(qad.viewcount,0) > 1000
     order by 1 desc, 3 desc
 )

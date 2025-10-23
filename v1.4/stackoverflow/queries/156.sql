@@ -1,3 +1,4 @@
+-- {"query": "156.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1936} 
 WITH user_base AS (
   SELECT u.Id, u.DisplayName, u.Reputation,
          (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS total_posts,
@@ -41,16 +42,5 @@ LEFT JOIN user_base bu ON bu.Id = u.Id
 LEFT JOIN activity a ON a.UserId = u.Id
 LEFT JOIN recent r ON r.Id = u.Id
 LEFT JOIN badges ba ON ba.UserId = u.Id
-GROUP BY u.Id,
-         u.DisplayName,
-         u.Reputation,
-         bu.total_posts,
-         bu.avg_post_score,
-         bu.last_post_date,
-         a.upvotes_cast,
-         a.downvotes_cast,
-         a.total_votes_cast,
-         r.recent_post_activity,
-         ba.badge_list
 ORDER BY u.Reputation DESC
 LIMIT 200;

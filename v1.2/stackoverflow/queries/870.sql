@@ -1,3 +1,4 @@
+-- {"query": "870.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1390} 
 with RecursiveTagCounts as (
     select
         p.Id as PostId,
@@ -81,17 +82,17 @@ QuestionsWithCloseInfo as (
             count(*) as ClosedCount
         from PostHistory ph
         join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
-        join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+        join CloseReasonTypes crt on ph.Comment::int = crt.Id
         where pht.Name = 'Post Closed'
         group by ph.PostId, crt.Name
     ) ch on qb.Id = ch.PostId
 ),
 RankedQuestions as (
     select
-        rq.*,
-        dense_rank() over (order by rq.Score desc) as ScoreRank,
-        ntile(10) over (order by rq.ViewCount desc) as ViewCountDecile
-    from QuestionsWithCloseInfo rq
+        *,
+        dense_rank() over (order by Score desc) as ScoreRank,
+        ntile(10) over (order by ViewCount desc) as ViewCountDecile
+    from QuestionsWithCloseInfo
 ),
 AnswerStats as (
     select
@@ -133,9 +134,7 @@ FinalSelection as (
         ta.LatestQuestionDate
     from RankedQuestions rq
     left join AnswerStats ans on rq.Id = ans.QuestionId
-    left join TagAggregates ta on ta.Tag = (
-        select unnest(string_to_array(substring(rq.Tags from 2 for length(rq.Tags)-2), '><')) limit 1
-    )
+    left join TagAggregates ta on ta.Tag = (select unnest(string_to_array(substring(rq.Tags from 2 for length(rq.Tags)-2), '><')) limit 1)
 )
 select
     fs.*,
@@ -144,8 +143,8 @@ select
         else 'Open'
     end as PostStatus,
     case
-        when (coalesce(fs.GoldBadges,0) + coalesce(fs.SilverBadges,0) + coalesce(fs.BronzeBadges,0)) >= 10 and fs.ReputationRank <= 100 then 'High Reputation Expert'
-        when (coalesce(fs.GoldBadges,0) + coalesce(fs.SilverBadges,0) + coalesce(fs.BronzeBadges,0)) >= 5 then 'Intermediate Contributor'
+        when fs.GoldBadges + fs.SilverBadges + fs.BronzeBadges >= 10 and fs.ReputationRank <= 100 then 'High Reputation Expert'
+        when fs.GoldBadges + fs.SilverBadges + fs.BronzeBadges >= 5 then 'Intermediate Contributor'
         else 'New or Low Contributor'
     end as UserContributorLevel,
     concat_ws(' / ',

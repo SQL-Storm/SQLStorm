@@ -1,3 +1,4 @@
+-- {"query": "325.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 22771} 
 WITH Q1 AS (
   SELECT
     u.Id AS UserId,
@@ -23,7 +24,7 @@ WITH Q1 AS (
       FROM (
         SELECT t.TagName, COUNT(*) AS c
         FROM Posts pp
-        CROSS JOIN UNNEST(string_to_array(substring(pp.Tags, 2, length(pp.Tags) - 2), '><')) AS t(TagName)
+        CROSS JOIN LATERAL unnest(string_to_array(substring(pp.Tags, 2, length(pp.Tags) - 2), '><')) AS t(TagName)
         WHERE pp.OwnerUserId = u.Id
         GROUP BY t.TagName
         ORDER BY c DESC
@@ -55,7 +56,7 @@ Q2 AS (
       FROM (
         SELECT t.TagName, COUNT(*) AS c
         FROM Posts pp
-        CROSS JOIN UNNEST(string_to_array(substring(pp.Tags, 2, length(pp.Tags) - 2), '><')) AS t(TagName)
+        CROSS JOIN LATERAL unnest(string_to_array(substring(pp.Tags, 2, length(pp.Tags) - 2), '><')) AS t(TagName)
         WHERE pp.OwnerUserId = u.Id
         GROUP BY t.TagName
         ORDER BY c DESC

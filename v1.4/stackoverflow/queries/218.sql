@@ -1,14 +1,15 @@
+-- {"query": "218.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 12526} 
 WITH
 PostAgg AS (
   SELECT OwnerUserId AS UserId,
-         COUNT(*) FILTER (WHERE CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AS PostsY365,
+         COUNT(*) FILTER (WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS PostsY365,
          MAX(CreationDate) AS LastPostDate
   FROM Posts
   GROUP BY OwnerUserId
 ),
 CommentAgg AS (
   SELECT UserId,
-         COUNT(*) FILTER (WHERE CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AS CommentsY365,
+         COUNT(*) FILTER (WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS CommentsY365,
          MAX(CreationDate) AS LastCommentDate
   FROM Comments
   GROUP BY UserId
@@ -23,8 +24,8 @@ BadgeAgg AS (
 ),
 LastActivity AS (
   SELECT u.Id AS UserId,
-         GREATEST(COALESCE(p.LastPostDate, TIMESTAMP '1970-01-01 00:00:00'),
-                  COALESCE(c.LastCommentDate, TIMESTAMP '1970-01-01 00:00:00'),
+         GREATEST(COALESCE(p.LastPostDate, TIMESTAMP 'epoch'),
+                  COALESCE(c.LastCommentDate, TIMESTAMP 'epoch'),
                   u.CreationDate) AS LastActivityDate
   FROM Users u
   LEFT JOIN PostAgg p ON p.UserId = u.Id
@@ -41,13 +42,13 @@ Active AS (
      COALESCE(ba.SilverBadges, 0) AS SilverBadges,
      COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
      la.LastActivityDate,
-     LOWER(u.DisplayName) || '_' || CAST(u.Id AS VARCHAR) AS DisplayKey
+     LOWER(u.DisplayName) || '_' || u.Id::text AS DisplayKey
   FROM Users u
-  INNER JOIN LastActivity la ON la.UserId = u.Id
+  JOIN LastActivity la ON la.UserId = u.Id
   LEFT JOIN PostAgg pa ON pa.UserId = u.Id
   LEFT JOIN CommentAgg ca ON ca.UserId = u.Id
   LEFT JOIN BadgeAgg ba ON ba.UserId = u.Id
-  WHERE la.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days'
+  WHERE la.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
 ),
 Inactive AS (
   SELECT
@@ -60,10 +61,10 @@ Inactive AS (
      0 AS SilverBadges,
      0 AS BronzeBadges,
      la.LastActivityDate,
-     LOWER(u.DisplayName) || '_' || CAST(u.Id AS VARCHAR) AS DisplayKey
+     LOWER(u.DisplayName) || '_' || u.Id::text AS DisplayKey
   FROM Users u
-  INNER JOIN LastActivity la ON la.UserId = u.Id
-  WHERE la.LastActivityDate < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days'
+  JOIN LastActivity la ON la.UserId = u.Id
+  WHERE la.LastActivityDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
 )
 SELECT
   UserId,

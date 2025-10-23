@@ -1,3 +1,4 @@
+-- {"query": "180.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1816} 
 WITH user_reputation AS (
   SELECT
     u.Id,
@@ -5,7 +6,7 @@ WITH user_reputation AS (
     u.Reputation,
     u.CreationDate AS JoinedDate,
     (SELECT MAX(CreationDate) FROM Votes WHERE UserId = u.Id) AS LastVoteDate
-  FROM Users AS u
+  FROM Users u
 ),
 user_post_stats AS (
   SELECT
@@ -13,7 +14,7 @@ user_post_stats AS (
     COUNT(*) AS PostCount,
     SUM(p.Score) AS ScoreSum,
     MAX(p.LastActivityDate) AS LastActivity
-  FROM Posts AS p
+  FROM Posts p
   GROUP BY p.OwnerUserId
 ),
 user_badge_summary AS (
@@ -21,7 +22,7 @@ user_badge_summary AS (
     b.UserId,
     COUNT(*) AS BadgeCount,
     ARRAY_AGG(b.Name) AS BadgeNames
-  FROM Badges AS b
+  FROM Badges b
   GROUP BY b.UserId
 )
 SELECT
@@ -36,16 +37,13 @@ SELECT
   COALESCE(s.ScoreSum, 0) AS ScoreSum,
   SUM(CASE WHEN t.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
   SUM(CASE WHEN t.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
-  RANK() OVER (
-    ORDER BY r.Reputation DESC,
-             COALESCE(s.PostCount, 0) DESC
-  ) AS RepRank
-FROM user_reputation AS r
-LEFT JOIN user_post_stats AS s ON s.Id = r.Id
-LEFT JOIN user_badge_summary AS b ON b.UserId = r.Id
-LEFT JOIN Posts AS p ON p.OwnerUserId = r.Id
-LEFT JOIN Votes AS t ON t.UserId = r.Id
-LEFT JOIN PostLinks AS pl ON pl.PostId = p.Id
+  RANK() OVER (ORDER BY r.Reputation DESC, COALESCE(s.PostCount, 0) DESC) AS RepRank
+FROM user_reputation r
+LEFT JOIN user_post_stats s ON s.Id = r.Id
+LEFT JOIN user_badge_summary b ON b.UserId = r.Id
+LEFT JOIN Posts p ON p.OwnerUserId = r.Id
+LEFT JOIN Votes t ON t.UserId = r.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
 GROUP BY
   r.Id,
   r.DisplayName,

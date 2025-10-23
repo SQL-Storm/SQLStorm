@@ -1,3 +1,4 @@
+-- {"query": "301.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18856} 
 WITH PostBase AS (
   SELECT p.Id,
          p.Title,
@@ -27,19 +28,13 @@ FullPostInfo AS (
          COALESCE((SELECT SUM(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = b.Id AND v2.VoteTypeId = 8), 0) AS BountyTotal,
          COALESCE((SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = b.Id AND v3.VoteTypeId = 2), 0) AS UpVotes,
          COALESCE((SELECT COUNT(*) FROM Votes v4 WHERE v4.PostId = b.Id AND v4.VoteTypeId = 3), 0) AS DownVotes,
-         (
-           SELECT STRING_AGG(t, ',')
-           FROM (
+         (SELECT string_agg(t, ',')
+          FROM (
                  SELECT t
-                 FROM (
-                       SELECT TRIM(value) AS t
-                       FROM UNNEST(
-                             COALESCE(string_to_array(substring(b.Tags FROM 2 FOR CHAR_LENGTH(b.Tags) - 2), '><'), ARRAY[]::TEXT[])
-                           ) AS s(value)
-                       ORDER BY value
-                      ) AS inner_t
-               LIMIT 3
-               ) AS s
+                 FROM unnest(COALESCE(string_to_array(substring(b.Tags, 2, length(b.Tags) - 2), '><'), ARRAY[]::text[])) AS t
+                 ORDER BY t
+                 LIMIT 3
+               ) s
          ) AS Top3Tags
   FROM PostBase b
 ),

@@ -1,3 +1,4 @@
+-- {"query": "587.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1472} 
 with RecursiveUserBadges as (
     select u.Id as UserId, u.DisplayName, b.Name as BadgeName, b.Class, b.Date,
         row_number() over (partition by u.Id order by b.Date desc) as rn
@@ -67,13 +68,10 @@ TopAnswersWithUser as (
     where ra.AnswerRank <= 3
 ),
 TagUsage as (
-    select tag.TagName, count(*) as UsageCount
-    from Posts p,
-         lateral (
-           select regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags) - 2), '><') as TagName
-         ) as tag
+    select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName, count(*) as UsageCount
+    from Posts p
     where p.PostTypeId = 1 and p.Tags is not null
-    group by tag.TagName
+    group by TagName
 ),
 PopularTags as (
     select TagName, UsageCount,
@@ -106,23 +104,8 @@ select cq.Id as QuestionId, cq.Title, cq.CreationDate, cq.Score, cq.ViewCount, c
     ta.UserId as AnswerUserId, ta.DisplayName as AnswerUserName, ta.Reputation as AnswerUserReputation,
     ta.GoldBadges, ta.SilverBadges, ta.BronzeBadges
 from CombinedQuestions cq
-left join lateral (
-    select pt.TagName, pt.UsageCount
-    from PopularTags pt,
-         lateral (
-           select regexp_split_to_table(substring(cq.Tags from 2 for length(cq.Tags) - 2), '><') as TagName
-         ) as t
-    where pt.TagName = t.TagName
-    limit 1
-) pt on true
+left join PopularTags pt on pt.TagName = (select unnest(string_to_array(substring(cq.Tags from 2 for length(cq.Tags) - 2), '><')) limit 1)
 left join TopAnswersWithUser ta on ta.QuestionId = cq.Id
 where cq.Score > 5 and (cq.CloseReason = 'Open' or cq.CloseReason is null)
-group by cq.Id, cq.Title, cq.CreationDate, cq.Score, cq.ViewCount, cq.Tags,
-    cq.AnswerCount, cq.AvgAnswerScore, cq.DuplicateCount, cq.CloseReason,
-    cq.UpVotes, cq.DownVotes, cq.BountySum,
-    pt.TagName, pt.UsageCount,
-    ta.AnswerId, ta.Score, ta.AnswerRank,
-    ta.UserId, ta.DisplayName, ta.Reputation,
-    ta.GoldBadges, ta.SilverBadges, ta.BronzeBadges
 order by cq.Score desc, cq.ViewCount desc, ta.AnswerRank asc
 limit 100;

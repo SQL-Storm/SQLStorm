@@ -1,3 +1,4 @@
+-- {"query": "242.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 12411} 
 WITH
 TagArrayQA AS (
   SELECT p.Id AS PostId,
@@ -43,21 +44,21 @@ FROM (
   SELECT
     p.Id AS PostId,
     p.Title,
-    NULL AS OwnerDisplayName,
-    NULL AS OwnerReputation,
+    NULL::text AS OwnerDisplayName,
+    NULL::int AS OwnerReputation,
     p.ViewCount,
     p.Score,
     p.CreationDate,
     p.LastActivityDate,
-    NULL AS Tags,
+    NULL::text[] AS Tags,
     (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
     (SELECT COUNT(*) FROM Posts aa WHERE aa.ParentId = p.Id AND aa.PostTypeId = 2) AS AnswerCount,
     COALESCE((SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id), 0) AS UpVotes,
     COALESCE((SELECT SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id), 0) AS DownVotes,
     FALSE AS HasAcceptedAnswer,
-    NULL AS Status,
-    NULL AS LastEditorDisplayName,
-    NULL AS OwnerQuestionRank
+    NULL::text AS Status,
+    NULL::text AS LastEditorDisplayName,
+    NULL::int AS OwnerQuestionRank
   FROM Posts p
   WHERE p.PostTypeId = 2
 ) AS Combined

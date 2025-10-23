@@ -1,3 +1,4 @@
+-- {"query": "489.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1494} 
 with RecursiveTagCounts as (
     select
         t.Id,
@@ -11,9 +12,9 @@ with RecursiveTagCounts as (
         u.Reputation,
         row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
     from Tags t
-    join Posts p on p.Tags like ('%' || '<' || t.TagName || '>' || '%') and p.PostTypeId = 1
+    join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
     left join Users u on u.Id = p.OwnerUserId
-    where p.CreationDate > (cast('2024-10-01' as date) - interval '365 days')
+    where p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
 ),
 TopTagPosts as (
     select * from RecursiveTagCounts where rn <= 5
@@ -24,7 +25,7 @@ UserBadgeRanks as (
         b.Class,
         count(*) as BadgeCount
     from Badges b
-    where b.Date > (cast('2024-10-01' as date) - interval '365 days')
+    where b.Date > cast('2024-10-01' as date) - interval '365 days'
     group by b.UserId, b.Class
 ),
 UserAggregates as (
@@ -64,10 +65,10 @@ RecentClosedQuestions as (
         p.Score,
         p.ViewCount
     from PostHistory ph
-    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
     join Posts p on p.Id = ph.PostId
     left join Users u on u.Id = p.OwnerUserId
-    where ph.CreationDate > (cast('2024-10-01' as date) - interval '180 days')
+    where ph.CreationDate > cast('2024-10-01' as date) - interval '180 days'
 ),
 AnswerRanks as (
     select
@@ -156,8 +157,8 @@ left join RecentClosedQuestions rc on rc.PostId = t.PostId
 left join TopAnswersWithComments ta on ta.QuestionId = t.PostId
 left join UserActivitySummary uas on uas.UserId = t.OwnerUserId
 where
-    (coalesce(ua.GoldBadges,0) + coalesce(ua.SilverBadges,0) + coalesce(ua.BronzeBadges,0)) > 0
+    (ua.GoldBadges + ua.SilverBadges + ua.BronzeBadges) > 0
     and (t.Score > 5 or t.ViewCount > 1000)
-    and (rc.ClosedDate is null or rc.ClosedDate > (cast('2024-10-01' as date) - interval '90 days'))
+    and (rc.ClosedDate is null or rc.ClosedDate > cast('2024-10-01' as date) - interval '90 days')
 order by t.TagName, t.Score desc, t.ViewCount desc
 limit 100;

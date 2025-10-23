@@ -1,3 +1,4 @@
+-- {"query": "308.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 21056} 
 WITH
   UserStats AS (
     SELECT
@@ -73,10 +74,10 @@ WITH
     LIMIT 50
   ),
   BenchmarkSet AS (
-    SELECT tr.UserId, tr.DisplayName, tr.Reputation, NULL AS Views
+    SELECT tr.UserId, tr.DisplayName, tr.Reputation, NULL::int AS Views
     FROM TopRep tr
     UNION ALL
-    SELECT tv.UserId, tv.DisplayName, NULL AS Reputation, tv.Views
+    SELECT tv.UserId, tv.DisplayName, NULL::int AS Reputation, tv.Views
     FROM TopViews tv
   )
 SELECT

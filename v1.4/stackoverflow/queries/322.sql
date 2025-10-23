@@ -1,3 +1,4 @@
+-- {"query": "322.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 22049} 
 WITH
   base AS (
     SELECT p.Id AS PostId,
@@ -11,7 +12,7 @@ WITH
            p.OwnerUserId,
            p.OwnerDisplayName AS OwnerName
     FROM Posts p
-    WHERE p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
   ),
   votes AS (
     SELECT v.PostId,
@@ -95,7 +96,7 @@ WITH
     SELECT *
     FROM composed
     WHERE PostTypeId IN (1,2)
-      AND LastCommentDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '14 days')
+      AND LastCommentDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '14 days'
     ORDER BY LastActivityDate DESC
     LIMIT 300
   ),

@@ -1,3 +1,4 @@
+-- {"query": "959.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1097} 
 WITH RecursiveAcceptedAnswers AS (
     SELECT
         q.Id AS QuestionId,
@@ -37,30 +38,15 @@ TopCommenters AS (
     HAVING COUNT(c.Id) > 50
 ),
 QuestionTagExplode AS (
-    -- Portable extraction: remove leading and trailing angle brackets if present and normalize separators to commas.
     SELECT
         p.Id AS PostId,
-        LOWER(TRIM(
-            CASE
-                WHEN p.Tags LIKE '<%>' THEN
-                    REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><', ','), ',,', ',')
-                ELSE p.Tags
-            END
-        )) AS Tag
+        LOWER(TRIM(tag)) AS Tag
     FROM Posts p
+    CROSS JOIN LATERAL regexp_split_to_table(
+        substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2),
+        '><'
+    ) AS tag
     WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
-),
-QuestionTagTokens AS (
-    -- Use regexp split when available; if not, replace regexp_split_to_table with the engine-specific splitter.
-    SELECT
-        PostId,
-        TRIM(value) AS Tag
-    FROM (
-        SELECT
-            PostId,
-            regexp_split_to_table(Tag, ',\\s*') AS value
-        FROM QuestionTagExplode
-    ) s
 ),
 TagPopularity AS (
     SELECT
@@ -68,7 +54,7 @@ TagPopularity AS (
         COUNT(DISTINCT p.Id) AS QuestionCount,
         AVG(p.ViewCount) AS AvgViewCount,
         SUM(COALESCE(p.Score,0)) AS TotalScore
-    FROM QuestionTagTokens t
+    FROM QuestionTagExplode t
     JOIN Posts p ON p.Id = t.PostId
     GROUP BY t.Tag
     ORDER BY QuestionCount DESC
@@ -96,57 +82,36 @@ SELECT
     ROW_NUMBER() OVER (PARTITION BY q.QuestionId ORDER BY q.AnswerScore DESC) AS AnswerScoreRank,
     CASE
         WHEN q.AnswerCreation > q.QuestionCreation THEN
-            (EXTRACT(EPOCH FROM (q.AnswerCreation - q.QuestionCreation)) / 3600.0)
+            EXTRACT(EPOCH FROM (q.AnswerCreation - q.QuestionCreation)) / 3600.0
         ELSE NULL
     END AS HoursToAnswer,
     COALESCE(pv.UpVotes, 0) - COALESCE(pv.DownVotes, 0) AS NetVotes,
     CASE
-        WHEN q.AnswerScore > 0 AND COALESCE(bs.GoldBadges,0) > 0 THEN 'High Impact'
-        WHEN q.AnswerScore <= 0 AND (COALESCE(bs.BronzeBadges,0) + COALESCE(bs.SilverBadges,0)) > 5 THEN 'Active User'
+        WHEN q.AnswerScore > 0 AND bs.GoldBadges > 0 THEN 'High Impact'
+        WHEN q.AnswerScore <= 0 AND (bs.BronzeBadges + bs.SilverBadges) > 5 THEN 'Active User'
         ELSE 'Regular'
     END AS UserCategory,
     CONCAT(
         'Q: ', LEFT(q.Title, 50),
         ' | Tag: ', tp.Tag,
-        ' | Owner Badges (G/S/B): ', CAST(COALESCE(bs.GoldBadges,0) AS VARCHAR), '/', CAST(COALESCE(bs.SilverBadges,0) AS VARCHAR), '/', CAST(COALESCE(bs.BronzeBadges,0) AS VARCHAR)
+        ' | Owner Badges (G/S/B): ', bs.GoldBadges, '/', bs.SilverBadges, '/', bs.BronzeBadges
     ) AS SummaryString
 FROM RecursiveAcceptedAnswers q
 LEFT JOIN Users u ON u.Id = q.AnswerOwner
 LEFT JOIN UserBadgesSummary bs ON bs.UserId = q.AnswerOwner
 LEFT JOIN TopCommenters tc ON tc.UserId = q.AnswerOwner
-LEFT JOIN QuestionTagTokens qe ON qe.PostId = q.QuestionId
+LEFT JOIN QuestionTagExplode qe ON qe.PostId = q.QuestionId
 LEFT JOIN TagPopularity tp ON tp.Tag = qe.Tag
 LEFT JOIN (
     SELECT
-        v.PostId,
+        PostId,
         SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
         SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
     FROM Votes v
     JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
-    GROUP BY v.PostId
+    GROUP BY PostId
 ) pv ON pv.PostId = q.AnswerId
 WHERE q.AnswerRank <= 3
   AND q.AnswerOwner IS NOT NULL
-GROUP BY
-    q.QuestionId,
-    q.Title,
-    q.QuestionCreation,
-    q.AnswerId,
-    q.AnswerOwner,
-    u.DisplayName,
-    q.AnswerScore,
-    q.AnswerCreation,
-    bs.GoldBadges,
-    bs.SilverBadges,
-    bs.BronzeBadges,
-    bs.LastBadgeDate,
-    tc.CommentCount,
-    tc.AvgCommentWordCount,
-    tp.Tag,
-    tp.QuestionCount,
-    tp.AvgViewCount,
-    tp.TotalScore,
-    pv.UpVotes,
-    pv.DownVotes
 ORDER BY q.QuestionCreation DESC, q.AnswerScore DESC
 LIMIT 100;

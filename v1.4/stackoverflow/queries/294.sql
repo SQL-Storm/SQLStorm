@@ -1,3 +1,4 @@
+-- {"query": "294.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 10469} 
 WITH
 UserBase AS (
   SELECT u.Id AS UserId,
@@ -40,7 +41,7 @@ TopTagPerUser AS (
   LEFT JOIN LATERAL (
      SELECT TagName
      FROM Posts p
-     CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(TagName)
+     CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS t(TagName)
      WHERE p.OwnerUserId = u.UserId
      GROUP BY TagName
      ORDER BY COUNT(*) DESC

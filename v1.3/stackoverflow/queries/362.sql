@@ -1,8 +1,9 @@
+-- {"query": "362.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18453} 
 WITH
 recent_posts AS (
     SELECT *
     FROM Posts
-    WHERE CreationDate >= CAST(CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' AS timestamp)
+    WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
 ),
 user_posts AS (
     SELECT
@@ -50,9 +51,9 @@ tag_counts AS (
            COUNT(*) AS cnt
     FROM Posts p
     CROSS JOIN LATERAL (
-       SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag
+       SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
     ) t
-    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 AND p.OwnerUserId IS NOT NULL
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2 AND p.OwnerUserId IS NOT NULL
     GROUP BY p.OwnerUserId, t.tag
 ),
 top_tags AS (
@@ -67,7 +68,7 @@ top_tags AS (
 comment_agg AS (
     SELECT UserId,
            COUNT(*) AS comments_made,
-           AVG(LENGTH(Text)) AS avg_comment_len,
+           AVG(length(Text)) AS avg_comment_len,
            COUNT(DISTINCT PostId) AS distinct_posts_commented
     FROM Comments
     GROUP BY UserId
@@ -76,7 +77,7 @@ history_agg AS (
     SELECT UserId,
            SUM(CASE WHEN PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS body_edits,
            SUM(CASE WHEN PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS title_edits,
-           BOOL_OR(PostHistoryTypeId = 12) AS has_deletion_event
+           bool_or(PostHistoryTypeId = 12) AS has_deletion_event
     FROM PostHistory
     GROUP BY UserId
 ),
@@ -99,17 +100,17 @@ link_graph AS (
 ),
 quarterly_post_counts AS (
     SELECT OwnerUserId,
-           DATE_TRUNC('quarter', CreationDate) AS quarter,
+           date_trunc('quarter', CreationDate) AS quarter,
            COUNT(*) AS posts_in_quarter
     FROM Posts
     WHERE OwnerUserId IS NOT NULL
-    GROUP BY OwnerUserId, DATE_TRUNC('quarter', CreationDate)
+    GROUP BY OwnerUserId, date_trunc('quarter', CreationDate)
 ),
 quarterly_growth AS (
     SELECT OwnerUserId, quarter, posts_in_quarter,
            LAG(posts_in_quarter) OVER (PARTITION BY OwnerUserId ORDER BY quarter) AS prev_posts,
            CASE WHEN LAG(posts_in_quarter) OVER (PARTITION BY OwnerUserId ORDER BY quarter) IS NULL THEN NULL
-                ELSE (CAST(posts_in_quarter AS double precision) - LAG(posts_in_quarter) OVER (PARTITION BY OwnerUserId ORDER BY quarter)) / NULLIF(LAG(posts_in_quarter) OVER (PARTITION BY OwnerUserId ORDER BY quarter),0)
+                ELSE (posts_in_quarter::float - LAG(posts_in_quarter) OVER (PARTITION BY OwnerUserId ORDER BY quarter)) / NULLIF(LAG(posts_in_quarter) OVER (PARTITION BY OwnerUserId ORDER BY quarter),0)
            END AS growth_ratio
     FROM quarterly_post_counts
 ),
@@ -124,7 +125,7 @@ latest_quarter_growth AS (
 ),
 post_score_median AS (
     SELECT OwnerUserId,
-           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) AS median_score
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS median_score
     FROM Posts
     WHERE OwnerUserId IS NOT NULL
     GROUP BY OwnerUserId
@@ -171,10 +172,10 @@ main_rows AS (
       COALESCE(up.q_count,0) AS q_count,
       COALESCE(up.a_count,0) AS a_count,
       COALESCE(up.total_posts,0) AS total_posts,
-      CAST(ROUND(COALESCE(up.avg_score,0),3) AS numeric) AS avg_score,
+      ROUND(COALESCE(up.avg_score,0)::numeric,3) AS avg_score,
       COALESCE(pm.median_score,0) AS median_score,
       COALESCE(up.max_score,0) AS max_score,
-      CAST(ROUND(COALESCE(at.avg_seconds_to_accept,0),2) AS numeric) AS avg_seconds_to_accept,
+      ROUND(COALESCE(at.avg_seconds_to_accept,0)::numeric,2) AS avg_seconds_to_accept,
       COALESCE(at.accepted_count,0) AS accepted_count,
       COALESCE(b.gold,0) AS gold,
       COALESCE(b.silver,0) AS silver,
@@ -186,7 +187,7 @@ main_rows AS (
       tt.top_tag,
       COALESCE(tt.top_tag_count,0) AS top_tag_count,
       COALESCE(ca.comments_made,0) AS comments_made,
-      CAST(ROUND(COALESCE(ca.avg_comment_len,0),2) AS numeric) AS avg_comment_len,
+      ROUND(COALESCE(ca.avg_comment_len,0)::numeric,2) AS avg_comment_len,
       COALESCE(lg.outgoing_links,0) AS outgoing_links,
       COALESCE(lg.incoming_links,0) AS incoming_links,
       COALESCE(ha.body_edits,0) AS body_edits,
@@ -199,8 +200,8 @@ main_rows AS (
       lastc.last_comment_text,
       lastc.last_comment_date,
       (SELECT COUNT(*) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = a.Id)) AS accepted_answers_given,
-      COALESCE(latest.growth_ratio,0) AS latest_quarter_growth_ratio,
-      CAST(ROUND(
+      COALESCE(latest.growth_ratio,0)::numeric AS latest_quarter_growth_ratio,
+      ROUND(
         (
           COALESCE(up.total_posts,0) * 1.5
           + COALESCE(b.total_badges,0) * 4
@@ -209,7 +210,7 @@ main_rows AS (
           + COALESCE(at.accepted_count,0) * 2.5
           - COALESCE(vp.spam_votes,0) * 5
           + COALESCE(pm.median_score,0) * 0.5
-        ),2) AS numeric) AS combined_score,
+        )::numeric,2) AS combined_score,
       RANK() OVER (ORDER BY
          (
           COALESCE(up.total_posts,0) * 1.5
@@ -240,89 +241,55 @@ main_rows AS (
        WHERE p.OwnerUserId = u.Id
        ORDER BY p.CreationDate DESC
        LIMIT 1
-    ) lastp ON TRUE
+    ) lastp ON true
     LEFT JOIN LATERAL (
        SELECT c.Text AS last_comment_text, c.CreationDate AS last_comment_date
        FROM Comments c
        WHERE c.UserId = u.Id
        ORDER BY c.CreationDate DESC
        LIMIT 1
-    ) lastc ON TRUE
-    GROUP BY
-      u.Id,
-      u.DisplayName,
-      u.Reputation,
-      urb.rep_bucket,
-      COALESCE(up.q_count,0),
-      COALESCE(up.a_count,0),
-      COALESCE(up.total_posts,0),
-      COALESCE(up.avg_score,0),
-      COALESCE(pm.median_score,0),
-      COALESCE(up.max_score,0),
-      COALESCE(at.avg_seconds_to_accept,0),
-      COALESCE(at.accepted_count,0),
-      COALESCE(b.gold,0),
-      COALESCE(b.silver,0),
-      COALESCE(b.bronze,0),
-      COALESCE(b.total_badges,0),
-      COALESCE(vp.upvotes_received,0),
-      COALESCE(vp.downvotes_received,0),
-      COALESCE(vp.spam_votes,0),
-      tt.top_tag,
-      COALESCE(tt.top_tag_count,0),
-      COALESCE(ca.comments_made,0),
-      COALESCE(ca.avg_comment_len,0),
-      COALESCE(lg.outgoing_links,0),
-      COALESCE(lg.incoming_links,0),
-      COALESCE(ha.body_edits,0),
-      COALESCE(ha.title_edits,0),
-      COALESCE(ha.has_deletion_event,false),
-      lastp.last_post_title,
-      lastp.last_post_date,
-      lastc.last_comment_text,
-      lastc.last_comment_date,
-      COALESCE(latest.growth_ratio,0)
+    ) lastc ON true
 )
 SELECT * FROM main_rows
 UNION ALL
 SELECT
-  NULL AS user_id,
-  'AGGREGATE' AS display_name,
-  SUM(reputation) AS reputation,
-  'Mixed' AS rep_bucket,
-  SUM(q_count) AS q_count,
-  SUM(a_count) AS a_count,
-  SUM(total_posts) AS total_posts,
-  CAST(ROUND(AVG(NULLIF(avg_score,0)),3) AS numeric) AS avg_score,
-  AVG(median_score) AS median_score,
-  MAX(max_score) AS max_score,
-  CAST(ROUND(AVG(NULLIF(avg_seconds_to_accept,0)),2) AS numeric) AS avg_seconds_to_accept,
-  SUM(accepted_count) AS accepted_count,
-  SUM(gold) AS gold,
-  SUM(silver) AS silver,
-  SUM(bronze) AS bronze,
-  SUM(total_badges) AS total_badges,
-  SUM(upvotes_received) AS upvotes_received,
-  SUM(downvotes_received) AS downvotes_received,
-  SUM(spam_votes) AS spam_votes,
-  '---' AS top_tag,
-  MAX(top_tag_count) AS top_tag_count,
-  SUM(comments_made) AS comments_made,
-  CAST(ROUND(AVG(NULLIF(avg_comment_len,0)),2) AS numeric) AS avg_comment_len,
-  SUM(outgoing_links) AS outgoing_links,
-  SUM(incoming_links) AS incoming_links,
-  SUM(body_edits) AS body_edits,
-  SUM(title_edits) AS title_edits,
-  BOOL_OR(has_deletion_event) AS has_deletion_event,
-  BOOL_OR(is_suspicious) AS is_suspicious,
-  BOOL_OR(suspicious_and_deleted) AS suspicious_and_deleted,
-  NULL AS last_post_title,
+  NULL::int AS user_id,
+  'AGGREGATE'::varchar AS display_name,
+  SUM(reputation)::int AS reputation,
+  'Mixed'::varchar AS rep_bucket,
+  SUM(q_count)::int AS q_count,
+  SUM(a_count)::int AS a_count,
+  SUM(total_posts)::int AS total_posts,
+  ROUND(AVG(NULLIF(avg_score,0)),3)::numeric AS avg_score,
+  AVG(median_score)::numeric AS median_score,
+  MAX(max_score)::int AS max_score,
+  ROUND(AVG(NULLIF(avg_seconds_to_accept,0)),2)::numeric AS avg_seconds_to_accept,
+  SUM(accepted_count)::int AS accepted_count,
+  SUM(gold)::int AS gold,
+  SUM(silver)::int AS silver,
+  SUM(bronze)::int AS bronze,
+  SUM(total_badges)::int AS total_badges,
+  SUM(upvotes_received)::int AS upvotes_received,
+  SUM(downvotes_received)::int AS downvotes_received,
+  SUM(spam_votes)::int AS spam_votes,
+  '---'::varchar AS top_tag,
+  MAX(top_tag_count)::int AS top_tag_count,
+  SUM(comments_made)::int AS comments_made,
+  ROUND(AVG(NULLIF(avg_comment_len,0)),2)::numeric AS avg_comment_len,
+  SUM(outgoing_links)::int AS outgoing_links,
+  SUM(incoming_links)::int AS incoming_links,
+  SUM(body_edits)::int AS body_edits,
+  SUM(title_edits)::int AS title_edits,
+  bool_or(has_deletion_event) AS has_deletion_event,
+  bool_or(is_suspicious) AS is_suspicious,
+  bool_or(suspicious_and_deleted) AS suspicious_and_deleted,
+  NULL::varchar AS last_post_title,
   MAX(last_post_date) AS last_post_date,
-  NULL AS last_comment_text,
+  NULL::varchar AS last_comment_text,
   MAX(last_comment_date) AS last_comment_date,
-  SUM(accepted_answers_given) AS accepted_answers_given,
-  AVG(latest_quarter_growth_ratio) AS latest_quarter_growth_ratio,
-  SUM(combined_score) AS combined_score,
-  MIN(global_rank) AS global_rank
+  SUM(accepted_answers_given)::int AS accepted_answers_given,
+  AVG(latest_quarter_growth_ratio)::numeric AS latest_quarter_growth_ratio,
+  SUM(combined_score)::numeric AS combined_score,
+  MIN(global_rank)::int AS global_rank
 FROM main_rows
 ORDER BY global_rank NULLS LAST;

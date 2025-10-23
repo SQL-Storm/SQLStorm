@@ -1,3 +1,4 @@
+-- {"query": "367.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1654} 
 with RecursiveTagCounts as (
     select
         t.Id as TagId,
@@ -13,13 +14,13 @@ UserBadgeStats as (
     select
         u.Id as UserId,
         u.DisplayName,
-        count(case when b.Class = 1 then b.Id end) as GoldBadges,
-        count(case when b.Class = 2 then b.Id end) as SilverBadges,
-        count(case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
         coalesce(sum(v.BountyAmount), 0) as TotalBountyEarned
     from Users u
     left join Badges b on b.UserId = u.Id
-    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8 -- BountyStart votes given by user
     group by u.Id, u.DisplayName
 ),
 PostActivityWindow as (
@@ -45,9 +46,9 @@ ClosedQuestionsWithReasons as (
         ph.UserId as ClosedByUserId,
         u.DisplayName as ClosedByUserName
     from PostHistory ph
-    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
     left join Users u on u.Id = ph.UserId
-    where ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10 -- Post Closed
 ),
 DuplicateLinks as (
     select
@@ -67,7 +68,7 @@ UserCommentStats as (
         u.DisplayName,
         count(c.Id) as TotalComments,
         avg(length(c.Text)) as AvgCommentLength,
-        sum(case when c.CreationDate > (cast('2024-10-01' as date) - interval '30 days') then 1 else 0 end) as CommentsLast30Days
+        sum(case when c.CreationDate > cast('2024-10-01' as date) - interval '30 days' then 1 else 0 end) as CommentsLast30Days
     from Comments c
     left join Users u on u.Id = c.UserId
     group by c.UserId, u.DisplayName
@@ -135,19 +136,10 @@ from Users u
 left join UserBadgeStats ubs on ubs.UserId = u.Id
 left join RecursiveTagCounts tc on tc.TagName = (
     select
-        x.tag
-    from (
-        select
-            regexp_split_to_table(
-                substring(p.Tags from 2 for (length(p.Tags) - 2)),
-                '><'
-            ) as tag,
-            p.CreationDate
-        from Posts p
-        where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
-    ) x
-    order by x.CreationDate desc
-    limit 1
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+    from Posts p
+    where p.OwnerUserId = u.Id and p.PostTypeId = 1
+    order by p.CreationDate desc limit 1
 )
 left join TopAnswerers tas on tas.OwnerUserId = u.Id
 left join UserCommentStats ucs on ucs.UserId = u.Id

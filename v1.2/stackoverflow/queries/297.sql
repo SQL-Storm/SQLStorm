@@ -1,3 +1,4 @@
+-- {"query": "297.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1921} 
 with RecursiveUserBadges as (
     select 
         u.Id as UserId,
@@ -23,7 +24,7 @@ QuestionStats as (
         max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews,
         string_agg(distinct substring(t.TagName from 1 for 10), ', ') as SampleTags
     from Posts p
-    left join lateral (
+    left join LATERAL (
         select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
     ) t on true
     where p.OwnerUserId is not null and p.PostTypeId = 1
@@ -126,35 +127,12 @@ UserAggregated as (
 ),
 RankedUsers as (
     select 
-        ua.Id,
-        ua.DisplayName,
-        ua.Reputation,
-        ua.CreationDate,
-        ua.LastAccessDate,
-        ua.QuestionCount,
-        ua.AcceptedQuestions,
-        ua.AvgQuestionScore,
-        ua.MaxQuestionViews,
-        ua.AnswerCount,
-        ua.AvgAnswerScore,
-        ua.MaxAnswerScore,
-        ua.AcceptedAnswersCount,
-        ua.UpVotesCast,
-        ua.DownVotesCast,
-        ua.FavoritesCast,
-        ua.BountiesStarted,
-        ua.BountiesClosed,
-        ua.CommentCount,
-        ua.AvgCommentLength,
-        ua.MaxCommentScore,
-        ua.EditedPostsCount,
-        ua.TotalEdits,
-        ua.DistinctEditTypes,
-        rank() over (order by ua.Reputation desc, ua.QuestionCount desc, ua.AnswerCount desc) as ReputationRank,
-        dense_rank() over (order by ua.QuestionCount desc) as QuestionRank,
-        dense_rank() over (order by ua.AnswerCount desc) as AnswerRank,
-        ntile(4) over (order by ua.Reputation desc) as ReputationQuartile
-    from UserAggregated ua
+        *,
+        rank() over (order by Reputation desc, QuestionCount desc, AnswerCount desc) as ReputationRank,
+        dense_rank() over (order by QuestionCount desc) as QuestionRank,
+        dense_rank() over (order by AnswerCount desc) as AnswerRank,
+        ntile(4) over (order by Reputation desc) as ReputationQuartile
+    from UserAggregated
 ),
 FilteredUsers as (
     select * from RankedUsers
@@ -192,10 +170,10 @@ select
     fu.ReputationQuartile,
     fu.QuestionCount,
     fu.AcceptedQuestions,
-    round(CAST(fu.AvgQuestionScore AS numeric),2) as AvgQuestionScore,
+    round(fu.AvgQuestionScore::numeric,2) as AvgQuestionScore,
     fu.MaxQuestionViews,
     fu.AnswerCount,
-    round(CAST(fu.AvgAnswerScore AS numeric),2) as AvgAnswerScore,
+    round(fu.AvgAnswerScore::numeric,2) as AvgAnswerScore,
     fu.MaxAnswerScore,
     fu.AcceptedAnswersCount,
     fu.UpVotesCast,
@@ -204,7 +182,7 @@ select
     fu.BountiesStarted,
     fu.BountiesClosed,
     fu.CommentCount,
-    round(CAST(fu.AvgCommentLength AS numeric),2) as AvgCommentLength,
+    round(fu.AvgCommentLength::numeric,2) as AvgCommentLength,
     fu.MaxCommentScore,
     fu.EditedPostsCount,
     fu.TotalEdits,

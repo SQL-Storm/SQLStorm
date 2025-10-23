@@ -1,3 +1,4 @@
+-- {"query": "194.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1975} 
 WITH user_activity AS (
   SELECT
     u.Id AS UserId,

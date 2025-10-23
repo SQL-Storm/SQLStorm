@@ -1,3 +1,4 @@
+-- {"query": "624.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1201} 
 with RecursiveUserBadges as (
     select u.Id as UserId,
            u.DisplayName,
@@ -58,7 +59,7 @@ PostCloseReasons as (
            crt.Name as CloseReasonName,
            ph.CreationDate as CloseDate
       from PostHistory ph
-      join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+      join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
      where ph.PostHistoryTypeId = 10
 ),
 UserPostStats as (
@@ -98,7 +99,7 @@ select u.Id as UserId,
          else 'No Website'
        end as WebsitePresence,
        case 
-         when ua.TotalPosts > 0 then cast(ua.UpVotesReceived as double precision) / nullif(ua.TotalPosts,0)
+         when ua.TotalPosts > 0 then ua.UpVotesReceived::float / nullif(ua.TotalPosts,0)
          else null
        end as AvgUpVotesPerPost
   from Users u

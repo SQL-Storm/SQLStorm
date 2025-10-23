@@ -1,3 +1,4 @@
+-- {"query": "585.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1359} 
 with RecursiveTagCounts as (
     select
         t.Id,
@@ -11,7 +12,7 @@ with RecursiveTagCounts as (
         u.DisplayName,
         row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
     from Tags t
-    join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%' and p.PostTypeId = 1
+    join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
     left join Users u on p.OwnerUserId = u.Id
     where t.Count > 1000
 ),
@@ -22,9 +23,9 @@ UserBadgeStats as (
     select
         u.Id as UserId,
         u.DisplayName,
-        count(case when b.Class = 1 then b.Id end) as GoldBadges,
-        count(case when b.Class = 2 then b.Id end) as SilverBadges,
-        count(case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
         max(b.Date) as LastBadgeDate
     from Users u
     left join Badges b on u.Id = b.UserId
@@ -35,9 +36,9 @@ PostVoteStats as (
         p.Id as PostId,
         p.Score,
         p.ViewCount,
-        count(case when v.VoteTypeId = 2 then v.Id end) as UpVotes,
-        count(case when v.VoteTypeId = 3 then v.Id end) as DownVotes,
-        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end) as TotalBounty
     from Posts p
     left join Votes v on p.Id = v.PostId
     group by p.Id, p.Score, p.ViewCount
@@ -72,7 +73,7 @@ CloseReasonsCount as (
         crt.Name as CloseReasonName,
         count(*) as CloseCount
     from PostHistory ph
-    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
     where ph.PostHistoryTypeId = 10
     group by ph.Comment, crt.Name
 ),
@@ -83,8 +84,8 @@ UserActivityWindow as (
         u.Reputation,
         u.CreationDate,
         u.LastAccessDate,
-        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
-        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
         count(distinct c.Id) as CommentsCount,
         sum(coalesce(p.Score,0)) as TotalPostScore,
         sum(coalesce(vs.UpVotes,0)) as TotalUpVotes,
@@ -129,11 +130,12 @@ select
         when ua.Reputation > 1000 then 'Intermediate'
         else 'Beginner'
     end as ReputationLevel,
-    (coalesce(t.TagName, '') || ' | ' ||
-     coalesce(u.DisplayName, '') || ' | ' ||
-     coalesce(qa.Title, '') || ' | ' ||
-     coalesce(cr.CloseReasonName, '') || ' | ' ||
-     coalesce(cast(ua.UserRank as varchar), '')
+    concat_ws(' | ',
+        coalesce(t.TagName, ''),
+        coalesce(u.DisplayName, ''),
+        coalesce(qa.Title, ''),
+        coalesce(cr.CloseReasonName, ''),
+        coalesce(ua.UserRank::text, '')
     ) as CompositeString
 from TopTagPosts t
 left join Users u on t.OwnerUserId = u.Id
@@ -143,38 +145,9 @@ left join FilteredQuestionAnswers qa on qa.QuestionId = t.PostId
 left join CloseReasonsCount cr on cr.CloseReasonId = (
     select ph.Comment from PostHistory ph
     where ph.PostId = t.PostId and ph.PostHistoryTypeId = 10
-    order by ph.CreationDate desc
-    limit 1
+    order by ph.CreationDate desc limit 1
 )
 left join UserActivityWindow ua on ua.Id = t.OwnerUserId
-where t.Score > 5 and (coalesce(pvs.UpVotes,0) - coalesce(pvs.DownVotes,0)) > 3
-group by
-    t.TagName,
-    t.Count,
-    t.PostId,
-    t.Score,
-    t.ViewCount,
-    t.CreationDate,
-    u.DisplayName,
-    ub.GoldBadges,
-    ub.SilverBadges,
-    ub.BronzeBadges,
-    pvs.UpVotes,
-    pvs.DownVotes,
-    pvs.TotalBounty,
-    qa.Title,
-    qa.AnswerId,
-    qa.AnswerScore,
-    qa.AnswerDate,
-    cr.CloseReasonName,
-    cr.CloseCount,
-    ua.QuestionsCount,
-    ua.AnswersCount,
-    ua.CommentsCount,
-    ua.TotalPostScore,
-    ua.TotalUpVotes,
-    ua.TotalDownVotes,
-    ua.UserRank,
-    ua.Reputation
+where t.Score > 5 and (pvs.UpVotes - pvs.DownVotes) > 3
 order by t.Count desc, t.Score desc, ua.UserRank asc
 limit 100;

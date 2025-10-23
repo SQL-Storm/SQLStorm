@@ -1,3 +1,4 @@
+-- {"query": "581.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1246} 
 with RecursiveTagStats as (
     select
         t.Id as TagId,
@@ -98,7 +99,6 @@ FinalResults as (
         tq.CommentCount as TopQuestionComments,
         tq.UpVotes as TopQuestionUpVotes,
         tq.DownVotes as TopQuestionDownVotes,
-        qa.QuestionId,
         qa.AnswerId,
         qa.AnswerScore,
         qa.IsAccepted,
@@ -119,7 +119,7 @@ select
     ReopenedPosts,
     LastPostDate,
     FirstPostDate,
-    round(cast(AveragePostScore as numeric), 2) as AveragePostScore,
+    round(AveragePostScore::numeric, 2) as AveragePostScore,
     GoldBadges,
     SilverBadges,
     BronzeBadges,

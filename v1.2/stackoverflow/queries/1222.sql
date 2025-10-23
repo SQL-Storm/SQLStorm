@@ -1,9 +1,10 @@
+-- {"query": "1222.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1436} 
 with RecursiveTagCounts as (
     select
         t.Id,
         t.TagName,
         t.Count,
-        coalesce(p.AnswerCount, 0) as AnswersCount,
+        coalesce(p.AnswerCount,0) as AnswersCount,
         row_number() over (partition by t.TagName order by t.Count desc) as rn
     from Tags t
     left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
@@ -37,7 +38,7 @@ QuestionStats as (
         p.AcceptedAnswerId,
         rank() over (partition by p.OwnerUserId order by p.Score desc) as QuestionRankByOwner
     from Posts p
-    where p.PostTypeId = 1 and p.CreationDate > date '2010-01-01'
+    where p.PostTypeId = 1 and p.CreationDate > '2010-01-01'
 ),
 FilteredAnswers as (
     select
@@ -54,8 +55,8 @@ FilteredAnswers as (
 AnswerVotes as (
     select
         a.Id,
-        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
-        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
         max(v.CreationDate) as LastVoteDate
     from FilteredAnswers a
     left join Votes v on v.PostId = a.Id
@@ -70,31 +71,6 @@ PostCommentsAggregated as (
         max(c.CreationDate) as LastCommentDate
     from Comments c
     group by c.PostId
-),
-LatestPostHistoryPerPost as (
-    select pht2.PostId, pht2.PostHistoryTypeId, pht2.CreationDate
-    from (
-        select
-            pht2.PostId,
-            pht2.PostHistoryTypeId,
-            pht2.CreationDate,
-            row_number() over (partition by pht2.PostId order by pht2.CreationDate desc) as rn
-        from PostHistory pht2
-        where pht2.CreationDate is not null
-    ) pht2
-    where pht2.rn = 1
-),
-LatestPostLinkPerPost as (
-    select pl.PostId, pl.LinkTypeId, pl.CreationDate
-    from (
-        select
-            pl.PostId,
-            pl.LinkTypeId,
-            pl.CreationDate,
-            row_number() over (partition by pl.PostId order by pl.CreationDate desc) as rn
-        from PostLinks pl
-    ) pl
-    where pl.rn = 1
 )
 select 
     q.Id as QuestionId,
@@ -118,12 +94,13 @@ select
     (
         select count(*)
         from Votes v2
-        where v2.PostId = q.Id and v2.VoteTypeId = 2 and v2.CreationDate > (date '2024-10-01' - interval '30' day)
+        where v2.PostId = q.Id and v2.VoteTypeId = 2 and v2.CreationDate > cast('2024-10-01' as date) - interval '30 days'
     ) as RecentQuestionUpVotes,
     greatest(
         ((coalesce(fa.Score, 0) * 0.6) + (coalesce(av.UpVotes, 0) * 0.3) - (coalesce(av.DownVotes, 0) * 0.4) + (coalesce(pc2.NumberOfComments, 0)*0.1)),
         0
     ) as CalculatedAnswerScore,
+    -- correlated subquery in select
     (
         select max(pht.CreationDate)
         from PostHistory pht
@@ -139,29 +116,31 @@ select
 from QuestionStats q
 left join Tags tc on tc.TagName = any(string_to_array(replace(replace(q.Tags, '<', ''), '>', ','), ','))
 left join UserReputations ur on ur.Id = q.OwnerUserId
-left join (
-    select pa.ParentId, count(*) as AnswerCount
-    from Posts pa
-    where pa.PostTypeId = 2
-    group by pa.ParentId
-) qa on qa.ParentId = q.Id
-left join lateral (
-    select fa2.Id, fa2.ParentId, fa2.Score, fa2.CreationDate, fa2.OwnerUserId, fa2.Body
-    from (
-        select
-            fa.*,
-            dense_rank() over (partition by fa.ParentId order by fa.Score desc, fa.CreationDate) as rn
-        from Posts fa
-        where fa.PostTypeId = 2 and fa.Score > 0
-    ) fa2
-    where fa2.rn = 1 and fa2.ParentId = q.Id
+left join LATERAL (
+    select count(*) as AnswerCount from Posts pa where pa.ParentId = q.Id and pa.PostTypeId = 2
+) qa on true
+left join LATERAL (
+    select fa.*
+    from FilteredAnswers fa
+    where fa.ParentId = q.Id and fa.AnswerRank = 1
+    limit 1
 ) fa on true
 left join AnswerVotes av on av.Id = fa.Id
 left join PostCommentsAggregated pc on pc.PostId = q.Id
 left join PostCommentsAggregated pc2 on pc2.PostId = fa.Id
-left join LatestPostHistoryPerPost ph on ph.PostId = q.Id
+left join LATERAL (
+    select pht2.PostHistoryTypeId, pht2.CreationDate
+    from PostHistory pht2
+    where pht2.PostId = q.Id
+    order by pht2.CreationDate desc nulls last limit 1
+) ph on true
 left join PostHistoryTypes ts on ts.Id = ph.PostHistoryTypeId
-left join LatestPostLinkPerPost plk on plk.PostId = q.Id
+left join LATERAL (
+    select pl.LinkTypeId
+    from PostLinks pl
+    where pl.PostId = q.Id
+    order by pl.CreationDate desc nulls last limit 1
+) plk on true
 left join LinkTypes lkt on lkt.Id = plk.LinkTypeId
 where ur.Reputation > 1000
 order by q.Score desc, qa.AnswerCount desc

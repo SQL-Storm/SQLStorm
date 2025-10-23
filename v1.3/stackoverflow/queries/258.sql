@@ -1,3 +1,4 @@
+-- {"query": "258.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4879} 
 WITH recent_questions AS (
   SELECT
     p.Id,
@@ -7,15 +8,15 @@ WITH recent_questions AS (
     p.AcceptedAnswerId,
     p.Tags,
     CASE
-      WHEN p.Tags IS NULL OR p.Tags = '' THEN CAST(ARRAY[] AS varchar[])
-      ELSE regexp_split_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')
+      WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::varchar[]
+      ELSE string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')
     END AS tag_array,
     p.Score,
     p.ViewCount,
     p.AnswerCount
   FROM Posts p
   WHERE p.PostTypeId = 1
-    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
 ),
 tag_expansion AS (
   SELECT rq.Id, rq.Title, rq.CreationDate, rq.OwnerUserId, rq.AcceptedAnswerId, rq.Tags, unnest(rq.tag_array) AS tag
@@ -27,7 +28,7 @@ answer_stats AS (
     count(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS total_answers,
     avg(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS avg_answer_score,
     max(a.Score) AS max_answer_score,
-    sum(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS has_accepted_present
+    sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) AS has_accepted_present
   FROM recent_questions q
   LEFT JOIN Posts a ON a.ParentId = q.Id
   GROUP BY q.Id
@@ -75,9 +76,9 @@ user_stats AS (
     u.Reputation,
     u.CreationDate,
     count(b.Id) AS badges_total,
-    sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
-    sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
-    sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    sum(case when b.Class = 1 then 1 else 0 end) AS gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) AS silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) AS bronze_badges
   FROM Users u
   LEFT JOIN Badges b ON b.UserId = u.Id
   GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
@@ -85,7 +86,7 @@ user_stats AS (
 correlated AS (
   SELECT
     q.Id AS QuestionId,
-    (SELECT CAST(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS bigint)
+    (SELECT EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))::bigint
      FROM Posts a
      WHERE a.Id = q.AcceptedAnswerId AND a.CreationDate IS NOT NULL
      LIMIT 1) AS seconds_to_accept,
@@ -128,28 +129,28 @@ combined AS (
 ),
 ranked AS (
   SELECT
-    c.*,
+    *,
     row_number() OVER (PARTITION BY tag ORDER BY (computed_answer_count + avg_answer_score * 0.5 + q_upvotes) DESC NULLS LAST) AS tag_rank,
     rank() OVER (ORDER BY (computed_answer_count + avg_answer_score + q_upvotes * 2) DESC) AS global_rank,
     dense_rank() OVER (PARTITION BY date_trunc('month', CreationDate) ORDER BY q_upvotes DESC) AS monthly_popularity_rank
-  FROM combined c
+  FROM combined
 ),
 final AS (
   SELECT
     r.*,
     (coalesce(r.computed_answer_count, 0) * 10
      + coalesce(r.avg_answer_score, 0) * 5
-     + (CASE WHEN r.seconds_to_accept >= 0 THEN greatest(0, 86400 - r.seconds_to_accept) / 8640.0 ELSE 0 END)
-     + (CASE WHEN r.substantive_edits > 0 THEN ln(r.substantive_edits + 1) ELSE 0 END)
-     + (CASE WHEN r.top_answerer_reputation > 10000 THEN 50 WHEN r.top_answerer_reputation > 1000 THEN 20 ELSE coalesce(r.top_answerer_reputation, 0) / 100 END)
+     + (case when r.seconds_to_accept >= 0 then greatest(0, 86400 - r.seconds_to_accept) / 8640.0 else 0 end)
+     + (case when r.substantive_edits > 0 then ln(r.substantive_edits + 1) else 0 end)
+     + (case when r.top_answerer_reputation > 10000 then 50 when r.top_answerer_reputation > 1000 then 20 else coalesce(r.top_answerer_reputation, 0) / 100 end)
     ) AS synthetic_hotness,
     concat(
       coalesce(r.tag, '<untagged>'),
       ':',
       coalesce(nullif(trim(r.Title), ''), '[no title]'),
-      ' (', COALESCE(CAST(r.TopAnswerId AS text), 'NA'), ')'
+      ' (', coalesce(r.TopAnswerId::text, 'NA'), ')'
     ) AS brief_repr,
-    (CASE WHEN r.seconds_to_accept >= 0 AND r.seconds_to_accept < 86400 THEN true ELSE false END) AS accepted_within_day
+    (case when r.seconds_to_accept >= 0 and r.seconds_to_accept < 86400 then true else false end) AS accepted_within_day
   FROM ranked r
 )
 SELECT

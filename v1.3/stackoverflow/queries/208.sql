@@ -1,3 +1,4 @@
+-- {"query": "208.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 6653} 
 WITH tags_expanded AS (
   SELECT p.Id AS PostId, lower(trim(tg)) AS tag
   FROM Posts p
@@ -7,7 +8,7 @@ WITH tags_expanded AS (
   WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
 ), comments_recent AS (
   SELECT PostId,
-    count(*) FILTER (WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90' DAY) AS recent_comments,
+    count(*) FILTER (WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') AS recent_comments,
     max(CreationDate) AS last_comment_date
   FROM Comments
   GROUP BY PostId
@@ -32,7 +33,7 @@ WITH tags_expanded AS (
     coalesce(avg(p.Score),0) AS avg_score,
     coalesce(apu.accepted_answers,0) AS accepted_answers,
     coalesce(bc.gold,0) AS gold, coalesce(bc.silver,0) AS silver, coalesce(bc.bronze,0) AS bronze,
-    coalesce(sum(CASE WHEN p.PostTypeId = 2 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY THEN 1 ELSE 0 END),0) AS recent_answers
+    coalesce(sum(CASE WHEN p.PostTypeId = 2 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' THEN 1 ELSE 0 END),0) AS recent_answers
   FROM Users u
   LEFT JOIN Posts p ON p.OwnerUserId = u.Id
   LEFT JOIN accepted_per_user apu ON apu.UserId = u.Id
@@ -56,7 +57,7 @@ WITH tags_expanded AS (
     avg(p.Score) AS avg_score,
     avg(coalesce(p.AnswerCount,0)) AS avg_answers,
     sum(CASE WHEN coalesce(p.AnswerCount,0) > 0 THEN 1 ELSE 0 END) AS questions_with_answers,
-    (CAST(sum(CASE WHEN coalesce(p.AnswerCount,0) > 0 THEN 1 ELSE 0 END) AS double precision) / nullif(count(distinct p.Id),0)) AS pct_answered
+    (sum(CASE WHEN coalesce(p.AnswerCount,0) > 0 THEN 1 ELSE 0 END)::float / nullif(count(distinct p.Id),0)) AS pct_answered
   FROM tags_expanded t
   JOIN Posts p ON p.Id = t.PostId
   GROUP BY t.tag
@@ -88,11 +89,9 @@ WITH tags_expanded AS (
     u.DisplayName AS top_user_name,
     tfq.question_id AS featured_question_id, left(coalesce(tfq.Title,''),200) AS featured_question_title_snippet,
     tfq.activity_score,
-    (CASE WHEN (
-       SELECT avg(pa2.activity_score) FROM post_activity pa2 JOIN tags_expanded te2 ON pa2.question_id = te2.PostId WHERE te2.tag = ts.tag AND pa2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
-     ) > (
-       SELECT avg(pa3.activity_score) FROM post_activity pa3 JOIN tags_expanded te3 ON pa3.question_id = te3.PostId WHERE te3.tag = ts.tag
-     ) * 1.5 THEN true ELSE false END) AS trending
+    (CASE WHEN (SELECT avg(activity_score) FROM post_activity pa2 JOIN tags_expanded te2 ON pa2.question_id = te2.PostId WHERE te2.tag = ts.tag AND pa2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+           > (SELECT avg(activity_score) FROM post_activity pa3 JOIN tags_expanded te3 ON pa3.question_id = te3.PostId WHERE te3.tag = ts.tag) * 1.5
+     THEN true ELSE false END) AS trending
   FROM tag_stats ts
   LEFT JOIN tag_duplicates td ON td.tag = ts.tag
   LEFT JOIN (
@@ -104,8 +103,8 @@ WITH tags_expanded AS (
   ) tfq ON tfq.tag = ts.tag
 ), untagged AS (
   SELECT '(untagged)' AS tag, count(*) AS question_count, avg(ViewCount) AS avg_views, avg(Score) AS avg_score, avg(coalesce(AnswerCount,0)) AS avg_answers,
-    (CAST(sum(CASE WHEN coalesce(AnswerCount,0) > 0 THEN 1 ELSE 0 END) AS double precision) / nullif(count(*),0)) AS pct_answered,
-    0 AS duplicate_links, CAST(NULL AS integer) AS top_user_id, CAST(NULL AS integer) AS top_user_answers, CAST(NULL AS text) AS top_user_name, CAST(NULL AS integer) AS featured_question_id, CAST(NULL AS text) AS featured_question_title_snippet, 0.0 AS activity_score, false AS trending
+    (sum(CASE WHEN coalesce(AnswerCount,0) > 0 THEN 1 ELSE 0 END)::float / nullif(count(*),0)) AS pct_answered,
+    0 AS duplicate_links, null::int AS top_user_id, null::int AS top_user_answers, null::varchar AS top_user_name, null::int AS featured_question_id, null::varchar AS featured_question_title_snippet, 0.0 AS activity_score, false AS trending
   FROM Posts p WHERE p.PostTypeId = 1 AND (p.Tags IS NULL OR p.Tags = '')
 ), combined_tags AS (
   SELECT * FROM tag_summary

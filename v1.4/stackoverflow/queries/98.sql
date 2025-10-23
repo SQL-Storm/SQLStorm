@@ -1,3 +1,4 @@
+-- {"query": "98.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 842} 
 WITH top_users AS (
   SELECT
     u.Id,
@@ -29,7 +30,7 @@ recent_questions AS (
     p.PostTypeId
   FROM Posts p
   WHERE p.PostTypeId = 1 -- Question
-    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
 ),
 question_review AS (
   SELECT
@@ -82,15 +83,9 @@ complex_metrics AS (
       WHERE c.UserId = tq.OwnerUserId
         AND c.PostId = tq.PostId
     ) AS OwnerCommentCount,
-    -- Use CROSS JOIN LATERAL to explode tags if necessary, otherwise compute rank per tag using unnest result
-    ROW_NUMBER() OVER (
-      PARTITION BY tag_value
-      ORDER BY tq.ViewCount DESC, tq.Score DESC
-    ) AS tag_rank
+    -- Window function: rank questions by popularity within last 180 days per tag
+    ROW_NUMBER() OVER (PARTITION BY UNNEST(string_to_array(tq.Tags, '><')) ORDER BY tq.ViewCount DESC, tq.Score DESC) AS tag_rank
   FROM question_review tq
-  CROSS JOIN LATERAL (
-    SELECT unnest(string_to_array(tq.Tags, '><')) AS tag_value
-  ) AS t
   ORDER BY tq.LastActivityDate DESC
 )
 SELECT

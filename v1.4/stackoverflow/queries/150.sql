@@ -1,4 +1,6 @@
+-- {"query": "150.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2604} 
 WITH
+-- Top-level per-user recent activity and profile context
 UserProfile AS (
   SELECT
     u.Id AS UserId,
@@ -12,22 +14,13 @@ UserProfile AS (
     u.DownVotes,
     COALESCE(u.WebsiteUrl, '') AS WebsiteUrl,
     COALESCE(u.AboutMe, '') AS AboutMe,
-    SUM(CASE WHEN p.PostTypeId = 1 AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY THEN 1 ELSE 0 END) AS RecentQuestions
+    -- Number of questions recently opened by the user (PostTypeId = 1) in last 180 days
+    SUM(CASE WHEN p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days' THEN 1 ELSE 0 END) AS RecentQuestions
   FROM Users u
   LEFT JOIN Posts p ON p.OwnerUserId = u.Id
-  GROUP BY
-    u.Id,
-    u.DisplayName,
-    u.Reputation,
-    u.CreationDate,
-    u.LastAccessDate,
-    u.Location,
-    u.Views,
-    u.UpVotes,
-    u.DownVotes,
-    u.WebsiteUrl,
-    u.AboutMe
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.AboutMe
 ),
+-- Per-user last activity post with computed windowed rankings
 UserPostRank AS (
   SELECT
     p.Id AS PostId,
@@ -46,8 +39,9 @@ UserPostRank AS (
         p.CreationDate DESC
     ) AS rn
   FROM Posts p
-  WHERE p.PostTypeId IN (1, 2)
+  WHERE p.PostTypeId IN (1,2) -- focus on questions and answers for benchmarking
 ),
+-- Aggregated vote statistics per post (sum of bounty amounts and counts)
 PostVotes AS (
   SELECT
     v.PostId,
@@ -58,6 +52,7 @@ PostVotes AS (
   FROM Votes v
   GROUP BY v.PostId
 ),
+-- Tag statistics enriched from Tags and their associated posts
 TagStats AS (
   SELECT
     tg.TagName,
@@ -66,6 +61,7 @@ TagStats AS (
   JOIN Posts p ON p.Id = tg.Id OR p.Id = tg.ExcerptPostId OR p.Id = tg.WikiPostId
   GROUP BY tg.TagName
 ),
+-- Historical context: recent close/reopen activity to stress correlation
 CloseActivity AS (
   SELECT
     ph.PostId,
@@ -74,8 +70,9 @@ CloseActivity AS (
     ph.Comment,
     ph.UserId
   FROM PostHistory ph
-  WHERE ph.PostHistoryTypeId IN (10, 11, 52, 53)
+  WHERE ph.PostHistoryTypeId IN (10,11,52,53) -- Post Closed / Reopened / SelectedHotQuestion / RemovedHotQuestion
 ),
+-- Build a complex derived set combining posts with user, votes, and tags
 BenchmarkSet AS (
   SELECT
     up.UserId,
@@ -104,16 +101,12 @@ BenchmarkSet AS (
   LEFT JOIN PostVotes pv
     ON pv.PostId = pr.PostId
   LEFT JOIN TagStats ts
-    ON ts.TagName IN (
-      SELECT value
-      FROM (
-        SELECT unnest(string_to_array(pr.Tags, '><')) AS value
-      ) AS t_sub
-    )
+    ON ts.TagName IN (SELECT UNNEST(string_to_array(pr.Tags, '><')) AS TagName)
   LEFT JOIN CloseActivity ca
     ON ca.PostId = pr.PostId
-  WHERE pr.rn = 1
+  WHERE pr.rn = 1 -- take latest activity per user
 ),
+-- Complex correlated predicate set to stress conditions and NULL handling
 Predicates AS (
   SELECT
     b.*,
@@ -129,7 +122,7 @@ Predicates AS (
     END AS PostKind,
     CASE
       WHEN b.CloseTypeId IS NULL THEN NULL
-      ELSE (SELECT cr.Name FROM CloseReasonTypes cr WHERE cr.Id = b.CloseTypeId)
+      ELSE (SELECT Name FROM CloseReasonTypes cr WHERE cr.Id = b.CloseTypeId)
     END AS CloseReason
   FROM BenchmarkSet b
 )

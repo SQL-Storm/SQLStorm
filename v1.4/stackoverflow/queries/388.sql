@@ -1,7 +1,8 @@
+-- {"query": "388.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 25090} 
 WITH YearPosts AS (
   SELECT p.Id, p.OwnerUserId, p.Score, p.LastActivityDate, p.Tags, p.CreationDate, p.PostTypeId
   FROM Posts p
-  WHERE p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
 ),
 ActiveBase AS (
   SELECT
@@ -31,12 +32,12 @@ ActiveDetailed AS (
     awr.YearScoreSum,
     awr.LastActivityDate,
     (
-      SELECT COALESCE(string_agg(DISTINCT tg.TagName, ','), '')
+      SELECT COALESCE(STRING_AGG(DISTINCT tg.TagName, ','), '')
       FROM YearPosts yp
       CROSS JOIN LATERAL UNNEST(
         CASE
           WHEN yp.Tags IS NULL OR length(yp.Tags) <= 2 THEN ARRAY[]::text[]
-          ELSE string_to_array(substr(yp.Tags, 2, length(yp.Tags) - 2), '><')
+          ELSE string_to_array(substring(yp.Tags from 2 for length(yp.Tags) - 2), '><')
         END
       ) AS tg(TagName)
       WHERE yp.OwnerUserId = awr.UserId

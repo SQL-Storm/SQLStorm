@@ -1,3 +1,4 @@
+-- {"query": "322.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1525} 
 with RecursiveUserActivity as (
     select
         u.Id as UserId,
@@ -98,28 +99,6 @@ UserBadgeSummary as (
         bool_or(b.TagBased) as HasTagBasedBadges
     from Badges b
     group by b.UserId
-),
--- emulate lateral: pick top post per user
-UserTopPost as (
-    select pd.*
-    from (
-        select
-            pd.*,
-            row_number() over (partition by pd.OwnerUserId order by pd.Score desc nulls last) as rn
-        from PostDetails pd
-    ) pd
-    where rn = 1
-),
--- emulate lateral: pick top answer per question (for questions present in UserTopPost)
-TopAnswerPerPost as (
-    select aw.*
-    from (
-        select
-            aw.*,
-            row_number() over (partition by aw.QuestionId order by aw.AnswerScore desc nulls last) as rn
-        from AnswerWithVotes aw
-    ) aw
-    where rn = 1
 )
 select
     tu.UserId,
@@ -168,9 +147,19 @@ select
     ) as PostSummary
 from TopUsersCTE tu
 left join UserBadgeSummary ubs on ubs.UserId = tu.UserId
-left join UserTopPost pd on pd.OwnerUserId = tu.UserId
+left join lateral (
+    select * from PostDetails pd
+    where pd.OwnerUserId = tu.UserId
+    order by pd.Score desc nulls last
+    limit 1
+) pd on true
 left join PostHistoryAggregates ph on ph.PostId = pd.Id
-left join TopAnswerPerPost aw on aw.QuestionId = pd.Id
+left join lateral (
+    select * from AnswerWithVotes aw
+    where aw.QuestionId = pd.Id
+    order by aw.AnswerScore desc nulls last
+    limit 1
+) aw on pd.PostTypeId = 1
 left join DuplicateLinks dl on dl.DuplicatePostId = pd.Id
 where tu.Reputation > 1000
 order by tu.Reputation desc, pd.Score desc

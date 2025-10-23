@@ -1,3 +1,4 @@
+-- {"query": "917.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1264} 
 with RecursiveBadgeCounts as (
     select 
         u.Id as UserId,
@@ -47,7 +48,7 @@ CloseReasonCounts as (
         count(distinct ph.PostId) as CloseCount
     from PostHistory ph
     join PostHistoryTypes chtt on chtt.Id = ph.PostHistoryTypeId
-    join CloseReasonTypes cht on cht.Id = cast(ph.Comment as integer)
+    join CloseReasonTypes cht on cht.Id = cast(ph.Comment as int)
     where ph.PostHistoryTypeId = 10
     group by cht.Name
 ),
@@ -104,7 +105,7 @@ FinalResults as (
         ans.AvgSiblingAnswerScore,
         ans.RankByScore
     from QuestionsWithAnswerStats q
-    left join CloseReasonCounts r on (q.ClosedDate is not null and r.CloseReason is not null)
+    left join CloseReasonCounts r on q.ClosedDate is not null
     left join RecursiveBadgeCounts u on u.UserId = q.OwnerUserId
     left join UserActivity ua on ua.UserId = q.OwnerUserId
     left join AnswerSentimentScores ans on ans.QuestionId = q.QuestionId and ans.RankByScore = 1
@@ -118,13 +119,13 @@ FinalResults as (
 select 
     QuestionId,
     Title,
-    ('Views: ' || cast(ViewCount as varchar) || ', Score: ' || cast(QuestionScore as varchar) || ', Answers: ' || cast(AnswerCount as varchar)) as QuestionSummary,
+    concat('Views: ', ViewCount::text, ', Score: ', QuestionScore::text, ', Answers: ', AnswerCount::text) as QuestionSummary,
     Status,
     coalesce(CloseReason, 'N/A') as CloseReason,
     OwnerName,
     Reputation,
-    ('Badges (G/S/B): ' || cast(GoldBadges as varchar) || '/' || cast(SilverBadges as varchar) || '/' || cast(BronzeBadges as varchar)) as BadgeSummary,
-    ('Posts: ' || cast(TotalPosts as varchar) || ', Comments: ' || cast(TotalComments as varchar) || ', UpVotes: ' || cast(TotalUpVotes as varchar) || ', DownVotes: ' || cast(TotalDownVotes as varchar)) as UserActivitySummary,
+    concat('Badges (G/S/B): ', GoldBadges::text, '/', SilverBadges::text, '/', BronzeBadges::text) as BadgeSummary,
+    concat('Posts: ', TotalPosts::text, ', Comments: ', TotalComments::text, ', UpVotes: ', TotalUpVotes::text, ', DownVotes: ', TotalDownVotes::text) as UserActivitySummary,
     AnswerId,
     BodyLength,
     AvgSiblingAnswerScore,

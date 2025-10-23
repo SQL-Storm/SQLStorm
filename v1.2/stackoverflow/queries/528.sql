@@ -1,3 +1,4 @@
+-- {"query": "528.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1177} 
 with RecursiveUserBadges as (
     select
         u.Id as UserId,
@@ -10,19 +11,14 @@ with RecursiveUserBadges as (
     where u.Reputation > 1000
 ),
 LatestPostHistoryPerPost as (
-    select
+    select distinct on (ph.PostId)
         ph.PostId,
         ph.PostHistoryTypeId,
         ph.CreationDate,
         ph.UserId,
         ph.Comment
-    from (
-        select
-            ph.*,
-            row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
-        from PostHistory ph
-    ) ph
-    where ph.rn = 1
+    from PostHistory ph
+    order by ph.PostId, ph.CreationDate desc
 ),
 HighScoreAnswers as (
     select
@@ -61,7 +57,7 @@ UserActivityWindow as (
         sum(v.BountyAmount) over (partition by u.Id order by v.CreationDate rows between unbounded preceding and current row) as CumulativeBountyGiven
     from Users u
     left join Posts p on u.Id = p.OwnerUserId
-    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8 -- BountyStart
 ),
 DuplicateLinks as (
     select
@@ -73,7 +69,7 @@ DuplicateLinks as (
     from PostLinks pl
     inner join Posts p1 on pl.PostId = p1.Id
     inner join Posts p2 on pl.RelatedPostId = p2.Id
-    where pl.LinkTypeId = 3
+    where pl.LinkTypeId = 3 -- Duplicate
 ),
 UserBadgeSummary as (
     select
@@ -92,7 +88,7 @@ select
     qas.QuestionScore,
     qas.AnswerCount,
     qas.MaxAnswerScore,
-    round(cast(qas.AvgAnswerScore as numeric), 2) as AvgAnswerScore,
+    round(qas.AvgAnswerScore::numeric,2) as AvgAnswerScore,
     lub.BadgeName as LatestBadge,
     lub.Class as LatestBadgeClass,
     lub.DisplayName as BadgeUser,
@@ -116,8 +112,8 @@ left join RecursiveUserBadges lub on lub.UserId = (select OwnerUserId from Posts
 left join HighScoreAnswers hsa on hsa.ParentId = qas.QuestionId and hsa.rn = 1
 left join UserActivityWindow ua on ua.Id = (select OwnerUserId from Posts where Id = qas.QuestionId)
 left join DuplicateLinks dpl on dpl.PostId = qas.QuestionId
-left join LatestPostHistoryPerPost phc on phc.PostId = qas.QuestionId and phc.PostHistoryTypeId = 10
-where qas.QuestionCreation > (cast('2024-10-01' as date) - interval '1 year')
+left join LatestPostHistoryPerPost phc on phc.PostId = qas.QuestionId and phc.PostHistoryTypeId = 10 -- Post Closed
+where qas.QuestionCreation > cast('2024-10-01' as date) - interval '1 year'
   and (qas.AnswerCount > 0 or dpl.PostId is not null)
 order by qas.QuestionScore desc
 limit 100;

@@ -1,12 +1,13 @@
+-- {"query": "152.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1916} 
 WITH
 -- recent activity windows per post and user
 recent_posts AS (
   SELECT p.*,
-         (CAST(p.Score AS FLOAT) / NULLIF(GREATEST(p.ViewCount,1),0)) AS score_per_view,
+         (p.Score::float / NULLIF(GREATEST(p.ViewCount,1),0)) AS score_per_view,
          regexp_split_to_array(substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,'')) - 2,0)), '><') AS tag_array,
          ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC NULLS LAST, p.Score DESC) AS rn_by_user
   FROM Posts p
-  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
 ),
 -- aggregate post statistics per user (questions and answers)
 user_post_stats AS (
@@ -80,11 +81,10 @@ users_without_posts AS (
 -- computed heavy expression for benchmarking: nested correlated subquery that computes decay-weighted score per user
 decay_scores AS (
   SELECT u.Id AS user_id,
-         CAST((
-           SELECT SUM(p.Score * POWER(0.85, EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400.0))
-           FROM Posts p
-           WHERE p.OwnerUserId = u.Id
-         ) AS numeric(18,6)) AS decay_weighted_score
+         (SELECT SUM(p.Score * POWER(0.85, EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0))
+          FROM Posts p
+          WHERE p.OwnerUserId = u.Id
+         )::numeric(18,6) AS decay_weighted_score
   FROM Users u
 ),
 -- final ranking of active users by mixed metric using window functions and various NULL logic
@@ -116,7 +116,7 @@ SELECT
   ur.q_count,
   ur.a_count,
   ur.total_score,
-  ROUND(CAST(ur.decay_score AS numeric),6) AS decay_weighted_score,
+  ROUND(ur.decay_score::numeric,6) AS decay_weighted_score,
   ur.badge_count,
   COALESCE(ur.top_tag,'<none>') AS top_tag,
   ur.tag_rank,
@@ -132,9 +132,9 @@ SELECT
     JOIN Posts p2 ON p2.Id = dl.duplicate_post
     WHERE p2.OwnerUserId = ur.user_id
   ) AS has_duplicates,
-  -- scalar correlated subquery returning aggregated recent post titles
+  -- scalar correlated subquery returning JSON-like string (concatenate) of up to 3 recent post titles, with null-safe trimming and length limiting
   (SELECT string_agg(
-            LEFT(COALESCE(NULLIF(p.Title,''), '<<no title>>') || ' [' || COALESCE(CAST(p.Score AS text),'0') || ']', 120),
+            LEFT(COALESCE(NULLIF(p.Title,''), '<<no title>>') || ' [' || COALESCE(p.Score::text,'0') || ']', 120),
             ' || '
           )
    FROM (

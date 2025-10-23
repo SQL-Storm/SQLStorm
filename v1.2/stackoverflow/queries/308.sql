@@ -1,3 +1,4 @@
+-- {"query": "308.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1318} 
 with RecursiveUserBadges as (
     select
         u.Id as UserId,
@@ -7,15 +8,15 @@ with RecursiveUserBadges as (
         row_number() over (partition by u.Id order by b.Date desc, b.Class) as BadgeRank
     from Users u
     left join Badges b on u.Id = b.UserId
-    where b.Date >= (cast('2024-10-01' as date) - interval '365 days')
+    where b.Date >= cast('2024-10-01' as date) - interval '365 days'
 ),
 TopUsers as (
     select
         u.Id,
         u.DisplayName,
         u.Reputation,
-        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
-        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
         coalesce(sum(v.VoteCount), 0) as TotalVotes,
         max(p.Score) as MaxPostScore,
         min(p.CreationDate) as FirstPostDate,
@@ -25,12 +26,12 @@ TopUsers as (
     left join (
         select PostId, count(*) as VoteCount
         from Votes
-        where VoteTypeId in (2,3)
+        where VoteTypeId in (2,3) -- UpMod and DownMod
         group by PostId
     ) v on v.PostId = p.Id
     group by u.Id, u.DisplayName, u.Reputation
-    having count(distinct case when p.PostTypeId = 1 then p.Id end) > 10
-       and count(distinct case when p.PostTypeId = 2 then p.Id end) > 10
+    having count(distinct p.Id) filter (where p.PostTypeId = 1) > 10
+       and count(distinct p.Id) filter (where p.PostTypeId = 2) > 10
 ),
 UserActivityWindow as (
     select
@@ -48,7 +49,7 @@ UserActivityWindow as (
     left join Posts p on p.OwnerUserId = u.Id
     left join Comments c on c.PostId = p.Id
     left join Votes v on v.PostId = p.Id
-    where p.CreationDate >= (cast('2024-10-01' as date) - interval '180 days')
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '180 days'
 ),
 DuplicateQuestions as (
     select
@@ -61,23 +62,17 @@ DuplicateQuestions as (
     from PostLinks pl
     join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
     join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
-    where pl.LinkTypeId = 3
+    where pl.LinkTypeId = 3 -- Duplicate
 ),
 UserTagExpertise as (
     select
         u.Id as UserId,
-        trim(tag) as Tag,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
         count(*) as PostsCount,
         avg(p.Score) as AvgScore
     from Users u
     join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
-    cross join lateral (
-        select regexp_split_to_table(
-            substring(p.Tags from 2 for length(p.Tags) - 2),
-            '><'
-        ) as tag
-    ) t
-    group by u.Id, trim(tag)
+    group by u.Id, Tag
 ),
 RankedUserTags as (
     select
@@ -99,8 +94,8 @@ RecentPostHistoryEdits as (
         ph.Text,
         row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
     from PostHistory ph
-    where ph.PostHistoryTypeId in (4,5,6)
-      and ph.CreationDate >= (cast('2024-10-01' as date) - interval '90 days')
+    where ph.PostHistoryTypeId in (4,5,6) -- Edit Title, Edit Body, Edit Tags
+      and ph.CreationDate >= cast('2024-10-01' as date) - interval '90 days'
 )
 select
     tu.Id as UserId,
@@ -136,43 +131,14 @@ left join UserActivityWindow ruw on ruw.UserId = tu.Id and ruw.RecentPostRank = 
 left join DuplicateQuestions dt on dt.DuplicateQuestionId = ruw.PostId
 left join (
     select
-        (select OwnerUserId from Posts p where p.Id = rph.PostId) as UserId,
+        UserId,
         count(*) as EditsCount,
         max(CreationDate) as LastEditDate
-    from RecentPostHistoryEdits rph
-    group by (select OwnerUserId from Posts p where p.Id = rph.PostId)
+    from RecentPostHistoryEdits
+    group by UserId
 ) ph on ph.UserId = tu.Id
 left join RankedUserTags rut on rut.UserId = tu.Id and rut.TagRank = 1
 left join RecursiveUserBadges rub on rub.UserId = tu.Id and rub.BadgeRank = 1
 where (rut.Tag is not null or dt.DuplicateQuestionId is not null)
-group by
-    tu.Id,
-    tu.DisplayName,
-    tu.Reputation,
-    tu.QuestionCount,
-    tu.AnswerCount,
-    tu.TotalVotes,
-    tu.MaxPostScore,
-    tu.FirstPostDate,
-    tu.LastActivityDate,
-    ruw.PostId,
-    ruw.PostTypeId,
-    ruw.Score,
-    ruw.CommentCount,
-    ruw.UpVotes,
-    ruw.DownVotes,
-    dt.DuplicateQuestionId,
-    dt.OriginalQuestionId,
-    dt.DuplicateTitle,
-    dt.OriginalTitle,
-    dt.DuplicateCreation,
-    dt.OriginalCreation,
-    rut.Tag,
-    rut.PostsCount,
-    rut.AvgScore,
-    ph.EditsCount,
-    ph.LastEditDate,
-    rub.BadgeName,
-    rub.Class
 order by tu.Reputation desc, ph.EditsCount desc
 limit 100;

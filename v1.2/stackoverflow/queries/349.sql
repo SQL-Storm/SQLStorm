@@ -1,3 +1,4 @@
+-- {"query": "349.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1378} 
 with RecursiveTagCounts as (
     select
         t.Id,
@@ -65,7 +66,7 @@ PostCloseReasons as (
         crt.Name as CloseReason,
         ph.CreationDate as CloseDate
     from PostHistory ph
-    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
     where ph.PostHistoryTypeId = 10
 ),
 UserActivityWindow as (
@@ -74,12 +75,12 @@ UserActivityWindow as (
         u.DisplayName,
         u.Reputation,
         u.CreationDate,
-        count(case when p.PostTypeId = 1 then p.Id end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
-        count(case when p.PostTypeId = 2 then p.Id end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days,
         sum(coalesce(p.Score,0)) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
     from Users u
     left join Posts p on p.OwnerUserId = u.Id
-    where u.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - interval '30' day)
+    where u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
 ),
 DuplicateLinks as (
     select
@@ -128,7 +129,7 @@ select
         else 'Cold'
     end as PostHeat,
     length(coalesce(p.Body,'')) as BodyLength,
-    (strpos(lower(coalesce(p.Title,'')), 'sql') > 0) as TitleContainsSQL,
+    strpos(lower(coalesce(p.Title,'')), 'sql') > 0 as TitleContainsSQL,
     case when p.ClosedDate is null then 0 else 1 end as IsClosed
 from TopRecentPosts tr
 left join Users u on u.Id = tr.OwnerUserId
@@ -143,33 +144,5 @@ left join Posts p on p.Id = tr.PostId
 where tr.TagName in (
     select TagName from Tags where Count > 1000
 )
-group by
-    tr.TagName,
-    tr.Count,
-    tr.PostId,
-    tr.CreationDate,
-    tr.Score,
-    tr.ViewCount,
-    ub.GoldBadges,
-    ub.SilverBadges,
-    ub.BronzeBadges,
-    pvs.UpVotes,
-    pvs.DownVotes,
-    pas.AnswerCount,
-    pas.MaxAnswerScore,
-    pas.AvgAnswerScore,
-    pcr.CloseReason,
-    pcr.CloseDate,
-    uaw.QuestionsLast30Days,
-    uaw.AnswersLast30Days,
-    uaw.ScoreLast30Days,
-    dl.RelatedPostId,
-    dl.RelatedPostTitle,
-    cc.CommentsAfterPostCreation,
-    p.Body,
-    p.Title,
-    p.ClosedDate,
-    tr.OwnerUserId,
-    tr.TagName
 order by tr.Count desc, tr.Score desc
 limit 100;

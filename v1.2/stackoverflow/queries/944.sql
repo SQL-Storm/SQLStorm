@@ -1,3 +1,4 @@
+-- {"query": "944.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1725} 
 with RecursiveUserStats as (
     select
         u.Id as UserId,
@@ -162,7 +163,7 @@ select
     fs.OwnerSilverBadges,
     fs.OwnerBronzeBadges,
     fs.CommentCount,
-    round(cast(fs.AvgCommentScore as numeric), 2) as AvgCommentScore,
+    round(fs.AvgCommentScore::numeric, 2) as AvgCommentScore,
     fs.CommenterNames,
     case 
         when fs.OriginalQuestionId is not null then fs.OriginalQuestionId

@@ -1,3 +1,4 @@
+-- {"query": "955.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1232} 
 with RankedAnswers as (
     select
         a.Id,
@@ -53,10 +54,7 @@ with RankedAnswers as (
         crt.Name as CloseReason,
         ph.CreationDate as CloseDate
     from PostHistory ph
-    left join CloseReasonTypes crt on (case
-        when trim(ph.Comment) ~ '^[0-9]+$' then cast(ph.Comment as integer)
-        else null
-    end) = crt.Id
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
     where ph.PostHistoryTypeId = 10
 ), UserBadgeSummary as (
     select
@@ -105,12 +103,12 @@ select
     ua.CommentCount as OwnerCommentCount,
     -- Complex calculated field: weighted score difference normalized by days since creation
     case
-        when extract(epoch from (timestamp '2024-10-01 12:34:56' - qs.CreationDate)) / 86400 > 0 then
-            round( (qs.QuestionScore - coalesce(tad.Score,0)) / (extract(epoch from (timestamp '2024-10-01 12:34:56' - qs.CreationDate)) / 86400)::double precision, 4)
+        when extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.CreationDate)) / 86400 > 0 then
+            round( (qs.QuestionScore - coalesce(tad.Score,0))::numeric / (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.CreationDate)) / 86400), 4)
         else null
     end as ScoreDiffPerDay,
     -- String expression with NULL logic
-    ('Q: ' || qs.Title || ' [Tag: ' || coalesce(qs.FirstTag, 'none') || ']' || ' - Owner: ' || coalesce(qs.QuestionOwnerName, 'Anonymous')) as QuestionSummary
+    concat('Q: ', qs.Title, ' [Tag: ', coalesce(qs.FirstTag, 'none'), ']', ' - Owner: ', coalesce(qs.QuestionOwnerName, 'Anonymous')) as QuestionSummary
 from QuestionStats qs
 left join CloseInfo ci on qs.QuestionId = ci.PostId
 left join TopAnswerDetails tad on qs.QuestionId = tad.QuestionId

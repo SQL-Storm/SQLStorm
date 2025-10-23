@@ -1,3 +1,4 @@
+-- {"query": "241.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8234} 
 WITH
 UsersWithRecent AS (
   SELECT Id AS user_id,
@@ -63,7 +64,7 @@ SELECT
   NULL AS last_close_reason,
   NULL AS comment_count,
   CONCAT('UserReputation=', Reputation) AS metrics_string,
-  CAST(1 AS BIGINT) AS rank
+  1::bigint AS rank
 FROM UsersWithRecent u
 WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.user_id)
 

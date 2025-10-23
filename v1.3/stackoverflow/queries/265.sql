@@ -1,16 +1,16 @@
+-- {"query": "265.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3576} 
 WITH
 questions AS (
   SELECT
     p.Id,
     p.Title,
     p.OwnerUserId,
-    CAST(p.CreationDate AS date) AS qdate,
+    p.CreationDate::date AS qdate,
     p.Score,
     p.ViewCount,
     p.AcceptedAnswerId,
     COALESCE(p.Tags,'') AS raw_tags,
-    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN CAST(ARRAY[] AS varchar[])
-         ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') END AS tag_array
+    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') END AS tag_array
   FROM Posts p
   WHERE p.PostTypeId = 1
 ),
@@ -31,7 +31,7 @@ tag_aggregates AS (
   GROUP BY qt.tag
 ),
 answers AS (
-  SELECT a.Id, a.ParentId, a.OwnerUserId, CAST(a.CreationDate AS date) AS a_date, a.Score
+  SELECT a.Id, a.ParentId, a.OwnerUserId, a.CreationDate::date AS a_date, a.Score
   FROM Posts a
   WHERE a.PostTypeId = 2
 ),
@@ -72,12 +72,9 @@ daily_activity AS (
 ),
 daily_moving AS (
   SELECT
-    d.qdate,
-    d.questions,
-    d.views,
-    d.avg_score,
-    AVG(d.questions) OVER (ORDER BY d.qdate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_weekly_questions,
-    SUM(d.views) OVER (ORDER BY d.qdate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS monthly_views_sum
+    d.*,
+    AVG(questions) OVER (ORDER BY qdate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_weekly_questions,
+    SUM(views) OVER (ORDER BY qdate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS monthly_views_sum
   FROM daily_activity d
 ),
 ranked_tags AS (
@@ -92,20 +89,21 @@ ranked_tags AS (
     tcf.top_user,
     ROW_NUMBER() OVER (ORDER BY ta.question_count DESC NULLS LAST, ta.total_views DESC) AS tag_rank
   FROM tag_aggregates ta
-  LEFT JOIN tag_answer_stats tas ON tas.tag = ta.tag
-  LEFT JOIN top_contrib_first tcf ON tcf.tag = ta.tag
+  LEFT JOIN tag_answer_stats tas USING (tag)
+  LEFT JOIN top_contrib_first tcf USING (tag)
 )
 SELECT
   rt.tag_rank,
   rt.tag,
   rt.question_count,
   rt.total_views,
-  CAST(COALESCE(rt.avg_q_score,0) AS numeric(10,3)) AS avg_q_score,
-  CAST(COALESCE(rt.median_q_score,0) AS numeric(10,3)) AS median_q_score,
+  COALESCE(rt.avg_q_score,0)::numeric(10,3) AS avg_q_score,
+  COALESCE(rt.median_q_score,0)::numeric(10,3) AS median_q_score,
   COALESCE(rt.answer_count,0) AS answer_count,
-  CAST(COALESCE(rt.avg_answer_score,0) AS numeric(10,3)) AS avg_answer_score,
+  COALESCE(rt.avg_answer_score,0)::numeric(10,3) AS avg_answer_score,
   rt.top_user,
   u.DisplayName AS top_user_name,
+  -- correlated subquery: count of distinct answerer locations for this tag (NULLs coalesced)
   (
     SELECT COUNT(DISTINCT COALESCE(us.Location,'<unknown>'))
     FROM Posts a
@@ -113,6 +111,7 @@ SELECT
     WHERE a.PostTypeId = 2
       AND a.ParentId IN (SELECT q.Id FROM questions q WHERE q.tag_array @> ARRAY[rt.tag])
   ) AS distinct_answerer_locations,
+  -- sample concatenated recent titles (top 5) for the tag
   (
     SELECT string_agg(substring(s.Title,1,50),' || ')
     FROM (
@@ -124,6 +123,7 @@ SELECT
       LIMIT 5
     ) s
   ) AS sample_titles,
+  -- correlated subquery using EXISTS and complex boolean/NULL logic: whether there exists a high-rep gold-badged user answering frequently on this tag
   CASE
     WHEN EXISTS (
       SELECT 1 FROM Posts a2
@@ -139,6 +139,7 @@ SELECT
     ) THEN TRUE
     ELSE FALSE
   END AS has_prolific_gold_answerer,
+  -- tag profile heuristic using NULL logic and numeric comparisons
   CASE
     WHEN rt.median_q_score IS NULL OR rt.question_count < 10 THEN 'low-data'
     WHEN rt.total_views > 100000 AND COALESCE(rt.avg_q_score,0) > 1 THEN 'hot'

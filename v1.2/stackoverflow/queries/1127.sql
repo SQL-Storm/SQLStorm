@@ -1,3 +1,4 @@
+-- {"query": "1127.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1135} 
 WITH RankedPosts AS (
   SELECT
     p.Id,
@@ -14,7 +15,7 @@ WITH RankedPosts AS (
     ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
   FROM Posts p
   LEFT JOIN Users u ON p.OwnerUserId = u.Id
-  WHERE p.PostTypeId IN (1, 2)
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
 ),
 TopBadgesPerUser AS (
   SELECT
@@ -54,26 +55,17 @@ QuestionDuplicates AS (
   FROM PostLinks pl
   INNER JOIN Posts p1 ON pl.PostId = p1.Id AND p1.PostTypeId = 1
   INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id AND p2.PostTypeId = 1
-  WHERE pl.LinkTypeId = 3
+  WHERE pl.LinkTypeId = 3 -- Duplicate link type
 ),
 UserTopTags AS (
   SELECT
     p.OwnerUserId AS UserId,
-    tag AS Tag,
+    UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS Tag,
     COUNT(*) AS TagUsageCount,
     ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
-  FROM Posts p,
-  LATERAL (
-    SELECT trim(t::varchar) AS tag
-    FROM UNNEST(
-      CASE
-        WHEN p.Tags IS NULL THEN ARRAY[]::varchar[]
-        ELSE regexp_split_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags) - 2)), '><')
-      END
-    ) AS t
-  ) AS tags
+  FROM Posts p
   WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
-  GROUP BY p.OwnerUserId, tag
+  GROUP BY p.OwnerUserId, Tag
 ),
 BadgeAggregate AS (
   SELECT

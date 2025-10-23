@@ -1,3 +1,4 @@
+-- {"query": "353.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 13741} 
 WITH
 questions AS (
   SELECT Id, Title, Tags, OwnerUserId, Score, ViewCount, AnswerCount, AcceptedAnswerId, CreationDate, ClosedDate, Body
@@ -10,10 +11,10 @@ answers AS (
   WHERE PostTypeId = 2
 ),
 q_tags AS (
-  SELECT q.Id AS QuestionId, t.tag AS TagName
+  SELECT q.Id AS QuestionId, t.tag::text AS TagName
   FROM questions q
   CROSS JOIN LATERAL (
-    SELECT unnest(string_to_array(substring(q.Tags FROM 2 FOR (length(q.Tags)-2)), '><')) AS tag
+    SELECT unnest(string_to_array(substring(q.Tags FROM 2 FOR (char_length(q.Tags)-2)), '><')) AS tag
   ) t
   WHERE q.Tags IS NOT NULL AND q.Tags <> ''
 ),
@@ -66,7 +67,7 @@ link_graph AS (
 ),
 duplicate_chains AS (
   WITH RECURSIVE dup_chain(root, id, depth, path) AS (
-    SELECT pl.PostId AS root, pl.RelatedPostId AS id, 1 AS depth, ARRAY[pl.PostId, pl.RelatedPostId] AS path
+    SELECT pl.PostId AS root, pl.RelatedPostId AS id, 1 AS depth, ARRAY[pl.PostId, pl.RelatedPostId]::int[] AS path
     FROM PostLinks pl WHERE pl.LinkTypeId = 3
     UNION ALL
     SELECT dc.root, pl.RelatedPostId, dc.depth + 1, dc.path || pl.RelatedPostId
@@ -78,10 +79,10 @@ duplicate_chains AS (
 ),
 post_text_metrics AS (
   SELECT p.Id AS PostId,
-         COALESCE(length(p.Body),0) AS BodyLength,
-         COALESCE((length(p.Body) - length(replace(p.Body, '<code>', ''))) / NULLIF(length('<code>'),0), 0) AS CodeSnippets,
-         COALESCE((length(COALESCE(p.Title,'')) - length(replace(COALESCE(p.Title,''), ' ', ''))) + CASE WHEN COALESCE(p.Title,'') = '' THEN 0 ELSE 1 END, 0) AS TitleWords,
-         CASE WHEN p.Tags IS NULL THEN 0 ELSE (length(p.Tags) - length(replace(p.Tags,'<',''))) END AS TagCount
+         COALESCE(char_length(p.Body),0) AS BodyLength,
+         COALESCE((char_length(p.Body) - char_length(replace(p.Body, '<code>', ''))) / NULLIF(char_length('<code>'),0), 0) AS CodeSnippets,
+         COALESCE((char_length(COALESCE(p.Title,'')) - char_length(replace(COALESCE(p.Title,''), ' ', ''))) + CASE WHEN COALESCE(p.Title,'') = '' THEN 0 ELSE 1 END, 0) AS TitleWords,
+         CASE WHEN p.Tags IS NULL THEN 0 ELSE (char_length(p.Tags) - char_length(replace(p.Tags,'<',''))) END AS TagCount
   FROM Posts p
 ),
 editing_history AS (
@@ -129,8 +130,8 @@ question_complexity AS (
 tag_popularity AS (
   SELECT qt.TagName,
          COUNT(*) AS RecentQuestions,
-         COUNT(*) FILTER (WHERE q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS Last30Days,
-         COUNT(*) FILTER (WHERE q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS Last365Days,
+         COUNT(*) FILTER (WHERE q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS Last30Days,
+         COUNT(*) FILTER (WHERE q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS Last365Days,
          AVG(q.Score) AS AvgScore,
          SUM(COALESCE(q.ViewCount,0)) AS TotalViews
   FROM q_tags qt
@@ -155,14 +156,14 @@ score_correlations AS (
          SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS ScoreAsAnswer,
          SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS ScoreAsQuestion,
          CASE WHEN SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) > 0 
-           THEN SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0)
+           THEN SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)::float / NULLIF(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0)
            ELSE NULL END AS AvgAnswerScorePerUser
   FROM Users u
   LEFT JOIN Posts p ON p.OwnerUserId = u.Id
-  GROUP BY u.Id, u.Reputation
+  GROUP BY u.Id
 ),
 recent_high_rep_users AS (
-  SELECT Id FROM Users WHERE Reputation >= 1000 AND Id IN (SELECT OwnerUserId FROM Posts WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' AND OwnerUserId IS NOT NULL)
+  SELECT Id FROM Users WHERE Reputation >= 1000 AND Id IN (SELECT OwnerUserId FROM Posts WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' AND OwnerUserId IS NOT NULL)
 ),
 popular_answerers AS (
   SELECT OwnerUserId AS Id FROM Posts WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL GROUP BY OwnerUserId HAVING COUNT(*) > 50
@@ -176,16 +177,16 @@ active_popular_users AS (
 SELECT *
 FROM (
   SELECT 
-    'tag' AS entity_type,
+    'tag'::text AS entity_type,
     tm.TagName AS entity_key,
     COALESCE(tm.RecentQuestions,0) AS metric1,
     COALESCE(tm.Last30Days,0) AS metric2,
     COALESCE(tm.PopAvgScore,0) AS metric3,
     COALESCE(tm.AvgSecondsToFirstAnswer,-1) AS metric4,
     COALESCE(tm.PopTotalViews, COALESCE(tm.StatTotalViews,0),0) AS metric5,
-    COALESCE(CAST(ta.top_user_id AS text),'') AS extra_info,
+    COALESCE(ta.top_user_id::text,'') AS extra_info,
     (COALESCE(tm.Last30Days,0) * 2 + COALESCE(tm.Last365Days,0) * 0.5 + COALESCE(tm.PopAvgScore,0) * 5 + COALESCE(tm.QuestionsWithAccepted,0) * 10) / NULLIF(GREATEST(COALESCE(tm.QuestionCount,1),1),1) AS engagement_index,
-    DENSE_RANK() OVER (ORDER BY COALESCE(tm.Last30Days,0) DESC) AS popularity_rank
+    DENSE_RANK() OVER (ORDER BY COALESCE(tm.Last30Days,0) DESC NULLS LAST) AS popularity_rank
   FROM tags_merged tm
   LEFT JOIN LATERAL (
     SELECT a.OwnerUserId AS top_user_id, COUNT(a.Id) AS answers_for_tag
@@ -199,8 +200,8 @@ FROM (
   UNION ALL
 
   SELECT
-    'user' AS entity_type,
-    CAST(u.UserId AS text) AS entity_key,
+    'user'::text AS entity_type,
+    u.UserId::text AS entity_key,
     u.QuestionsPosted AS metric1,
     u.AnswersPosted AS metric2,
     COALESCE(sc.AvgAnswerScorePerUser,0) AS metric3,
@@ -218,7 +219,7 @@ FROM (
                ) sub
              ), '') AS extra_info,
     (COALESCE(sc.ScoreAsAnswer,0) * 0.3 + COALESCE(u.TotalScore,0) * 0.1 + COALESCE(u.Reputation,0) * 0.01) AS engagement_index,
-    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS popularity_rank
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS popularity_rank
   FROM user_stats u
   LEFT JOIN score_correlations sc ON sc.UserId = u.UserId
   WHERE u.QuestionsPosted + u.AnswersPosted > 0

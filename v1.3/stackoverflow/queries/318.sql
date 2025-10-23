@@ -1,3 +1,4 @@
+-- {"query": "318.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 22720} 
 WITH
 base_questions AS (
   SELECT
@@ -29,7 +30,7 @@ answers_agg AS (
   SELECT
     a.ParentId AS question_id,
     COUNT(*) AS answer_count,
-    AVG(COALESCE(a.Score,0)) AS avg_answer_score,
+    AVG(COALESCE(a.Score,0))::numeric AS avg_answer_score,
     MAX(COALESCE(a.Score,0)) AS max_answer_score,
     COUNT(*) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS answers_with_owner
   FROM Posts a
@@ -138,9 +139,9 @@ tag_level_stats AS (
   SELECT
     qt.tag,
     COUNT(DISTINCT qt.question_id) AS tag_question_count,
-    AVG(COALESCE(bq.Score,0)) AS avg_question_score,
-    AVG(COALESCE(bq.ViewCount,0)) AS avg_question_views,
-    AVG(COALESCE(a.avg_answer_score,0)) AS avg_answer_score_per_tag,
+    AVG(COALESCE(bq.Score,0))::numeric AS avg_question_score,
+    AVG(COALESCE(bq.ViewCount,0))::numeric AS avg_question_views,
+    AVG(COALESCE(a.avg_answer_score,0))::numeric AS avg_answer_score_per_tag,
     MAX(COALESCE(bq.Score,0)) AS max_question_score,
     SUM(COALESCE(bq.ViewCount,0)) AS total_views
   FROM question_tags qt
@@ -172,15 +173,15 @@ scored_posts AS (
     COALESCE(user_activity.reputation,0) AS owner_reputation,
     COALESCE(user_activity.badge_count,0) AS owner_badge_count,
     COALESCE(bq.FavoriteCount,0) AS favorite_count,
-    GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - bq.CreationDate))/86400.0, 0) AS age_days,
-    EXP(-GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - bq.CreationDate))/86400.0, 0) / 365.0) AS recency_weight,
+    GREATEST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - bq.CreationDate))/86400.0, 0) AS age_days,
+    EXP(-GREATEST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - bq.CreationDate))/86400.0, 0) / 365.0) AS recency_weight,
     LN(GREATEST(bq.ViewCount, 1)) AS log_views,
     (
-      (COALESCE(bq.Score,0) * 3.0)
+      (COALESCE(bq.Score,0)::numeric * 3.0)
       + (COALESCE(votes_agg.upvotes,0) * 1.0) - (COALESCE(votes_agg.downvotes,0) * 1.5)
       + (COALESCE(answers_agg.answer_count,0) * 2.0)
       + (COALESCE(answers_agg.avg_answer_score,0) * 1.8)
-      + (LN(GREATEST(bq.ViewCount,1)) * 0.9) * EXP(-GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - bq.CreationDate))/86400.0, 0) / 365.0)
+      + (LN(GREATEST(bq.ViewCount,1)) * 0.9) * EXP(-GREATEST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - bq.CreationDate))/86400.0, 0) / 365.0)
       + (COALESCE(comments_agg.comment_count,0) * 1.2)
       + (COALESCE(bq.FavoriteCount,0) * 2.5)
       + (COALESCE(user_activity.reputation,0) / GREATEST(NULLIF((COALESCE(user_activity.questions_posted,0) + COALESCE(user_activity.answers_posted,0)),0),1) * 0.0005)
@@ -201,32 +202,7 @@ scored_posts AS (
 ranked_per_tag AS (
   SELECT
     qt.tag,
-    sp.question_id,
-    sp.Title,
-    sp.OwnerUserId,
-    sp.OwnerDisplayName,
-    sp.CreationDate,
-    sp.LastActivityDate,
-    sp.score,
-    sp.viewcount,
-    sp.answer_count,
-    sp.avg_answer_score,
-    sp.upvotes,
-    sp.downvotes,
-    sp.total_votes,
-    sp.comment_count,
-    sp.distinct_commenters,
-    sp.top_commenter_id,
-    sp.history_count,
-    sp.link_count,
-    sp.duplicate_out_count,
-    sp.owner_reputation,
-    sp.owner_badge_count,
-    sp.favorite_count,
-    sp.age_days,
-    sp.recency_weight,
-    sp.log_views,
-    sp.composite_score,
+    sp.*,
     COALESCE(substring(regexp_replace(sp.Title, '<[^>]+>', '', 'g'),1,160), '') ||
       CASE WHEN length(COALESCE(sp.Title,'')) > 160 THEN '...' ELSE '' END AS title_snippet,
     ROW_NUMBER() OVER (PARTITION BY qt.tag ORDER BY sp.composite_score DESC NULLS LAST, sp.viewcount DESC) AS rn,
@@ -245,37 +221,6 @@ ranked_per_tag AS (
   FROM question_tags qt
   JOIN scored_posts sp ON sp.question_id = qt.question_id
   LEFT JOIN tag_level_stats tls ON tls.tag = qt.tag
-  GROUP BY
-    qt.tag,
-    sp.question_id,
-    sp.Title,
-    sp.OwnerUserId,
-    sp.OwnerDisplayName,
-    sp.CreationDate,
-    sp.LastActivityDate,
-    sp.score,
-    sp.viewcount,
-    sp.answer_count,
-    sp.avg_answer_score,
-    sp.upvotes,
-    sp.downvotes,
-    sp.total_votes,
-    sp.comment_count,
-    sp.distinct_commenters,
-    sp.top_commenter_id,
-    sp.history_count,
-    sp.link_count,
-    sp.duplicate_out_count,
-    sp.owner_reputation,
-    sp.owner_badge_count,
-    sp.favorite_count,
-    sp.age_days,
-    sp.recency_weight,
-    sp.log_views,
-    sp.composite_score,
-    tls.avg_question_views,
-    tls.tag_question_count,
-    tls.avg_question_score
 ),
 top_per_tag_set AS (
   SELECT tag, question_id, title_snippet AS title, OwnerUserId AS owner_id, composite_score, viewcount, age_days, rn, rnk, avg_question_views, tag_question_count, z_score_within_tag
@@ -292,11 +237,11 @@ unseen_gems AS (
     sp.composite_score,
     sp.viewcount,
     sp.age_days,
-    CAST(NULL AS integer) AS rn,
-    CAST(NULL AS integer) AS rnk,
+    NULL::int AS rn,
+    NULL::int AS rnk,
     tls.avg_question_views,
     tls.tag_question_count,
-    CAST(NULL AS numeric) AS z_score_within_tag
+    NULL::numeric AS z_score_within_tag
   FROM scored_posts sp
   JOIN question_tags qt ON qt.question_id = sp.question_id
   LEFT JOIN tag_level_stats tls ON tls.tag = qt.tag
@@ -309,9 +254,9 @@ unseen_gems AS (
 recent_activity_posts AS (
   SELECT
     sp.*,
-    ( (sp.composite_score * 0.6) + (sp.comment_count * 1.5) + (COALESCE(sp.answer_count,0) * 2.0) + (CASE WHEN GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - sp.CreationDate))/86400.0, 0) < 14 THEN 15 ELSE 0 END) ) AS hot_score
+    ( (sp.composite_score * 0.6) + (sp.comment_count * 1.5) + (COALESCE(sp.answer_count,0) * 2.0) + (CASE WHEN GREATEST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - sp.CreationDate))/86400.0, 0) < 14 THEN 15 ELSE 0 END) ) AS hot_score
   FROM scored_posts sp
-  WHERE sp.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '14 days'
+  WHERE sp.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '14 days'
   ORDER BY hot_score DESC
   LIMIT 500
 ),
@@ -331,11 +276,11 @@ recent_activity_wrapped AS (
     fr.composite_score,
     fr.viewcount,
     fr.age_days,
-    CAST(NULL AS integer) AS rn,
-    CAST(NULL AS integer) AS rnk,
-    CAST(NULL AS numeric) AS avg_question_views,
-    CAST(NULL AS integer) AS tag_question_count,
-    CAST(NULL AS numeric) AS z_score_within_tag
+    NULL::int AS rn,
+    NULL::int AS rnk,
+    NULL::numeric AS avg_question_views,
+    NULL::int AS tag_question_count,
+    NULL::numeric AS z_score_within_tag
   FROM filtered_recent_activity fr
   JOIN question_tags qt ON qt.question_id = fr.question_id
   LIMIT 1000

@@ -1,3 +1,4 @@
+-- {"query": "13.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2335} 
 with
 -- user stats and recent activity
 user_activity as (
@@ -17,7 +18,7 @@ user_activity as (
   from users u
   left join posts p on p.owneruserid = u.id
   left join badges b on b.userid = u.id
-  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.websiteurl, u.location
+  group by u.id
 ),
 -- heavy questions: combine content metrics, tags exploded, and recent edits
 question_enrichment as (
@@ -32,9 +33,9 @@ question_enrichment as (
     coalesce(q.favoritecount,0) as favoritecount,
     q.tags,
     -- estimated tag count from tag string like '<tag1><tag2>'
-    greatest(array_length(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><'),1),0) as tag_count,
+    greatest(array_length(string_to_array(substring(q.tags from 2 for char_length(q.tags)-2), '><'),1),0) as tag_count,
     length(coalesce(q.body,'')) as body_len,
-    regexp_replace(coalesce(q.body,''), '<[^>]+>', '') as body_text,
+    regexp_replace(coalesce(q.body,''), '<[^>]+>', '', 'g') as body_text,
     -- last edit info from PostHistory (most recent edit or title/body change)
     (select ph.creationdate from posthistory ph
      where ph.postid = q.id and ph.posthistorytypeid in (2,4,5,6,24)
@@ -46,7 +47,6 @@ question_enrichment as (
     (select c.userid from comments c where c.postid = q.id group by c.userid order by count(*) desc nulls last limit 1) as top_commenter_id
   from posts q
   where q.posttypeid = 1
-  group by q.id, q.owneruserid, q.title, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.tags, q.body
 ),
 -- answers with correlation to their parent question
 answer_enrichment as (
@@ -68,7 +68,6 @@ answer_enrichment as (
     end as score_z
   from posts a
   where a.posttypeid = 2
-  group by a.id, a.parentid, a.owneruserid, a.creationdate, a.score, a.body
 ),
 -- tag popularity from questions
 tag_popularity as (
@@ -80,7 +79,6 @@ tag_popularity as (
     coalesce(q.viewcount,0) as excerpt_views
   from tags t
   left join posts q on q.id = t.excerptpostid
-  group by t.tagname, t.id, t.count, q.id, q.viewcount
 ),
 -- aggregate votes and compute unusual voting patterns
 vote_aggregates as (
@@ -95,7 +93,7 @@ vote_aggregates as (
     bool_or(v.userid is null) as has_anonymous_votes
   from posts p
   left join votes v on v.postid = p.id
-  group by p.id, p.posttypeid
+  group by p.id
 ),
 -- sample of post links for graph-style operations
 link_graph as (
@@ -106,7 +104,6 @@ link_graph as (
     lt.name as linktype_name
   from postlinks pl
   left join linktypes lt on lt.id = pl.linktypeid
-  group by pl.postid, pl.relatedpostid, pl.linktypeid, lt.name
 ),
 -- identify questions with weird closure/reopen history using PostHistory
 closure_patterns as (
@@ -114,8 +111,8 @@ closure_patterns as (
     ph.postid,
     sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
     sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
-    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_at,
-    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at
   from posthistory ph
   group by ph.postid
 ),
@@ -150,11 +147,11 @@ final_candidates as (
     ae.is_accepted,
     ae.score_z,
     -- complex computed metric that favors high views, high score, many answers, but penalizes close events and lots of downvotes
-    (ln(1 + q.viewcount) * (1 + greatest(q.score,0)) * (1 + q.answercount) / nullif(1 + ve.downvotes + coalesce(cp.close_events,0)*5,1)) as interestingness_score,
+    (log(1 + q.viewcount)::numeric * (1 + greatest(q.score,0)) * (1 + q.answercount) / nullif(1 + ve.downvotes + cp.close_events*5,1)) as interestingness_score,
     -- compute text similarity heuristic: length ratio of top answer to question body
-    case when q.body_len > 0 then (cast(ae.body_len as numeric)) / q.body_len else null end as answer_body_to_question_body_ratio,
-    rank() over (partition by tg.tagname order by (ln(1+q.viewcount) * (1+greatest(q.score,0))) desc) as tag_rank_by_popularity,
-    dense_rank() over (order by (ln(1+q.viewcount) * (1+greatest(q.score,0))) desc) as global_popularity_rank
+    case when q.body_len > 0 then cast(ae.body_len as numeric) / q.body_len else null end as answer_body_to_question_body_ratio,
+    rank() over (partition by tg.tagname order by (log(1+q.viewcount)::numeric * (1+greatest(q.score,0))) desc) as tag_rank_by_popularity,
+    dense_rank() over (order by (log(1+q.viewcount)::numeric * (1+greatest(q.score,0))) desc) as global_popularity_rank
   from question_enrichment q
   left join user_activity ua on ua.user_id = q.owneruserid
   left join vote_aggregates ve on ve.post_id = q.question_id
@@ -162,7 +159,7 @@ final_candidates as (
   left join lateral (
     select tg.tagname from tags tg
     where tg.tagname in (
-      select unnest(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><'))
+      select unnest(string_to_array(substring(q.tags from 2 for char_length(q.tags)-2), '><'))
     )
     order by tg.count desc nulls last limit 1
   ) tg on true
@@ -177,11 +174,6 @@ final_candidates as (
     where lg.postid = q.question_id
     order by lg.linktypeid limit 1
   ) lg on true
-  group by
-    q.question_id, q.title, ua.user_id, ua.displayname, ua.reputation, q.creationdate, q.score, q.viewcount, q.answercount,
-    q.favoritecount, q.tag_count, q.body_len, q.comment_count, q.distinct_editors, ve.upvotes, ve.downvotes, ve.total_votes,
-    ve.bounty_awarded, cp.close_events, cp.reopen_events, lg.linktype_name, tg.tagname, ae.answer_id, ae.owneruserid, ae.score,
-    ae.is_accepted, ae.score_z, ae.body_len
 )
 select
   fc.question_id,

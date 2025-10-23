@@ -1,9 +1,10 @@
+-- {"query": "220.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8222} 
 with
 base as (
   select p.Id, p.Title, p.Tags, p.CreationDate, p.LastActivityDate, p.OwnerUserId
   from Posts p
   where p.PostTypeId = 1
-    and p.CreationDate >= (cast('2024-10-01' as date) - interval '90 day')
+    and p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '90 days')
 ),
 up as (
   select v.PostId, count(*) as UpVotes
@@ -49,13 +50,13 @@ net as (
 ),
 top_day as (
   select NetScore, Id as PostId, Title, Tags, CreationDate, LastActivityDate, OwnerUserId, CommentCount, LinkCount,
-         row_number() over (partition by CAST(CreationDate AS date) order by NetScore desc, LastActivityDate desc) as rn
+         row_number() over (partition by date(CreationDate) order by NetScore desc, LastActivityDate desc) as rn
   from net
 ),
 selectable as (
   select t.PostId, t.Title, t.Tags, t.CreationDate, t.LastActivityDate, t.OwnerUserId, t.CommentCount, t.LinkCount, t.NetScore,
-         (case when t.Tags is null then cast(array[] as text[])
-               else (select array_agg(trim(x)) from unnest(string_to_array(substr(t.Tags, 2, length(t.Tags) - 2), '><')) as x)
+         (case when t.Tags is null then ARRAY[]::text[]
+               else (select array_agg(trim(x)) from unnest(string_to_array(substr(t.Tags,2, length(t.Tags)-2), '><')) as x)
           end) as TagNames
   from top_day t
   where t.rn = 1
@@ -74,7 +75,7 @@ final2 as (
          s.CommentCount as comment_count, s.LinkCount as link_count, u.DisplayName as owner_display_name, s.CreationDate as creation_date
   from selectable s
   join Users u on u.Id = s.OwnerUserId
-  where cast(s.CreationDate as date) = cast('2024-10-01' as date)
+  where date(s.CreationDate) = cast('2024-10-01' as date)
   order by s.CommentCount desc
   limit 30
 )

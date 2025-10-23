@@ -1,3 +1,4 @@
+-- {"query": "698.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1460} 
 with RecursiveUserActivity as (
     select 
         u.Id as UserId,
@@ -12,7 +13,7 @@ with RecursiveUserActivity as (
         p.Score,
         p.ViewCount,
         p.CreationDate as PostCreationDate,
-        row_number() over (partition by u.Id order by p.CreationDate desc) as PostRank
+        row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as PostRank
     from Users u
     left join Posts p on p.OwnerUserId = u.Id
     where u.Reputation > 1000
@@ -85,7 +86,7 @@ RankedUserPosts as (
         pci.ClosedDate,
         pci.ReopenedDate,
         pci.CloseReasonId,
-        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as ScoreRank
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc nulls last) as ScoreRank
     from Posts p
     left join PostVotesSummary ps on ps.PostId = p.Id
     left join PostCommentsCount pc on pc.PostId = p.Id
@@ -106,7 +107,7 @@ UserAggregatedStats as (
         sum(coalesce(rp.CommentCount,0)) as TotalComments,
         sum(coalesce(rp.Favorites,0)) as TotalFavorites,
         sum(case when rp.ClosedDate is not null then 1 else 0 end) as ClosedPostsCount,
-        sum(case when cast(rp.CloseReasonId as integer) in (101,102,103,104,105) then 1 else 0 end) as SpecificCloseReasonsCount
+        sum(case when rp.CloseReasonId::int in (101,102,103,104,105) then 1 else 0 end) as SpecificCloseReasonsCount
     from Users u
     left join UserBadgeCounts ubc on ubc.UserId = u.Id
     left join RankedUserPosts rp on rp.OwnerUserId = u.Id and rp.ScoreRank <= 5
@@ -131,16 +132,14 @@ select
     fu.ClosedPostsCount,
     fu.SpecificCloseReasonsCount,
     string_agg(distinct t.TagName, ', ') as TopTags,
-    max(case when rp.ScoreRank = 1 then rp.Title end) as TopScoringPostTitle,
-    max(case when rp.ScoreRank = 1 then rp.Score end) as TopScoringPostScore,
-    max(case when rp.ScoreRank = 1 then rp.ViewCount end) as TopScoringPostViews
+    max(rp.Title) filter (where rp.ScoreRank = 1) as TopScoringPostTitle,
+    max(rp.Score) filter (where rp.ScoreRank = 1) as TopScoringPostScore,
+    max(rp.ViewCount) filter (where rp.ScoreRank = 1) as TopScoringPostViews
 from FilteredUsers fu
 left join RankedUserPosts rp on rp.OwnerUserId = fu.UserId and rp.ScoreRank = 1
 left join Posts p on p.Id = rp.Id
 left join lateral (
-    select trim(both '<>' from tag) as TagName from (
-        select regexp_split_to_table(coalesce(p.Tags,''), '><') as tag
-    ) s
+    select unnest(string_to_array(coalesce(p.Tags,''), '><')) as TagName
 ) tags on true
 left join Tags t on t.TagName = tags.TagName
 group by fu.UserId, fu.DisplayName, fu.Reputation, fu.GoldBadges, fu.SilverBadges, fu.BronzeBadges, fu.TotalPosts, fu.AvgPostScore, fu.MaxPostViews, fu.TotalComments, fu.TotalFavorites, fu.ClosedPostsCount, fu.SpecificCloseReasonsCount

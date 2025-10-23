@@ -1,3 +1,4 @@
+-- {"query": "222.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5240} 
 WITH
 UserPostStats AS (
   SELECT
@@ -24,7 +25,7 @@ RecentCommentSum AS (
     UserId,
     COUNT(*) AS RecentCommentCount
   FROM Comments
-  WHERE CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days'
+  WHERE CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
   GROUP BY UserId
 ),
 TopLocationRanking AS (
@@ -39,7 +40,7 @@ TopLocationRanking AS (
       ORDER BY up.Reputation DESC
     ) AS RankInLocation,
     -- Correlated subquery: number of posts by this user in the last 180 days
-    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = up.UserId AND p2.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days') AS RecentPosts
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = up.UserId AND p2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days') AS RecentPosts
   FROM UserPostStats up
 ),
 TopBadged AS (
@@ -78,11 +79,11 @@ Combined AS (
     u.Location,
     u.Reputation,
     (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastActivityDate,
-    NULL AS RankInLocation,
+    NULL::int AS RankInLocation,
     COALESCE(b.GoldBadges, 0) AS GoldBadges,
     COALESCE(b.SilverBadges, 0) AS SilverBadges,
     COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
-    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days') AS RecentPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days') AS RecentPosts,
     (u.DisplayName || ' [Active]') AS UserTag
   FROM Users u
   LEFT JOIN TopBadged b ON b.UserId = u.Id

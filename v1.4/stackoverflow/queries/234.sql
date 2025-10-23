@@ -1,3 +1,4 @@
+-- {"query": "234.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8663} 
 WITH
 Questions AS (
   SELECT
@@ -11,14 +12,7 @@ Questions AS (
     COALESCE(u.Reputation, 0) AS OwnerRep,
     (SELECT COUNT(*) FROM Posts ap WHERE ap.ParentId = p.Id AND ap.PostTypeId = 2) AS Extra1, -- AnswerCount
     (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS Extra2, -- CommentCount
-    COALESCE(
-      (
-        SELECT STRING_AGG(b.Name, ',')
-        FROM Badges b
-        WHERE b.UserId = p.OwnerUserId
-      ),
-      ''
-    ) AS Extra3, -- OwnerBadges
+    COALESCE((SELECT string_agg(b.Name, ', ') FROM Badges b WHERE b.UserId = p.OwnerUserId), '') AS Extra3, -- OwnerBadges
     (p.Score * 1.5) + ((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) * 0.75) AS Extra4, -- Impact
     ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
   FROM Posts p
@@ -46,9 +40,11 @@ Answers AS (
 )
 SELECT *
 FROM (
-  SELECT * FROM Questions
+  SELECT *
+  FROM Questions
   UNION ALL
-  SELECT * FROM Answers
+  SELECT *
+  FROM Answers
 ) AS combined
 ORDER BY Type, rn
 LIMIT 1000;

@@ -1,8 +1,9 @@
+-- {"query": "374.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 15584} 
 WITH
   active_users AS (
     SELECT u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.Location, u.WebsiteUrl
     FROM Users u
-    WHERE u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days')
+    WHERE u.LastAccessDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days')
        OR u.Reputation > 1000
   ),
   user_metrics AS (
@@ -46,31 +47,31 @@ WITH
       ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS rn
     FROM Posts p
     LEFT JOIN LATERAL (
-      SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+      SELECT unnest(string_to_array(substring(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName
     ) t ON true
-    WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '60 days')
+    WHERE p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '60 days')
     GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.CreationDate, p.LastActivityDate
   ),
   set_union AS (
     SELECT
-      CAST('USER' AS TEXT) AS source_type,
+      'USER'::text AS source_type,
       t.Id AS key_id,
       t.DisplayName AS name,
-      CAST(t.Reputation AS TEXT) AS metric_a,
-      CAST(t.SumPostScore AS TEXT) AS metric_b,
-      CAST(t.TotalPosts AS TEXT) AS metric_c,
-      CAST(t.UserBadges AS TEXT) AS metric_d,
+      CAST(t.Reputation AS text) AS metric_a,
+      CAST(t.SumPostScore AS text) AS metric_b,
+      CAST(t.TotalPosts AS text) AS metric_c,
+      CAST(t.UserBadges AS text) AS metric_d,
       t.LastAccessDate,
       t.rn
     FROM top_users t
     UNION ALL
     SELECT
-      CAST('POST' AS TEXT) AS source_type,
+      'POST'::text AS source_type,
       rp.PostId AS key_id,
       rp.Title AS name,
-      CAST(rp.Score AS TEXT) AS metric_a,
-      CAST(rp.ViewCount AS TEXT) AS metric_b,
-      CAST(rp.OwnerUserId AS TEXT) AS metric_c,
+      CAST(rp.Score AS text) AS metric_a,
+      CAST(rp.ViewCount AS text) AS metric_b,
+      CAST(rp.OwnerUserId AS text) AS metric_c,
       rp.TagList AS metric_d,
       rp.LastActivityDate,
       rp.rn

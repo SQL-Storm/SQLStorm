@@ -1,0 +1,161 @@
+-- {"query": "846.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1434} 
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswersForTag,
+        coalesce(p.ViewCount, 0) as ViewsForTag,
+        row_number() over (partition by t.TagName order by t.Count desc) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+FilteredUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000 and u.Location is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+PostAggregates as (
+    select 
+        p.OwnerUserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        sum(p.FavoriteCount) filter (where p.PostTypeId = 1) as TotalFavorites
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserPostHistory as (
+    select 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.UserId is not null
+),
+LatestEdits as (
+    select 
+        uph.UserId,
+        uph.PostId,
+        uph.PostHistoryTypeId,
+        uph.CreationDate
+    from UserPostHistory uph
+    where uph.rn = 1 and uph.PostHistoryTypeId in (4,5,6,10,11)
+),
+PostLinkSummary as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        count(*) over (partition by pl.PostId, pl.LinkTypeId) as LinkTypeCount
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+UserActivityWindow as (
+    select 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by p.OwnerUserId order by p.CreationDate rows between 29 preceding and current row) as PostsLast30Days
+    from Posts p
+    where p.OwnerUserId is not null
+)
+select 
+    fu.Id as UserId,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.Location,
+    fu.UpVotes,
+    fu.DownVotes,
+    pa.QuestionCount,
+    pa.AnswerCount,
+    pa.AvgPostScore,
+    pa.TotalQuestionViews,
+    pa.TotalFavorites,
+    fu.BadgeCount,
+    fu.GoldBadges,
+    fu.SilverBadges,
+    fu.BronzeBadges,
+    fu.LastBadgeDate,
+    max(le.CreationDate) as LastEditDate,
+    max(pls.LinkTypeCount) as MaxLinkCount,
+    max(uw.PostsLast30Days) as MaxPostsIn30Days,
+    rtc.TagName,
+    rtc.Count as TagGlobalCount,
+    rtc.AnswersForTag,
+    rtc.ViewsForTag
+from FilteredUsers fu
+left join PostAggregates pa on pa.OwnerUserId = fu.Id
+left join LatestEdits le on le.UserId = fu.Id
+left join PostLinkSummary pls on pls.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = fu.Id
+)
+left join UserActivityWindow uw on uw.OwnerUserId = fu.Id
+left join RecursiveTagCounts rtc on rtc.rn = 1 and rtc.TagName in (
+    select distinct unnest(string_to_array(trim(both '<>' from p.Tags), '><')) 
+    from Posts p where p.OwnerUserId = fu.Id and p.PostTypeId = 1 and p.Tags is not null
+)
+where 
+    fu.BadgeCount > 5
+    and (
+        fu.GoldBadges > 0 or fu.Reputation > 5000
+    )
+    and (
+        pa.AvgPostScore > 2 or pa.QuestionCount > 10
+    )
+group by 
+    fu.Id, fu.DisplayName, fu.Reputation, fu.Location, fu.UpVotes, fu.DownVotes,
+    pa.QuestionCount, pa.AnswerCount, pa.AvgPostScore, pa.TotalQuestionViews, pa.TotalFavorites,
+    fu.BadgeCount, fu.GoldBadges, fu.SilverBadges, fu.BronzeBadges, fu.LastBadgeDate,
+    rtc.TagName, rtc.Count, rtc.AnswersForTag, rtc.ViewsForTag
+having max(uw.PostsLast30Days) > 1
+union
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    0 as QuestionCount,
+    0 as AnswerCount,
+    null as AvgPostScore,
+    0 as TotalQuestionViews,
+    0 as TotalFavorites,
+    0 as BadgeCount,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as LastBadgeDate,
+    null as LastEditDate,
+    null as MaxLinkCount,
+    null as MaxPostsIn30Days,
+    null as TagName,
+    null as TagGlobalCount,
+    null as AnswersForTag,
+    null as ViewsForTag
+from Users u
+where u.Reputation > 10000 and not exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id
+)
+order by Reputation desc, BadgeCount desc, QuestionCount desc
+limit 100;

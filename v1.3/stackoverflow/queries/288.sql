@@ -1,3 +1,4 @@
+-- {"query": "288.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 6073} 
 WITH
 posts_by_user AS (
   SELECT
@@ -18,8 +19,7 @@ tag_exploded AS (
          lower(trim(s.tg)) AS tag
   FROM Posts p
   JOIN LATERAL (
-    -- use standard substring function and character_length replacement with LENGTH
-    SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS tg
+    SELECT regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') AS tg
   ) s ON (p.PostTypeId = 1 AND p.Tags IS NOT NULL)
 ),
 user_tag_stats AS (
@@ -69,9 +69,9 @@ user_metrics AS (
     COALESCE(hc.edits,0) AS edits,
     COALESCE(hc.closes_reopens,0) AS closes_reopens,
     COALESCE(hc.migrations,0) AS migrations,
-    CASE WHEN u.LastAccessDate IS NOT NULL THEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate))/86400 ELSE NULL END AS days_since_last_access,
-    CASE WHEN COALESCE(pb.a_count,0) = 0 THEN NULL ELSE COALESCE(pb.accepted_answers * 1.0 / NULLIF(pb.a_count,0),0) END AS acceptance_ratio_estimate,
-    (u.Reputation * 0.6 + COALESCE(bagg.gold,0) * 50 + COALESCE(bagg.silver,0) * 10 + COALESCE(bagg.bronze,0) * 2 + (COALESCE(pb.total_post_score,0) * 3) + GREATEST(0, 365 - COALESCE(EXTRACT(DAY FROM CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate), 365))/10) AS raw_health_score
+    CASE WHEN u.LastAccessDate IS NOT NULL THEN EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp)-u.LastAccessDate))/86400 ELSE NULL END AS days_since_last_access,
+    CASE WHEN COALESCE(pb.a_count,0) = 0 THEN NULL ELSE COALESCE(pb.accepted_answers::float / NULLIF(pb.a_count,0),0) END AS acceptance_ratio_estimate,
+    (u.Reputation * 0.6 + COALESCE(bagg.gold,0) * 50 + COALESCE(bagg.silver,0) * 10 + COALESCE(bagg.bronze,0) * 2 + (COALESCE(pb.total_post_score,0) * 3) + GREATEST(0, 365 - COALESCE(EXTRACT(DAY FROM cast('2024-10-01 12:34:56' as timestamp)-u.LastAccessDate), 365))/10) AS raw_health_score
   FROM Users u
   LEFT JOIN posts_by_user pb ON pb.user_id = u.Id
   LEFT JOIN badge_agg bagg ON bagg.UserId = u.Id
@@ -106,12 +106,12 @@ vote_type_counts AS (
     FROM Votes v
     GROUP BY v.UserId, v.VoteTypeId
     UNION ALL
-    SELECT NULL AS UserId, NULL AS VoteTypeId, 0 AS count
+    SELECT NULL::int, NULL::smallint, 0
   ) v2 ON v2.UserId = u.Id
   GROUP BY u.Id
 ),
 ranked_users AS (
-  SELECT um.user_id, um.Reputation, um.CreationDate, um.DisplayName, um.profile_views, um.questions, um.answers, um.post_score, um.gold_badges, um.silver_badges, um.bronze_badges, um.edits, um.closes_reopens, um.migrations, um.days_since_last_access, um.acceptance_ratio_estimate, um.raw_health_score,
+  SELECT um.*,
     COALESCE(tt.top_tag, '<none>') AS top_tag,
     COALESCE(vtc.upvotes,0) AS upvotes,
     COALESCE(vtc.downvotes,0) AS downvotes,
@@ -120,8 +120,8 @@ ranked_users AS (
     urp.post_id AS recent_post_id,
     urp.Title AS recent_post_title,
     urp.Score AS recent_post_score,
-    RANK() OVER (ORDER BY um.raw_health_score DESC) AS health_rank,
-    ROW_NUMBER() OVER (ORDER BY um.Reputation DESC, um.raw_health_score DESC) AS reputation_rank
+    RANK() OVER (ORDER BY um.raw_health_score DESC NULLS LAST) AS health_rank,
+    ROW_NUMBER() OVER (ORDER BY um.Reputation DESC NULLS LAST, um.raw_health_score DESC) AS reputation_rank
   FROM user_metrics um
   LEFT JOIN top_tags_per_user tt ON tt.user_id = um.user_id
   LEFT JOIN vote_type_counts vtc ON vtc.user_id = um.user_id
@@ -152,5 +152,5 @@ FROM ranked_users r
 WHERE (r.questions + r.answers) > 0
   AND COALESCE(r.Reputation,0) > 10
   AND NOT (r.DisplayName IS NULL OR trim(r.DisplayName) = '')
-ORDER BY r.health_rank, r.reputation_rank
+ORDER BY r.health_rank NULLS LAST, r.reputation_rank
 LIMIT 250;

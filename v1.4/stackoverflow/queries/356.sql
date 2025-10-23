@@ -1,3 +1,4 @@
+-- {"query": "356.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 25979} 
 WITH
   user_base AS (
     SELECT u.Id AS UserId,
@@ -46,7 +47,7 @@ WITH
     SELECT p.OwnerUserId AS UserId,
            STRING_AGG(DISTINCT tn.TagName, ',') AS DistinctTags
     FROM Posts p
-    CROSS JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS tn(TagName)
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS tn(TagName)
     WHERE p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
     GROUP BY p.OwnerUserId
   ),

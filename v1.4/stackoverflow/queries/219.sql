@@ -1,3 +1,4 @@
+-- {"query": "219.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8435} 
 WITH
 PostTags AS (
   SELECT p.Id AS PostId,
@@ -8,7 +9,7 @@ PostTags AS (
          p.OwnerUserId,
          tn.TagName
   FROM Posts p
-  CROSS JOIN LATERAL UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tn(TagName)
+  CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tn(TagName)
   WHERE p.PostTypeId = 1
 ),
 TopPerTag AS (
@@ -31,7 +32,7 @@ UserActivity AS (
          COALESCE(AVG(p.ViewCount),0) AS AvgView
   FROM Users u
   LEFT JOIN Posts p ON p.OwnerUserId = u.Id
-  GROUP BY u.Id, u.DisplayName, u.Reputation
+  GROUP BY u.Id
 ),
 BadgeCounts AS (
   SELECT UserId,
@@ -76,7 +77,7 @@ TaggedSummary AS (
          (
            SELECT STRING_AGG(DISTINCT TagName, ',')
            FROM (
-             SELECT UNNEST(string_to_array(substr(p.Tags,2,length(p.Tags)-2), '><')) AS TagName
+             SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS TagName
              FROM Posts p
              WHERE p.OwnerUserId = s.UserId AND p.PostTypeId = 1
            ) AS TagNames
@@ -84,18 +85,8 @@ TaggedSummary AS (
   FROM Summary s
 ),
 Final AS (
-  SELECT f.UserId,
-         f.DisplayName,
-         f.Reputation,
-         f.TotalPostScore,
-         f.PostCount,
-         f.QuestionCount,
-         f.AvgView,
-         f.GoldBadges,
-         f.SilverBadges,
-         f.BronzeBadges,
-         f.LastActiveDate,
-         ts.TopTags,
+  SELECT f.UserId, f.DisplayName, f.Reputation, f.TotalPostScore, f.PostCount, f.QuestionCount, f.AvgView,
+         f.GoldBadges, f.SilverBadges, f.BronzeBadges, f.LastActiveDate, ts.TopTags,
          (SELECT COUNT(*) FROM TopPostsAllTags tpa WHERE tpa.OwnerUserId = f.UserId) AS TopPostsByAnyTag
   FROM Summary f
   LEFT JOIN TaggedSummary ts ON ts.UserId = f.UserId

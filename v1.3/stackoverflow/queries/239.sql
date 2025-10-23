@@ -1,3 +1,4 @@
+-- {"query": "239.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5248} 
 WITH
 tag_posts AS (
   SELECT p.Id AS PostId, p.OwnerUserId, unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag
@@ -60,14 +61,14 @@ close_summary AS (
   GROUP BY ph.UserId
 ),
 event_stream AS (
-  SELECT OwnerUserId AS UserId, CreationDate, 'post' AS EventType, CAST(Id AS text) AS EventId
+  SELECT OwnerUserId AS UserId, CreationDate, 'post' AS EventType, Id::text AS EventId
   FROM Posts WHERE OwnerUserId IS NOT NULL
   UNION ALL
-  SELECT UserId, CreationDate, 'comment' AS EventType, CAST(Id AS text) FROM Comments WHERE UserId IS NOT NULL
+  SELECT UserId, CreationDate, 'comment' AS EventType, Id::text FROM Comments WHERE UserId IS NOT NULL
   UNION ALL
-  SELECT UserId, Date AS CreationDate, 'badge' AS EventType, CAST(Id AS text) FROM Badges
+  SELECT UserId, Date AS CreationDate, 'badge' AS EventType, Id::text FROM Badges
   UNION ALL
-  SELECT UserId, CreationDate, 'vote' AS EventType, CAST(Id AS text) FROM Votes WHERE UserId IS NOT NULL
+  SELECT UserId, CreationDate, 'vote' AS EventType, Id::text FROM Votes WHERE UserId IS NOT NULL
 ),
 user_events AS (
   SELECT
@@ -118,11 +119,12 @@ SELECT
   ru.LastEvent,
   ru.EngagementRank,
   (COALESCE(ru.Answers,0) + COALESCE(ru.Questions,0)) AS TotalContributions,
-  CASE WHEN COALESCE(ru.Answers,0) = 0 THEN 0 ELSE round((COALESCE(ru.AcceptedAnswers,0) * 1.0 / ru.Answers) * 100,2) END AS AcceptedPercent,
-  CASE WHEN ru.Questions>0 THEN round((ru.VotesReceived * 1.0/NULLIF(ru.Questions,0)),2) ELSE NULL END AS AvgVotesPerQuestion,
+  CASE WHEN COALESCE(ru.Answers,0) = 0 THEN 0 ELSE round((COALESCE(ru.AcceptedAnswers,0)::numeric / ru.Answers) * 100,2) END AS AcceptedPercent,
+  CASE WHEN ru.Questions>0 THEN round((ru.VotesReceived::numeric/NULLIF(ru.Questions,0)),2) ELSE NULL END AS AvgVotesPerQuestion,
   bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges,
   COALESCE(vs.UpVotesReceived,0) - COALESCE(vs.DownVotesReceived,0) AS NetVoteDiff,
   COALESCE(ls.MarkedDuplicates,0) AS DuplicatesMarked,
+  /* Top 3 tags (tag:count) */
   (SELECT string_agg(t.tag || ':' || t.cnt, ', ' ORDER BY t.cnt DESC)
    FROM (
      SELECT Tag, count(*) AS cnt
@@ -133,16 +135,20 @@ SELECT
      LIMIT 3
    ) t(tag,cnt)
   ) AS Top3Tags,
+  /* Latest comment snippet */
   (SELECT substring(c.Text from 1 for 120) || CASE WHEN length(c.Text) > 120 THEN '...' ELSE '' END
    FROM Comments c
    WHERE c.UserId = ru.UserId
    ORDER BY c.CreationDate DESC
    LIMIT 1
   ) AS LatestCommentSnippet,
+  /* Active in last 30 days */
   EXISTS (
-    SELECT 1 FROM event_stream es2 WHERE es2.UserId = ru.UserId AND es2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    SELECT 1 FROM event_stream es2 WHERE es2.UserId = ru.UserId AND es2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
   ) AS ActiveLast30Days,
+  /* Hot questions without accepted answers */
   (SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = ru.UserId AND p2.PostTypeId=1 AND COALESCE(p2.ViewCount,0) > 10000 AND (p2.AcceptedAnswerId IS NULL)) AS HotUnacceptedQuestions,
+  /* Vote types they cast */
   (SELECT string_agg(vt.Name || ':' || cnt, ', ' ORDER BY cnt DESC)
    FROM (
      SELECT vt.Name, count(*) AS cnt FROM Votes v
@@ -151,7 +157,7 @@ SELECT
      GROUP BY vt.Name
    ) vt
   ) AS VoteTypesCastSummary,
-  dense_rank() OVER (ORDER BY CASE WHEN (COALESCE(ru.Questions,0)+COALESCE(ru.Answers,0))=0 THEN NULL ELSE (ru.Reputation * 1.0 / NULLIF((COALESCE(ru.Questions,0)+COALESCE(ru.Answers,0)),0)) END DESC NULLS LAST) AS RepPerContributionRank
+  dense_rank() OVER (ORDER BY CASE WHEN (COALESCE(ru.Questions,0)+COALESCE(ru.Answers,0))=0 THEN NULL ELSE (ru.Reputation::numeric / NULLIF((COALESCE(ru.Questions,0)+COALESCE(ru.Answers,0)),0)) END DESC NULLS LAST) AS RepPerContributionRank
 FROM ranked_users ru
 LEFT JOIN badge_summary bs ON bs.UserId = ru.UserId
 LEFT JOIN vote_summary vs ON vs.UserId = ru.UserId

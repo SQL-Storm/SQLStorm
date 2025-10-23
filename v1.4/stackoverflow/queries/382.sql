@@ -1,8 +1,9 @@
+-- {"query": "382.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 20703} 
 WITH
 recent AS (
   SELECT p.Id AS PostId, p.Title, p.Tags, p.CreationDate, p.LastActivityDate, p.ViewCount, p.Score, p.OwnerUserId
   FROM Posts p
-  WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '365' DAY
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
 ),
 votes AS (
   SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
@@ -17,8 +18,8 @@ allvotes AS (
 tagcounts AS (
   SELECT p.Id AS PostId,
          CASE 
-           WHEN p.Tags IS NULL OR LENGTH(p.Tags) < 3 THEN 0
-           ELSE ARRAY_LENGTH(string_to_array(substr(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1)
+           WHEN p.Tags IS NULL OR length(p.Tags) < 3 THEN 0
+           ELSE array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1)
          END AS TagCount
   FROM Posts p
 ),
@@ -26,14 +27,14 @@ close_info AS (
   SELECT m.PostId,
          COALESCE(crt.Name, 'None') AS CloseReasonName
   FROM (
-     SELECT ph.PostId, MAX(ph.CreationDate) AS max_close
+     SELECT ph.PostId, max(ph.CreationDate) AS max_close
      FROM PostHistory ph
      WHERE ph.PostHistoryTypeId = 10
      GROUP BY ph.PostId
   ) AS m
   LEFT JOIN PostHistory ph ON ph.PostId = m.PostId AND ph.CreationDate = m.max_close
   LEFT JOIN CloseReasonTypes crt ON crt.Id = CASE
-       WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+       WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN ph.Comment::int
        ELSE NULL
   END
 ),
@@ -71,14 +72,14 @@ dataset AS (
     COALESCE(bi.Gold, 0) AS GoldBadges,
     COALESCE(bi.Silver, 0) AS SilverBadges,
     COALESCE(bi.Bronze, 0) AS BronzeBadges,
-    ((r.Score * 1.5
+    (r.Score * 1.5
      + COALESCE(a.TotalVotes, 0) * 1.0
      + COALESCE(tc.TagCount, 0) * 0.5
      + COALESCE(o.Reputation, 0) * 0.01
      + COALESCE(bi.Gold, 0) * 20
      + COALESCE(bi.Silver, 0) * 8
      + COALESCE(bi.Bronze, 0) * 3
-    )) AS ScoreWeight,
+    ) AS ScoreWeight,
     ROW_NUMBER() OVER (ORDER BY
       (r.Score * 1.5
        + COALESCE(a.TotalVotes, 0) * 1.0

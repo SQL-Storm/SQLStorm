@@ -1,15 +1,16 @@
+-- {"query": "601.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1287} 
 WITH UserBadgeCounts AS (
     SELECT
         u.Id AS UserId,
         u.DisplayName,
-        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
-        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
-        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
         COUNT(b.Id) AS TotalBadges,
         ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC, u.Reputation DESC) AS BadgeRank
     FROM Users u
     LEFT JOIN Badges b ON b.UserId = u.Id
-    GROUP BY u.Id, u.DisplayName, u.Reputation
+    GROUP BY u.Id, u.DisplayName
 ),
 TopUsersPosts AS (
     SELECT
@@ -17,7 +18,7 @@ TopUsersPosts AS (
         COUNT(p.Id) AS TotalPosts,
         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
-        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgScore,
         MAX(p.CreationDate) AS LastPostDate
     FROM Posts p
     WHERE p.OwnerUserId IS NOT NULL
@@ -33,16 +34,16 @@ RecentClosedQuestions AS (
         u.DisplayName AS OwnerName
     FROM PostHistory ph
     INNER JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Name = 'Post Closed'
-    INNER JOIN CloseReasonTypes crt ON CAST(crt.Id AS VARCHAR) = ph.Comment
+    INNER JOIN CloseReasonTypes crt ON crt.Id::varchar = ph.Comment
     INNER JOIN Posts p ON p.Id = ph.PostId
     LEFT JOIN Users u ON u.Id = p.OwnerUserId
-    WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+    WHERE ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
 ),
 PostLinkCounts AS (
     SELECT
         pl.PostId,
-        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateLinks,
-        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedPosts
+        COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateLinks,
+        COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkedPosts
     FROM PostLinks pl
     INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
     GROUP BY pl.PostId
@@ -139,5 +140,5 @@ LEFT JOIN HighEngagementPosts hep ON hep.Id = ua.PostId
 LEFT JOIN RecentClosedQuestions rcq ON rcq.OwnerName = ubc.DisplayName
 WHERE ubc.BadgeRank <= 50
   AND (ua.PostScoreRank <= 10 OR ua.PostScoreRank IS NULL)
-ORDER BY ubc.TotalBadges DESC, tup.TotalPosts DESC, hep.Score DESC
+ORDER BY ubc.TotalBadges DESC, tup.TotalPosts DESC, hep.Score DESC NULLS LAST
 LIMIT 100;

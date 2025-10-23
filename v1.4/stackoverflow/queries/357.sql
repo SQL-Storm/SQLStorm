@@ -1,3 +1,4 @@
+-- {"query": "357.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 22884} 
 WITH
   -- Basic user context
   user_base AS (
@@ -53,8 +54,7 @@ WITH
            (
              SELECT tag
              FROM (
-               SELECT
-                 unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag
+               SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
                FROM Posts p
                WHERE p.OwnerUserId = u.Id
              ) s
@@ -79,7 +79,7 @@ WITH
       COALESCE(li.LinkedPostCount, 0) AS LinkedPostCount,
       COALESCE(la.LastActive, bu.CreationDate) AS LastActive,
       COALESCE(tTop.TopTag, 'Unknown') AS TopTag,
-      CONCAT(bu.DisplayName, ' [Rep=', bu.Reputation, ', TopTag=', COALESCE(tTop.TopTag, 'Unknown'), ', LastActive=', COALESCE(CAST(la.LastActive AS TEXT), 'NULL'), ']') AS DisplaySummary,
+      CONCAT(bu.DisplayName, ' [Rep=', bu.Reputation, ', TopTag=', COALESCE(tTop.TopTag, 'Unknown'), ', LastActive=', COALESCE(la.LastActive::text, 'NULL'), ']') AS DisplaySummary,
       (COALESCE(po.TotalViews, 0) * 0.5 +
        COALESCE(po.AvgPostScore, 0) * 1.5 +
        COALESCE(ba.BadgeCount, 0) * 2.0 +

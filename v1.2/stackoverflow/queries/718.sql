@@ -1,3 +1,4 @@
+-- {"query": "718.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1118} 
 with RecursiveUserBadges as (
     select 
         u.Id as UserId,
@@ -17,7 +18,7 @@ UserBadgeSummary as (
         count(case when BadgeClass = 1 then 1 end) as GoldBadges,
         count(case when BadgeClass = 2 then 1 end) as SilverBadges,
         count(case when BadgeClass = 3 then 1 end) as BronzeBadges,
-        max(case when BadgeRank = 1 then BadgeName end) as MostRecentBadge
+        max(BadgeName) filter (where BadgeRank = 1) as MostRecentBadge
     from RecursiveUserBadges
     group by UserId, DisplayName
 ),
@@ -33,46 +34,16 @@ QuestionAnswerStats as (
         sum(case when a.Score > 10 then 1 else 0 end) as HighScoreAnswers
     from Posts q
     left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
-    where q.PostTypeId = 1 and q.CreationDate >= (cast('2024-10-01' as date) - interval '1' year)
+    where q.PostTypeId = 1 and q.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
     group by q.Id, q.Title, q.CreationDate, q.OwnerUserId
 ),
 TopTags as (
     select 
-        tag,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
         count(*) as TagCount
-    from (
-        select
-            trim(t) as tag
-        from Posts p,
-        lateral (
-            select t from (
-                with recursive split_cte(orig, rest, part, idx) as (
-                    select p.Tags,
-                           case when p.Tags is null then null
-                                when length(p.Tags) >= 2 then substring(p.Tags from 2 for (length(p.Tags)-2))
-                                else '' end as rest,
-                           null,
-                           1
-                    union all
-                    select orig,
-                           case 
-                             when position('><' in rest) > 0 then substring(rest from position('><' in rest)+2)
-                             else ''
-                           end,
-                           case 
-                             when position('><' in rest) > 0 then substring(rest from 1 for position('><' in rest)-1)
-                             else rest
-                           end,
-                           idx+1
-                    from split_cte
-                    where rest <> ''
-                )
-                select part as t from split_cte where part is not null and part <> ''
-            ) s2
-        ) s
-        where p.PostTypeId = 1 and p.Tags is not null
-    ) x
-    group by tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
     having count(*) > 1000
 ),
 PostLinkStats as (
@@ -94,39 +65,6 @@ UserActivityRank as (
     from Users u
     left join Posts p on p.OwnerUserId = u.Id
     group by u.Id, u.DisplayName
-),
-QuestionTags as (
-    select
-        q.Id as QuestionId,
-        trim(t) as Tag
-    from Posts q,
-    lateral (
-        select t from (
-            with recursive split_cte(orig, rest, part, idx) as (
-                select q.Tags,
-                       case when q.Tags is null then null
-                            when length(q.Tags) >= 2 then substring(q.Tags from 2 for (length(q.Tags)-2))
-                            else '' end as rest,
-                       null,
-                       1
-                union all
-                select orig,
-                       case 
-                         when position('><' in rest) > 0 then substring(rest from position('><' in rest)+2)
-                         else ''
-                       end,
-                       case 
-                         when position('><' in rest) > 0 then substring(rest from 1 for position('><' in rest)-1)
-                         else rest
-                       end,
-                       idx+1
-                from split_cte
-                where rest <> ''
-            )
-            select part as t from split_cte where part is not null and part <> ''
-        ) s2
-    ) s
-    where q.PostTypeId = 1 and q.Tags is not null
 )
 select 
     uas.UserId,
@@ -145,23 +83,19 @@ select
     qas.HighScoreAnswers,
     pls.LinkedPostsCount,
     pls.DuplicateLinksCount,
-    tt.tag as PopularTag,
+    tt.Tag as PopularTag,
     tt.TagCount,
-    row_number() over (partition by uas.UserId order by qas.AnswerCount desc NULLS LAST) as UserTopQuestionRank
+    row_number() over (partition by uas.UserId order by qas.AnswerCount desc nulls last) as UserTopQuestionRank
 from UserActivityRank uas
 left join UserBadgeSummary ubs on uas.UserId = ubs.UserId
 left join QuestionAnswerStats qas on qas.OwnerUserId = uas.UserId
 left join PostLinkStats pls on pls.PostId = qas.QuestionId
-left join (
-    select distinct tag, TagCount from TopTags
-) tt on exists (
-    select 1 from QuestionTags qt where qt.QuestionId = qas.QuestionId and qt.Tag = tt.tag
+left join TopTags tt on tt.Tag in (
+    select unnest(string_to_array(substring(qas.Title from 2 for length(qas.Title)-2), '><'))
 )
 where uas.AnswerRank <= 100
 and (qas.AnswerCount > 0 or pls.LinkedPostsCount > 0)
-
 union
-
 select 
     u.Id as UserId,
     u.DisplayName,
@@ -186,5 +120,5 @@ from Users u
 where not exists (
     select 1 from Posts p where p.OwnerUserId = u.Id
 )
-order by AnswerCount desc NULLS LAST, GoldBadges desc NULLS LAST, UserTopQuestionRank asc NULLS LAST
+order by AnswerCount desc nulls last, GoldBadges desc nulls last, UserTopQuestionRank asc nulls last
 limit 200;

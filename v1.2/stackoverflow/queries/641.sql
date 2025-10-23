@@ -1,3 +1,4 @@
+-- {"query": "641.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1468} 
 with RecursiveTagCounts as (
     select
         t.Id,
@@ -50,7 +51,7 @@ ClosedQuestions as (
         ph.UserId as ClosedByUserId,
         u.DisplayName as ClosedByUserName
     from PostHistory ph
-    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) 
     left join Users u on u.Id = ph.UserId
     where ph.PostHistoryTypeId = 10
 ),
@@ -144,35 +145,5 @@ left join AcceptedAnswerInfo aa on aa.AcceptedUserId = u.Id
 where u.Reputation > 1000
   and (pt.Score > 10 or pt.FavToViewRatio > 0.01)
   and (ca.CloseDate is null or ca.CloseDate > u.CreationDate)
-group by
-    u.Id,
-    u.DisplayName,
-    u.Reputation,
-    u.CreationDate,
-    ub.GoldBadges,
-    ub.SilverBadges,
-    ub.BronzeBadges,
-    ua.QuestionsAsked,
-    ua.AnswersGiven,
-    ua.CommentsMade,
-    ua.UpVotesCast,
-    ua.DownVotesCast,
-    ua.BountyGiven,
-    pt.Title,
-    pt.Score,
-    pt.ScoreCategory,
-    pt.FavToViewRatio,
-    dt.TagName,
-    dt.Count,
-    dt.TotalAnswers,
-    dt.TagRank,
-    ca.CloseReason,
-    ca.CloseDate,
-    ca.ClosedByUserName,
-    da.PostTitle,
-    da.RelatedPostTitle,
-    aa.Title,
-    aa.AcceptedAnswerScore,
-    aa.AcceptedUserId
 order by u.Reputation desc, pt.Score desc
 limit 100;

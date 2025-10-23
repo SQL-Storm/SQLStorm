@@ -1,3 +1,4 @@
+-- {"query": "341.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17322} 
 WITH
 questions AS (
   SELECT Id, CreationDate, ViewCount, Score, AcceptedAnswerId, OwnerUserId, Tags, AnswerCount, ClosedDate, LastActivityDate
@@ -37,17 +38,17 @@ tag_question_map AS (
   CROSS JOIN LATERAL (
     SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag
   ) t
-  WHERE q.Tags IS NOT NULL AND q.Tags <> '' AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+  WHERE q.Tags IS NOT NULL AND q.Tags <> '' AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
 ),
 tag_agg AS (
   SELECT
     tag,
     scope,
     COUNT(*) AS q_count,
-    SUM(COALESCE(AnswerCount,0)) AS total_answers,
-    CAST(AVG(COALESCE(AnswerCount,0)) AS numeric(12,4)) AS avg_answers_per_question,
-    CAST(AVG(COALESCE(ViewCount,0)) AS numeric(12,2)) AS avg_views,
-    percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(ViewCount,0)) AS median_views,
+    SUM(coalesce(AnswerCount,0)) AS total_answers,
+    AVG(coalesce(AnswerCount,0))::numeric(12,4) AS avg_answers_per_question,
+    AVG(coalesce(ViewCount,0))::numeric(12,2) AS avg_views,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY coalesce(ViewCount,0)) AS median_views,
     SUM(CASE WHEN AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count,
     SUM(CASE WHEN ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS closed_count,
     MAX(LastActivityDate) AS last_activity_date
@@ -75,18 +76,12 @@ tag_answerers_agg AS (
 ),
 tag_answerers_ranked AS (
   SELECT
-    tag,
-    scope,
-    user_id,
-    display_name,
-    answers_count,
-    total_score,
-    total_comments,
+    *,
     ROW_NUMBER() OVER (PARTITION BY tag, scope ORDER BY total_score DESC NULLS LAST, answers_count DESC) AS rnk
   FROM tag_answerers_agg
 ),
 top_answerers_agg AS (
-  SELECT tag, scope, string_agg(display_name || ' [' || CAST(answers_count AS text) || ' / ' || CAST(total_score AS text) || ']', ', ' ORDER BY total_score DESC) AS top_3_answerers
+  SELECT tag, scope, string_agg(display_name || ' [' || answers_count::text || ' / ' || total_score::text || ']', ', ' ORDER BY total_score DESC) AS top_3_answerers
   FROM tag_answerers_ranked
   WHERE rnk <= 3
   GROUP BY tag, scope
@@ -98,7 +93,7 @@ accepted_delays AS (
     COUNT(*) AS accepted_qs,
     percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (ap.CreationDate - tq.CreationDate))) AS median_seconds_to_accept,
     AVG(EXTRACT(EPOCH FROM (ap.CreationDate - tq.CreationDate))) AS avg_seconds_to_accept,
-    SUM(CASE WHEN ap.CreationDate - tq.CreationDate > INTERVAL '7 days' THEN 1 ELSE 0 END) AS accepted_after_7d
+    SUM(CASE WHEN ap.CreationDate - tq.CreationDate > interval '7 days' THEN 1 ELSE 0 END) AS accepted_after_7d
   FROM tag_question_map tq
   JOIN Posts ap ON ap.Id = tq.AcceptedAnswerId
   WHERE tq.AcceptedAnswerId IS NOT NULL
@@ -132,9 +127,8 @@ herfindahl AS (
   SELECT
     t.tag,
     t.scope,
-    SUM( (CAST(a.answers_count AS numeric) / NULLIF(t.total_answers,0)) * (CAST(a.answers_count AS numeric) / NULLIF(t.total_answers,0)) ) AS herfindahl_index,
-    COUNT(a.user_id) AS distinct_answerers,
-    t.total_answers
+    SUM( (a.answers_count::numeric / NULLIF(t.total_answers,0)) * (a.answers_count::numeric / NULLIF(t.total_answers,0)) ) AS herfindahl_index,
+    COUNT(a.user_id) AS distinct_answerers
   FROM tag_agg t
   LEFT JOIN tag_answerers_agg a ON a.tag = t.tag AND a.scope = t.scope
   GROUP BY t.tag, t.scope, t.total_answers
@@ -166,9 +160,9 @@ SELECT
   t.avg_views,
   t.median_views,
   t.accepted_count,
-  ROUND(COALESCE(CAST(t.accepted_count AS numeric) / NULLIF(t.q_count,0),0)::numeric,4) AS accept_rate,
+  ROUND(COALESCE(t.accepted_count::numeric / NULLIF(t.q_count,0),0)::numeric,4) AS accept_rate,
   t.closed_count,
-  ROUND(COALESCE(CAST(t.closed_count AS numeric) / NULLIF(t.q_count,0),0)::numeric,4) AS close_rate,
+  ROUND(COALESCE(t.closed_count::numeric / NULLIF(t.q_count,0),0)::numeric,4) AS close_rate,
   COALESCE(ad.median_seconds_to_accept, NULL) AS median_seconds_to_accept,
   COALESCE(ad.avg_seconds_to_accept, NULL) AS avg_seconds_to_accept,
   COALESCE(ad.accepted_after_7d, 0) AS accepted_after_7d,
@@ -177,7 +171,7 @@ SELECT
   COALESCE(pl_in.link_count_in,0) AS link_count_in,
   COALESCE(pl_in.unique_linking_posts_in,0) AS unique_linking_posts_in,
   COALESCE(ta.top_3_answerers, '<none>') AS top_3_answerers,
-  COALESCE(CAST(h.herfindahl_index AS numeric(12,6)), 0) AS herfindahl_index,
+  COALESCE(h.herfindahl_index, 0)::numeric(12,6) AS herfindahl_index,
   COALESCE(h.distinct_answerers, 0) AS distinct_answerers,
   COALESCE(tv.upvotes,0) AS upvotes,
   COALESCE(tv.downvotes,0) AS downvotes,
@@ -197,7 +191,7 @@ SELECT
     0
   ) AS distinct_commenters,
   ROUND(
-    (t.avg_views * ln(GREATEST(t.q_count,1) + 1)) / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(t.last_activity_date, CAST('2024-10-01 12:34:56' AS timestamp)))) / 86400 + 1, 0.0),
+    (t.avg_views * ln(GREATEST(t.q_count,1) + 1)) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(t.last_activity_date, cast('2024-10-01 12:34:56' as timestamp)))) / 86400 + 1, 0.0),
     4
   ) AS recency_score,
   CASE WHEN EXISTS (SELECT 1 FROM trending_tags tt WHERE tt.tag = t.tag) THEN true ELSE false END AS is_trending,

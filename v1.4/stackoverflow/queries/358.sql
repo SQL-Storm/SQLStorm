@@ -1,3 +1,4 @@
+-- {"query": "358.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 22629} 
 WITH Ranked AS (
   SELECT
     p.Id AS PostId,
@@ -17,7 +18,7 @@ WITH Ranked AS (
   FROM Posts p
   LEFT JOIN Users u ON p.OwnerUserId = u.Id
   WHERE p.PostTypeId IN (1, 2)
-    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days')
+    AND p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days')
 )
 SELECT
   PostId,
@@ -32,29 +33,23 @@ SELECT
   CommentCount,
   UpVotes,
   DownVotes,
-  COALESCE(
-    ARRAY_TO_STRING(
-      STRING_TO_ARRAY(SUBSTR(TagField, 2, LENGTH(TagField) - 2), '><'),
-      ', '
-    ),
-    ''
-  ) AS TagList
+  COALESCE(array_to_string(string_to_array(substring(TagField, 2, length(TagField) - 2), '><'), ', '), '') AS TagList
 FROM Ranked
 WHERE OwnerRank <= 5
 UNION ALL
 SELECT
-  NULL AS PostId,
+  NULL::int AS PostId,
   'Summary' AS Title,
-  NULL AS PostTypeId,
-  CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS CreationDate,
-  CAST(AVG(Score) AS INTEGER) AS Score,
-  NULL AS ViewCount,
+  NULL::smallint AS PostTypeId,
+  cast('2024-10-01 12:34:56' as timestamp)::timestamp AS CreationDate,
+  CAST(AVG(Score) AS int) AS Score,
+  NULL::int AS ViewCount,
   'System' AS OwnerName,
-  NULL AS OwnerRank,
-  NULL AS LinkCount,
-  NULL AS CommentCount,
-  NULL AS UpVotes,
-  NULL AS DownVotes,
+  NULL::int AS OwnerRank,
+  NULL::int AS LinkCount,
+  NULL::int AS CommentCount,
+  NULL::int AS UpVotes,
+  NULL::int AS DownVotes,
   '' AS TagList
 FROM Ranked
 ORDER BY 7, 8;

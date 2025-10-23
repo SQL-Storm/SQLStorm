@@ -1,3 +1,4 @@
+-- {"query": "332.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 26940} 
 WITH
 AllPosts AS (
   SELECT p.Id AS PostId,
@@ -20,14 +21,13 @@ TagInfo AS (
          COALESCE(TAGS.TagList, '') AS TagList,
          COALESCE(TAGS.TagCount, 0) AS TagCount
   FROM AllPosts ap
-  LEFT JOIN (
+  LEFT JOIN LATERAL (
      SELECT COUNT(*) AS TagCount,
-            STRING_AGG(tag_tag, ', ') AS TagList
+            string_agg(tag_tag, ', ') AS TagList
      FROM (
-        SELECT UNNEST(string_to_array(SUBSTRING(ap.Tags FROM 2 FOR LENGTH(ap.Tags) - 2), '><')) AS tag_tag
-        FROM AllPosts ap
+        SELECT unnest(string_to_array(substring(ap.Tags, 2, length(ap.Tags) - 2), '><')) AS tag_tag
      ) s
-  ) AS TAGS ON TRUE
+  ) AS TAGS ON ap.PostTypeId = 1
 ),
 UpDown AS (
   SELECT ap.PostId,

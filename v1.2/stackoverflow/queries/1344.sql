@@ -1,3 +1,4 @@
+-- {"query": "1344.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1121} 
 WITH RecursiveUserBadgeCount AS (
     SELECT
         u.Id AS UserId,
@@ -64,7 +65,7 @@ QuestionCloseInfo AS (
         COUNT(*) AS CloseCount,
         STRING_AGG(DISTINCT crt.Name, ' | ') AS CloseReasons
     FROM PostHistory ph
-    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS VARCHAR) = ph.Comment AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id::text = ph.Comment AND ph.PostHistoryTypeId = 10
     WHERE ph.PostHistoryTypeId = 10
     GROUP BY ph.PostId
 )
@@ -89,14 +90,14 @@ SELECT
         WHEN qc.CloseCount > 0 THEN 'Closed'
         ELSE 'Open'
     END AS QuestionStatus,
-    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY a.AnswerScore DESC) AS AnswerRankForUser
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY a.AnswerScore DESC NULLS LAST) AS AnswerRankForUser
 FROM Users u
 JOIN RecursiveUserBadgeCount gu ON gu.UserId = u.Id AND gu.BadgeRank <= 100
 LEFT JOIN (
     SELECT
         OwnerUserId,
-        COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN Id END) AS QuestionCount,
-        COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN Id END) AS AnswerCount
+        COUNT(DISTINCT Id) FILTER (WHERE PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT Id) FILTER (WHERE PostTypeId = 2) AS AnswerCount
     FROM Posts
     GROUP BY OwnerUserId
 ) lt ON lt.OwnerUserId = u.Id
@@ -114,6 +115,6 @@ LEFT JOIN QuestionCloseInfo qc ON qc.PostId = qs.Id
 WHERE u.Reputation > (
     SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Reputation) FROM Users
 ) 
-AND (utp.TagName IS NOT NULL OR COALESCE(lt.QuestionCount, 0) > 0)
+AND (utp.TagName IS NOT NULL OR lt.QuestionCount > 0)
 ORDER BY u.Reputation DESC, gu.GoldBadges DESC, a.AnswerScore DESC
 LIMIT 200;

@@ -1,3 +1,4 @@
+-- {"query": "243.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 12439} 
 WITH
 PostsBase AS (
   SELECT
@@ -71,28 +72,28 @@ LEFT JOIN CommentAgg ca ON pb.PostId = ca.PostId
 
 UNION ALL
 SELECT
-  CAST(-1 AS BIGINT) AS PostId,
+  -1 AS PostId,
   'Benchmark: meta' AS Title,
-  CAST(NULL AS SMALLINT) AS PostTypeId,
-  CAST(NULL AS INTEGER) AS OwnerUserId,
-  CAST(NULL AS TEXT) AS OwnerDisplayName,
-  CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS CreationDate,
-  CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS LastActivityDate,
+  NULL::smallint AS PostTypeId,
+  NULL::int AS OwnerUserId,
+  NULL::text AS OwnerDisplayName,
+  cast('2024-10-01 12:34:56' as timestamp) AS CreationDate,
+  cast('2024-10-01 12:34:56' as timestamp) AS LastActivityDate,
   0 AS Score,
   0 AS ViewCount,
   0 AS CommentCount,
   0 AS FavoriteCount,
-  CAST(NULL AS TEXT) AS Tags,
-  CAST(NULL AS TEXT) AS Body,
-  CAST(NULL AS INTEGER) AS AcceptedAnswerId,
-  CAST(NULL AS TIMESTAMP) AS ClosedDate,
-  CAST(NULL AS INTEGER) AS OwnerReputation,
+  NULL::text AS Tags,
+  NULL::text AS Body,
+  NULL::int AS AcceptedAnswerId,
+  NULL::timestamp AS ClosedDate,
+  NULL::int AS OwnerReputation,
   0 AS UpVotes,
   0 AS DownVotes,
-  CAST(NULL AS TEXT) AS FirstTag,
-  CAST(NULL AS INTEGER) AS TagCount,
-  CAST(NULL AS INTEGER) AS OwnerRecentPosts,
-  CAST(NULL AS TEXT) AS LastEditorDisplayName,
-  CAST(NULL AS INTEGER) AS GoldBadges,
-  CAST(NULL AS INTEGER) AS OwnerPostRank
+  NULL::text AS FirstTag,
+  NULL::int AS TagCount,
+  NULL::int AS OwnerRecentPosts,
+  NULL::text AS LastEditorDisplayName,
+  NULL::int AS GoldBadges,
+  NULL::int AS OwnerPostRank
 ;

@@ -1,3 +1,4 @@
+-- {"query": "349.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18689} 
 WITH
 tag_questions AS (
   SELECT q.Id AS question_id,
@@ -106,10 +107,10 @@ tag_metrics AS (
          t.question_count,
          COALESCE(AVG(tq.score),0) AS avg_question_score,
          COALESCE(AVG(tq.view_count),0) AS avg_question_views,
-         CASE WHEN t.question_count = 0 THEN NULL ELSE SUM(CASE WHEN tq.answer_count > 0 THEN 1 ELSE 0 END) * 1.0 / NULLIF(t.question_count,0) END AS pct_answered,
+         SUM(CASE WHEN tq.answer_count > 0 THEN 1 ELSE 0 END)::float / NULLIF(t.question_count,0) AS pct_answered,
          AVG(COALESCE(am.answers_total,0)) AS avg_answers_per_question,
          AVG(COALESCE(am.answers_avg_score,0)) AS avg_answer_score_per_question,
-         COALESCE( (SELECT STRING_AGG((CAST(tc.user_id AS text) || '::' || tc.display_name || '::' || CAST(tc.answers_for_tag AS text)), ' || ' ORDER BY tc.contributor_rank)
+         COALESCE( (SELECT STRING_AGG(concat_ws('::', tc.user_id::text, tc.display_name, tc.answers_for_tag::text), ' || ' ORDER BY tc.contributor_rank)
                     FROM top_contributors tc WHERE tc.tag = t.tag AND tc.contributor_rank <= 5), '<none>') AS top_contributors_summary,
          percentile_disc(0.5) WITHIN GROUP (ORDER BY tq.score) AS median_question_score
   FROM top_tags t
@@ -133,12 +134,10 @@ enriched_questions AS (
          COALESCE(am.answers_median_score,0) AS answers_median_score,
          COALESCE(ou.Reputation,0) AS owner_reputation,
          CASE WHEN COALESCE(ou.Reputation,0) > gs.median_reputation THEN TRUE ELSE FALSE END AS owner_is_high_rep,
-         (
-            (CASE WHEN q.ViewCount IS NULL OR q.ViewCount = 0 THEN LOG(1) ELSE LOG(q.ViewCount) END) * (GREATEST(COALESCE(q.Score,0),0) + 1)
+         (LOG(GREATEST(NULLIF(q.ViewCount,0),1)) * (GREATEST(NULLIF(q.Score,0),0) + 1)
             + COALESCE(am.answers_total,0) * 10
             + (COALESCE(vs.upvotes,0) - COALESCE(vs.downvotes,0)) * 2
-            - COALESCE(dc.duplicate_links,0) * 5
-         ) * EXP(-GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate))/86400.0,1.0)/30.0)
+            - COALESCE(dc.duplicate_links,0) * 5) * EXP(-GREATEST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/86400.0,1.0)/30.0)
             AS trending_score
   FROM (
     SELECT Id AS question_id, Title, CreationDate, Score, ViewCount, OwnerUserId FROM Posts WHERE PostTypeId = 1
@@ -171,13 +170,12 @@ SELECT
   round(tm.avg_answers_per_question::numeric,2) AS avg_answers_per_question,
   round(tm.avg_answer_score_per_question::numeric,2) AS avg_answer_score_per_question,
   tm.top_contributors_summary,
-  COALESCE( (SELECT STRING_AGG((CAST(tt.question_id AS text) || '||' || tt.Title || '||' || CAST(round(tt.trending_score::numeric,2) AS text)), ' || ')
+  COALESCE( (SELECT STRING_AGG(concat_ws('||', tt.question_id::text, tt.Title, round(tt.trending_score::numeric,2)::text), ' || ')
              FROM tag_top_questions tt WHERE tt.tag = tm.tag AND tt.tag_rank <= 3), '<none>') AS top_3_questions,
   (SELECT COUNT(*) FROM interesting_posts ip JOIN tag_questions tq ON tq.question_id = ip.Id WHERE tq.tag = tm.tag) AS interesting_overlap,
-  (SELECT CAST(AVG(u.Reputation) AS int) FROM Users u JOIN tag_questions tq2 ON tq2.owner_user_id = u.Id WHERE tq2.tag = tm.tag) AS avg_owner_reputation,
-  (SELECT SUM(CASE WHEN COALESCE(dc.duplicate_links,0) > 0 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*),0)
+  (SELECT AVG(u.Reputation)::int FROM Users u JOIN tag_questions tq2 ON tq2.owner_user_id = u.Id WHERE tq2.tag = tm.tag) AS avg_owner_reputation,
+  (SELECT SUM(CASE WHEN COALESCE(dc.duplicate_links,0) > 0 THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*),0)
      FROM tag_questions tq3 LEFT JOIN duplicate_counts dc ON dc.post_id = tq3.question_id
      WHERE tq3.tag = tm.tag) AS pct_questions_with_duplicates
 FROM tag_metrics tm
-GROUP BY tm.tag, tm.question_count, tm.avg_question_score, tm.median_question_score, tm.avg_question_views, tm.pct_answered, tm.avg_answers_per_question, tm.avg_answer_score_per_question, tm.top_contributors_summary
 ORDER BY tm.question_count DESC, tm.avg_question_views DESC;

@@ -1,3 +1,4 @@
+-- {"query": "678.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1481} 
 with RecursiveUserBadges as (
     select 
         u.Id as UserId,
@@ -59,7 +60,7 @@ FilteredPosts as (
             when p.AcceptedAnswerId is not null then 'Accepted'
             else 'Open'
         end as PostStatus,
-        array_to_string(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'), ', ') as ParsedTags
+        array_to_string(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), ', ') as ParsedTags
     from Posts p
     left join Users u on p.OwnerUserId = u.Id
     where p.PostTypeId = 1 and p.Score > 5
@@ -95,7 +96,7 @@ RecentClosedQuestions as (
         u.DisplayName as CloserName
     from PostHistory ph
     inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
-    inner join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    inner join CloseReasonTypes crt on ph.Comment::int = crt.Id
     inner join Posts p on ph.PostId = p.Id
     left join Users u on ph.UserId = u.Id
     where ph.PostHistoryTypeId = 10
@@ -162,26 +163,5 @@ left join QuestionsWithDuplicates qwd on qwd.Id = fp.Id
 left join RecentClosedQuestions rcq on rcq.PostId = fp.Id
 where us.Reputation > 1000
   and (qwd.PostStatus = 'Open' or qwd.PostStatus is null)
-group by
-    us.DisplayName,
-    us.Reputation,
-    us.GoldBadges,
-    us.SilverBadges,
-    us.BronzeBadges,
-    us.QuestionsCount,
-    us.AnswersCount,
-    us.ClosedPostsCount,
-    us.DuplicateLinksCount,
-    qwd.Title,
-    qwd.Score,
-    qwd.ViewCount,
-    qwd.AnswerCount,
-    qwd.FavoriteCount,
-    qwd.PostStatus,
-    qwd.ParsedTags,
-    qwd.DuplicateOfTitle,
-    rcq.CloseDate,
-    rcq.CloseReason,
-    rcq.CloserName
 order by us.Reputation desc, qwd.Score desc
 limit 100;

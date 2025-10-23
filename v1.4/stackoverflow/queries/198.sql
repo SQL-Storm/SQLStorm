@@ -1,3 +1,4 @@
+-- {"query": "198.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2041} 
 WITH base_posts AS (
   SELECT Id, OwnerUserId, Score, CreationDate, LastActivityDate, PostTypeId, Tags, Title, Body, ViewCount
   FROM Posts
@@ -49,7 +50,7 @@ SELECT
   s.badge_count,
   s.last_active,
   s.total_score,
-  (SELECT ROUND(AVG(LENGTH(p.Body)) , 2)
+  (SELECT ROUND(AVG(LENGTH(p.Body))::numeric, 2)
    FROM Posts p
    WHERE p.OwnerUserId = s.UserId) AS avg_body_length,
   (SELECT COUNT(*) 
@@ -59,8 +60,8 @@ SELECT
      AND pl.LinkTypeId = 1) AS linked_post_count,
   (CASE
      WHEN s.Reputation IS NULL THEN NULL
-     WHEN s.Reputation > 5000 THEN TRUE
-     ELSE FALSE
+     WHEN s.Reputation > 5000 THEN true
+     ELSE false
    END) AS is_veteran
 FROM set_ops s
 ORDER BY s.total_score DESC NULLS LAST, s.Reputation DESC NULLS LAST

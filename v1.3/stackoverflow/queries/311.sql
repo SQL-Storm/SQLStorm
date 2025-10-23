@@ -1,8 +1,9 @@
+-- {"query": "311.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16939} 
 WITH
 recent_posts AS (
   SELECT p.*
   FROM Posts p
-  WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '180 days'
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
 ),
 safe_tags AS (
   SELECT p.Id AS PostId,
@@ -14,8 +15,8 @@ safe_tags AS (
 ),
 post_tags AS (
   SELECT p.PostId, t.tag
-  FROM safe_tags p,
-       unnest(p.tag_array) AS t(tag)
+  FROM safe_tags p
+  CROSS JOIN LATERAL unnest(p.tag_array) AS t(tag)
   WHERE p.tag_array IS NOT NULL
 ),
 post_votes AS (
@@ -109,9 +110,8 @@ tag_hotness AS (
   FULL OUTER JOIN tag_recent_activity tra ON tra.TagName = ts.TagName
 ),
 ranked_tags AS (
-  SELECT TagName, question_count, answer_count, total_views, avg_question_score, avg_answer_score, net_votes, last_activity, recent_post_count, recent_score, hotness_score,
-         dense_rank() OVER (ORDER BY hotness_score DESC NULLS LAST) AS hot_rank,
-         rank() OVER (ORDER BY question_count DESC NULLS LAST) AS activity_rank
+  SELECT *, dense_rank() OVER (ORDER BY hotness_score DESC NULLS LAST) AS hot_rank,
+           rank() OVER (ORDER BY question_count DESC NULLS LAST) AS activity_rank
   FROM tag_hotness
 ),
 top_tags AS (
@@ -156,8 +156,8 @@ post_complex_stats AS (
          qta.TopAnswerScore,
          qta.TopAnswerOwner,
          (SELECT count(distinct c.UserId) FROM Comments c WHERE c.PostId = p.Id) AS commenting_user_count,
-         extract(epoch FROM ((TIMESTAMP '2024-10-01 12:34:56') - coalesce(p.CreationDate, TIMESTAMP '2024-10-01 12:34:56'))) / 86400.0 AS age_days,
-         ((coalesce(v.upvotes,0)+1) / greatest((coalesce(v.downvotes,0)+1),1) * ln(greatest((coalesce(phs.revision_count,0) + 1),1)) * (1 + least(1, (extract(epoch FROM ((TIMESTAMP '2024-10-01 12:34:56') - coalesce(p.LastActivityDate, p.CreationDate)))/(60*60*24*30)))) ) AS volatility_score
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)))) / 86400.0 AS age_days,
+         ((coalesce(v.upvotes,0)+1) / greatest((coalesce(v.downvotes,0)+1),1) * ln(greatest((coalesce(phs.revision_count,0) + 1),1)) * (1 + least(1, (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.LastActivityDate, p.CreationDate)))/(60*60*24*30))))) AS volatility_score
   FROM Posts p
   LEFT JOIN Users u ON u.Id = p.OwnerUserId
   LEFT JOIN post_votes v ON v.PostId = p.Id

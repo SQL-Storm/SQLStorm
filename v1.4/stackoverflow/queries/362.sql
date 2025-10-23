@@ -1,3 +1,4 @@
+-- {"query": "362.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18345} 
 WITH
   UserStats AS (
      SELECT
@@ -9,7 +10,7 @@ WITH
         COALESCE(SUM(p.Score), 0) AS TotalPostScore,
         COUNT(p.Id) AS PostCount,
         (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id) AS LastCommentDate,
-        (SELECT COUNT(*) FROM Posts pp WHERE pp.OwnerUserId = u.Id AND pp.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) AS PostsLast30,
+        (SELECT COUNT(*) FROM Posts pp WHERE pp.OwnerUserId = u.Id AND pp.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') AS PostsLast30,
         MAX(p.LastActivityDate) AS LastActivityDate
      FROM Users u
      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
@@ -42,30 +43,30 @@ WITH
      LEFT JOIN TopPosts tp ON tp.OwnerUserId = us.UserId AND tp.rn = 1
   ),
   SystemRow AS (
-     SELECT CAST(-1 AS INTEGER) AS UserId,
+     SELECT -1 AS UserId,
             'System' AS DisplayName,
-            NULL AS Reputation,
-            NULL AS Location,
-            NULL AS UserCreationDate,
-            NULL AS TotalPostScore,
-            NULL AS PostCount,
-            NULL AS LastCommentDate,
-            NULL AS PostsLast30,
+            NULL::int AS Reputation,
+            NULL::varchar(100) AS Location,
+            NULL::timestamp AS UserCreationDate,
+            NULL::bigint AS TotalPostScore,
+            NULL::int AS PostCount,
+            NULL::timestamp AS LastCommentDate,
+            NULL::int AS PostsLast30,
             'SystemTop' AS TopQuestionTitle,
-            NULL AS TopScore
+            NULL::int AS TopScore
   ),
   SystemRow2 AS (
-     SELECT CAST(-2 AS INTEGER) AS UserId,
+     SELECT -2 AS UserId,
             'Benchmark' AS DisplayName,
-            NULL AS Reputation,
-            NULL AS Location,
-            NULL AS UserCreationDate,
-            NULL AS TotalPostScore,
-            NULL AS PostCount,
-            NULL AS LastCommentDate,
-            NULL AS PostsLast30,
+            NULL::int AS Reputation,
+            NULL::varchar(100) AS Location,
+            NULL::timestamp AS UserCreationDate,
+            NULL::bigint AS TotalPostScore,
+            NULL::int AS PostCount,
+            NULL::timestamp AS LastCommentDate,
+            NULL::int AS PostsLast30,
             'BenchmarkTop' AS TopQuestionTitle,
-            NULL AS TopScore
+            NULL::int AS TopScore
   )
 SELECT
    UserId,

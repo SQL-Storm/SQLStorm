@@ -1,15 +1,10 @@
+-- {"query": "253.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3608} 
 WITH RECURSIVE linked_chain AS (
-  SELECT pl.PostId,
-         pl.RelatedPostId,
-         1 AS depth,
-         ARRAY[pl.PostId, pl.RelatedPostId] AS path
+  SELECT pl.PostId, pl.RelatedPostId, 1 AS depth, ARRAY[pl.PostId, pl.RelatedPostId] AS path
   FROM PostLinks pl
   WHERE pl.LinkTypeId IN (1,3)
   UNION ALL
-  SELECT lc.PostId,
-         pl.RelatedPostId,
-         lc.depth + 1,
-         lc.path || ARRAY[pl.RelatedPostId]
+  SELECT lc.PostId, pl.RelatedPostId, lc.depth + 1, lc.path || pl.RelatedPostId
   FROM linked_chain lc
   JOIN PostLinks pl ON pl.PostId = lc.RelatedPostId
   WHERE lc.depth < 4 AND NOT (pl.RelatedPostId = ANY(lc.path))
@@ -57,13 +52,13 @@ recent_activity AS (
          p.OwnerUserId,
          p.CreationDate,
          p.LastActivityDate,
-         CAST(floor(extract(epoch FROM (coalesce(p.LastActivityDate, p.CreationDate) - p.CreationDate))/3600) AS integer) AS hours_active,
+         (extract(epoch FROM (coalesce(p.LastActivityDate, p.CreationDate) - p.CreationDate))/3600)::int AS hours_active,
          coalesce(u.Reputation,0) AS owner_rep,
          coalesce((SELECT count(*) FROM Comments c WHERE c.PostId = p.Id),0) AS comment_count,
          coalesce((SELECT count(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),0) AS upvotes
   FROM Posts p
   LEFT JOIN Users u ON u.Id = p.OwnerUserId
-  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
 ),
 tag_medians AS (
   SELECT tag,
@@ -115,7 +110,8 @@ SELECT it.tag,
        greatest(it.max_score,
                 coalesce((SELECT max(Score) FROM Posts WHERE Id IN (SELECT question_id FROM question_tags WHERE tag = it.tag)),0)
        ) AS greatest_score,
-       (SELECT round(100.0 * CAST(count(*) AS numeric) / nullif(it.questions,0),2)
+       -- correlated indicator: proportion of questions with title containing the tag string (case-insensitive)
+       (SELECT round(100.0 * count(*)::numeric / nullif(it.questions,0),2)
         FROM question_tags q2
         WHERE q2.tag = it.tag AND lower(coalesce(q2.Title,'')) LIKE '%' || lower(it.tag) || '%'
        ) AS pct_title_contains_tag

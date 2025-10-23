@@ -1,3 +1,4 @@
+-- {"query": "952.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1695} 
 WITH UserBadgeStats AS (
     SELECT
         u.Id AS UserId,
@@ -6,7 +7,7 @@ WITH UserBadgeStats AS (
         COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
         COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
         COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
-        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0) AS DaysSinceCreation,
+        AVG(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/86400) AS DaysSinceCreation,
         COALESCE(STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name), 'No Badges') AS BadgeNames
     FROM Users u
     LEFT JOIN Badges b ON b.UserId = u.Id
@@ -21,7 +22,7 @@ TopQuestionPosts AS (
         p.Score,
         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
     FROM Posts p
-    WHERE p.PostTypeId = 1
+    WHERE p.PostTypeId = 1 -- Questions only
 ),
 UserTopQuestions AS (
     SELECT
@@ -38,9 +39,9 @@ RecentCommentsPerUser AS (
         c.UserId,
         COUNT(*) AS RecentCommentCount,
         AVG(LENGTH(c.Text)) AS AvgCommentLength,
-        SUM(CASE WHEN LOWER(c.Text) LIKE '%sql%' THEN 1 ELSE 0 END) AS SqlKeywordCount
+        SUM(CASE WHEN c.Text ILIKE '%sql%' THEN 1 ELSE 0 END) AS SqlKeywordCount
     FROM Comments c
-    WHERE c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days')
+    WHERE c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
     GROUP BY c.UserId
 ),
 UserActivityScore AS (
@@ -59,6 +60,7 @@ UserActivityScore AS (
         COALESCE(rcp.RecentCommentCount, 0) AS RecentCommentCount,
         COALESCE(rcp.SqlKeywordCount, 0) AS SqlKeywordCount,
         (
+            -- A weighted activity score combining various aspects
             u.Reputation * 0.5 +
             COALESCE(uts.GoldBadges, 0) * 10 +
             COALESCE(uts.SilverBadges, 0) * 5 +
@@ -85,7 +87,7 @@ PostScoreWindows AS (
         RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
         COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostCountPerUser
     FROM Posts p
-    WHERE p.PostTypeId IN (1, 2)
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
 ),
 ComplexPostStats AS (
     SELECT
@@ -137,26 +139,28 @@ SELECT
     hau.DownVotes,
     hau.BadgeNames,
     hau.NumTopScorePosts,
-    COALESCE(ROUND(CAST(hau.AvgMovingScoreForActiveUsers AS NUMERIC), 2), 0) AS AvgMovingScoreForActiveUsers,
+    COALESCE(ROUND(hau.AvgMovingScoreForActiveUsers::numeric, 2), 0) AS AvgMovingScoreForActiveUsers,
     hau.DistinctLinkedPostsCount,
     hau.DuplicateLinksCount,
     hau.RegularLinksCount,
     ROUND(hau.ActivityScore, 2) AS ActivityScore,
+    -- Correlated subquery: retrieve the most recent closed question title by user if exists
     (
         SELECT p.Title
         FROM Posts p
-        JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 -- Post Closed
         WHERE p.OwnerUserId = hau.UserId AND p.PostTypeId = 1
         ORDER BY ph.CreationDate DESC
-        FETCH FIRST 1 ROW ONLY
+        LIMIT 1
     ) AS MostRecentClosedQuestionTitle,
-    (CASE
+    -- Use NULL logic and string expressions to create a custom summary
+    CASE
         WHEN hau.DuplicateLinksCount > 5 THEN 'Prolific duplicator'
         WHEN hau.NumTopScorePosts >= 10 THEN 'Top scorer'
         WHEN hau.ActivityScore > 1000 THEN 'Highly active user'
         ELSE 'Regular contributor'
-    END) ||
+    END || 
     ' - Has ' || COALESCE(NULLIF(hau.BadgeNames, ''), 'no badges') AS UserSummary
 FROM HighlyActiveUsers hau
 ORDER BY hau.ActivityScore DESC, hau.Reputation DESC
-FETCH FIRST 50 ROWS ONLY;
+LIMIT 50;

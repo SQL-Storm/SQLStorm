@@ -1,0 +1,156 @@
+-- {"query": "778.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1338} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        coalesce(p.ViewCount, 0) as ViewCount
+    from Tags t
+    left join (
+        select
+            p.Id,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.ViewCount,
+            p.Tags
+        from Posts p
+        where p.PostTypeId = 1
+    ) p on p.Tags like concat('%<', t.TagName, '>%')
+    where t.Count > 100
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct a.Id) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        sum(coalesce(vpUp.VotesCount,0)) as TotalUpVotes,
+        sum(coalesce(vpDown.VotesCount,0)) as TotalDownVotes,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select PostId, count(*) as VotesCount
+        from Votes
+        where VoteTypeId = 2
+        group by PostId
+    ) vpUp on vpUp.PostId = p.Id
+    left join (
+        select PostId, count(*) as VotesCount
+        from Votes
+        where VoteTypeId = 3
+        group by PostId
+    ) vpDown on vpDown.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostLinkAggregates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId = 1) as LinkedCount,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId = 3) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+),
+QuestionDetails as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        ua.DisplayName as OwnerName,
+        ua.Reputation as OwnerReputation,
+        pla.LinkedCount,
+        pla.DuplicateCount,
+        row_number() over (partition by p.Tags order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    left join UserActivity ua on ua.UserId = p.OwnerUserId
+    left join PostLinkAggregates pla on pla.PostId = p.Id
+    where p.PostTypeId = 1
+),
+AcceptedAnswerScores as (
+    select
+        a.Id,
+        a.Score,
+        a.CreationDate,
+        a.ParentId,
+        u.Reputation as AnswererReputation,
+        u.DisplayName as AnswererName
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2 and a.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+),
+QuestionsWithAcceptedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerName,
+        q.OwnerReputation,
+        q.LinkedCount,
+        q.DuplicateCount,
+        aa.Id as AcceptedAnswerId,
+        aa.Score as AcceptedAnswerScore,
+        aa.AnswererName,
+        aa.AnswererReputation,
+        q.RankByScore
+    from QuestionDetails q
+    left join AcceptedAnswerScores aa on aa.Id = q.AcceptedAnswerId
+    where q.AcceptedAnswerId is not null and q.RankByScore <= 5
+)
+select
+    qwa.QuestionId,
+    qwa.Title,
+    qwa.QuestionDate,
+    qwa.QuestionScore,
+    qwa.ViewCount,
+    qwa.Tags,
+    qwa.OwnerName,
+    qwa.OwnerReputation,
+    qwa.LinkedCount,
+    qwa.DuplicateCount,
+    qwa.AcceptedAnswerId,
+    qwa.AcceptedAnswerScore,
+    qwa.AnswererName,
+    qwa.AnswererReputation,
+    utc.Count as TagUsageCount,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.LastBadgeDate,
+    -- Window function: rank questions by score and views
+    rank() over (order by qwa.QuestionScore desc, qwa.ViewCount desc) as GlobalRank,
+    -- Complex case with NULL logic and string manipulation
+    case
+        when qwa.OwnerReputation > 10000 and qwa.AcceptedAnswerScore > 50 then 'HighRepHighScore'
+        when qwa.OwnerReputation is null or qwa.AcceptedAnswerScore is null then 'MissingData'
+        else concat('Q', qwa.QuestionId, '_A', coalesce(cast(qwa.AcceptedAnswerId as varchar), 'NA'))
+    end as QuestionAnswerTag,
+    -- Correlated subquery with EXISTS and NOT EXISTS
+    exists (
+        select 1 from Comments c 
+        where c.PostId = qwa.QuestionId and c.Score > 10
+    ) as HasHighScoreComment,
+    not exists (
+        select 1 from Votes v 
+        where v.PostId = qwa.QuestionId and v.VoteTypeId = 4 -- Offensive vote
+    ) as NoOffensiveVotes
+from QuestionsWithAcceptedAnswers qwa
+left join RecursiveTagCounts utc on utc.TagName = substring(qwa.Tags from '<([^>]+)>')
+left join UserActivity ua on ua.DisplayName = qwa.OwnerName
+order by GlobalRank, qwa.QuestionDate desc
+limit 100;

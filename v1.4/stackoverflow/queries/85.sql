@@ -1,3 +1,4 @@
+-- {"query": "85.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 722} 
 WITH TopQuestions AS (
   SELECT
     p.Id,
@@ -27,7 +28,7 @@ RecentActivity AS (
       SELECT 1
       FROM Votes v
       WHERE v.PostId = p.Id
-        AND v.VoteTypeId = 6
+        AND v.VoteTypeId = 6 -- close votes (when stored in Votes in older schemas; keep for benchmarking)
         AND v.CreationDate > p.LastActivityDate
     ) AS HadLateActivity
   FROM Posts p
@@ -45,7 +46,7 @@ ComplexStats AS (
     (SELECT COUNT(*) FROM Comments c WHERE c.PostId = t.Id) AS CommentCount,
     (SELECT COUNT(*) FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId = 2) AS UpVotes,
     (SELECT COUNT(*) FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId = 3) AS DownVotes,
-    (SELECT ARRAY_AGG(v.UserId) FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId = 2) AS UpVoterIds
+    (SELECT ARRAY_AGG(v.UserId)::int[] FROM Votes v WHERE v.PostId = t.Id AND v.VoteTypeId = 2) AS UpVoterIds
   FROM TopQuestions t
   WHERE t.rn <= 5
 ),

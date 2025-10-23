@@ -1,3 +1,4 @@
+-- {"query": "674.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2092} 
 with RecursiveTagCounts as (
     select
         t.Id as TagId,
@@ -11,7 +12,7 @@ with RecursiveTagCounts as (
         u.Id as OwnerUserId,
         u.Reputation,
         u.DisplayName,
-        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as PostRank
+        row_number() over (partition by t.Id order by p.Score desc nulls last, p.ViewCount desc nulls last) as PostRank
     from Tags t
     left join Posts p on p.Tags like concat('%<', t.TagName, '>%')
     left join Users u on u.Id = p.OwnerUserId
@@ -34,9 +35,9 @@ TopPostsByTag as (
 UserBadgesAgg as (
     select
         b.UserId,
-        count(case when b.Class = 1 then 1 end) as GoldBadges,
-        count(case when b.Class = 2 then 1 end) as SilverBadges,
-        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
         count(distinct b.Name) as DistinctBadgeCount,
         max(b.Date) as LastBadgeDate
     from Badges b
@@ -58,9 +59,9 @@ UserActivity as (
         (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as AnswerCount,
         (select avg(p.Score) from Posts p where p.OwnerUserId = u.Id) as AvgPostScore,
         (select max(p.Score) from Posts p where p.OwnerUserId = u.Id) as MaxPostScore,
-        case when lower(coalesce(u.Location, '')) like '%united states%' then 'USA'
-             when lower(coalesce(u.Location, '')) like '%india%' then 'India'
-             when lower(coalesce(u.Location, '')) like '%united kingdom%' then 'UK'
+        case when u.Location ilike '%United States%' then 'USA'
+             when u.Location ilike '%India%' then 'India'
+             when u.Location ilike '%United Kingdom%' then 'UK'
              else 'Other' end as Region
     from Users u
     left join UserBadgesAgg uba on uba.UserId = u.Id
@@ -70,10 +71,10 @@ PostVotesAgg as (
         p.Id as PostId,
         p.PostTypeId,
         p.OwnerUserId,
-        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
-        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
-        count(case when v.VoteTypeId = 5 then 1 end) as FavoriteVotes,
-        count(case when v.VoteTypeId in (8,9) then 1 end) as BountyVotes,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as FavoriteVotes,
+        count(v.Id) filter (where v.VoteTypeId = 8 or v.VoteTypeId = 9) as BountyVotes,
         sum(coalesce(v.BountyAmount,0)) as TotalBountyAmount
     from Posts p
     left join Votes v on v.PostId = p.Id
@@ -99,8 +100,8 @@ PostWithVotesAndLinks as (
         pvo.FavoriteVotes,
         pvo.BountyVotes,
         pvo.TotalBountyAmount,
-        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateLinksCount,
-        count(case when pl.LinkTypeId = 1 then 1 end) as LinkedPostsCount
+        count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateLinksCount,
+        count(pl.Id) filter (where pl.LinkTypeId = 1) as LinkedPostsCount
     from Posts p
     left join PostVotesAgg pvo on pvo.PostId = p.Id
     left join PostLinks pl on pl.PostId = p.Id
@@ -128,9 +129,13 @@ DetailedPostAnalysis as (
         p.TotalBountyAmount,
         p.DuplicateLinksCount,
         p.LinkedPostsCount,
+        -- Correlated subquery for count of comments with positive score on post
         (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentsCount,
-        rank() over (partition by p.OwnerUserId order by p.Score desc) as OwnerPostScoreRank,
+        -- Window function: rank posts by score over owner
+        rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as OwnerPostScoreRank,
+        -- String expression: truncated and concatenated tags
         case when p.Tags is not null then substring(p.Tags from 1 for 100) || '...' else 'No Tags' end as ShortTags,
+        -- NULL logic with COALESCE
         coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerIdSafe
     from PostWithVotesAndLinks p
     left join Users u on u.Id = p.OwnerUserId
@@ -142,7 +147,7 @@ ClosedReasonCounts as (
         crt.Name as CloseReasonName,
         count(*) as CloseVotesCount
     from PostHistory ph
-    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
     where ph.PostHistoryTypeId = 10
     group by ph.PostId, crt.Name
 ),
@@ -152,8 +157,8 @@ UserRecentActivity as (
         max(p.LastActivityDate) as LastPostActivity,
         max(ph.CreationDate) as LastHistoryActivity,
         greatest(
-            coalesce(max(p.LastActivityDate), timestamp '1970-01-01 00:00:00'),
-            coalesce(max(ph.CreationDate), timestamp '1970-01-01 00:00:00')
+            coalesce(max(p.LastActivityDate), '1970-01-01'::timestamp),
+            coalesce(max(ph.CreationDate), '1970-01-01'::timestamp)
         ) as LastOverallActivity
     from Users u
     left join Posts p on p.OwnerUserId = u.Id
@@ -195,7 +200,9 @@ FinalResult as (
         ua.MaxPostScore,
         ua.Region,
         ur.LastOverallActivity,
+        -- Complex predicate: flag hot question if score > 100 and viewcount > 10000 and not closed
         case when dpa.Score > 100 and dpa.ViewCount > 10000 and dpa.IsClosed = false then true else false end as IsHotQuestion,
+        -- Set operator: check if user is in top 10% by reputation using a window function
         case when ur2.ReputationRank <= (0.1 * ur2.TotalUsers) then true else false end as IsTop10PercentUser
     from DetailedPostAnalysis dpa
     left join ClosedReasonCounts crc on crc.PostId = dpa.Id
@@ -213,5 +220,5 @@ FinalResult as (
 )
 select *
 from FinalResult
-order by Score desc, ViewCount desc, CreationDate desc
+order by Score desc nulls last, ViewCount desc nulls last, CreationDate desc
 limit 100;

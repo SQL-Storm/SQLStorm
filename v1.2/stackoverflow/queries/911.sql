@@ -1,3 +1,4 @@
+-- {"query": "911.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1247} 
 with RecursiveUserBadgeStats as (
     select
         u.Id as UserId,
@@ -41,15 +42,8 @@ with RecursiveUserBadgeStats as (
     select
         p.Id as PostId,
         trim(tg.value) as Tag
-    from Posts p,
-    lateral (
-      -- Convert tags like '<tag1><tag2>' into array by replacing '><' with '>|<' then splitting on '|'
-      -- Uses standard SQL functions: replace and regexp_split_to_table if available; fallback to split_part in a generate_series approach isn't used here.
-      -- For broad compatibility, use replace + split on '|' via regexp_split_to_table when supported.
-      select value from (
-        select regexp_split_to_table(replace(substring(p.Tags from 2 for length(p.Tags) - 2), '><', '>|<'), '\\|') as value
-      ) s
-    ) as tg
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tg(value)
     where p.Tags is not null and p.PostTypeId = 1
 ), TopTagsByUser as (
     select
@@ -104,8 +98,9 @@ select
         (select count(*)
          from Comments c
          where c.PostId = lp.Id
-           and ((c.Text ilike '%performance%') or (c.Text ilike '%benchmark%'))
+           and (c.Text ilike '%performance%' or c.Text ilike '%benchmark%')
            and c.CreationDate > lp.CreationDate - interval '90 days'), 0) as RecentPerformanceComments,
+    -- String expressions and NULL-aware concatenation
     concat_ws(' | ',
       rus.DisplayName,
       concat('Rep: ', rus.Reputation),

@@ -1,3 +1,4 @@
+-- {"query": "160.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2297} 
 WITH
 RecentPosts AS (
   SELECT
@@ -9,9 +10,9 @@ RecentPosts AS (
     p.ViewCount,
     p.CreationDate,
     p.LastActivityDate,
-    STRING_TO_ARRAY(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS TagArray
+    string_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><') AS TagArray
   FROM Posts p
-  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
 ),
 UserStats AS (
   SELECT
